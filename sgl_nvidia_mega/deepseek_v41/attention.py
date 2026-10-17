@@ -27,6 +27,20 @@ from sgl_nvidia_mega.deepseek_v41.sm103.attention.q_norm_quant import rmsnorm_mx
 
 logger = logging.getLogger(__name__)
 
+# (slot, rows, variant) already logged: engagement is logged from the callables SGLang's
+# dispatch runs, once per width on each rank
+_ENGAGED: set = set()
+
+
+def _log_engaged(slot: str, rows: int, variant: str = "") -> None:
+    key = (slot, rows, variant)
+    if key not in _ENGAGED:
+        _ENGAGED.add(key)
+        logger.info(
+            "sgl-nvidia-mega attention: %s runs at %d rows%s", slot, rows, variant
+        )
+
+
 # MQALayer takes these compress ratios on its low-ratio multi-stream prepare, whose
 # KV and index producers all run on side streams joined before attention
 _LOW_RATIOS = (1, 2)
@@ -162,6 +176,11 @@ def _sparse_decode(
     **_,
 ):
     """The backend's swap-AB / FlashMLA choice, as swap-AB on the 16 local heads."""
+    _log_engaged(
+        "swap-AB sparse decode",
+        q.shape[0],
+        " (query RoPE + KV before the wait)" if q_rope is not None else "",
+    )
     return swapab.swapab_attention(
         q[..., : swapab.NUM_HEADS, :],
         swa_k_cache,
@@ -204,6 +223,7 @@ class AttentionSlots:
         from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 
         attn = self.attn
+        _log_engaged("q-LoRA norm + quant", q.shape[0])
         y, quant, scale = rmsnorm_mxfp8(
             q, attn.q_norm.weight, attn.q_norm.variance_epsilon, pdl=True
         )

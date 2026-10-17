@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The DeepSeek-V4.1 routed forward's glue on CPU: what the fast gate hands the
-kernel, and where the MoE slot joins the quantized input."""
+kernel, where the MoE slot joins the quantized input, and when the embedding falls
+back to SGLang's sharded lookup."""
 
 from types import SimpleNamespace
 
@@ -62,3 +63,13 @@ def test_the_quantized_input_is_joined_before_the_top_k(monkeypatch):
     )
     assert order == [("join", "ready"), ("top-k", None)]
 
+
+def test_the_embedding_is_sglangs_without_a_replicated_table():
+    class _Embedding:
+        pass
+
+    ids = torch.zeros(6, dtype=torch.int32)
+    assert forward.local_embedding(None, ids) is None
+    assert forward.local_embedding(_Embedding(), ids) is None
+    assert forward._embedding_reason(_Embedding()) == "the embedding is _Embedding"
+    assert "embed" in forward.SLOTS

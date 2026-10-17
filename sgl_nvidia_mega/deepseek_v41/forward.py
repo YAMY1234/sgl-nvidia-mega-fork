@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import weakref
 
 import msgspec
 import torch
@@ -38,8 +39,8 @@ SGLANG_READS = {
         "set_written",
         "read_output",
         "clear",
-    ),
         "written_residual",
+    ),
     "kernels/ops/layernorm/mhc.py": ("hc_broadcast", "hc_combine"),
     "srt/models/deepseek_v4_mhc.py": ("HcState", "with_residual", "materialized"),
     "srt/models/deepseek_v4_boundary.py": (
@@ -50,9 +51,9 @@ SGLANG_READS = {
         "materialize",
         "materialize(next)",
         "FinalRead",
-    ),
         "quantized",
         "return_moe_output",
+    ),
     "srt/runtime_context.py": (
         "get_parallel",
         '"tp_size"',
@@ -184,9 +185,27 @@ SGLANG_READS = {
         "with_current_layer",
         "disable_this_region",
     ),
+    # the replicated embedding: the whole table on every rank, looked up locally
+    "srt/layers/vocab_parallel_embedding.py": (
+        "VocabParallelEmbedding",
+        "tp_size",
+        "use_attn_tp_group",
+        "quant_method",
+        "num_added_embeddings",
+        "num_embeddings_padded",
+        "org_vocab_size",
+        "output_dtype",
+        "num_embeddings",
+        "_use_triton_embedding",
+        "_use_triton_embedding(input_)",
+    ),
+    "srt/layers/quantization/unquant.py": ("UnquantizedEmbeddingMethod",),
+    "kernels/ops/embeddings/vocab_parallel_embedding.py": ("vocab_parallel_embedding",),
+    "srt/utils/async_probe.py": ("maybe_detect_oob",),
     # DeepseekV4ForCausalLMDSpark.forward, which the draft forward stands in for
     "srt/models/deepseek_v4_dspark.py": (
         "forward_embed",
+        "embed_tokens",
         "stages",
         "hc_mult",
         "hc_pre_from_prev_sublayer",
@@ -217,11 +236,14 @@ PARITY = PARITY_MODE in ("1", "control")
 # both arms, so the indexer top-k's emission order (atomic arrival order) does not
 # change the attention's accumulation order between the two forwards
 PARITY_SORT_TOPK = os.environ.get("SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK", "0") == "1"
-# Test only: the slots build may fill (hop_a, moe, gate; "dual" runs SGLang's own MoE
-# on the dual-stream path); default all
+# Test only: the slots build may fill (hop_a, moe, gate, embed; "dual" runs SGLang's
+# own MoE on the dual-stream path); default all
 SLOTS = frozenset(
-    os.environ.get("SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate").split(",")
+    os.environ.get("SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate,embed").split(",")
 ) - {""}
+# The target embedding module -> its whole table on this rank (``replicate_embedding``).
+# The draft attaches the target's module only after both builds, so it looks it up here.
+_FULL_TABLES = weakref.WeakKeyDictionary()
 
 
 def model_disable_reasons(model, hf_config) -> list[str]:
@@ -313,7 +335,11 @@ class Routed:
 
         m = self.model
         try:
-            x = m.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            x = input_embeds
+            if x is None:
+                x = local_embedding(m.embed_tokens, input_ids)
+            if x is None:
+                x = m.embed_tokens(input_ids)
             x = hc_broadcast(x, m.hc_mult)
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
             aux = [] if m.dspark_layers_to_capture is not None else None
@@ -617,6 +643,10 @@ class MoeSlot:
             x_q, x_s = experts.quant_method.quantize_routed_input(
                 hidden_states, routed_hidden_size(experts)
             )
+        if ready is not None:
+            # before the top-k, as SGLang joins it: between the route kernel and GEMM1
+            # the join would cost GEMM1 its PDL early launch
+            torch.cuda.current_stream().wait_event(ready)
         if isinstance(topk_output, _GateTopK):
             rows, weights, permuted, _ = self.gemm.gate_topk_and_gemms(
                 x_q,
@@ -640,10 +670,6 @@ class MoeSlot:
             top_k=self.gemm.top_k,
         )
 
-        if ready is not None:
-            # before the top-k, as SGLang joins it: between the route kernel and GEMM1
-            # the join would cost GEMM1 its PDL early launch
-            torch.cuda.current_stream().wait_event(ready)
 
 def moe_seam() -> str:
     """Why SGLang cannot run the MoE slot, or "" when it can: the dual-stream MoE's
@@ -719,6 +745,79 @@ def _gather_errors(group, error: str, value, what: str):
     if any(v != value for _, v in gathered):
         raise RuntimeError(f"sgl-nvidia-mega: the ranks disagree on {what}: {gathered}")
     return value
+
+
+def _embedding_reason(embed) -> str:
+    """Why the embedding cannot be replicated, or "": SGLang's TP-sharded table with
+    no padding or added vocabulary, read by its fused lookup."""
+    from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+    if type(embed) is not VocabParallelEmbedding:
+        return f"the embedding is {type(embed).__name__}"
+    weight = embed.weight
+    if not (
+        embed.tp_size > 1
+        and not embed.use_attn_tp_group
+        and isinstance(embed.quant_method, UnquantizedEmbeddingMethod)
+        and embed.num_added_embeddings == 0
+        and embed.num_embeddings_padded == embed.org_vocab_size
+        and embed.output_dtype is None
+        and weight.is_cuda
+        and weight.dim() == 2
+        and weight.stride(1) == 1
+    ):
+        return "not a plain TP-sharded vocabulary"
+    return ""
+
+
+def replicate_embedding(embed, copies: dict, group) -> str:
+    """All-gather the target embedding's vocabulary shards once, so every rank looks
+    tokens up in the whole table and the step skips the embedding's all-reduce (+1 GB
+    a rank at TP4; the draft reuses it). The reason it did not, or ""."""
+    reasons = [None] * group.world_size
+    torch.distributed.all_gather_object(
+        reasons, _embedding_reason(embed), group=group.cpu_group
+    )
+    if any(reasons):
+        return "; ".join(f"rank {r}: {e}" for r, e in enumerate(reasons) if e)
+    shard = embed.weight.detach().contiguous()
+    rows = shard.size(0)
+    full = shard.new_empty((rows * group.world_size, shard.size(1)))
+    torch.distributed.all_gather_into_tensor(full, shard, group=group.device_group)
+    start = group.rank_in_group * rows
+    error = ""
+    if full.size(0) != embed.org_vocab_size:
+        error = f"{full.size(0)} rows for a vocabulary of {embed.org_vocab_size}"
+    elif not torch.equal(full[start : start + rows], shard):
+        error = "its shard is not at its vocabulary offset"
+    _gather_errors(group, error, None, "the embedding gather")
+    copies[("embedding", "model.embed_tokens.weight")] = full
+    _FULL_TABLES[embed] = full
+    return ""
+
+
+def local_embedding(embed, input_ids):
+    """``embed(input_ids)`` from this rank's whole table, or None where SGLang's sharded
+    lookup + all-reduce runs. The same values: the all-reduce sums one row and zeros."""
+    from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
+        vocab_parallel_embedding,
+    )
+    from sglang.srt.layers.layer_boundary import get_attn_tp_context
+    from sglang.srt.utils.async_probe import maybe_detect_oob
+
+    table = _FULL_TABLES.get(embed) if embed is not None else None
+    if (
+        table is None
+        or get_attn_tp_context().input_scattered
+        or not embed._use_triton_embedding(input_ids)
+    ):
+        return None
+    maybe_detect_oob(
+        input_ids, 0, embed.num_embeddings, "VocabParallelEmbedding input id"
+    )
+    vocab = table.size(0)
+    return vocab_parallel_embedding(input_ids, table, 0, vocab, 0, vocab, vocab)
 
 
 def _build_hop_a(runner, model, hf_config, ctx, group) -> list[int]:
@@ -853,6 +952,11 @@ def build(model, hf_config, ctx) -> Routed:
     if not moe_reason:
         moe_reason = _build_moe(runner, layers, gate_topk=True, group=group)
         moe = _moe_slots(runner, layers)
+    embed_reason = (
+        replicate_embedding(m.embed_tokens, ctx.copies, group)
+        if "embed" in SLOTS
+        else "off (SGLANG_NVIDIA_MEGA_SLOTS)"
+    )
     facts = slot_plan.Facts(hop_a=not reason, hop_a_reason=reason)
     slots = {
         w: msgspec.structs.replace(s, hop_a=s.hop_a and w in taken)
@@ -861,7 +965,7 @@ def build(model, hf_config, ctx) -> Routed:
     logger.info(
         "sgl-nvidia-mega deepseek_v41: widths %s; hop A at %s rows (%s; mailbox %.1f "
         "MiB); routed experts on the GEMM pair in %d layers (%s), fast gate in %d of "
-        "them at %s rows",
+        "them at %s rows; embedding %s",
         list(ctx.widths),
         [w for w, s in slots.items() if s.hop_a],
         reason or "built",
@@ -870,6 +974,7 @@ def build(model, hf_config, ctx) -> Routed:
         moe_reason or "built",
         sum(m.gate for m in moe.values()),
         [w for w, s in slots.items() if s.fast_gate],
+        embed_reason or "replicated (no all-reduce)",
     )
     return Routed(model, slots, runner, moe)
 
@@ -920,7 +1025,13 @@ class Draft:
         from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 
         lm = self.lm
-        x = lm.forward_embed(input_ids) if input_embeds is None else input_embeds
+        x = input_embeds
+        if x is None:
+            x = local_embedding(lm.embed_tokens, input_ids)
+            if x is None:
+                x = lm.forward_embed(input_ids)
+            else:  # forward_embed's broadcast to the mHC streams
+                x = x.unsqueeze(1).repeat(1, lm.hc_mult, 1)
         try:
             residual_batch.start(forward_batch)
             # draft stages have no recorder layer indices

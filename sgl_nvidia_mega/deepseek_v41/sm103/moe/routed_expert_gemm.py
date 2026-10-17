@@ -8,8 +8,9 @@ kernel and a GEMM pair of 8-row tcgen05 block-scaled tiles (persistent schedule,
 compiled with NVRTC on first use. An expert chosen by more than 8 rows gets several
 consecutive tiles (route_wide.cu). The kernels read the same shuffled MXFP4 weights and
 MXFP8 activations as FlashInfer and return its deferred-finalize triple, so the fused
-finalize + all-reduce + mHC consumer is unchanged. On the target router, gate_topk.cu
-runs the router's top-k ahead of the route kernel.
+finalize + all-reduce + mHC consumer is unchanged. On the target and DSpark draft
+routers, gate_topk.cu / gate_topk_draft.cu run the router's top-k ahead of the route
+kernel.
 """
 
 from __future__ import annotations
@@ -58,9 +59,19 @@ def compile_source(source, name, arch, options=NVRTC_OPTIONS, headers=None) -> b
 
 # The rows the forward routes through the pair; larger steps keep FlashInfer
 SERVED_MAX_ROWS = 48
-# gate_topk.cu is specialized to the DSV4.1 target router.
+# gate_topk.cuh specialized per router (experts, top_k), one NVRTC program and symbol
+# each: the DSV4.1 target's and the DSpark draft's.
 GATE_TOPK_EXPERTS = 384
 GATE_TOPK_TOP_K = 6
+DRAFT_GATE_TOPK_EXPERTS = 128
+DRAFT_GATE_TOPK_TOP_K = 3
+GATE_TOPK_VARIANTS = {
+    (GATE_TOPK_EXPERTS, GATE_TOPK_TOP_K): ("gate_topk", "dsv41_gate_topk"),
+    (DRAFT_GATE_TOPK_EXPERTS, DRAFT_GATE_TOPK_TOP_K): (
+        "gate_topk_draft",
+        "dsv41_gate_topk_e128_k3",
+    ),
+}
 
 
 def max_ctas(rows: int, top_k: int, experts: int) -> int:
@@ -130,7 +141,6 @@ def load_route_wide(device_index: int) -> _Kernel:
         )
 
 
-GATE_TOPK_THREADS = 384
 # Triton's libdevice reflection (flush to zero, approximate sqrt and division), so the router
 # math is bit for bit moe_fused_gate's.
 GATE_TOPK_NVRTC_OPTIONS = (
@@ -140,19 +150,29 @@ GATE_TOPK_NVRTC_OPTIONS = (
     "--prec-sqrt=false",
     "--prec-div=false",
 )
+GATE_TOPK_HEADERS = ("gate_topk.cuh",)
 
 
 @cache
-def load_gate_topk(device_index: int) -> _Kernel:
+def load_gate_topk(
+    device_index: int, experts: int = GATE_TOPK_EXPERTS, top_k: int = GATE_TOPK_TOP_K
+) -> _Kernel:
+    """The gate top-k kernel of the (experts, top_k) router, one thread per expert."""
+    name, symbol = GATE_TOPK_VARIANTS[(experts, top_k)]
     device = torch.device("cuda", device_index)
     with torch.cuda.device(device):
         torch.zeros(1, device=device)
         major, minor = torch.cuda.get_device_capability(device)
-        source = (SOURCE_DIR / "gate_topk.cu").read_text()
+        source = (SOURCE_DIR / f"{name}.cu").read_text()
+        headers = {h: (SOURCE_DIR / h).read_text() for h in GATE_TOPK_HEADERS}
         cubin = compile_source(
-            source, "gate_topk", f"sm_{major}{minor}a", GATE_TOPK_NVRTC_OPTIONS
+            source,
+            name,
+            f"sm_{major}{minor}a",
+            GATE_TOPK_NVRTC_OPTIONS,
+            headers=headers,
         )
-        return _load(cubin, "dsv41_gate_topk", (GATE_TOPK_THREADS, 1, 1), 0)
+        return _load(cubin, symbol, (experts, 1, 1), 0)
 
 
 def _weight_map(weights: torch.Tensor, m: int, k: int, chunks: int):
@@ -273,9 +293,12 @@ class RoutedExpertGemm:
         self.route_wide = (
             load_route_wide(w13.device.index) if max_rows > MAX_ROWS else None
         )
-        fits_gate_topk = self.experts == GATE_TOPK_EXPERTS and top_k == GATE_TOPK_TOP_K
+        # the router's (experts, top_k) picks the variant: target or DSpark draft
+        fits_gate_topk = (self.experts, top_k) in GATE_TOPK_VARIANTS
         self.gate_topk_kernel = (
-            load_gate_topk(w13.device.index) if gate_topk and fits_gate_topk else None
+            load_gate_topk(w13.device.index, self.experts, top_k)
+            if gate_topk and fits_gate_topk
+            else None
         )
         # route.cu flips bit 31 of this word on every launch.
         self.barrier = torch.zeros(1, dtype=torch.int32, device=w13.device)
@@ -478,7 +501,7 @@ class RoutedExpertGemm:
             and logits.dtype == torch.float32
             and logits.dim() == 2
             and logits.is_contiguous()
-            and tuple(logits.shape[1:]) == (GATE_TOPK_EXPERTS,)
+            and tuple(logits.shape[1:]) == (self.experts,)
             and 1 <= logits.size(0) <= self.max_rows
             and bias.dtype == torch.float32
             and bias.is_contiguous()

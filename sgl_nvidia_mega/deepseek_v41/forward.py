@@ -236,10 +236,11 @@ PARITY = PARITY_MODE in ("1", "control")
 # both arms, so the indexer top-k's emission order (atomic arrival order) does not
 # change the attention's accumulation order between the two forwards
 PARITY_SORT_TOPK = os.environ.get("SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK", "0") == "1"
-# Test only: the slots build may fill (hop_a, moe, gate, embed; "dual" runs SGLang's
-# own MoE on the dual-stream path); default all
+# Test only: the slots build may fill (hop_a, moe, gate, embed, draft_gate: the draft's
+# gate; "dual" runs SGLang's own MoE on the dual-stream path); default all
+DEFAULT_SLOTS = "hop_a,moe,gate,embed,draft_gate"
 SLOTS = frozenset(
-    os.environ.get("SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate,embed").split(",")
+    os.environ.get("SGLANG_NVIDIA_MEGA_SLOTS", DEFAULT_SLOTS).split(",")
 ) - {""}
 # The target embedding module -> its whole table on this rank (``replicate_embedding``).
 # The draft attaches the target's module only after both builds, so it looks it up here.
@@ -685,7 +686,8 @@ def moe_seam() -> str:
 
 
 def _gate_applies(mlp) -> bool:
-    """The DSV4.1 target router gate_topk.cu reproduces bit for bit."""
+    """A DSV4.1 router gate_topk.cuh reproduces bit for bit: the target's or the DSpark
+    draft's (the same routing; the loaded variant matches its experts and top-k)."""
     config = mlp.topk.topk_config
     bias_vl = getattr(mlp.gate, "e_score_correction_bias_vl", None)
     return (
@@ -701,9 +703,12 @@ def _gate_applies(mlp) -> bool:
     )
 
 
-def _moe_slots(runner, layers, key=lambda i, layer: layer.layer_id) -> dict:
+def _moe_slots(
+    runner, layers, key=lambda i, layer: layer.layer_id, gate_slot: str = "gate"
+) -> dict:
     """The MoE slot of every layer whose pair built and whose MoE runs SGLang's
-    dual-stream path (alternate stream, no fused shared experts)."""
+    dual-stream path (alternate stream, no fused shared experts); ``gate_slot`` names
+    the SLOTS entry that turns its fast gate on."""
     slots = {}
     for i, layer in layers:
         mlp, gemm = layer.mlp, runner.moe.get(i)
@@ -712,7 +717,7 @@ def _moe_slots(runner, layers, key=lambda i, layer: layer.layer_id) -> dict:
         slots[key(i, layer)] = MoeSlot(
             mlp,
             gemm,
-            gate="gate" in SLOTS
+            gate=gate_slot in SLOTS
             and gemm.gate_topk_kernel is not None
             and _gate_applies(mlp),
         )
@@ -1054,7 +1059,7 @@ class Draft:
                         runner=self.runner,
                         hop_a=False,
                         moe=moe,
-                        fast_gate=False,
+                        fast_gate=slots.fast_gate,
                     )
             state = residual_batch.read_output(
                 x, forward_batch, hc_boundary.FinalRead(), None
@@ -1079,23 +1084,27 @@ def build_draft(model, hf_config, ctx) -> Draft:
     stages = list(enumerate(model.stages))
     device = next(model.parameters()).device
     runner = Runner(device=device, rank=group.rank_in_group)
-    # the draft's stages route with SGLang's top-k; their posts finalize the
-    # deferred output (fused or not)
+    # at fast-gate widths the draft router's top-k runs in gate_topk_draft.cu; the
+    # stages' posts finalize the deferred output (fused or not)
     moe_reason = moe_seam() or (
         "" if "moe" in SLOTS else "off (SGLANG_NVIDIA_MEGA_SLOTS)"
     )
     moe = {}
     if not moe_reason:
-        moe_reason = _build_moe(runner, stages, gate_topk=False, group=group)
-        moe = _moe_slots(runner, stages, key=lambda i, _: i)
+        moe_reason = _build_moe(
+            runner, stages, gate_topk="draft_gate" in SLOTS, group=group
+        )
+        moe = _moe_slots(runner, stages, key=lambda i, _: i, gate_slot="draft_gate")
     slots = slot_plan.plan(
         ctx.widths, slot_plan.Facts(hop_a=False, hop_a_reason="draft")
     )
     logger.info(
         "sgl-nvidia-mega deepseek_v41 draft: widths %s; routed experts on the GEMM "
-        "pair in %d stages (%s)",
+        "pair in %d stages (%s), fast gate in %d of them at %s rows",
         list(ctx.widths),
         len(moe),
         moe_reason or "built",
+        sum(m.gate for m in moe.values()),
+        [w for w, s in slots.items() if s.fast_gate],
     )
     return Draft(model, slots, runner, moe)

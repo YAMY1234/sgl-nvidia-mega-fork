@@ -98,7 +98,10 @@ def step(layer, m_in: torch.Tensor, st):
     mlp, t = layer.mlp, st.transport
     num_token_non_padded = st.fb.moe_num_token_non_padded()
     use_vision_topk = mlp.gate.e_score_correction_bias_vl is not None
-    if dual_stream(mlp, m_in.shape[0]):
+    bound = st.bound.get("moe") if st.slots.routed else None
+    slot = bound.slots.get(layer.layer_id) if bound is not None else None
+    # the routed pair runs in the dual-stream order in every mode
+    if slot is not None or dual_stream(mlp, m_in.shape[0]):
         return _dual_stream(
             mlp,
             m_in,
@@ -106,6 +109,8 @@ def step(layer, m_in: torch.Tensor, st):
             num_token_non_padded,
             use_vision_topk,
             bool(t.return_moe_output),
+            slot=slot,
+            fast_gate=slot is not None and slot.gate and st.slots.fast_gate,
         )
     return _eager(
         mlp,
@@ -179,11 +184,21 @@ def _eager(
 
 
 def _dual_stream(
-    mlp, x, input_ids_global, num_token_non_padded, use_vision_topk, defer
+    mlp,
+    x,
+    input_ids_global,
+    num_token_non_padded,
+    use_vision_topk,
+    defer,
+    *,
+    slot=None,
+    fast_gate=False,
 ):
     """``DeepseekV2MoE.forward_normal_dual_stream`` with ``leave_output_sum``: the
     router and routed experts on the main stream, the routed MXFP8 input on its own
-    stream, the shared expert on the alternate stream after the routed branch."""
+    stream, the shared expert on the alternate stream after the routed branch. With
+    ``slot`` the routed experts run on the GEMM pair (a deferred finalize), and with
+    ``fast_gate`` its top-k takes SGLang's router logits."""
     from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopKOutputFormat
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         Mxfp4FlashinferTrtllmMoEMethod,
@@ -206,7 +221,12 @@ def _dual_stream(
         mlp.routed_quant_stream.wait_stream(current)
     has_shared = x.shape[0] > 0 and mlp.num_fused_shared_experts == 0
 
-    if bypass:
+    if fast_gate:
+        router_logits = mlp.gate(x, None)
+        topk_output = slot.select(
+            router_logits, input_ids_global, num_token_non_padded, use_vision_topk
+        )
+    elif bypass:
         topk_output = BypassedTopKOutput(
             hidden_states=x,
             router_logits=mlp.gate(x, None),
@@ -225,18 +245,25 @@ def _dual_stream(
             ready = mlp.routed_quant_stream.record_event()
         routed_pre_quant = Mxfp8RoutedInputPreQuant(x_q, x_sf, ready)
     deferred = (
-        has_shared
-        and not mlp._shared_expert_tp1
-        and topk_output.format == TopKOutputFormat.BYPASSED
-        and mlp.experts.supports_deferred_finalize
-        and (
-            mlp._deferred_finalize_max_tokens <= 0
-            or x.shape[0] <= mlp._deferred_finalize_max_tokens
+        slot is not None
+        or (
+            has_shared
+            and not mlp._shared_expert_tp1
+            and topk_output.format == TopKOutputFormat.BYPASSED
+            and mlp.experts.supports_deferred_finalize
+            and (
+                mlp._deferred_finalize_max_tokens <= 0
+                or x.shape[0] <= mlp._deferred_finalize_max_tokens
+            )
         )
-    ) or (
-        defer and isinstance(mlp.experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod)
+        or (
+            defer
+            and isinstance(mlp.experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod)
+        )
     )
-    if deferred:
+    if slot is not None:
+        routed = slot.run(x, topk_output, routed_pre_quant)
+    elif deferred:
         routed = mlp.experts.forward_deferred_finalize(
             x, topk_output, pre_quant_input=routed_pre_quant
         )

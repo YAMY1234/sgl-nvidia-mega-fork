@@ -166,7 +166,12 @@ def _run_both(capture, defers_sum, skip_shared=False, **block):
                     do_shared_local=skip_shared,
                     return_moe_output=defers_sum,
                 )
-                st = SimpleNamespace(fb=batch, transport=transport)
+                st = SimpleNamespace(
+                    fb=batch,
+                    transport=transport,
+                    slots=SimpleNamespace(routed=False, fast_gate=False),
+                    bound={"moe": None},
+                )
                 out = moe.step(SimpleNamespace(mlp=mlp), x, st)
         runs.append((log, out))
     return runs
@@ -206,3 +211,41 @@ def test_the_branch_follows_capture_mode():
         with _sglang(log, cur, capture=capture):
             assert dual_stream(mlp, 3) is capture
             assert not dual_stream(mlp, 0)
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("fast_gate", [False, True])
+def test_the_routed_pair_replaces_only_the_top_k_and_the_routed_call(
+    capture, fast_gate
+):
+    log = []
+    mlp, x, cur = _block(log, inplace=False, quant_once=False, quant_routed=False)
+
+    def logged(name, out):
+        def run(*args):
+            log.append((name, cur["stream"]))
+            return out
+
+        return run
+
+    slot = SimpleNamespace(
+        gate=True,
+        select=logged("fast_gate", "gate_topk"),
+        run=logged("pair", "deferred"),
+    )
+    st = SimpleNamespace(
+        fb=SimpleNamespace(moe_num_token_non_padded=lambda: "nnp"),
+        transport=SimpleNamespace(
+            input_ids_global="ids_g", do_shared_local=False, return_moe_output=True
+        ),
+        slots=SimpleNamespace(routed=True, fast_gate=fast_gate),
+        bound={"moe": SimpleNamespace(slots={7: slot})},
+    )
+    with _sglang(log, cur, capture=capture):
+        out = moe.step(SimpleNamespace(mlp=mlp, layer_id=7), x, st)
+    names = [e[:2] if e[0] in ("fast_gate", "pair") else e[0] for e in log]
+    assert ("pair", "main") in names and "experts" not in names
+    assert (("fast_gate", "main") in names) is fast_gate
+    assert ("topk" in names) is not fast_gate
+    assert ("shared", "alt", ("x",), (("gemm_output_zero_allocator", None),)) in log
+    assert out.routed == "deferred" and out.shared == "shared_out"

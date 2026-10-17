@@ -11,12 +11,30 @@ Today it is the stock step (``moe/step.py``).
 
 from __future__ import annotations
 
+import logging
+
+from sgl_nvidia_mega.deepseek_v41.moe import routed
 from sgl_nvidia_mega.deepseek_v41.moe.step import step
+
+logger = logging.getLogger(__name__)
 
 
 def build(model, ctx, group):
-    """Bind weights, allocate buffers, compile; the result is ``st.bound["moe"]``."""
-    return None
+    """The routed-expert GEMM pair of every MoE layer (slot ``moe``; slot ``gate``:
+    its fast top-k); the result is ``st.bound["moe"]``."""
+    from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+
+    if "moe" not in SLOTS:
+        return routed.Bound(reason="stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
+    bound = routed.build(model, group, gate_topk="gate" in SLOTS)
+    logger.info(
+        "sgl-nvidia-mega deepseek_v41 moe: routed experts on the GEMM pair in %d "
+        "layers, fast gate in %d (%s)",
+        len(bound.slots),
+        sum(s.gate for s in bound.slots.values()),
+        bound.reason or "built",
+    )
+    return bound
 
 
 __all__ = ["build", "step"]

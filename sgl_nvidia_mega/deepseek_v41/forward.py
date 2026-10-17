@@ -39,6 +39,7 @@ SGLANG_READS = {
         "read_output",
         "clear",
     ),
+        "written_residual",
     "kernels/ops/layernorm/mhc.py": ("hc_broadcast", "hc_combine"),
     "srt/models/deepseek_v4_mhc.py": ("HcState", "with_residual", "materialized"),
     "srt/models/deepseek_v4_boundary.py": (
@@ -50,6 +51,8 @@ SGLANG_READS = {
         "materialize(next)",
         "FinalRead",
     ),
+        "quantized",
+        "return_moe_output",
     "srt/runtime_context.py": (
         "get_parallel",
         '"tp_size"',
@@ -125,8 +128,6 @@ SGLANG_READS = {
         "transport_context",
         "exit",
     ),
-    "srt/layers/layer_boundary/residual/batch.py": ("written_residual",),
-    "srt/models/deepseek_v4_boundary.py": ("quantized", "return_moe_output"),
     "srt/models/deepseek_common/moe_transport.py": (
         "input_ids",
         "input_ids_global",

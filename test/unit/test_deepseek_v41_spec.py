@@ -65,7 +65,7 @@ def test_the_slot_plan_follows_the_measured_bounds():
     on = plan.Facts(hop_a=True)
     table = plan.plan(dsv41.WIDTHS, on)
     assert [w for w, s in table.items() if s.hop_a] == list(range(1, 9))
-    assert [w for w, s in table.items() if s.fast_gate] == [*range(1, 9), 48]
+    assert [w for w, s in table.items() if s.fast_gate] == [*range(1, 17), 48]
     assert all(s.routed for s in table.values())
     # without SGLang's attention output before wo_b, the hop-A slot stays off
     assert not any(

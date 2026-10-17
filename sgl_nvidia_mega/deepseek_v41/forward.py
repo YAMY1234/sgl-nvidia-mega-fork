@@ -555,7 +555,7 @@ class _GateTopK(msgspec.Struct):
     router_logits: torch.Tensor
     bias: torch.Tensor
     scale: float
-    num_valid: torch.Tensor
+    num_valid: object  # a 1-element int32 tensor, or None when every row is valid
     alt: object
     eps: float
 
@@ -587,12 +587,6 @@ class MoeSlot:
                 f"sgl-nvidia-mega: the fast gate cannot take router logits "
                 f"{router_logits.dtype} {tuple(router_logits.shape)}"
             )
-        rows = router_logits.shape[0]
-        num_valid = (
-            num_token_non_padded
-            if num_token_non_padded is not None
-            else torch.full((1,), rows, dtype=torch.int32, device=router_logits.device)
-        )
         alt, eps = None, 0.0
         if use_vision_topk:
             # vision routing: image tokens rank with the alternate bias
@@ -602,7 +596,10 @@ class MoeSlot:
                 int(self.mlp.config.image_token_id),
             )
             eps = self.eps
-        return _GateTopK(router_logits, self.bias, self.scale, num_valid, alt, eps)
+        # None (no padded rows) launches no fill kernel, which would break the PDL chain
+        return _GateTopK(
+            router_logits, self.bias, self.scale, num_token_non_padded, alt, eps
+        )
 
     def run(self, *, hidden_states, topk_output, pre_quant_input):
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -628,13 +625,10 @@ class MoeSlot:
                 topk_output.bias,
                 topk_output.scale,
                 topk_output.num_valid,
-                input_ready=ready,
                 alt=topk_output.alt,
                 renormalize_epsilon=topk_output.eps,
             )
         else:
-            if ready is not None:
-                torch.cuda.current_stream().wait_event(ready)
             rows, weights, permuted = self.gemm(
                 x_q, x_s, topk_output.topk_ids, topk_output.topk_weights
             )
@@ -646,6 +640,10 @@ class MoeSlot:
             top_k=self.gemm.top_k,
         )
 
+        if ready is not None:
+            # before the top-k, as SGLang joins it: between the route kernel and GEMM1
+            # the join would cost GEMM1 its PDL early launch
+            torch.cuda.current_stream().wait_event(ready)
 
 def moe_seam() -> str:
     """Why SGLang cannot run the MoE slot, or "" when it can: the dual-stream MoE's

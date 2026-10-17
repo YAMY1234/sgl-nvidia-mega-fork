@@ -396,16 +396,16 @@ class RoutedExpertGemm:
         logits: torch.Tensor,
         bias: torch.Tensor,
         routed_scaling_factor: float,
-        num_valid: torch.Tensor,
-        input_ready: Optional[torch.cuda.Event] = None,
+        num_valid: Optional[torch.Tensor],
         alt: Optional[tuple[torch.Tensor, torch.Tensor, int]] = None,
         renormalize_epsilon: float = 0.0,
     ):
         """``__call__`` from the router's fp32 logits: gate_topk.cu does moe_fused_gate's
         top-k (sqrtsoftplus via log1p, renormalized, scaled), then the route kernel.
         ``alt`` = (bias_alt, input_ids, token id): rows whose token is that id rank with
-        bias_alt (DSV4.1 VL routing). ``input_ready`` (the quantized input's event) is joined
-        before GEMM1, the first reader of ``x_quant``.
+        bias_alt (DSV4.1 VL routing). ``num_valid`` None means every row is valid. The
+        caller joins the quantized input before this call: a stream join between the route
+        kernel and GEMM1 would cost GEMM1 its PDL early launch.
         Returns (gemm2 rows, top-k weights, slot -> row, top-k ids)."""
         rows = logits.size(0)
         device = logits.device
@@ -425,7 +425,7 @@ class RoutedExpertGemm:
                     input_ids is not None and input_ids.dtype == torch.int64
                 ),
                 ctypes.c_int64(alt_token_id),
-                _pointer(num_valid),
+                _null_or_pointer(num_valid),
                 _pointer(weights),
                 _pointer(ids),
                 ctypes.c_float(routed_scaling_factor),
@@ -435,8 +435,6 @@ class RoutedExpertGemm:
         )
         ctas = max_ctas(rows, self.top_k, self.experts)
         permuted, record = self._route(ids, rows, ctas)
-        if input_ready is not None:
-            torch.cuda.current_stream(device).wait_event(input_ready)
         return self._gemms(x_quant, x_scale, record, ctas), weights, permuted, ids
 
     def _route(self, ids: torch.Tensor, rows: int, ctas: int):

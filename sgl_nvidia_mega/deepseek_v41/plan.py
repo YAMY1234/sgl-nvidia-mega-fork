@@ -4,8 +4,8 @@
 
 The row bounds are the measured ones: the wo_b publish + Lamport hop wins at 1-8
 rows (FlashInfer's low-latency GEMM takes at most 8), the routed-expert pair at
-1-48 rows, and the fast gate top-k only at 1-8 and 48 rows (a leave-one-out
-measured it slower at 12 and 24). Everything else is SGLang's own op.
+1-48 rows, and the fast gate top-k only at 1-16 and 48 rows (serving measured it
+slower at 24). Everything else is SGLang's own op.
 """
 
 from __future__ import annotations
@@ -14,7 +14,8 @@ import msgspec
 
 MAX_ROWS = 48  # the largest routed width
 HOP_A_MAX_ROWS = 8
-FAST_GATE_ROWS = frozenset(range(1, HOP_A_MAX_ROWS + 1)) | {MAX_ROWS}
+FAST_GATE_MAX_SMALL_ROWS = 16
+FAST_GATE_ROWS = frozenset(range(1, FAST_GATE_MAX_SMALL_ROWS + 1)) | {MAX_ROWS}
 
 
 class Slots(msgspec.Struct, frozen=True):

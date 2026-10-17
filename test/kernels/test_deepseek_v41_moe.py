@@ -7,8 +7,8 @@
   chosen by more than 8 rows (several tiles), and on the DSpark draft layer (128
   experts, top-3) at 1-8 rows; eager and replayed from a CUDA graph;
 - gate_topk.cu against SGLang's moe_fused_gate, bit for bit (ids and weights) at 1-64
-  rows, including ties, both softplus branches, NaN logits, padded rows and the
-  vision-token routing.
+  rows, including ties, both softplus branches, NaN logits, padded rows, no padded-row
+  count (every row valid) and the vision-token routing.
 """
 
 import ctypes
@@ -272,7 +272,7 @@ def _fast(logits, bias, num_valid, vl=None):
             reg._null_or_pointer(input_ids),
             ctypes.c_int32(input_ids is not None and input_ids.dtype == torch.int64),
             ctypes.c_int64(token),
-            reg._pointer(num_valid),
+            reg._null_or_pointer(num_valid),
             reg._pointer(weights),
             reg._pointer(ids),
             ctypes.c_float(SCALE),
@@ -310,6 +310,8 @@ def test_gate_topk_matches_moe_fused_gate(kind):
             bias = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.05
             valid = rows if trial % 2 == 0 else max(1, rows - 1 - trial)
             num_valid = torch.tensor([valid], dtype=torch.int32, device="cuda")
+            if trial == 2:  # no num_token_non_padded: every row is valid
+                num_valid = None
             sw, sid = _stock(logits, bias, num_valid)
             fw, fid = _fast(logits, bias, num_valid)
             torch.cuda.synchronize()
@@ -318,12 +320,15 @@ def test_gate_topk_matches_moe_fused_gate(kind):
             assert torch.equal(fw.view(torch.int32), sw.view(torch.int32)), where
 
 
-def test_gate_topk_follows_live_inputs_in_a_graph():
-    gen = torch.Generator(device="cuda").manual_seed(7)
-    rows = 6
+@pytest.mark.parametrize("rows", [6, 12, 16, 48])
+@pytest.mark.parametrize("count", [True, False])
+def test_gate_topk_follows_live_inputs_in_a_graph(rows, count):
+    gen = torch.Generator(device="cuda").manual_seed(7 + rows)
     logits = torch.randn((rows, TARGET_EXPERTS), device="cuda", generator=gen)
     bias = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.05
-    num_valid = torch.tensor([rows], dtype=torch.int32, device="cuda")
+    num_valid = (
+        torch.tensor([rows], dtype=torch.int32, device="cuda") if count else None
+    )
     _fast(logits, bias, num_valid)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -341,7 +346,7 @@ def test_gate_topk_follows_live_inputs_in_a_graph():
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
 def test_gate_topk_vision_routing_matches_moe_fused_gate(ids_dtype):
     gen = torch.Generator(device="cuda").manual_seed(99)
-    for rows in [1, 6, 7, 12, 24, 48, 64]:
+    for rows in [1, 6, 7, 12, 16, 24, 48, 64]:
         for trial in range(4):
             logits = _logits("normal", rows, gen).contiguous()
             bias = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.05
@@ -353,6 +358,8 @@ def test_gate_topk_vision_routing_matches_moe_fused_gate(ids_dtype):
             input_ids = input_ids.to(ids_dtype)
             valid = rows if trial % 2 == 0 else max(1, rows - 2)
             num_valid = torch.tensor([valid], dtype=torch.int32, device="cuda")
+            if trial == 2:
+                num_valid = None
             vl = (bias_alt, input_ids, IMAGE_TOKEN)
             sw, sid = _stock(logits, bias, num_valid, vl)
             fw, fid = _fast(logits, bias, num_valid, vl)
@@ -373,10 +380,12 @@ def test_gate_topk_then_pair_matches_the_two_steps(target_layer):
         gate_topk=True,
     )
     gen = torch.Generator(device="cuda").manual_seed(3)
-    for rows in (1, 6, 12, 48):
+    for rows, count in ((1, True), (6, False), (12, False), (16, True), (48, False)):
         logits = torch.randn((rows, TARGET_EXPERTS), device="cuda", generator=gen)
         bias = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.05
-        num_valid = torch.tensor([rows], dtype=torch.int32, device="cuda")
+        num_valid = (
+            torch.tensor([rows], dtype=torch.int32, device="cuda") if count else None
+        )
         x = torch.randn(rows, reg.HIDDEN, device="cuda", generator=gen).to(
             torch.bfloat16
         )

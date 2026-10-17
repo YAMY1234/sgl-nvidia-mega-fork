@@ -9,129 +9,109 @@ SGLang does). ``start`` / ``final`` open and close the streams around the layers
 ``materialize`` / ``set_residual`` serve the readers between layers (Engram, the
 draft's capture).
 
-SKELETON: every function calls SGLang's stage boundaries in the order
-``DeepseekV4CudaDecoderLayer.forward`` does. The boundary lane replaces them with
-the ported stock code, then with the plugin's kernels.
+Today every function runs SGLang's stock decode boundary (``stock.py``): SGLang's
+own mHC functions in its stage boundary's order, without its stage objects. The
+MoE post runs right after the MoE, so the streams are always materialized between
+layers.
 """
 
 from __future__ import annotations
 
+import msgspec
+
+from sgl_nvidia_mega.deepseek_v41.boundary.stock import BoundaryState, StockBoundaries
+
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/layers/layer_boundary/residual/batch.py": (
-        "start",
-        "set_written",
-        "written_residual",
-        "read_output",
-        "clear",
-    ),
-    "srt/models/deepseek_v4_mhc.py": ("HcState", "with_residual", "materialized"),
-    "srt/models/deepseek_v4_boundary.py": (
-        "LayerCall",
-        "HcRead",
-        "bind",
-        "next_boundary",
-        "materialize",
-        "materialize(next)",
-        "FinalRead",
-        "quantized",
-    ),
-    "srt/models/deepseek_v4.py": (
-        "attn_boundary",
-        "ffn_boundary",
-        "hc_cfg",
-        "end_layer",
-        "layers",
-        # the module aliases SGLang's DSV4 model imports too
-        "hc_boundary",
-        "mhc",
-        "residual_batch",
-    ),
-    "srt/layers/layer_boundary/stage.py": (
-        "prepare",
-        "finish",
-        "transport_context",
-        "exit",
+    "srt/models/deepseek_v4.py": ("layers", "start_layer", "end_layer"),
+    "srt/models/deepseek_v4_mhc.py": ("materialized", "residual", "pre"),
+    "srt/runtime_context.py": (
+        "get_forward",
+        "scoped",
+        '"mlp_reduce_scatter"',
+        '"defer_moe_finalize"',
     ),
 }
 
 
+class MoeOperands(msgspec.Struct, frozen=True):
+    """What SGLang's MoE transport hands the MoE in this configuration (no DP
+    gather, no attention-TP scatter, no context parallelism)."""
+
+    input_ids: object
+    input_ids_global: object
+    do_shared_local: bool
+    return_moe_output: bool  # the MoE leaves its finalize to the post
+
+
 def build(model, ctx, group):
     """Bind weights, allocate buffers, compile; the result is ``st.bound["boundary"]``."""
-    return None
+    m = model.model
+    return StockBoundaries([m.layers[i] for i in range(m.start_layer, m.end_layer)])
+
+
+def _state(st) -> BoundaryState:
+    return st.scratch["boundary.state"]
 
 
 def start(st, x) -> None:
     """Open the residual streams from the broadcast embedding ``x`` [rows, hc, dim]."""
-    from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-    from sglang.srt.models import deepseek_v4_mhc as mhc
-
-    st.state = mhc.HcState(x)
-    residual_batch.start(st.fb)
-    st.hidden = residual_batch.set_written(st.state, st.fb)
+    bs = st.bound["boundary"].start(x)
+    st.scratch["boundary.state"] = bs
+    st.state = st.hidden = bs.hc
 
 
 def materialize(layer, st):
     """The streams as an ``HcState`` before ``layer`` (for Engram and the capture)."""
-    from sglang.srt.models import deepseek_v4_boundary as hc_boundary
-
-    call = hc_boundary.LayerCall(st.input_ids, st.input_ids_global)
-    nxt = hc_boundary.HcRead(layer, True).bind(st.fb, call).next_boundary
-    st.hidden = st.state = hc_boundary.materialize(st.hidden, st.fb, next=nxt)
+    st.state = st.hidden = _state(st).hc
     return st.state
 
 
 def set_residual(st, residual) -> None:
     """Replace the materialized streams' residual (Engram's output)."""
-    from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-
-    st.state = st.state.with_residual(residual)
-    st.hidden = residual_batch.set_written(st.state, st.fb)
+    bs = _state(st)
+    st.bound["boundary"].with_residual(bs, residual)
+    st.state = st.hidden = bs.hc
 
 
 def pre(layer, sublayer: str, st):
-    """The input of ``layer``'s ``sublayer`` ("attn"); sets ``st.call`` and
-    ``st.x_quant``."""
-    from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-    from sglang.srt.models import deepseek_v4_boundary as hc_boundary
-
+    """The input of ``layer``'s ``sublayer`` ("attn"); sets ``st.x_quant``."""
     assert sublayer == "attn"
-    st.call = hc_boundary.LayerCall(st.input_ids, st.input_ids_global, True)
-    x = layer.attn_boundary.prepare(st.hidden, st.fb, read_context=st.call)
-    st.x_quant = residual_batch.written_residual(st.fb).quantized
+    x, st.x_quant = st.bound["boundary"].pre(layer, "attn", _state(st), st.fb)
     return x
 
 
 def post(layer, sublayer: str, out, st):
     """Reduce ``out`` of ``layer``'s ``sublayer`` into the streams. After "attn"
     returns the MoE input (and sets ``st.transport``); after "ffn" returns None."""
-    if sublayer == "attn":
-        hidden = layer.attn_boundary.finish(out, st.fb)
-        x = layer.ffn_boundary.prepare(hidden, st.fb, read_context=st.call)
-        st.transport = layer.ffn_boundary.transport_context(st.fb)
-        st.scratch["boundary.ffn_output"] = st.exit.enter_context(
-            layer.ffn_boundary.exit(st.fb)
-        )
-        return x
-    assert sublayer == "ffn"
-    st.hidden = st.scratch.pop("boundary.ffn_output").finish(out)
-    return None
+    boundaries, bs = st.bound["boundary"], _state(st)
+    boundaries.post(layer, sublayer, out, bs)
+    if sublayer == "ffn":
+        st.state = st.hidden = bs.hc
+        return None
+    x, st.x_quant = boundaries.pre(layer, "ffn", bs, st.fb)
+    st.transport = MoeOperands(
+        st.input_ids,
+        st.input_ids_global,
+        do_shared_local=False,
+        return_moe_output=boundaries.defers_sum(layer, "ffn", x.shape[0]),
+    )
+    # the scope SGLang's MoE transport opens around the MoE
+    from sglang.srt.runtime_context import get_forward
+
+    st.exit.enter_context(
+        get_forward().scoped(mlp_reduce_scatter=False, defer_moe_finalize=False)
+    )
+    return x
 
 
 def final(st):
     """Close the streams after the last layer: (residual [rows, hc, dim], pre)."""
-    from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-    from sglang.srt.models import deepseek_v4_boundary as hc_boundary
-
     m = st.model
-    state = residual_batch.read_output(st.hidden, st.fb, hc_boundary.FinalRead(), None)
-    residual_batch.clear(st.fb)
-    state = state.materialized(m.layers[m.end_layer - 1].hc_cfg)
+    state = _state(st).hc.materialized(m.layers[m.end_layer - 1].hc_cfg)
     return state.residual, state.pre
 
 
 def clear(st) -> None:
     """Drop the step's stream state (also on an error)."""
-    from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-
-    residual_batch.clear(st.fb)
+    st.scratch.pop("boundary.state", None)

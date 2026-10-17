@@ -743,7 +743,7 @@ def _build_hop_a(runner, model, hf_config, ctx, group) -> list[int]:
     return _gather_errors(group, error, taken, "the hop-A build")
 
 
-def _build_moe(runner, layers, *, finalize: bool, gate_topk: bool, group) -> str:
+def _build_moe(runner, layers, *, gate_topk: bool, group) -> str:
     """A routed-expert GEMM pair per MoE layer, reading SGLang's loaded MXFP4
     experts in place; the reason none was built, or ""."""
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
@@ -772,7 +772,6 @@ def _build_moe(runner, layers, *, finalize: bool, gate_topk: bool, group) -> str
                 clamp=method._gemm1_clamp_limit_tensor,
                 top_k=experts.top_k,
                 max_rows=SERVED_MAX_ROWS,
-                finalize=finalize,
                 gate_topk=gate_topk,
             )
     except Exception as e:  # gathered, then the slot is off on every rank
@@ -853,9 +852,7 @@ def build(model, hf_config, ctx) -> Routed:
     )
     moe = {}
     if not moe_reason:
-        moe_reason = _build_moe(
-            runner, layers, finalize=False, gate_topk=True, group=group
-        )
+        moe_reason = _build_moe(runner, layers, gate_topk=True, group=group)
         moe = _moe_slots(runner, layers)
     facts = slot_plan.Facts(hop_a=not reason, hop_a_reason=reason)
     slots = {
@@ -973,15 +970,13 @@ def build_draft(model, hf_config, ctx) -> Draft:
     device = next(model.parameters()).device
     runner = Runner(device=device, rank=group.rank_in_group)
     # the draft's stages route with SGLang's top-k; their posts finalize the
-    # deferred output (fused or not), so the pair needs no finalize kernel
+    # deferred output (fused or not)
     moe_reason = moe_seam() or (
         "" if "moe" in SLOTS else "off (SGLANG_NVIDIA_MEGA_SLOTS)"
     )
     moe = {}
     if not moe_reason:
-        moe_reason = _build_moe(
-            runner, stages, finalize=False, gate_topk=False, group=group
-        )
+        moe_reason = _build_moe(runner, stages, gate_topk=False, group=group)
         moe = _moe_slots(runner, stages, key=lambda i, _: i)
     slots = slot_plan.plan(
         ctx.widths, slot_plan.Facts(hop_a=False, hop_a_reason="draft")

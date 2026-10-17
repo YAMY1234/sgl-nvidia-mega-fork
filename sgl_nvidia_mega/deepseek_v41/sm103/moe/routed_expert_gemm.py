@@ -8,9 +8,8 @@ kernel and a GEMM pair of 8-row tcgen05 block-scaled tiles (persistent schedule,
 compiled with NVRTC on first use. An expert chosen by more than 8 rows gets several
 consecutive tiles (route_wide.cu). The kernels read the same shuffled MXFP4 weights and
 MXFP8 activations as FlashInfer and return its deferred-finalize triple, so the fused
-finalize + all-reduce + mHC consumer is unchanged; layers that finalize locally (the
-DSpark draft) add finalize.cu, FlashInfer's small-batch finalize arithmetic. On the
-target router, gate_topk.cu runs the router's top-k ahead of the route kernel.
+finalize + all-reduce + mHC consumer is unchanged. On the target router, gate_topk.cu
+runs the router's top-k ahead of the route kernel.
 """
 
 from __future__ import annotations
@@ -46,7 +45,6 @@ GEMM1_UNITS = 9  # 128-row tiles of w13 holding the 576-wide slice (10th is padd
 GEMM2_UNITS = HIDDEN // 128
 ROUTE_THREADS = 64
 ROUTE_WIDE_THREADS = 512
-FINALIZE_THREADS = 256  # one thread per output value, HIDDEN / 256 CTAs per row
 NVRTC_OPTIONS = ("-std=c++17", "-default-device", "--use_fast_math")
 HEADERS = ("route.cuh",)
 GEMM1_PARAMETERS = ("A", "SFA", "X", "XS", "route", "clamp", "H", "HS", "cta_words")
@@ -130,17 +128,6 @@ def load_route_wide(device_index: int) -> _Kernel:
         return _load(
             cubin, "dsv41_routed_expert_route_wide", (ROUTE_WIDE_THREADS, 1, 1), 0
         )
-
-
-@cache
-def load_finalize(device_index: int) -> _Kernel:
-    device = torch.device("cuda", device_index)
-    with torch.cuda.device(device):
-        torch.zeros(1, device=device)
-        major, minor = torch.cuda.get_device_capability(device)
-        source = (SOURCE_DIR / "finalize.cu").read_text()
-        cubin = compile_source(source, "finalize", f"sm_{major}{minor}a")
-        return _load(cubin, "dsv41_routed_expert_finalize", (FINALIZE_THREADS, 1, 1), 0)
 
 
 GATE_TOPK_THREADS = 384
@@ -270,7 +257,6 @@ class RoutedExpertGemm:
         clamp,
         top_k: int,
         max_rows: int,
-        finalize: bool = False,
         gate_topk: bool = False,
     ):
         w13, w13_scale = w13.view(torch.uint8), w13_scale.view(torch.uint8)
@@ -291,8 +277,6 @@ class RoutedExpertGemm:
         self.gate_topk_kernel = (
             load_gate_topk(w13.device.index) if gate_topk and fits_gate_topk else None
         )
-        # Calls that finalize locally (not deferred) take the pair only with this set.
-        self.finalize_kernel = load_finalize(w13.device.index) if finalize else None
         # route.cu flips bit 31 of this word on every launch.
         self.barrier = torch.zeros(1, dtype=torch.int32, device=w13.device)
         self._tensors = (
@@ -547,20 +531,3 @@ class RoutedExpertGemm:
             stream,
         )
         return gemm2_rows
-
-    def finalize(self, gemm2_rows, expert_weights, permuted, output) -> None:
-        """output[t] = BF16(sum_k w[t, k] * gemm2_rows[permuted[t, k]]), FlashInfer's
-        small-batch finalize arithmetic; output is BF16 [rows, 5120], contiguous."""
-        rows, top_k = expert_weights.shape
-        _launch(
-            self.finalize_kernel,
-            (HIDDEN // FINALIZE_THREADS, rows, 1),
-            [
-                _pointer(gemm2_rows),
-                _pointer(permuted),
-                _pointer(expert_weights),
-                _pointer(output),
-                ctypes.c_int32(top_k),
-            ],
-            torch.cuda.current_stream(output.device).cuda_stream,
-        )

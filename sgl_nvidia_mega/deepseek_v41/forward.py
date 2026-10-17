@@ -21,6 +21,7 @@ import os
 import msgspec
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import attention
 from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
 
 logger = logging.getLogger(__name__)
@@ -216,10 +217,10 @@ PARITY = PARITY_MODE in ("1", "control")
 # both arms, so the indexer top-k's emission order (atomic arrival order) does not
 # change the attention's accumulation order between the two forwards
 PARITY_SORT_TOPK = os.environ.get("SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK", "0") == "1"
-# Test only: the slots build may fill (hop_a, moe, gate; "dual" runs SGLang's own MoE
-# on the dual-stream path); default all
+# Test only: the slots build may fill (hop_a, moe, gate, attn; "dual" runs SGLang's
+# own MoE on the dual-stream path); default all
 SLOTS = frozenset(
-    os.environ.get("SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate").split(",")
+    os.environ.get("SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate,attn").split(",")
 ) - {""}
 
 
@@ -267,9 +268,12 @@ class Routed:
     """One rank's routed step: the model, the slot plan per width, the kernels, and
     the forward."""
 
-    def __init__(self, lm, slots: dict[int, slot_plan.Slots], runner=None, moe=None):
+    def __init__(
+        self, lm, slots: dict[int, slot_plan.Slots], runner=None, moe=None, attn=None
+    ):
         self.lm, self.model, self.slots, self.runner = lm, lm.model, slots, runner
         self.moe = moe or {}  # layer id -> MoeSlot
+        self.attn = attn or {}  # layer id -> attention.AttentionSlots
 
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
@@ -343,6 +347,7 @@ class Routed:
 
         m = self.model
         slots = self.slots[plan.key.rows]
+        swapab_rows = slots.swapab and attention.swapab_takes_step(plan.key.rows, fb)
         capture = m.dspark_layers_to_capture if aux is not None else ()
         hash_ids = (
             m.engram_hasher(input_ids, fb) if m.engram_hasher is not None else None
@@ -381,14 +386,38 @@ class Routed:
                 aux.append(state.residual.mean(dim=1))
             with recorder.with_current_layer(i):
                 hidden = self._layer(
-                    layer, slots, positions, hidden, input_ids, fb, input_ids_global
+                    layer,
+                    slots,
+                    positions,
+                    hidden,
+                    input_ids,
+                    fb,
+                    input_ids_global,
+                    swapab_rows=swapab_rows,
                 )
         state = residual_batch.read_output(hidden, fb, hc_boundary.FinalRead(), None)
         residual_batch.clear(fb)
         state = state.materialized(m.layers[m.end_layer - 1].hc_cfg)
         return state.residual, state.pre
 
-    def _layer(self, layer, slots, positions, hidden, input_ids, fb, input_ids_global):
+    def _layer(
+        self,
+        layer,
+        slots,
+        positions,
+        hidden,
+        input_ids,
+        fb,
+        input_ids_global,
+        *,
+        swapab_rows: bool,
+    ):
+        attn = self.attn.get(layer.layer_id)
+        op_slots = None
+        if attn is not None and (slots.attn_norm_quant or swapab_rows):
+            op_slots = attn.op_slots(
+                positions.shape[0], positions, fb, swapab_rows=swapab_rows
+            )
         if not (slots.hop_a or slots.routed or "dual" in SLOTS):
             return layer(
                 positions=positions,
@@ -409,6 +438,7 @@ class Routed:
             hop_a=slots.hop_a,
             moe=self.moe.get(layer.layer_id) if slots.routed else None,
             fast_gate=slots.fast_gate,
+            op_slots=op_slots,
         )
 
     def _with_parity(self, plan, input_ids, positions, forward_batch, input_embeds):
@@ -468,12 +498,14 @@ def run_layer(
     hop_a: bool,
     moe,
     fast_gate: bool,
+    op_slots=None,
 ):
     """``DeepseekV4CudaDecoderLayer.forward`` with this package's slots: SGLang's
     stage boundaries own the residual streams, the mHC stats and the posts. At hop-A
     widths wo_b publishes into the Lamport hop, which the attention post runs as its
     fused reduction; with a MoE slot the routed experts (and at fast-gate widths the
-    router's top-k) run on the GEMM pair inside SGLang's dual-stream MoE."""
+    router's top-k) run on the GEMM pair inside SGLang's dual-stream MoE. ``op_slots``
+    (an ``MQAOpSlots``) fills the attention's own op slots."""
     from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
     from sglang.srt.models import deepseek_v4_boundary as hc_boundary
     from sglang.srt.models import deepseek_v4_mhc as mhc
@@ -482,11 +514,17 @@ def run_layer(
     hidden = layer.attn_boundary.prepare(hidden, fb, read_context=call)
     quantized = residual_batch.written_residual(fb).quantized
     attn = layer.self_attn
+    # passed only when set, so SGLang without the attention op slots still runs
+    attn_kwargs = {} if op_slots is None else {"op_slots": op_slots}
     with attn.maybe_use_decode_attn_tp(fb):
         out = None
         if hop_a:
             o = attn.forward_before_wo_b(
-                x=hidden, positions=positions, forward_batch=fb, x_quant=quantized
+                x=hidden,
+                positions=positions,
+                forward_batch=fb,
+                x_quant=quantized,
+                **attn_kwargs,
             )
             # wo_b's input as _project_wo_b forms it: [rows, heads * dim]
             partial = runner.publish_wo_b(
@@ -497,6 +535,17 @@ def run_layer(
                 if partial is None
                 else mhc.AttnOutput(partial, fused_post=runner.hop_a)
             )
+        elif op_slots is not None:
+            # MQALayer.forward with the op slots: wo_b's deferred all-reduce as
+            # _run_boundary_attention asks for it
+            o = attn.forward_before_wo_b(
+                x=hidden,
+                positions=positions,
+                forward_batch=fb,
+                x_quant=quantized,
+                op_slots=op_slots,
+            )
+            out = attn._project_wo_b(o, defer_all_reduce=True)
         else:
             out = layer._run_boundary_attention(hidden, positions, fb, quantized)
         hidden = layer.attn_boundary.finish(out, fb)
@@ -857,7 +906,10 @@ def build(model, hf_config, ctx) -> Routed:
             runner, layers, finalize=False, gate_topk=True, group=group
         )
         moe = _moe_slots(runner, layers)
-    facts = slot_plan.Facts(hop_a=not reason, hop_a_reason=reason)
+    attn, attn_reason = ({}, "off (SGLANG_NVIDIA_MEGA_SLOTS)")
+    if "attn" in SLOTS:
+        attn, attn_reason = attention.build(model)
+    facts = slot_plan.Facts(hop_a=not reason, hop_a_reason=reason, attn=bool(attn))
     slots = {
         w: msgspec.structs.replace(s, hop_a=s.hop_a and w in taken)
         for w, s in slot_plan.plan(ctx.widths, facts).items()
@@ -875,7 +927,17 @@ def build(model, hf_config, ctx) -> Routed:
         sum(m.gate for m in moe.values()),
         [w for w, s in slots.items() if s.fast_gate],
     )
-    return Routed(model, slots, runner, moe)
+    logger.info(
+        "sgl-nvidia-mega deepseek_v41: attention (%s): q-LoRA norm + quant at %s rows "
+        "in %d layers; swap-AB at %s rows in %d layers, %d of them roping the query",
+        attn_reason or "built",
+        [w for w, s in slots.items() if s.attn_norm_quant],
+        sum(a.norm_quant for a in attn.values()),
+        [w for w, s in slots.items() if s.swapab],
+        sum(a.swapab for a in attn.values()),
+        sum(a.rope_in_attention for a in attn.values()),
+    )
+    return Routed(model, slots, runner, moe, attn)
 
 
 class Draft:

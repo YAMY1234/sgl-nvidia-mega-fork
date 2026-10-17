@@ -104,7 +104,6 @@ from flashinfer.gemm.kernels.cute_dsl.low_latency_blockscaled_gemm import (
     WorkTileInfo,
 )
 
-from .all_reduce_mhc import ACTIVE_STAGE, NEXT_STAGE, AllReduceMHC
 from sgl_nvidia_mega.common.sync import (
     VEC_BF16,
     _asm,
@@ -114,6 +113,8 @@ from sgl_nvidia_mega.common.sync import (
     shuffle_sync_idx_u32,
     stmc_bf16x8,
 )
+
+from .all_reduce_mhc import ACTIVE_STAGE, NEXT_STAGE, AllReduceMHC
 
 # FlashInfer's tactic tuple: (cta_k, ab_stages, sfb_tmem_stages, split_k).
 Tactic = tuple[int, int, int, int]

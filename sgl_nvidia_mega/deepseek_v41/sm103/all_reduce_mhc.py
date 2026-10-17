@@ -45,7 +45,6 @@ from flashinfer.quantization.quantization_cute_dsl_utils import (
     ue8m0_to_inv_scale_fast,
 )
 
-
 from sgl_nvidia_mega.common.sync import (
     NEGATIVE_ZERO_BF16_BITS,
     QUAD_BF16,

@@ -19,7 +19,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
-
 from sglang.srt.distributed import parallel_state as ps
 from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import publish_build_topology

@@ -32,7 +32,6 @@ from sgl_nvidia_mega.common.jit import load as _load
 from sgl_nvidia_mega.common.jit import null_or_pointer as _null_or_pointer
 from sgl_nvidia_mega.common.jit import pointer as _pointer
 
-
 SOURCE_DIR = Path(__file__).resolve().parent / "src"
 
 HIDDEN = 5120

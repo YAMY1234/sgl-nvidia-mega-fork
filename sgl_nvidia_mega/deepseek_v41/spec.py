@@ -79,6 +79,12 @@ NUMERICS = Numerics(
         # the routed experts against FlashInfer's routed MoE: one BF16 rounding
         "moe.routed.rel": 2**-7,
         "draft_moe.out.rel": 2**-7,
+        # the draft's tokens and kept step logits, as SGLang's Markov block picks them
+        # from the same base logits
+        "draft_markov.tokens.max_abs": 0.0,
+        "draft_markov.step_logits.max_abs": 0.0,
+        # the draft's base logits on the low-M kernel: the K summation order differs
+        "draft_lm_head.logits.rel": 2**-7,
     },
 )
 

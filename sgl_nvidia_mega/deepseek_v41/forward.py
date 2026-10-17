@@ -22,6 +22,7 @@ import msgspec
 import torch
 
 from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
+from sgl_nvidia_mega.deepseek_v41 import sampler
 
 logger = logging.getLogger(__name__)
 
@@ -216,10 +217,12 @@ PARITY = PARITY_MODE in ("1", "control")
 # both arms, so the indexer top-k's emission order (atomic arrival order) does not
 # change the attention's accumulation order between the two forwards
 PARITY_SORT_TOPK = os.environ.get("SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK", "0") == "1"
-# Test only: the slots build may fill (hop_a, moe, gate; "dual" runs SGLang's own MoE
-# on the dual-stream path); default all
+# Test only: the slots build may fill (hop_a, moe, gate, and the draft's markov and
+# draft_lm_head; "dual" runs SGLang's own MoE on the dual-stream path); default all
 SLOTS = frozenset(
-    os.environ.get("SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate").split(",")
+    os.environ.get(
+        "SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate,markov,draft_lm_head"
+    ).split(",")
 ) - {""}
 
 
@@ -881,9 +884,18 @@ def build(model, hf_config, ctx) -> Routed:
 class Draft:
     """One rank's routed DSpark draft step."""
 
-    def __init__(self, lm, slots: dict[int, slot_plan.Slots], runner=None, moe=None):
+    def __init__(
+        self,
+        lm,
+        slots: dict[int, slot_plan.Slots],
+        runner=None,
+        moe=None,
+        draft_sampler=None,
+    ):
         self.lm, self.slots, self.runner = lm, slots, runner
         self.moe = moe or {}  # stage index -> MoeSlot
+        # BuiltMonokernels.draft_sampler: SGLang's folded proposal calls it (sampler.py)
+        self.draft_sampler = draft_sampler
 
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
@@ -986,11 +998,21 @@ def build_draft(model, hf_config, ctx) -> Draft:
     slots = slot_plan.plan(
         ctx.widths, slot_plan.Facts(hop_a=False, hop_a_reason="draft")
     )
+    # not gated on ctx.widths: the chain serves every batch of the folded proposal
+    sampler_reason = sampler.seam() or (
+        "" if "markov" in SLOTS else "off (SGLANG_NVIDIA_MEGA_SLOTS)"
+    )
+    draft_sampler = None
+    if not sampler_reason:
+        draft_sampler = sampler.DraftSampler(
+            model, deadline_s=ctx.deadline_s, slots=SLOTS
+        )
     logger.info(
         "sgl-nvidia-mega deepseek_v41 draft: widths %s; routed experts on the GEMM "
-        "pair in %d stages (%s)",
+        "pair in %d stages (%s); draft sampler %s",
         list(ctx.widths),
         len(moe),
         moe_reason or "built",
+        sampler_reason or "offered to SGLang's folded proposal",
     )
-    return Draft(model, slots, runner, moe)
+    return Draft(model, slots, runner, moe, draft_sampler)

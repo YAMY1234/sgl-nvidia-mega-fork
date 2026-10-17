@@ -9,7 +9,7 @@ streams, the mHC stats stream and the fused posts), the head's combine and norm,
 SGLang's logits processor. It follows SGLang's step for the one configuration the
 spec accepts (TP4, no pipeline, no attention DP, no context parallelism, no
 two-batch overlap, no late-layer tail in verify steps); the contract test pins every
-SGLang name it reads, and the composition-parity check (``SGLANG_NVIDIA_MEGA_G1``)
+SGLang name it reads, and the composition-parity check (``SGLANG_NVIDIA_MEGA_PARITY``)
 compares it with SGLang's forward step by step.
 """
 
@@ -169,7 +169,7 @@ SGLANG_READS = {
         "top_k",
     ),
     "srt/model_executor/forward_batch_info.py": ("moe_num_token_non_padded",),
-    # the test-only sorted sparse indices (SGLANG_NVIDIA_MEGA_G1_SORT_TOPK)
+    # the test-only sorted sparse indices (SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK)
     "srt/layers/attention/deepseek_v4_backend.py": (
         "DeepseekV4AttnBackend",
         "DSV4AttnMetadata",
@@ -210,12 +210,12 @@ SGLANG_SEAMS = {
 # Composition parity (test only): run SGLang's own forward on the same step first and
 # compare its logits and auxiliary hidden states with the routed forward's
 # ("control": SGLang's forward twice, the run-to-run floor the check is read against)
-G1_MODE = os.environ.get("SGLANG_NVIDIA_MEGA_G1", "0")
-G1 = G1_MODE in ("1", "control")
-# Test only (with G1): sort each row's sparse attention indices before FlashMLA in
+PARITY_MODE = os.environ.get("SGLANG_NVIDIA_MEGA_PARITY", "0")
+PARITY = PARITY_MODE in ("1", "control")
+# Test only (with PARITY): sort each row's sparse attention indices before FlashMLA in
 # both arms, so the indexer top-k's emission order (atomic arrival order) does not
 # change the attention's accumulation order between the two forwards
-G1_SORT_TOPK = os.environ.get("SGLANG_NVIDIA_MEGA_G1_SORT_TOPK", "0") == "1"
+PARITY_SORT_TOPK = os.environ.get("SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK", "0") == "1"
 # Test only: the slots build may fill (hop_a, moe, gate; "dual" runs SGLang's own MoE
 # on the dual-stream path); default all
 SLOTS = frozenset(
@@ -274,7 +274,7 @@ class Routed:
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
     ):
-        if G1 and not torch.cuda.is_current_stream_capturing():
+        if PARITY and not torch.cuda.is_current_stream_capturing():
             return self._with_parity(
                 plan, input_ids, positions, forward_batch, input_embeds
             )
@@ -417,7 +417,7 @@ class Routed:
         lm = self.lm
         want = type(lm).forward(lm, input_ids, positions, forward_batch, input_embeds)
         want = (_clone(want.next_token_logits), _clone(want.hidden_states))
-        if G1_MODE == "control":
+        if PARITY_MODE == "control":
             got = type(lm).forward(
                 lm, input_ids, positions, forward_batch, input_embeds
             )
@@ -428,8 +428,8 @@ class Routed:
             for a, b in zip(want, (got.next_token_logits, got.hidden_states))
         ]
         logger.info(
-            "sgl-nvidia-mega G1%s %s rows=%d logits_max_abs=%s hidden_max_abs=%s",
-            " control" if G1_MODE == "control" else "",
+            "sgl-nvidia-mega parity%s %s rows=%d logits_max_abs=%s hidden_max_abs=%s",
+            " control" if PARITY_MODE == "control" else "",
             plan.key.forward_mode,
             plan.key.rows,
             *diffs,
@@ -786,9 +786,9 @@ def _build_moe(runner, layers, *, finalize: bool, gate_topk: bool, group) -> str
     return ""
 
 
-def _install_g1_sorted_topk() -> None:
+def _install_parity_sorted_topk() -> None:
     """Test only: sort each decode or verify row's valid sparse indices in place
-    before SGLang's DSV4 attention reads them (``SGLANG_NVIDIA_MEGA_G1_SORT_TOPK``)."""
+    before SGLang's DSV4 attention reads them (``SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK``)."""
     import functools
 
     from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -831,8 +831,8 @@ def _install_g1_sorted_topk() -> None:
 def build(model, hf_config, ctx) -> Routed:
     from sglang.srt.runtime_context import get_parallel
 
-    if G1_SORT_TOPK:
-        _install_g1_sorted_topk()
+    if PARITY_SORT_TOPK:
+        _install_parity_sorted_topk()
 
     from sgl_nvidia_mega.deepseek_v41.sm103.runner import Runner
 
@@ -888,13 +888,13 @@ class Draft:
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
     ):
-        if G1 and not torch.cuda.is_current_stream_capturing():
+        if PARITY and not torch.cuda.is_current_stream_capturing():
             lm = self.lm
             want = type(lm).forward(
                 lm, input_ids, positions, forward_batch, input_embeds
             )
             want = _clone(want.hidden_states)
-            if G1_MODE == "control":
+            if PARITY_MODE == "control":
                 got = type(lm).forward(
                     lm, input_ids, positions, forward_batch, input_embeds
                 )
@@ -903,8 +903,8 @@ class Draft:
                     plan, input_ids, positions, forward_batch, input_embeds
                 )
             logger.info(
-                "sgl-nvidia-mega G1%s draft %s rows=%d hidden_max_abs=%s",
-                " control" if G1_MODE == "control" else "",
+                "sgl-nvidia-mega parity%s draft %s rows=%d hidden_max_abs=%s",
+                " control" if PARITY_MODE == "control" else "",
                 plan.key.forward_mode,
                 plan.key.rows,
                 _max_abs(want, got.hidden_states),

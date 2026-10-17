@@ -51,8 +51,11 @@ def build(model, hf_config, ctx):
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
+    from sgl_nvidia_mega.deepseek_v41.runtime import parity
     from sgl_nvidia_mega.deepseek_v41.runtime.executor import PACKAGES, Executor
 
+    if parity.SORT_TOPK:
+        parity.install_sorted_topk()
     group = get_parallel().tp_group
     bound = {name: pkg.build(model, ctx, group) for name, pkg in PACKAGES.items()}
     slots = slot_plan.plan(ctx.widths, slot_plan.Facts())

@@ -219,8 +219,9 @@ PARITY = PARITY_MODE in ("1", "control")
 PARITY_SORT_TOPK = os.environ.get("SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK", "0") == "1"
 # Test only: the slots build may fill (hop_a, moe, gate; draft_post, draft_seam: the
 # draft stages on the fused posts, and each stage's MoE post writing the next stage's
-# input; draft_tail: the draft head combines the BF16 streams; "dual" runs SGLang's
-# own MoE on the dual-stream path); default all
+# input; draft_tail: the draft head combines the BF16 streams; draft_qkv_a: the draft's
+# wq_a + wkv as one GEMM, off until its KV bytes are declared; "dual" runs SGLang's own
+# MoE on the dual-stream path); default all but draft_qkv_a
 SLOTS = frozenset(
     os.environ.get(
         "SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate,draft_post,draft_seam,draft_tail"
@@ -484,6 +485,7 @@ def run_layer(
     moe,
     fast_gate: bool,
     mhc_fusions=None,
+    accepts_mxfp8=None,
 ):
     """``DeepseekV4CudaDecoderLayer.forward`` with this package's slots: SGLang's
     stage boundaries own the residual streams, the mHC stats and the posts. At hop-A
@@ -496,6 +498,8 @@ def run_layer(
 
     # mhc_fusions: the call's choice of SGLang's fused posts (None: the layer's own)
     extra = {} if mhc_fusions is None else {"mhc_fusions": mhc_fusions}
+    if accepts_mxfp8 is not None:
+        extra["accepts_mxfp8"] = accepts_mxfp8
     call = hc_boundary.LayerCall(input_ids, input_ids_global, cross_layer, **extra)
     hidden = layer.attn_boundary.prepare(hidden, fb, read_context=call)
     quantized = residual_batch.written_residual(fb).quantized
@@ -919,6 +923,7 @@ class Draft:
         post=False,
         seam=False,
         tail_bf16=False,
+        mxfp8_input=False,
     ):
         self.lm, self.slots, self.runner = lm, slots, runner
         self.moe = moe or {}  # stage index -> MoeSlot
@@ -926,6 +931,8 @@ class Draft:
         # stage's MoE post also writes the next stage's attention input
         self.post, self.seam = post, seam
         self.tail_bf16 = tail_bf16
+        # each stage's attention reads the post's MXFP8 rows (the fused wqkv_a takes them)
+        self.mxfp8_input = mxfp8_input
 
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
@@ -995,6 +1002,7 @@ class Draft:
                         moe=moe,
                         fast_gate=False,
                         mhc_fusions=True if self.post else None,
+                        accepts_mxfp8=True if self.mxfp8_input else None,
                     )
             state = residual_batch.read_output(
                 x, forward_batch, hc_boundary.FinalRead(), None
@@ -1038,14 +1046,22 @@ def build_draft(model, hf_config, ctx) -> Draft:
         "" if "draft_post" in SLOTS else "off (SGLANG_NVIDIA_MEGA_SLOTS)"
     )
     seam = not post_reason and "draft_seam" in SLOTS
+    from sgl_nvidia_mega.deepseek_v41.draft_layers import install_qkv_a
+
+    qkv_reason = (
+        install_qkv_a(model.stages)
+        if "draft_qkv_a" in SLOTS
+        else "off (SGLANG_NVIDIA_MEGA_SLOTS)"
+    )
     logger.info(
         "sgl-nvidia-mega deepseek_v41 draft: widths %s; routed experts on the GEMM "
-        "pair in %d stages (%s); fused posts %s; seam %s",
+        "pair in %d stages (%s); fused posts %s; seam %s; fused wqkv_a %s",
         list(ctx.widths),
         len(moe),
         moe_reason or "built",
         post_reason or "on",
         "on" if seam else "off",
+        qkv_reason or "on",
     )
     return Draft(
         model,
@@ -1055,4 +1071,5 @@ def build_draft(model, hf_config, ctx) -> Draft:
         post=not post_reason,
         seam=seam,
         tail_bf16="draft_tail" in SLOTS,
+        mxfp8_input=not post_reason and not qkv_reason,
     )

@@ -89,3 +89,38 @@ def test_the_draft_routes_its_stages_by_the_post_slot(post, seam):
         assert c.kwargs["mhc_fusions"] is True
         assert c.kwargs["cross_layer"] is seam
         assert c.kwargs["moe"] is None and not c.kwargs["hop_a"]
+
+
+@pytest.mark.parametrize("tail_bf16", [False, True])
+def test_the_draft_tail_combines_bf16_only_with_its_slot(tail_bf16):
+    import torch
+
+    lm = SimpleNamespace(forward_embed=lambda ids: "embed", stages=[], hc_mult=4)
+    slots = {5: SimpleNamespace(routed=False)}
+    draft = forward.Draft(lm, slots, tail_bf16=tail_bf16)
+    residual = torch.ones(5, 4, 8, dtype=torch.bfloat16)
+    state = SimpleNamespace(residual=residual, pre="pre")
+    recorder = SimpleNamespace(disable_this_region=nullcontext)
+    with (
+        patch("sglang.srt.layers.layer_boundary.residual.batch.start"),
+        patch(
+            "sglang.srt.layers.layer_boundary.residual.batch.read_output",
+            return_value=state,
+        ),
+        patch("sglang.srt.layers.layer_boundary.residual.batch.clear"),
+        patch(
+            "sglang.srt.eplb.expert_distribution."
+            "get_global_expert_distribution_recorder",
+            return_value=recorder,
+        ),
+        patch("sglang.kernels.ops.layernorm.mhc.hc_combine") as combine,
+    ):
+        plan = SimpleNamespace(key=SimpleNamespace(rows=5))
+        draft._forward(plan, "ids", "pos", "fb", None)
+    streams, pre, hc, out_dtype = combine.call_args.args
+    assert streams.shape == (5, 32) and (pre, hc, out_dtype) == (
+        "pre",
+        4,
+        torch.bfloat16,
+    )
+    assert streams.dtype == (torch.bfloat16 if tail_bf16 else torch.float32)

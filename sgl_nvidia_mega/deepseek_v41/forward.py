@@ -219,10 +219,11 @@ PARITY = PARITY_MODE in ("1", "control")
 PARITY_SORT_TOPK = os.environ.get("SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK", "0") == "1"
 # Test only: the slots build may fill (hop_a, moe, gate; draft_post, draft_seam: the
 # draft stages on the fused posts, and each stage's MoE post writing the next stage's
-# input; "dual" runs SGLang's own MoE on the dual-stream path); default all
+# input; draft_tail: the draft head combines the BF16 streams; "dual" runs SGLang's
+# own MoE on the dual-stream path); default all
 SLOTS = frozenset(
     os.environ.get(
-        "SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate,draft_post,draft_seam"
+        "SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate,draft_post,draft_seam,draft_tail"
     ).split(",")
 ) - {""}
 
@@ -439,6 +440,16 @@ class Routed:
             *diffs,
         )
         return got
+
+
+_ENGAGED: set = set()
+
+
+def _engaged(slot: str, rows: int) -> None:
+    """Log once per slot and width that the model's dispatch took the slot."""
+    if (slot, rows) not in _ENGAGED:
+        _ENGAGED.add((slot, rows))
+        logger.info("sgl-nvidia-mega engaged %s rows=%d", slot, rows)
 
 
 def _clone(t):
@@ -907,12 +918,14 @@ class Draft:
         *,
         post=False,
         seam=False,
+        tail_bf16=False,
     ):
         self.lm, self.slots, self.runner = lm, slots, runner
         self.moe = moe or {}  # stage index -> MoeSlot
         # the stages run on SGLang's fused all-reduce + mHC posts; with the seam each
         # stage's MoE post also writes the next stage's attention input
         self.post, self.seam = post, seam
+        self.tail_bf16 = tail_bf16
 
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
@@ -953,11 +966,14 @@ class Draft:
         from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 
         lm = self.lm
+        rows = plan.key.rows
         x = lm.forward_embed(input_ids) if input_embeds is None else input_embeds
+        if self.post:
+            _engaged("draft_seam" if self.seam else "draft_post", rows)
         try:
             residual_batch.start(forward_batch)
             # draft stages have no recorder layer indices
-            slots = self.slots[plan.key.rows]
+            slots = self.slots[rows]
             with get_global_expert_distribution_recorder().disable_this_region():
                 for i, stage in enumerate(lm.stages):
                     moe = self.moe.get(i) if slots.routed else None
@@ -985,12 +1001,13 @@ class Draft:
             )
         finally:
             residual_batch.clear(forward_batch)
-        x = hc_combine(
-            state.residual.flatten(1).float(),
-            state.pre,
-            lm.hc_mult,
-            state.residual.dtype,
-        )
+        streams = state.residual.flatten(1)
+        if self.tail_bf16:
+            # hc_combine widens each load to FP32: the same result without the copy
+            _engaged("draft_tail", rows)
+        else:
+            streams = streams.float()
+        x = hc_combine(streams, state.pre, lm.hc_mult, state.residual.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
 
@@ -1030,4 +1047,12 @@ def build_draft(model, hf_config, ctx) -> Draft:
         post_reason or "on",
         "on" if seam else "off",
     )
-    return Draft(model, slots, runner, moe, post=not post_reason, seam=seam)
+    return Draft(
+        model,
+        slots,
+        runner,
+        moe,
+        post=not post_reason,
+        seam=seam,
+        tail_bf16="draft_tail" in SLOTS,
+    )

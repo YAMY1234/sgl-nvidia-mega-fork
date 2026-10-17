@@ -555,6 +555,7 @@ def test_a_missing_rank_faults_its_peers_in_time(rows, tmp_path):
     assert "NO-FAULT" not in log, log[-4000:]
     faulted = [line for line in log.splitlines() if "FAULTED after" in line]
     assert len(faulted) == 3, log[-4000:]
+    print("\n".join(faulted))
     for line in faulted:
         assert float(line.split("after ")[1].split(" s")[0]) < 4 * FAULT_DEADLINE_S + 10
     assert time.time() - t0 < 300

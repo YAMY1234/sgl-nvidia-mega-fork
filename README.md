@@ -81,9 +81,11 @@ sgl-nvidia-mega/
 │       ├── plan.py        # which kernel fills each slot, per width
 │       ├── forward.py     # the routed target and draft steps (SGLang glue)
 │       └── sm103/         # kernels and the build-time runner; no SGLang imports
+├── benchmark/             # the static decode table behind the speed numbers
 └── test/
     ├── unit/              # CPU: the specs, the slot plan and the SGLang interface contract
-    └── kernels/           # GPU: each kernel against SGLang's or FlashInfer's op, fail-stop
+    ├── kernels/           # GPU: each kernel against SGLang's or FlashInfer's op, fail-stop
+    └── e2e/               # GPU: serving accuracy, KL, passkey and fail-stop, switch on and off
 ```
 
 ## Testing
@@ -91,6 +93,7 @@ sgl-nvidia-mega/
 ```bash
 pytest test/unit               # CPU only
 pytest test/kernels            # 4 x GB300
+pytest test/e2e                # 4 x GB300, with DEEPSEEK_V41_FLASH_MODEL_PATH set
 ```
 
 ## Contributing

@@ -50,8 +50,9 @@ multicasts it into the three-generation Lamport mailbox, and only then can the
 launch, its grid wait and its read-back sit on the critical path.
 
 Responsibility. :class:`PublishingMxfp8Linear` runs the same GEMM, with the tactic
-``precompile`` fixed per row count (the pinned GB300 tactic, else FlashInfer's
-default), but its epilogue also
+FlashInfer's autotuner caches for SGLang's own call (before tuning, the one
+``precompile`` fixed: the pinned GB300 tactic, else FlashInfer's default), but its
+epilogue also
 does the publish kernel's work: every output value goes, rounded to BF16 with
 negative zero cleared, into this rank's slot of the mailbox generation
 ``stage_state[0]`` on all ranks (``multimem.st``), and one thread sets
@@ -515,6 +516,14 @@ class PublishingMxfp8Linear:
         m = a.shape[0]
         out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
         if tactic is None:
+            if not torch.cuda.is_current_stream_capturing():
+                # SGLang's own wo_b runs FlashInfer's low-latency GEMM at these rows
+                # with the autotuner's cached tactic; publish with the same one, so
+                # the partial equals wo_b's. Eager steps (graph warm-up included)
+                # refresh it; a capture replays the last eager choice.
+                chosen = _autotuned_tactic(a, weight.t(), a_scale, weight_scale, out)
+                if chosen is not None:
+                    self._tactics[m] = chosen
             tactic = self._tactics[m]
         compiled = self._compile(tactic, torch.bfloat16, a.device)
         compiled(
@@ -612,6 +621,34 @@ def _is_low_latency_linear(linear: torch.nn.Module) -> bool:
         and linear.weight.is_contiguous()
         and mxfp8_ll.supported()
     )
+
+
+def _autotuned_tactic(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    a_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> Optional[Tactic]:
+    """The tactic FlashInfer's autotuner has cached for ``mm_mxfp8``'s low-latency
+    GEMM on these operands, or None before tuning."""
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.gemm import gemm_base
+
+    major, minor = torch.cuda.get_device_capability(a.device)
+    runner = gemm_base._cutedsl_low_latency_blockscaled_gemm_runner(
+        major * 10 + minor, True
+    )
+    workspace = gemm_base._get_cache_buf(
+        "mm_mxfp8_workspace", gemm_base.DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    inputs = [a, weight, a_scale, weight_scale, out.dtype, out, workspace]
+    _, tactic = AutoTuner.get().choose_one(
+        "mxfp8_gemm", [runner], gemm_base._MM_MXFP8_CUTE_DSL_TUNING_CONFIG, inputs
+    )
+    if tactic is None or tactic == -1:
+        return None
+    return tuple(tactic)
 
 
 def _selected_tactic(

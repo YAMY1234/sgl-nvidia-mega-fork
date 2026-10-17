@@ -148,7 +148,9 @@ SPEC = MonoSpec(
             "dsv4_attn_backend": frozenset({"flashmla"}),
             # the paged SWA cache, not a request window
             "enable_encoder_swa_bounded_replay": frozenset({False}),
-            "enable_decoder_swa_bounded_replay": frozenset({False, True}),
+            # None: SGLang resolves it at startup (on by default since main made it
+            # Optional); the slots serve with it on or off
+            "enable_decoder_swa_bounded_replay": frozenset({None, False, True}),
             # the kernels read weights in place, after SGLang's last conversion
             "startup_weight_load_mode": frozenset({"serial"}),
         },

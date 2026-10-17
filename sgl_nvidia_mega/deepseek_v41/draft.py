@@ -57,7 +57,9 @@ SPEC = MonoSpec(
     name="deepseek_v41_dspark_draft_nvidia",
     devices={
         target.ISA: DeviceLimits(
-            widths=target.WIDTHS, tp_sizes=(4,), resident_blocks=target.RESIDENT_BLOCKS
+            widths=target.ROUTED_WIDTHS,
+            tp_sizes=(4,),
+            resident_blocks=target.RESIDENT_BLOCKS,
         )
     },
     features=target.SPEC.features,

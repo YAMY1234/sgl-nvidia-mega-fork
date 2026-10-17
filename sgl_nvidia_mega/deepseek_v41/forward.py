@@ -15,6 +15,7 @@ compares it with SGLang's forward step by step.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 
@@ -40,7 +41,21 @@ SGLANG_READS = {
         "clear",
     ),
     "kernels/ops/layernorm/mhc.py": ("hc_broadcast", "hc_combine"),
-    "srt/models/deepseek_v4_mhc.py": ("HcState", "with_residual", "materialized"),
+    "srt/models/deepseek_v4_mhc.py": (
+        "HcState",
+        "with_residual",
+        "materialized",
+        # the two-shot posts: what SGLang's own post hands the next sublayer
+        "AttnOutput",
+        "is_deferred_finalize",
+        "HcNormed",
+        "HcQuantized",
+        "norm",
+        "norm_fusable",
+        "accepts_mxfp8",
+    ),
+    "srt/layers/quantization/mxfp8_input.py": ("Mxfp8SwizzledInput",),
+    "srt/layers/layernorm.py": ("variance_epsilon",),
     "srt/models/deepseek_v4_boundary.py": (
         "LayerCall",
         "HcRead",
@@ -133,6 +148,7 @@ SGLANG_READS = {
         "do_shared_local",
     ),
     "srt/models/deepseek_v2.py": (
+        "MoEOutput",
         "forward(skip_shared_experts)",
         "forward(return_moe_output)",
         "forward(leave_output_sum)",
@@ -195,12 +211,15 @@ SGLANG_READS = {
     ),
 }
 
-# The SGLang seams the hop-A and MoE slots need, probed at build (``hop_a_seams``,
-# ``moe_seam``): without them a slot stays off and the reason is logged;
-# test/unit/test_contract.py pins them against SGLang trees that have them
+# The SGLang seams the hop-A, MoE and two-shot slots need, probed at build
+# (``hop_a_seams``, ``moe_seam``, ``two_shot_seams``): without them a slot stays off
+# and the reason is logged; test/unit/test_contract.py pins them against SGLang trees
+# that have them
 SGLANG_SEAMS = {
     "srt/models/deepseek_v4.py": ("forward_before_wo_b",),
     "srt/models/deepseek_v4_mhc.py": ("fused_post",),
+    "srt/layers/moe/moe_runner/flashinfer_trtllm.py": ("fused_post",),
+    "srt/models/deepseek_v4_boundary.py": ("can_fuse_sum",),
     "srt/models/deepseek_v2.py": (
         "forward_normal_dual_stream(select_experts)",
         "forward_normal_dual_stream(run_routed_experts)",
@@ -216,11 +235,7 @@ PARITY = PARITY_MODE in ("1", "control")
 # both arms, so the indexer top-k's emission order (atomic arrival order) does not
 # change the attention's accumulation order between the two forwards
 PARITY_SORT_TOPK = os.environ.get("SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK", "0") == "1"
-# Test only: the slots build may fill (hop_a, moe, gate; "dual" runs SGLang's own MoE
-# on the dual-stream path); default all
-SLOTS = frozenset(
-    os.environ.get("SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate").split(",")
-) - {""}
+SLOTS = slot_plan.SLOTS
 
 
 def model_disable_reasons(model, hf_config) -> list[str]:
@@ -267,9 +282,17 @@ class Routed:
     """One rank's routed step: the model, the slot plan per width, the kernels, and
     the forward."""
 
-    def __init__(self, lm, slots: dict[int, slot_plan.Slots], runner=None, moe=None):
+    def __init__(
+        self,
+        lm,
+        slots: dict[int, slot_plan.Slots],
+        runner=None,
+        moe=None,
+        two_shot=None,
+    ):
         self.lm, self.model, self.slots, self.runner = lm, lm.model, slots, runner
         self.moe = moe or {}  # layer id -> MoeSlot
+        self.two_shot = two_shot  # TwoShotPosts
 
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
@@ -389,7 +412,7 @@ class Routed:
         return state.residual, state.pre
 
     def _layer(self, layer, slots, positions, hidden, input_ids, fb, input_ids_global):
-        if not (slots.hop_a or slots.routed or "dual" in SLOTS):
+        if not (slots.hop_a or slots.routed or slots.two_shot or "dual" in SLOTS):
             return layer(
                 positions=positions,
                 hidden_states=hidden,
@@ -409,6 +432,7 @@ class Routed:
             hop_a=slots.hop_a,
             moe=self.moe.get(layer.layer_id) if slots.routed else None,
             fast_gate=slots.fast_gate,
+            two_shot=self.two_shot if slots.two_shot else None,
         )
 
     def _with_parity(self, plan, input_ids, positions, forward_batch, input_embeds):
@@ -468,17 +492,21 @@ def run_layer(
     hop_a: bool,
     moe,
     fast_gate: bool,
+    two_shot=None,
 ):
     """``DeepseekV4CudaDecoderLayer.forward`` with this package's slots: SGLang's
     stage boundaries own the residual streams, the mHC stats and the posts. At hop-A
     widths wo_b publishes into the Lamport hop, which the attention post runs as its
     fused reduction; with a MoE slot the routed experts (and at fast-gate widths the
-    router's top-k) run on the GEMM pair inside SGLang's dual-stream MoE."""
+    router's top-k) run on the GEMM pair inside SGLang's dual-stream MoE. From 49 rows
+    both posts run this package's two-shot all-reduce + mHC (``two_shot``)."""
     from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
     from sglang.srt.models import deepseek_v4_boundary as hc_boundary
     from sglang.srt.models import deepseek_v4_mhc as mhc
 
-    call = hc_boundary.LayerCall(input_ids, input_ids_global, cross_layer)
+    # the two-shot posts carry their own exchange, so the sums defer at their widths
+    fits = {} if two_shot is None else {"can_fuse_sum": two_shot.fits}
+    call = hc_boundary.LayerCall(input_ids, input_ids_global, cross_layer, **fits)
     hidden = layer.attn_boundary.prepare(hidden, fb, read_context=call)
     quantized = residual_batch.written_residual(fb).quantized
     attn = layer.self_attn
@@ -499,6 +527,8 @@ def run_layer(
             )
         else:
             out = layer._run_boundary_attention(hidden, positions, fb, quantized)
+            if two_shot is not None and isinstance(out, mhc.AttnOutput):
+                out = out._replace(fused_post=two_shot.attn_post)
         hidden = layer.attn_boundary.finish(out, fb)
     hidden = layer.ffn_boundary.prepare(hidden, fb, read_context=call)
     if hop_a:
@@ -545,6 +575,8 @@ def run_layer(
                 select_experts=moe.select if fast_gate and moe.gate else None,
                 run_routed_experts=moe.run,
             )
+        if two_shot is not None:
+            hidden = two_shot.attach_moe_post(hidden)
         return output.finish(hidden)
 
 
@@ -709,6 +741,110 @@ def hop_a_seams() -> str:
     return f"this SGLang lacks {', '.join(missing)}" if missing else ""
 
 
+def two_shot_seams() -> str:
+    """Why SGLang cannot run the two-shot slot, or "" when it can: a deferred MoE
+    output that names its fused post (H1), a layer call that decides which widths
+    defer their sums (H1b), and the attention output's fused post."""
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        FlashInferTrtllmDeferredFinalizeOutput,
+    )
+    from sglang.srt.models import deepseek_v4_boundary as hc_boundary
+    from sglang.srt.models import deepseek_v4_mhc as mhc
+
+    missing = []
+    fields = getattr(FlashInferTrtllmDeferredFinalizeOutput, "__dataclass_fields__", {})
+    if "fused_post" not in fields:
+        missing.append("FlashInferTrtllmDeferredFinalizeOutput.fused_post")
+    if "can_fuse_sum" not in hc_boundary.LayerCall.__struct_fields__:
+        missing.append("LayerCall.can_fuse_sum")
+    if "fused_post" not in getattr(mhc.AttnOutput, "_fields", ()):
+        missing.append("AttnOutput.fused_post")
+    return f"this SGLang lacks {', '.join(missing)}" if missing else ""
+
+
+class TwoShotPosts:
+    """The two-shot hops as SGLang's fused posts: ``fits`` is the layer call's defer
+    predicate, ``attn_post`` the attention output's, and ``attach_moe_post`` hangs the
+    MoE post on SGLang's deferred finalize. The MoE post builds the next input as
+    SGLang's own post would: quantized when the next sublayer takes MXFP8, normed when
+    its norm folds, else only the streams."""
+
+    def __init__(self, hop):
+        self.hop = hop
+        self._logged: set = set()
+
+    def fits(self, rows: int, hidden: int) -> bool:
+        return self.hop.fits(rows, hidden)
+
+    def attn_post(self, partial, residual, post, comb, pre, norm_weight, eps):
+        self._log_once("attention", partial.shape[0])
+        return self.hop.attn_post(partial, residual, post, comb, pre, norm_weight, eps)
+
+    def attach_moe_post(self, out):
+        from sglang.srt.models import deepseek_v4_mhc as mhc
+        from sglang.srt.models.deepseek_v2 import MoEOutput
+
+        if not (isinstance(out, MoEOutput) and mhc.is_deferred_finalize(out.routed)):
+            return out
+        routed = dataclasses.replace(out.routed, fused_post=self._moe_post)
+        return out._replace(routed=routed)
+
+    def _moe_post(self, gemm2, idx, weights, top_k, shared, residual, post, comb, pre, nxt):  # fmt: skip
+        from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+        from sglang.srt.models import deepseek_v4_mhc as mhc
+
+        rows = weights.shape[0]
+        args = (gemm2, idx, weights, top_k, shared, residual, post, comb)
+        if nxt is None or not nxt.norm_fusable:
+            self._log_once("moe", rows)
+            return self.hop.moe_post_only(*args), None
+        norm = (pre, nxt.norm.weight, nxt.norm.variance_epsilon)
+        if not nxt.accepts_mxfp8:
+            self._log_once("moe+norm", rows)
+            updated, normalized = self.hop.moe_post(*args, *norm)
+            return updated, mhc.HcNormed(normalized)
+        self._log_once("moe+quant", rows)
+        q = torch.empty(
+            (rows, residual.shape[-1]), dtype=torch.float8_e4m3fn, device=weights.device
+        )
+        sf = torch.empty(
+            self.hop.scale_bytes(rows), dtype=torch.uint8, device=weights.device
+        )
+        updated, normalized = self.hop.moe_post(*args, *norm, mxfp8_out=(q, sf))
+        return updated, mhc.HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
+
+    def _log_once(self, site: str, rows: int) -> None:
+        # engagement in the serving process: once per (site, width) on every rank
+        if (site, rows) not in self._logged:
+            self._logged.add((site, rows))
+            logger.info(
+                "sgl-nvidia-mega: two-shot hop serves %s at %d rows", site, rows
+            )
+
+
+def _build_two_shot(hf_config, ctx, device, group):
+    """The two-shot mailbox and kernels; None if no served width takes them."""
+    rows = [w for w in ctx.widths if w >= slot_plan.TWO_SHOT_MIN_ROWS]
+    if not rows:
+        return None
+    from sgl_nvidia_mega.deepseek_v41.sm103.two_shot_mhc import TwoShotMHC
+
+    error, hop = "", None
+    try:
+        hop = TwoShotMHC(
+            hidden_size=hf_config.hidden_size,
+            hc_mult=hf_config.hc_mult,
+            max_num_tokens=max(rows),
+            top_k=hf_config.num_experts_per_tok,
+            device=device,
+            group=group.device_group,
+        )
+    except Exception as e:  # gathered, then raised on every rank
+        error = f"{type(e).__name__}: {e}"
+    _gather_errors(group, error, max(rows), "the two-shot build")
+    return TwoShotPosts(hop)
+
+
 def _gather_errors(group, error: str, value, what: str):
     """All-gather each rank's (error, value) on the CPU group; raise on every rank if
     any rank failed or the ranks disagree, so none waits in a collective alone."""
@@ -857,7 +993,16 @@ def build(model, hf_config, ctx) -> Routed:
             runner, layers, finalize=False, gate_topk=True, group=group
         )
         moe = _moe_slots(runner, layers)
-    facts = slot_plan.Facts(hop_a=not reason, hop_a_reason=reason)
+    two_shot_reason = two_shot_seams() or (
+        "" if "two_shot" in SLOTS else "off (SGLANG_NVIDIA_MEGA_SLOTS)"
+    )
+    two_shot = None
+    if not two_shot_reason:
+        two_shot = _build_two_shot(hf_config, ctx, device, group)
+        two_shot_reason = "" if two_shot is not None else "no width from 49 rows"
+    facts = slot_plan.Facts(
+        hop_a=not reason, hop_a_reason=reason, two_shot=two_shot is not None
+    )
     slots = {
         w: msgspec.structs.replace(s, hop_a=s.hop_a and w in taken)
         for w, s in slot_plan.plan(ctx.widths, facts).items()
@@ -875,7 +1020,13 @@ def build(model, hf_config, ctx) -> Routed:
         sum(m.gate for m in moe.values()),
         [w for w, s in slots.items() if s.fast_gate],
     )
-    return Routed(model, slots, runner, moe)
+    two_shot_rows = [w for w, s in slots.items() if s.two_shot]
+    logger.info(
+        "sgl-nvidia-mega deepseek_v41: two-shot hops at %s rows (%s)",
+        f"{two_shot_rows[0]}-{two_shot_rows[-1]}" if two_shot_rows else "no",
+        two_shot_reason or "built",
+    )
+    return Routed(model, slots, runner, moe, two_shot)
 
 
 class Draft:

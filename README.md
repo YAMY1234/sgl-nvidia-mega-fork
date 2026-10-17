@@ -14,19 +14,20 @@ The library implements SGLang's monokernel interface (`sglang.srt.monokernels`) 
 
 | Model | GPU | Tensor parallel | Coverage |
 | --- | --- | --- | --- |
-| DeepSeek-V4.1-Flash | GB300 (SM103) | 4 | DSpark verify steps of 1 to 48 rows (batch 1 to 8 at 6 rows a request), and the DSpark draft stages |
+| DeepSeek-V4.1-Flash | GB300 (SM103) | 4 | DSpark verify steps of 1 to 384 rows (batch 1 to 64 at 6 rows a request), and the DSpark draft stages of 1 to 48 rows |
 
-Steps past 48 rows, prefill and extend steps run SGLang's standard path.
+Steps past 384 rows, prefill and extend steps run SGLang's standard path.
 
 ### What a routed step runs
 
-A routed step is SGLang's own step, rebuilt from SGLang's modules, with three slots filled by this package:
+A routed step is SGLang's own step, rebuilt from SGLang's modules, with four slots filled by this package:
 
 | Slot | Rows | Kernel |
 | --- | --- | --- |
 | `wo_b` + attention all-reduce + mHC post + next norm | 1–8 | `wo_b` GEMM whose epilogue stores its rows into a Lamport mailbox on every rank, and a Lamport consumer that reduces them and runs the mHC post, combine and RMSNorm |
 | Router top-k | 1–8, 48 | One CTA per row, bit for bit SGLang's fused gate (including the vision-token routing) |
 | Routed experts | 1–48 | A route kernel and a pair of block-scaled tcgen05 GEMMs with 8-row tiles; an expert chosen by more than 8 rows takes several tiles |
+| Attention and MoE all-reduce + mHC post + next norm | 49–384 | Two-shot exchange: each rank sends row t only to its owner rank (t mod 4), which sums the four partials in rank order and sends the row back; the MoE post also folds SGLang's top-k finalize and shared-expert add, and quantizes the next input to MXFP8 |
 
 Every other kernel is SGLang's. The kernels stay separate launches chained with programmatic dependent launch: on GB300 a kernel boundary with PDL costs less than an exchange between all blocks of one persistent grid.
 

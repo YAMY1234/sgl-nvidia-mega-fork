@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """DeepSeek-V4.1-Flash on SM103 (GB300): the monokernel spec.
 
-A routed step (a DSpark verify step of 1-48 rows) runs ``forward.Routed``, which
-rebuilds SGLang's step from SGLang's own modules and swaps three slots for this
+A routed step (a DSpark verify step of 1-384 rows) runs ``forward.Routed``, which
+rebuilds SGLang's step from SGLang's own modules and swaps four slots for this
 package's kernels (``plan.py``): wo_b publishing into a Lamport all-reduce + mHC at
-1-8 rows, the router's top-k, and the routed experts on an 8-row-tile GEMM pair. The
+1-8 rows, the router's top-k and the routed experts on an 8-row-tile GEMM pair at
+1-48 rows, and two-shot all-reduce + mHC posts from 49 rows. The
 step stays a chain of kernels launched back to back with programmatic dependent
 launch: on GB300 a kernel boundary with PDL costs less than an exchange inside one
 persistent grid.
@@ -28,7 +29,11 @@ from sglang.srt.monokernels.spec import (
 from sgl_nvidia_mega.deepseek_v41 import HF_CONFIG, plan
 
 ISA = "sm_103"
-WIDTHS = tuple(range(1, plan.MAX_ROWS + 1))
+ROUTED_WIDTHS = tuple(range(1, plan.ROUTED_MAX_ROWS + 1))
+# the two-shot slot alone serves the widths past the routed pair
+WIDTHS = (
+    tuple(range(1, plan.MAX_ROWS + 1)) if "two_shot" in plan.SLOTS else ROUTED_WIDTHS
+)
 # The largest grid the kernels need co-resident: the GEMM pair's persistent schedule
 # and the Lamport consumer stay within GB300's 152 SMs
 RESIDENT_BLOCKS = 152

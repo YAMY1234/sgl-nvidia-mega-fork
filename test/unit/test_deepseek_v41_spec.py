@@ -52,27 +52,35 @@ def test_the_specs_use_this_sglangs_api_version():
 
 
 def test_widths_are_the_routed_rows():
-    assert dsv41.WIDTHS == tuple(range(1, 49))
+    assert dsv41.WIDTHS == tuple(range(1, 385))
+    assert draft.SPEC.widths(dsv41.ISA) == dsv41.ROUTED_WIDTHS == tuple(range(1, 49))
     # aligning SGLang's speculative capture list (6 rows a request) to the widths
-    # keeps batch sizes 1-8, the batches the widths hold whole
+    # captures every batch size up to the configured ceiling; the draft's widths
+    # hold batch sizes 1-8 whole
+    sizes = [1, 2, 3, 4, 8, 16, 32, 64]
     covered = guards.covered_capture_sizes(
-        widths=dsv41.WIDTHS, tokens_per_request=6, sizes=[1, 2, 3, 4, 8, 16, 32, 64]
+        widths=dsv41.WIDTHS, tokens_per_request=6, sizes=sizes
+    )
+    assert covered == list(range(1, 65))
+    covered = guards.covered_capture_sizes(
+        widths=dsv41.ROUTED_WIDTHS, tokens_per_request=6, sizes=sizes
     )
     assert covered == [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64]
 
 
 def test_the_slot_plan_follows_the_measured_bounds():
-    on = plan.Facts(hop_a=True)
+    on = plan.Facts(hop_a=True, two_shot=True)
     table = plan.plan(dsv41.WIDTHS, on)
     assert [w for w, s in table.items() if s.hop_a] == list(range(1, 9))
     assert [w for w, s in table.items() if s.fast_gate] == [*range(1, 9), 48]
-    assert all(s.routed for s in table.values())
-    # without SGLang's attention output before wo_b, the hop-A slot stays off
-    assert not any(
-        s.hop_a for s in plan.plan(dsv41.WIDTHS, plan.Facts(hop_a=False)).values()
-    )
+    assert [w for w, s in table.items() if s.routed] == list(range(1, 49))
+    assert [w for w, s in table.items() if s.two_shot] == list(range(49, 385))
+    # without SGLang's attention output before wo_b, the hop-A slot stays off;
+    # without the two-shot build, no width past the routed pair has a slot
+    off = plan.plan(dsv41.WIDTHS, plan.Facts(hop_a=False))
+    assert not any(s.hop_a or s.two_shot for s in off.values())
     with pytest.raises(ValueError):
-        plan.slots(49, on)
+        plan.slots(385, on)
 
 
 def _server_args(**kw):

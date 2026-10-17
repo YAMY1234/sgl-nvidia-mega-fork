@@ -24,11 +24,12 @@ class Slots(msgspec.Struct, frozen=True):
 
 
 class Facts(msgspec.Struct, frozen=True):
-    """What build found, which every rank must agree on."""
+    """What build found, which every rank must agree on. All off: every step
+    function runs its stock code."""
 
-    # SGLang returns the attention output before wo_b, and the mailbox built
-    hop_a: bool
+    hop_a: bool = False  # the wo_b publish and the Lamport mailbox built
     hop_a_reason: str = ""
+    routed: bool = False  # the routed-expert GEMM pair (and its top-k) built
 
 
 def slots(rows: int, facts: Facts) -> Slots:
@@ -36,8 +37,8 @@ def slots(rows: int, facts: Facts) -> Slots:
         raise ValueError(f"{rows} rows are outside the routed widths 1-{MAX_ROWS}")
     return Slots(
         hop_a=facts.hop_a and rows <= HOP_A_MAX_ROWS,
-        fast_gate=rows in FAST_GATE_ROWS,
-        routed=True,
+        fast_gate=facts.routed and rows in FAST_GATE_ROWS,
+        routed=facts.routed,
     )
 
 

@@ -2,13 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """DeepSeek-V4.1-Flash on SM103 (GB300): the monokernel spec.
 
-A routed step (a DSpark verify step of 1-48 rows) runs ``forward.Routed``, which
-rebuilds SGLang's step from SGLang's own modules and swaps three slots for this
-package's kernels (``plan.py``): wo_b publishing into a Lamport all-reduce + mHC at
-1-8 rows, the router's top-k, and the routed experts on an 8-row-tile GEMM pair. The
-step stays a chain of kernels launched back to back with programmatic dependent
-launch: on GB300 a kernel boundary with PDL costs less than an exchange inside one
-persistent grid.
+A covered step (a DSpark verify step of 1-48 rows) runs the plugin's executor
+(``runtime``): the step's own code per package (``boundary``, ``attention``, ``moe``,
+``engram``, ``logits``) over SGLang's loaded weights, with this package's kernels
+where the slot plan (``plan.py``) puts them. The step stays a chain of kernels
+launched back to back with programmatic dependent launch: on GB300 a kernel
+boundary with PDL costs less than an exchange inside one persistent grid.
 """
 
 from __future__ import annotations
@@ -78,7 +77,6 @@ NUMERICS = Numerics(
         "hop_a.normed.rel": 3e-2,
         # the routed experts against FlashInfer's routed MoE: one BF16 rounding
         "moe.routed.rel": 2**-7,
-        "draft_moe.out.rel": 2**-7,
     },
 )
 
@@ -118,15 +116,15 @@ def _flashinfer_ll_gemm_digest():
 
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
-    from sgl_nvidia_mega.deepseek_v41 import forward
+    from sgl_nvidia_mega.deepseek_v41 import runtime
 
-    return forward.model_disable_reasons(model, hf_config)
+    return runtime.model_disable_reasons(model, hf_config)
 
 
 def _build(model, hf_config, ctx):
-    from sgl_nvidia_mega.deepseek_v41 import forward
+    from sgl_nvidia_mega.deepseek_v41 import runtime
 
-    return forward.build(model, hf_config, ctx)
+    return runtime.build(model, hf_config, ctx)
 
 
 SPEC = MonoSpec(

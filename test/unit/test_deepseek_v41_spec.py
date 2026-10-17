@@ -17,7 +17,7 @@ from sglang.srt.monokernels import spec as registry
 from sglang.srt.server_args import ServerArgs
 
 import sgl_nvidia_mega
-from sgl_nvidia_mega.deepseek_v41 import HF_CONFIG, draft, plan
+from sgl_nvidia_mega.deepseek_v41 import HF_CONFIG, plan
 from sgl_nvidia_mega.deepseek_v41 import spec as dsv41
 
 TARGET, DRAFT = "DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMDSpark"
@@ -31,17 +31,19 @@ def registered():
         yield
 
 
-def test_the_plugin_registers_both_specs():
-    for arch, spec in ((TARGET, dsv41.SPEC), (DRAFT, draft.SPEC)):
-        found, why = registry.find_spec(
-            backend=sgl_nvidia_mega.BACKEND, architectures=[arch], isa=dsv41.ISA
-        )
-        assert found is spec, why
+def test_the_plugin_registers_the_target_spec_only():
+    found, why = registry.find_spec(
+        backend=sgl_nvidia_mega.BACKEND, architectures=[TARGET], isa=dsv41.ISA
+    )
+    assert found is dsv41.SPEC, why
+    # the DSpark draft runs SGLang's own path
+    assert not registry.spec_registered(
+        backend=sgl_nvidia_mega.BACKEND, architectures=[DRAFT]
+    )
 
 
 def test_the_specs_use_this_sglangs_api_version():
-    for spec in (dsv41.SPEC, draft.SPEC):
-        assert spec.api_version == registry.MONOKERNEL_API_VERSION
+    assert dsv41.SPEC.api_version == registry.MONOKERNEL_API_VERSION
     # a spec of another version is refused with a reason, not loaded
     old = replace(dsv41.SPEC, api_version=registry.MONOKERNEL_API_VERSION + 1)
     with patch.object(dsv41, "SPEC", old):
@@ -62,14 +64,19 @@ def test_widths_are_the_routed_rows():
 
 
 def test_the_slot_plan_follows_the_measured_bounds():
-    on = plan.Facts(hop_a=True)
+    # nothing built: every step function runs its stock code
+    assert not any(
+        s.hop_a or s.fast_gate or s.routed
+        for s in plan.plan(dsv41.WIDTHS, plan.Facts()).values()
+    )
+    on = plan.Facts(hop_a=True, routed=True)
     table = plan.plan(dsv41.WIDTHS, on)
     assert [w for w, s in table.items() if s.hop_a] == list(range(1, 9))
     assert [w for w, s in table.items() if s.fast_gate] == [*range(1, 9), 48]
     assert all(s.routed for s in table.values())
     # without SGLang's attention output before wo_b, the hop-A slot stays off
     assert not any(
-        s.hop_a for s in plan.plan(dsv41.WIDTHS, plan.Facts(hop_a=False)).values()
+        s.hop_a for s in plan.plan(dsv41.WIDTHS, plan.Facts(routed=True)).values()
     )
     with pytest.raises(ValueError):
         plan.slots(49, on)

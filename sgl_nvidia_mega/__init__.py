@@ -5,7 +5,7 @@ that only make sense inside a fused step, and the forward that runs them.
 
 SGLang holds the interface (``sglang.srt.monokernels``). This package holds the
 shared CUDA runtime (``common``) and, per model, its specs and their forwards
-(``<model>/spec.py``, ``<model>/draft.py``) and its kernels per ISA
+(``<model>/spec.py``) and its kernels per ISA
 (``<model>/<isa>/``). SGLang loads the package as a general plugin
 (``pyproject.toml``: the ``sglang.srt.plugins`` entry point), which registers
 each spec with SGLang's monokernel framework.
@@ -19,7 +19,6 @@ BACKEND = "nvidia"
 # server runs this backend
 SPECS = {
     "DeepseekV4ForCausalLM": "sgl_nvidia_mega.deepseek_v41.spec:SPEC",
-    "DeepseekV4ForCausalLMDSpark": "sgl_nvidia_mega.deepseek_v41.draft:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)

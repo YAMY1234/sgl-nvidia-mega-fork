@@ -75,6 +75,9 @@ def test_the_slot_plan_follows_the_measured_bounds():
     assert [w for w, s in table.items() if s.fast_gate] == [*range(1, 9), 48]
     assert [w for w, s in table.items() if s.routed] == list(range(1, 49))
     assert [w for w, s in table.items() if s.two_shot] == list(range(49, 385))
+    assert not any(s.hop_b for s in table.values())
+    with_b = plan.plan(dsv41.WIDTHS, plan.Facts(hop_a=True, hop_b=True))
+    assert [w for w, s in with_b.items() if s.hop_b] == list(range(1, 9))
     # without SGLang's attention output before wo_b, the hop-A slot stays off;
     # without the two-shot build, no width past the routed pair has a slot
     off = plan.plan(dsv41.WIDTHS, plan.Facts(hop_a=False))

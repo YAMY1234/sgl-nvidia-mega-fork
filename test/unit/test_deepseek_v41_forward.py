@@ -86,3 +86,56 @@ def test_only_a_deferred_finalize_takes_the_moe_post():
     assert posts.attach_moe_post(plain) is plain
     merged = _moe_output(plain)
     assert posts.attach_moe_post(merged) is merged
+
+
+def test_hop_b_hands_the_next_input_sglangs_one_shot_post_would():
+    """At hop-A widths SGLang's own post quantizes only for an MXFP8 receiver whose
+    norm folds, and otherwise leaves the next sublayer to normalize its streams."""
+    from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+
+    from sgl_nvidia_mega.deepseek_v41.sm103.all_reduce_mhc import mxfp8_scale_bytes
+
+    rows = 4
+    updated, normalized = torch.zeros(rows, 2, HIDDEN), torch.ones(rows, HIDDEN)
+    hop = SimpleNamespace(top_k=6, finalize=Mock(return_value=(updated, normalized)))
+    posts = forward.HopBPosts(hop)
+    routed = Deferred(
+        torch.ones(rows * 6, HIDDEN), torch.ones(rows, 6), torch.zeros(rows, 6), 6
+    )
+    from sglang.srt.models.deepseek_v2 import MoEOutput
+
+    shared = torch.ones(rows, HIDDEN)
+    replicated = MoEOutput(routed, shared, None, 1.0, True)
+    assert posts.attach_moe_post(replicated) is replicated
+    post = posts.attach_moe_post(MoEOutput(routed, shared, None, 1.0, False))
+    post = post.routed.fused_post
+    norm = SimpleNamespace(weight=torch.ones(HIDDEN), variance_epsilon=1e-6)
+    residual, pre = torch.zeros(rows, 2, HIDDEN), torch.ones(rows, 2)
+    args = (routed.gemm2_out, routed.expanded_idx_to_permuted_idx)
+    args += (routed.expert_weights, 6, shared, residual)
+    args += (torch.ones(rows, 2), torch.ones(rows, 2, 2), pre)
+    stock = (routed.gemm2_out, routed.expert_weights)
+    stock += (routed.expanded_idx_to_permuted_idx, shared, residual)
+
+    for nxt in (
+        None,
+        SimpleNamespace(norm=norm, norm_fusable=False, accepts_mxfp8=True),
+        SimpleNamespace(norm=norm, norm_fusable=True, accepts_mxfp8=False),
+    ):
+        got, given = post(*args, nxt)
+        assert got is updated and given is None
+        call = hop.finalize.call_args
+        assert call.args[:5] == stock and call.args[-3:] == (None, None, 0.0)
+
+    nxt = SimpleNamespace(norm=norm, norm_fusable=True, accepts_mxfp8=True)
+    _, given = post(*args, nxt)
+    assert isinstance(given, mhc.HcQuantized)
+    assert isinstance(given.swizzled, Mxfp8SwizzledInput)
+    call = hop.finalize.call_args
+    assert call.args[-3:] == (pre, norm.weight, 1e-6)
+    q, sf = call.kwargs["mxfp8_out"]
+    assert given.swizzled.data is q and given.swizzled.scales is sf
+    assert sf.numel() == mxfp8_scale_bytes(rows, HIDDEN)
+
+    with pytest.raises(ValueError):
+        post(*args[:3], 8, *args[4:], nxt)

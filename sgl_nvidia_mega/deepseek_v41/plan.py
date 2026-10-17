@@ -21,8 +21,9 @@ HOP_A_MAX_ROWS = 8
 TWO_SHOT_MIN_ROWS = 49
 FAST_GATE_ROWS = frozenset(range(1, HOP_A_MAX_ROWS + 1)) | {ROUTED_MAX_ROWS}
 
-# Test only: the slots build may fill (hop_a, moe, gate, two_shot; "dual" runs
-# SGLang's own MoE on the dual-stream path); default all
+# The slots build may fill (hop_a, moe, gate, two_shot, hop_b, early_trigger; test
+# only: "dual" runs SGLang's own MoE on the dual-stream path); hop_b and
+# early_trigger stay off by default until their A/B books them
 SLOTS = frozenset(
     os.environ.get("SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate,two_shot").split(",")
 ) - {""}
@@ -33,6 +34,7 @@ class Slots(msgspec.Struct, frozen=True):
     fast_gate: bool  # the router's top-k runs in gate_topk.cu
     routed: bool  # the routed experts run on the GEMM pair
     two_shot: bool = False  # both posts run the two-shot all-reduce + mHC
+    hop_b: bool = False  # the MoE post runs the Lamport finalize + all-reduce + mHC
 
 
 class Facts(msgspec.Struct, frozen=True):
@@ -43,6 +45,8 @@ class Facts(msgspec.Struct, frozen=True):
     hop_a_reason: str = ""
     # the two-shot mailbox built (SGLang defers the sums the call asks it to)
     two_shot: bool = False
+    # the Lamport mailbox takes the routed pair's deferred finalize
+    hop_b: bool = False
 
 
 def slots(rows: int, facts: Facts) -> Slots:
@@ -53,6 +57,7 @@ def slots(rows: int, facts: Facts) -> Slots:
         fast_gate=rows in FAST_GATE_ROWS,
         routed=rows <= ROUTED_MAX_ROWS,
         two_shot=facts.two_shot and rows >= TWO_SHOT_MIN_ROWS,
+        hop_b=facts.hop_b and rows <= HOP_A_MAX_ROWS,
     )
 
 

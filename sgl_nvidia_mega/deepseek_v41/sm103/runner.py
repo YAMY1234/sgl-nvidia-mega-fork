@@ -51,10 +51,14 @@ class Runner:
         top_k: int,
         hop_a_rows: int,
         deadline_s: float,
+        hop_b: bool = False,
+        early_trigger: bool = False,
     ) -> None:
-        """The Lamport mailbox (collective over ``group``) and the publishing GEMM."""
+        """The Lamport mailbox (collective over ``group``) and the publishing GEMM;
+        with ``hop_b`` also the MoE finalize's quantized and streams-only consumers."""
         # before the consumer compiles: the deadline is a constant of its kernel
         all_reduce_mhc.set_wait_deadline(deadline_s)
+        extra = {"early_trigger": True} if early_trigger else {}
         self.hop = all_reduce_mhc.AllReduceMHC(
             hidden_size=hidden,
             hc_mult=hc_mult,
@@ -62,6 +66,9 @@ class Runner:
             top_k=top_k,
             device=self.device,
             group=group,
+            quantize_layer_input=hop_b,
+            residual_only=hop_b,
+            **extra,
         )
         self.publisher = PublishingMxfp8Linear(self.hop)
 

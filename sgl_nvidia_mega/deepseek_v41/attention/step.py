@@ -1,0 +1,233 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""The attention of a covered decode step: ``MQALayer.forward(defer_all_reduce=True)``
+on CUDA for DeepSeek-V4.1, over the layer's loaded weights and SGLang's attention
+backend and caches.
+
+The stock step runs SGLang's own ops in SGLang's order, so it is bitwise to
+SGLang's decode attention; the plugin's kernels replace single ops in it."""
+
+from __future__ import annotations
+
+from sgl_nvidia_mega.deepseek_v41.attention import ops, prepare
+
+# The SGLang names this package reads, by file under the sglang package (``f(p)``: a
+# parameter); test/unit/test_contract.py pins them.
+SGLANG_READS = {
+    "srt/models/deepseek_v4.py": (
+        "MQALayer",
+        "is_dsv41",
+        "use_mega_attention",
+        "q_head_norm",
+        "fuse_wqa_wkv",
+        "wqkv_a",
+        "wq_a",
+        "wkv",
+        "wq_b",
+        "q_norm",
+        "kv_norm",
+        "wo_a",
+        "wo_b",
+        "wo_a_fp8",
+        "use_fused_wo_a",
+        "use_flashinfer_mxfp8_wo_b",
+        "use_npu_arch35_mxfp8_wo_a",
+        "alt_streams",
+        "compressor",
+        "indexer",
+        "compress_ratio",
+        "layer_id",
+        "q_lora_rank",
+        "n_local_heads",
+        "n_local_groups",
+        "o_lora_rank",
+        "head_dim",
+        "qk_rope_head_dim",
+        "freqs_cis",
+        "eps",
+        "attn_mqa",
+        "attn_tp_size",
+        "_multi_stream_bs_limit",
+        "_kernel_num_heads",
+        "_local_attn_sink",
+        "maybe_use_decode_attn_tp",
+        "_FP8_WO_A_UE8M0",
+        "_FUSED_WO_A_MAX_TOKENS",
+        "_apply_wo_a_bf16_matmul",
+        "_fp8_wo_a_einsum",
+        "_wo_a_fp8_mxscale",
+        "_wo_a_fp8_mxscale_fused_invrope",
+    ),
+    "srt/models/deepseek_v4_mhc.py": ("AttnOutput",),
+    "srt/layers/layernorm.py": ("weight", "variance_epsilon"),
+    "kernels/ops/attention/dsv4/__init__.py": (
+        "fused_norm_rope_inplace",
+        "fused_q_norm_rope",
+        "fused_rope_inplace",
+        "sglang_per_token_group_quant_fp8_dsv4_wo_a",
+    ),
+    "kernels/ops/attention/dsv4/wo_a.py": ("fused_rope_wo_a_bf16",),
+    "kernels/ops/layernorm/mxfp8_epilogue.py": ("rmsnorm_mxfp8",),
+    "kernels/ops/quantization/fp8_kernel.py": ("sglang_per_token_group_quant_fp8",),
+    "kernels/ops/attention/dsv4/unified_kv_kernels/env_gate.py": (
+        "is_unified_kv_triton",
+    ),
+    "srt/layers/quantization/fp8_utils.py": (
+        "Mxfp8DenseGemmBackend",
+        "FLASHINFER_CUTEDSL",
+    ),
+    "srt/layers/quantization/fp8.py": (
+        "mxfp8_dense_backend",
+        "use_mxfp8",
+        "block_fp8_mxfp8_ready",
+    ),
+    "srt/layers/quantization/mxfp8_input.py": ("Mxfp8SwizzledInput",),
+    "srt/layers/moe/utils.py": ("should_skip_mlp_all_reduce",),
+    "srt/layers/attention/deepseek_v4_backend.py": (
+        "forward_metadata",
+        "q_pad_buffer",
+        "get_swa_out_cache_loc",
+        "forward_low_ratio_sources",
+        "forward_low_ratio_sources(run_indexer)",
+        "forward_low_ratio_sources(run_compressor)",
+        "store_cache",
+    ),
+    "srt/layers/attention/dsv4/compressor.py": ("forward_core_compressor",),
+    "srt/mem_cache/deepseek_v4_memory_pool.py": (
+        "set_swa_key_buffer_radix_fused_norm_rope",
+        "uniform_fp8",
+    ),
+    "srt/model_executor/forward_context.py": (
+        "get_attn_backend",
+        "get_token_to_kv_pool",
+    ),
+    "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
+    "srt/model_executor/runner_backend_utils/breakable_cuda_graph/context.py": (
+        "is_in_breakable_cuda_graph",
+    ),
+    "srt/batch_invariant_ops/*.py": ("is_batch_invariant_mode_enabled",),
+    "srt/runtime_context.py": ("get_exec", "get_forward", '"sp_active"'),
+    "srt/environ.py": (
+        "envs",
+        "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP",
+        "SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE",
+    ),
+}
+
+
+def disable_reason(attn) -> str:
+    """Why the stock step cannot stand in for ``attn``'s forward, or ""."""
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_triton,
+    )
+    from sglang.srt.models.deepseek_v4 import (
+        MQALayer,
+        _wo_a_fp8_mxscale,
+        _wo_a_fp8_mxscale_fused_invrope,
+    )
+
+    if not isinstance(attn, MQALayer):
+        return f"layer {attn.layer_id}: {type(attn).__name__}, not MQALayer"
+    if not attn.is_dsv41 or attn.use_mega_attention:
+        return f"layer {attn.layer_id}: not the DSV4.1 FlashMLA attention"
+    if attn.compress_ratio not in (0, 1, 2):
+        return f"layer {attn.layer_id}: compress ratio {attn.compress_ratio}"
+    if _wo_a_fp8_mxscale is not None or _wo_a_fp8_mxscale_fused_invrope is not None:
+        return "the ROCm wo_a kernels are loaded"
+    if is_unified_kv_triton():
+        return "the unified KV cache"
+    if not hasattr(attn.wo_a, "weight"):
+        return f"layer {attn.layer_id}: wo_a has no dense weight"
+    return ""
+
+
+class AttentionStep:
+    """One layer's attention in a covered step, over the layer's own modules."""
+
+    def __init__(self, attn):
+        self.attn = attn
+        self.low_ratio = attn.compress_ratio in (1, 2)
+
+    def _prepare_path(self, rows: int, fb):
+        """The prepare ``MQALayer.forward`` picks for this step on CUDA."""
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+            is_in_breakable_cuda_graph,
+        )
+
+        attn = self.attn
+        if attn.alt_streams is None:
+            return prepare.eager
+        if (
+            not self.low_ratio
+            and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            and get_is_capture_mode()
+            and (is_in_breakable_cuda_graph() or rows <= attn._multi_stream_bs_limit)
+        ):
+            return prepare.multi_stream
+        mode = fb.forward_mode
+        if self.low_ratio and (
+            mode.is_decode()
+            or (
+                mode.is_target_verify()
+                and getattr(attn.wq_b.quant_method, "mxfp8_dense_backend", None)
+                == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+            )
+        ):
+            return prepare.low_ratio
+        return prepare.eager
+
+    def _query_buffer(self, x, attn_backend):
+        """The query buffer as ``MQALayer.forward`` lays it out: the local heads, or
+        the zeroed 64-head FlashMLA pad shared through the step's metadata."""
+        attn = self.attn
+        heads = attn._kernel_num_heads(x.shape[0])
+        if heads == attn.n_local_heads:
+            return heads, None, None, slice(None)
+        want = (x.shape[0], heads, attn.head_dim)
+        meta = attn_backend.forward_metadata
+        q_padded = getattr(meta, "q_pad_buffer", None)
+        if (
+            q_padded is None
+            or tuple(q_padded.shape) != want
+            or q_padded.dtype != x.dtype
+        ):
+            q_padded = x.new_zeros(*want)
+            if meta is not None:
+                try:
+                    meta.q_pad_buffer = q_padded
+                except (AttributeError, TypeError):
+                    pass
+        tp_slice = slice(0, attn.n_local_heads)
+        return heads, q_padded, q_padded[:, tp_slice, :], tp_slice
+
+    def run(self, x, positions, fb, x_quant=None):
+        """The layer's TP-partial attention output (``mhc.AttnOutput``) for input
+        ``x`` (``x_quant``: the same input as MXFP8)."""
+        from sglang.srt.model_executor.forward_context import (
+            get_attn_backend,
+            get_token_to_kv_pool,
+        )
+
+        attn = self.attn
+        attn_backend = get_attn_backend()
+        assert not get_token_to_kv_pool().uniform_fp8, "the uniform-FP8 pool"
+        with attn.maybe_use_decode_attn_tp(fb):
+            heads, q_padded, q_out, tp_slice = self._query_buffer(x, attn_backend)
+            attn_sink = attn._local_attn_sink(heads)
+            path = self._prepare_path(x.shape[0], fb)
+            q = path(attn, x, positions, fb, attn_backend, q_out, x_quant)
+            o = attn_backend.forward(
+                q=q_padded if q_padded is not None else q,
+                k=q,
+                v=q,
+                layer=attn.attn_mqa,
+                forward_batch=fb,
+                compress_ratio=attn.compress_ratio,
+                attn_sink=attn_sink,
+                save_kv_cache=False,
+            )
+            o = o[:, tp_slice, :]
+            return ops.wo_b(attn, ops.wo_a(attn, o, positions, fb))

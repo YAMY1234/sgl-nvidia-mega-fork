@@ -205,6 +205,7 @@ SGLANG_SEAMS = {
         "forward_normal_dual_stream(select_experts)",
         "forward_normal_dual_stream(run_routed_experts)",
     ),
+    "srt/models/deepseek_v4_boundary.py": ("mhc_fusions",),
 }
 
 # Composition parity (test only): run SGLang's own forward on the same step first and
@@ -216,10 +217,13 @@ PARITY = PARITY_MODE in ("1", "control")
 # both arms, so the indexer top-k's emission order (atomic arrival order) does not
 # change the attention's accumulation order between the two forwards
 PARITY_SORT_TOPK = os.environ.get("SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK", "0") == "1"
-# Test only: the slots build may fill (hop_a, moe, gate; "dual" runs SGLang's own MoE
-# on the dual-stream path); default all
+# Test only: the slots build may fill (hop_a, moe, gate; draft_post, draft_seam: the
+# draft stages on the fused posts, and each stage's MoE post writing the next stage's
+# input; "dual" runs SGLang's own MoE on the dual-stream path); default all
 SLOTS = frozenset(
-    os.environ.get("SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate").split(",")
+    os.environ.get(
+        "SGLANG_NVIDIA_MEGA_SLOTS", "hop_a,moe,gate,draft_post,draft_seam"
+    ).split(",")
 ) - {""}
 
 
@@ -468,6 +472,7 @@ def run_layer(
     hop_a: bool,
     moe,
     fast_gate: bool,
+    mhc_fusions=None,
 ):
     """``DeepseekV4CudaDecoderLayer.forward`` with this package's slots: SGLang's
     stage boundaries own the residual streams, the mHC stats and the posts. At hop-A
@@ -478,7 +483,9 @@ def run_layer(
     from sglang.srt.models import deepseek_v4_boundary as hc_boundary
     from sglang.srt.models import deepseek_v4_mhc as mhc
 
-    call = hc_boundary.LayerCall(input_ids, input_ids_global, cross_layer)
+    # mhc_fusions: the call's choice of SGLang's fused posts (None: the layer's own)
+    extra = {} if mhc_fusions is None else {"mhc_fusions": mhc_fusions}
+    call = hc_boundary.LayerCall(input_ids, input_ids_global, cross_layer, **extra)
     hidden = layer.attn_boundary.prepare(hidden, fb, read_context=call)
     quantized = residual_batch.written_residual(fb).quantized
     attn = layer.self_attn
@@ -694,6 +701,16 @@ def _moe_slots(runner, layers, key=lambda i, layer: layer.layer_id) -> dict:
     return slots
 
 
+def draft_post_seam() -> str:
+    """Why SGLang cannot run the draft stages on its fused posts, or "": a layer call
+    that turns on the mHC fusions of a stage built without them."""
+    from sglang.srt.models import deepseek_v4_boundary as hc_boundary
+
+    if "mhc_fusions" not in hc_boundary.LayerCall.__struct_fields__:
+        return "this SGLang lacks LayerCall.mhc_fusions"
+    return ""
+
+
 def hop_a_seams() -> str:
     """Why SGLang cannot run the hop-A slot, or "" when it can: the attention output
     before wo_b (``MQALayer.forward_before_wo_b``), and an attention output that names
@@ -881,9 +898,21 @@ def build(model, hf_config, ctx) -> Routed:
 class Draft:
     """One rank's routed DSpark draft step."""
 
-    def __init__(self, lm, slots: dict[int, slot_plan.Slots], runner=None, moe=None):
+    def __init__(
+        self,
+        lm,
+        slots: dict[int, slot_plan.Slots],
+        runner=None,
+        moe=None,
+        *,
+        post=False,
+        seam=False,
+    ):
         self.lm, self.slots, self.runner = lm, slots, runner
         self.moe = moe or {}  # stage index -> MoeSlot
+        # the stages run on SGLang's fused all-reduce + mHC posts; with the seam each
+        # stage's MoE post also writes the next stage's attention input
+        self.post, self.seam = post, seam
 
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
@@ -932,10 +961,11 @@ class Draft:
             with get_global_expert_distribution_recorder().disable_this_region():
                 for i, stage in enumerate(lm.stages):
                     moe = self.moe.get(i) if slots.routed else None
-                    if moe is None:
+                    if moe is None and not self.post:
                         x = stage(positions, x, forward_batch)
                         continue
-                    # DSparkV4CudaStage.forward: no token ids, no cross-layer fusion
+                    # DSparkV4CudaStage.forward: no token ids; cross-stage fusion only
+                    # with the seam
                     x = run_layer(
                         stage,
                         positions,
@@ -943,11 +973,12 @@ class Draft:
                         None,
                         forward_batch,
                         None,
-                        cross_layer=False,
+                        cross_layer=self.seam,
                         runner=self.runner,
                         hop_a=False,
                         moe=moe,
                         fast_gate=False,
+                        mhc_fusions=True if self.post else None,
                     )
             state = residual_batch.read_output(
                 x, forward_batch, hc_boundary.FinalRead(), None
@@ -986,11 +1017,17 @@ def build_draft(model, hf_config, ctx) -> Draft:
     slots = slot_plan.plan(
         ctx.widths, slot_plan.Facts(hop_a=False, hop_a_reason="draft")
     )
+    post_reason = draft_post_seam() or (
+        "" if "draft_post" in SLOTS else "off (SGLANG_NVIDIA_MEGA_SLOTS)"
+    )
+    seam = not post_reason and "draft_seam" in SLOTS
     logger.info(
         "sgl-nvidia-mega deepseek_v41 draft: widths %s; routed experts on the GEMM "
-        "pair in %d stages (%s)",
+        "pair in %d stages (%s); fused posts %s; seam %s",
         list(ctx.widths),
         len(moe),
         moe_reason or "built",
+        post_reason or "on",
+        "on" if seam else "off",
     )
-    return Draft(model, slots, runner, moe)
+    return Draft(model, slots, runner, moe, post=not post_reason, seam=seam)

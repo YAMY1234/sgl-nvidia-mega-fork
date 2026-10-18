@@ -240,6 +240,12 @@ def build(model, ctx):
         binding=getattr(ctx, "binding", None),
     )
     bound = {name: pkg.build(model, pctx, group) for name, pkg in PACKAGES.items()}
+    # hop B writes row-tile scales past 8 rows only for the chains that read them
+    bound["boundary"].row_tile_layers = frozenset(
+        lid
+        for lid, step in bound["attention"].items()
+        if step.chain is not None and step.chain[0].qkv_a_ll
+    )
     table, embed_reason = None, "not requested"
     if "embed" in SLOTS:
         table, embed_reason = embedding.replicate(

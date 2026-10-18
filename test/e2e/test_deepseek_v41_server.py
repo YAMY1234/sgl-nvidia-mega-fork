@@ -210,13 +210,19 @@ def _rank_process(process, rank):
 class TestMegakernelVerify(CustomTestCase):
     """DSpark verify steps: above 8 requests (48 rows) the normal path."""
 
-    RUNS = (
-        "NVIDIA megakernel: DeepSeek-V4.1 verify steps of [6, 12, 18, 24, 30, 36, 42, 48] rows built",
-        # every shipped slot built where PR #1 measured it: hop A at batch 1, the fast
-        # top-k at batch 1 and 8
-        "; slots ['gate', 'hop_a', 'moe']; hop A at [6] rows, fast gate at [6, 48] rows;",
-        "NVIDIA megakernel: active (DeepSeek-V4.1 verify steps of [6, 12, 18, 24, 30, 36, 42, 48] rows)",
+    # SGLang's startup line, once per TP rank: every shipped slot built where PR #1
+    # measured it (hop A at batch 1, the fast top-k at batch 1 and 8), every width
+    ACTIVE = re.compile(
+        r"NVIDIA megakernel: active \(DeepSeek-V4\.1: slots \['gate', 'hop_a', 'moe'\]; "
+        r"hop A at \[6\] rows, fast gate at \[6, 48\] rows; .*; "
+        r"widths \[6, 12, 18, 24, 30, 36, 42, 48\]; tolerance numerics;"
     )
+    # the captured decode graphs of 1 to 8 requests run it
+    CAPTURED = re.compile(
+        r"NVIDIA megakernel: DeepSeek-V4\.1 runs the decode graphs of batch sizes "
+        r"\[1, [^\]]*\b8\]"
+    )
+    TP = 4
 
     @classmethod
     def setUpClass(cls):
@@ -243,8 +249,8 @@ class TestMegakernelVerify(CustomTestCase):
             if log
             else "".join(Path(f.name).read_text() for f in self.logs)
         )
-        for line in self.RUNS:
-            self.assertIn(line, text)
+        self.assertEqual(len(self.ACTIVE.findall(text)), self.TP, text[-4000:])
+        self.assertEqual(len(self.CAPTURED.findall(text)), self.TP, text[-4000:])
 
     def test_gsm8k_past_the_largest_width(self):
         # 12 and 16 requests: batches move between <= 8 (routed) and >= 9 (standard)

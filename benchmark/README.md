@@ -40,7 +40,7 @@ Protocol:
 - Both arms on one node.
 - At least 2 fresh launches per arm, in palindrome order (on, off, off, on).
 - Diff the two launch commands and environments before reading a number.
-- Check the startup line `NVIDIA megakernel: DeepSeek-V4.1 verify steps of [6, 12, …, 48] rows built` in the switch-on arm.
+- Check the startup line `NVIDIA megakernel: active (DeepSeek-V4.1: …; widths [6, 12, …, 48]; …)` on every rank in the switch-on arm, and its absence in the switch-off arm.
 - A difference inside the run-to-run band (≈ 1.5 % at batch 1 and 4, ≈ 1 % elsewhere) is not a result.
 
 ## Accuracy

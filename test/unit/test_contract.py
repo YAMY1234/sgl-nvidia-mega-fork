@@ -106,13 +106,19 @@ def test_sglang_provides_what_the_plugin_reads(path):
 
 
 def _hook_targets() -> list:
-    """``plugin.HOOKS``' SGLang targets, read from the source (no import)."""
+    """``plugin.HOOKS`` and ``plugin.TEST_HOOKS``' SGLang targets, read from the
+    source (no import)."""
+    hooks, test_hooks = None, []
     for node in _tree(PACKAGE / "plugin.py").body:
         if isinstance(node, ast.Assign) and any(
             isinstance(t, ast.Name) and t.id == "HOOKS" for t in node.targets
         ):
-            return [target for target, _, _ in ast.literal_eval(node.value)]
-    raise AssertionError("plugin.py has no HOOKS")
+            hooks = [target for target, _, _ in ast.literal_eval(node.value)]
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "TEST_HOOKS" for t in node.targets
+        ):
+            test_hooks = [target for target, _, _ in ast.literal_eval(node.value)]
+    return hooks + test_hooks
 
 
 @pytest.mark.parametrize("target", _hook_targets())

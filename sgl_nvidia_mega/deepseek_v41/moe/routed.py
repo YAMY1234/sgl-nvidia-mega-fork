@@ -100,7 +100,7 @@ class MoeSlot:
     ) -> _GateTopK:
         if not self.gemm.supports_gate_topk(router_logits, self.bias):
             raise RuntimeError(
-                f"sgl-nvidia-mega: the fast gate cannot take router logits "
+                f"NVIDIA megakernel: the fast gate cannot take router logits "
                 f"{router_logits.dtype} {tuple(router_logits.shape)}"
             )
         rows = router_logits.shape[0]

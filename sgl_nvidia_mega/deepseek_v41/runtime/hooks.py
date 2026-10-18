@@ -48,8 +48,9 @@ def after_initialize(result, runner, *args, **kwargs):
     model = runner.model
     if type(model) is not DeepseekV4ForCausalLM:
         return result
-    reasons = requirements.disable_reasons(runner.server_args, runner.model_config)
-    reasons += runtime.model_disable_reasons(model)
+    resolved = requirements.Resolved(runner.server_args)
+    reasons = requirements.disable_reasons(resolved, runner.model_config)
+    reasons += runtime.slot_reasons() + runtime.model_disable_reasons(model)
     if "forward" in model.__dict__:
         reasons.append("the model's forward is already replaced on this instance")
     group = get_parallel().tp_group
@@ -61,7 +62,7 @@ def after_initialize(result, runner, *args, **kwargs):
             "SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1 cannot run this setup:\n  - "
             + "\n  - ".join(failed)
         )
-    executor = runtime.build(model, runner.server_args)
+    executor = runtime.build(model, resolved)
     install(model, executor)
     model._derived_weight_cache_error = WEIGHT_UPDATE_ERROR
     logger.info(

@@ -18,6 +18,18 @@ from sgl_nvidia_mega.deepseek_v41 import HF_CONFIG
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
+    "srt/runtime_context.py": (
+        "get_parallel",
+        "get_exec",
+        "get_memory",
+        "get_model",
+        "get_spec",
+        "get_lora",
+        "get_device",
+        "get_disagg",
+        "get_schedule",
+    ),
+    "srt/arg_groups/model_override_base.py": ("resolving_view",),
     "srt/arg_groups/fields/*.py": (
         "tp_size",
         "pp_size",
@@ -136,8 +148,61 @@ def deadline_s(watchdog_timeout) -> float:
     return min(MAX_DEADLINE_S, 0.5 * float(watchdog_timeout))
 
 
+class Resolved:
+    """SGLang's resolved value of each server argument, by name: the published config
+    namespaces the runners read (a raw argument may still be unset, e.g. the decode
+    CUDA graph config), else resolution's view of the arguments."""
+
+    def __init__(self, server_args):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.runtime_context import (
+            get_device,
+            get_disagg,
+            get_exec,
+            get_lora,
+            get_memory,
+            get_model,
+            get_parallel,
+            get_schedule,
+            get_spec,
+        )
+
+        self._view = resolving_view(server_args)
+        self._parallel = get_parallel()
+        bags = (get_exec, get_memory, get_model, get_spec, get_lora, get_device)
+        self._bags = [get() for get in (*bags, get_disagg, get_schedule)]
+
+    def __getattr__(self, name: str):
+        try:
+            return getattr(self._parallel, name)
+        except (AttributeError, ValueError):
+            pass
+        for bag in self._bags:
+            found = _leaf(bag, name)
+            if found is not _MISSING:
+                return found
+        return getattr(self._view, name)
+
+
+_MISSING = object()
+
+
+def _leaf(bag, name: str):
+    """``name`` in a config namespace or its sub-namespaces, else ``_MISSING``."""
+    fields = vars(bag)
+    if name in fields:
+        return fields[name]
+    for sub in fields.values():
+        if isinstance(sub, type(bag)):
+            found = _leaf(sub, name)
+            if found is not _MISSING:
+                return found
+    return _MISSING
+
+
 def disable_reasons(server_args, model_config) -> list[str]:
-    """Every reason the megakernel cannot serve this setup ([] when it can)."""
+    """Every reason the megakernel cannot serve this setup ([] when it can);
+    ``server_args`` holds resolved values (``Resolved``)."""
     from sglang.srt.environ import envs
 
     reasons = [f"{name} is in use" for name, on in FEATURES.items() if on(server_args)]

@@ -20,6 +20,17 @@ HOOKS = (
     ),
 )
 
+# Test only: with SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1, the composition check
+# sorts the sparse attention indices in both forwards (their emission order varies)
+PARITY_SORT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK"
+TEST_HOOKS = (
+    (
+        "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend.forward",
+        "AROUND",
+        "sgl_nvidia_mega.deepseek_v41.runtime.parity:around_attention_forward",
+    ),
+)
+
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     "srt/plugins/hook_registry.py": (
@@ -27,6 +38,7 @@ SGLANG_READS = {
         "HookType",
         "register",
         "AFTER",
+        "AROUND",
     ),
 }
 
@@ -43,5 +55,6 @@ def register() -> None:
 
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    for target, kind, hook in HOOKS:
+    hooks = HOOKS + (TEST_HOOKS if os.environ.get(PARITY_SORT_ENV) == "1" else ())
+    for target, kind, hook in hooks:
         HookRegistry.register(target, pkgutil.resolve_name(hook), HookType[kind])

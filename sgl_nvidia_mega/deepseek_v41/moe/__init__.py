@@ -28,7 +28,7 @@ def build(model, ctx, group) -> routed.Bound:
         return routed.Bound(reason="stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
     bound = routed.build(model, group, gate_topk="gate" in SLOTS)
     logger.info(
-        "sgl-nvidia-mega deepseek_v41 moe: routed experts on the GEMM pair in %d "
+        "NVIDIA megakernel: DeepSeek-V4.1 MoE: routed experts on the GEMM pair in %d "
         "layers, fast gate in %d (%s)",
         len(bound.slots),
         sum(s.gate for s in bound.slots.values()),

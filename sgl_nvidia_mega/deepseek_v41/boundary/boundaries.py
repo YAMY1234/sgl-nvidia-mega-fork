@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from SGLang (Apache-2.0, SGLang Team):
+# python/sglang/srt/models/deepseek_v4_mhc.py and deepseek_v4_boundary.py (the decode stage boundaries).
 """The mHC boundaries of a covered step: SGLang's stock decode boundary, with
 hop A's Lamport collect as the attention post where wo_b published.
 

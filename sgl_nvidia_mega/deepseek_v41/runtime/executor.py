@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from SGLang (Apache-2.0, SGLang Team):
+# python/sglang/srt/models/deepseek_v4.py (DeepseekV4ForCausalLM.forward, DeepseekV4Model.forward and its layer loop).
 """The executor: one covered decode step of the DeepSeek-V4.1 target.
 
 ``MegakernelDecode.plan`` decides from host state alone, identical on every rank,
@@ -92,13 +94,11 @@ class Step(msgspec.Struct, frozen=True):
 
 
 class MegakernelDecode:
-    """One rank's covered steps: the model, each width's slots, each package's
-    build result and the side streams."""
+    """One rank's covered steps: the model, each width's slots and each package's
+    build result."""
 
-    def __init__(
-        self, lm, slots: dict, bound: dict, streams: dict, widths: tuple[int, ...]
-    ):
-        self.lm, self.slots, self.bound, self.streams = lm, slots, bound, streams
+    def __init__(self, lm, slots: dict, bound: dict, widths: tuple[int, ...]):
+        self.lm, self.slots, self.bound = lm, slots, bound
         self.widths = frozenset(widths)
 
     def plan(
@@ -143,10 +143,8 @@ class MegakernelDecode:
             positions=positions,
             input_ids=input_ids,
             input_ids_global=getattr(forward_batch, "input_ids_global", input_ids),
-            plan=step,
             slots=self.slots[step.rows],
             bound=self.bound,
-            streams=self.streams,
         )
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden, pre_hc_head = self._model_forward(st, input_embeds)

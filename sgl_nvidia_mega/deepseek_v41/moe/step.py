@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from SGLang (Apache-2.0, SGLang Team):
+# python/sglang/srt/models/deepseek_v2.py (DeepseekV2MoE.forward and its dual-stream path).
 """The MoE step of a covered decode step, over SGLang's loaded ``DeepseekV2MoE`` block.
 
 The stock step issues what ``DeepseekV2MoE.forward`` issues for the covered

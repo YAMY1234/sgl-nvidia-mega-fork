@@ -78,8 +78,8 @@ def pinned_tactics(sm_version: int):
             return tactics
         if pinned not in tactics:
             logger.warning(
-                f"Pinned low-latency MXFP8 tactic {pinned} is not offered for "
-                f"N={n} K={k}; autotuning that shape instead."
+                f"NVIDIA megakernel: pinned low-latency MXFP8 tactic {pinned} is not "
+                f"offered for N={n} K={k}; autotuning that shape instead."
             )
             return tactics
         return [pinned]

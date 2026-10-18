@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from SGLang (Apache-2.0, SGLang Team):
+# python/sglang/srt/models/deepseek_v4.py (MQALayer.forward).
 """The attention of a covered decode step: ``MQALayer.forward(defer_all_reduce=True)``
 on CUDA for DeepSeek-V4.1, over the layer's loaded weights and SGLang's attention
 backend and caches.

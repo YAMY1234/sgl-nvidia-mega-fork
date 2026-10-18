@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from SGLang (Apache-2.0, SGLang Team):
+# python/sglang/srt/models/deepseek_v4.py (the tails of DeepseekV4Model.forward and DeepseekV4ForCausalLM.forward).
 """The head after the last layer: the mHC combine + norm (``head``), then the LM
 head and logits (``logits``, SGLang's logits processor). Stock: the tail of
 ``DeepseekV4Model.forward`` and of ``DeepseekV4ForCausalLM.forward``."""

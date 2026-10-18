@@ -7,12 +7,12 @@
 
 `static_table.py` measures tokens per second per user at each batch size: ISL 8K, OSL 1K,
 batch 1–64, one fresh server launch per arm. The two arms differ only by
-`SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1` (with the same `SGLANG_NVIDIA_MEGAKERNEL_SLOTS`).
+`SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1` (every shipped slot; no `SGLANG_NVIDIA_MEGAKERNEL_SLOTS`).
 
 Server (GB300, TP4, DSpark):
 
 ```
-[SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1 SGLANG_NVIDIA_MEGAKERNEL_SLOTS=moe,gate] \
+[SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1] \
 SGLANG_SIMULATE_ACC_LEN=3.51 SGLANG_SIMULATE_ACC_METHOD=match-expected \
 SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token \
 python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V4.1-Flash --trust-remote-code \

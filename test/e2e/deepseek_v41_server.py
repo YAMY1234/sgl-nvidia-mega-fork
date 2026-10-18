@@ -7,7 +7,7 @@ test can launch the normal path too."""
 import os
 
 MODEL = os.environ.get(
-    "DEEPSEEK_V41_FLASH_MODEL_PATH", "deepseek-ai/DeepSeek-V4.1-Flash"
+    "SGLANG_NVIDIA_MEGAKERNEL_E2E_MODEL_PATH", "deepseek-ai/DeepSeek-V4.1-Flash"
 )
 # An already running server, so the same checks can score the switch-off arm
 URL = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_URL")

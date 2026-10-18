@@ -43,6 +43,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
+from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS_ENV
 from sgl_nvidia_mega.plugin import ENABLE_ENV
 
 LAUNCH_TIMEOUT = 3600
@@ -103,8 +104,9 @@ def _long_prompts():
 
 
 def _launch(args=ARGS, extra_env=None, extra_args=(), log=None, backend=True):
+    # the product configuration: every slot the package ships, not a caller's override
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if k != SLOTS_ENV},
         **ENV,
         ENABLE_ENV: "1" if backend else "0",
         **(extra_env or {}),
@@ -211,6 +213,9 @@ class TestMegakernelVerify(CustomTestCase):
 
     RUNS = (
         "NVIDIA megakernel: DeepSeek-V4.1 verify steps of [6, 12, 18, 24, 30, 36, 42, 48] rows built",
+        # every shipped slot built where PR #1 measured it: hop A at batch 1, the fast
+        # top-k at batch 1 and 8
+        "; slots ['gate', 'hop_a', 'moe']; hop A at [6] rows, fast gate at [6, 48] rows;",
         "NVIDIA megakernel: active (DeepSeek-V4.1 verify steps of [6, 12, 18, 24, 30, 36, 42, 48] rows)",
     )
 

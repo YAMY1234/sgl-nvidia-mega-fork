@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from SGLang (Apache-2.0, SGLang Team):
+# python/sglang/srt/layers/engram.py (Engram.forward) and python/sglang/srt/models/deepseek_v4.py.
 """The Engram layers: table lookup, WKV GEMM and gate, before the layer's attention.
 
 ``hashes`` computes the step's token hashes once; ``apply`` runs one Engram layer

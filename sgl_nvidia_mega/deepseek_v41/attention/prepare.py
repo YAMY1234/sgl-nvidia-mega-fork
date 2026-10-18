@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from SGLang (Apache-2.0, SGLang Team):
+# python/sglang/srt/models/deepseek_v4.py (MQALayer.forward).
 """The query and cache-write half of SGLang's DeepSeek-V4.1 decode attention on CUDA:
 the three prepare paths ``MQALayer`` picks between, with their stream order.
 

@@ -69,10 +69,8 @@ def _state(engram_layers=(), capture=None):
         positions=None,
         input_ids=torch.zeros(6, dtype=torch.int64),
         input_ids_global=None,
-        plan=None,
         slots=None,
         bound={},
-        streams={},
     )
     st.aux = [] if capture is not None else None
     return st
@@ -88,7 +86,7 @@ LAYER = [
 
 
 def test_each_layer_runs_pre_attention_post_moe_post(calls):
-    out = executor.MegakernelDecode(None, {}, {}, {}, ())._layers(
+    out = executor.MegakernelDecode(None, {}, {}, ())._layers(
         _state(), torch.zeros(6, 4, 8)
     )
     assert out == (1, 2)
@@ -108,7 +106,7 @@ def test_engram_and_capture_layers_read_the_materialized_streams(calls, monkeypa
         st.state = SimpleNamespace(residual=st_residual)
 
     monkeypatch.setattr(executor.boundary, "materialize", materialize)
-    executor.MegakernelDecode(None, {}, {}, {}, ())._layers(st, torch.zeros(6, 4, 8))
+    executor.MegakernelDecode(None, {}, {}, ())._layers(st, torch.zeros(6, 4, 8))
     names = [(name, i) for name, i, _ in calls]
     # Engram before layer 1's attention; the capture before layer 2's
     assert names.index(("boundary.materialize", 1)) < names.index(("engram.apply", 1))
@@ -126,7 +124,7 @@ def _batch(mode="TARGET_VERIFY"):
 
 
 def test_only_verify_steps_of_built_widths_are_covered():
-    decode = executor.MegakernelDecode(None, {}, {}, {}, (6, 12, 48))
+    decode = executor.MegakernelDecode(None, {}, {}, (6, 12, 48))
     ids = torch.zeros(12, dtype=torch.int64)
     assert decode.plan(ids, _batch()) == executor.Step("TARGET_VERIFY", 12)
     assert decode.plan(torch.zeros(18, dtype=torch.int64), _batch()) is None
@@ -157,3 +155,22 @@ def test_the_forward_is_replaced_on_the_instance_only():
     # SGLang reads the forward's parameters (pipeline-parallel support)
     params = inspect.signature(model.forward).parameters
     assert list(params) == ["input_ids", "positions", "forward_batch", "input_embeds"]
+
+
+def test_slot_selection_is_validated(monkeypatch):
+    from sgl_nvidia_mega.deepseek_v41 import runtime
+
+    monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    assert runtime._requested_slots() == frozenset(runtime.SHIPPED_SLOTS)
+    monkeypatch.setenv(runtime.SLOTS_ENV, "")
+    assert runtime._requested_slots() == frozenset()
+    monkeypatch.setenv(runtime.SLOTS_ENV, " moe , gate ")
+    assert runtime._requested_slots() == {"moe", "gate"}
+    for raw, want in (
+        ("moe,gatee", "unknown slot 'gatee'"),
+        ("gate", "needs slot 'moe'"),
+    ):
+        monkeypatch.setattr(runtime, "SLOTS", frozenset(raw.split(",")))
+        assert any(want in r for r in runtime.slot_reasons()), raw
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(runtime.SHIPPED_SLOTS))
+    assert runtime.slot_reasons() == []

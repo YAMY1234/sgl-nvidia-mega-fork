@@ -16,6 +16,7 @@ MAX_ROWS = 48  # the largest routed width
 HOP_A_MAX_ROWS = 8
 FAST_GATE_MAX_SMALL_ROWS = 16
 FAST_GATE_ROWS = frozenset(range(1, FAST_GATE_MAX_SMALL_ROWS + 1)) | {MAX_ROWS}
+ENGRAM_PREFETCH_MAX_ROWS = 16  # the Engram prefetch plane's slot is sized for them
 
 
 class Slots(msgspec.Struct, frozen=True):
@@ -23,6 +24,7 @@ class Slots(msgspec.Struct, frozen=True):
     fast_gate: bool  # the router's top-k runs in gate_topk.cu
     routed: bool  # the routed experts run on the GEMM pair
     embed: bool = False  # the embedding looks up this rank's whole table
+    engram_prefetch: bool = False  # Engram lookups + WKVs run on the prefetch stream
 
 
 class Facts(msgspec.Struct, frozen=True):
@@ -33,6 +35,7 @@ class Facts(msgspec.Struct, frozen=True):
     hop_a_reason: str = ""
     routed: bool = False  # the routed-expert GEMM pair (and its top-k) built
     embed: bool = False  # the whole embedding table replicated on every rank
+    engram_prefetch: bool = False  # every Engram layer prefetches, checked at build
 
 
 def slots(rows: int, facts: Facts) -> Slots:
@@ -43,6 +46,7 @@ def slots(rows: int, facts: Facts) -> Slots:
         fast_gate=facts.routed and rows in FAST_GATE_ROWS,
         routed=facts.routed,
         embed=facts.embed,
+        engram_prefetch=facts.engram_prefetch and rows <= ENGRAM_PREFETCH_MAX_ROWS,
     )
 
 

@@ -211,11 +211,13 @@ class TestMegakernelVerify(CustomTestCase):
     """DSpark verify steps: above 8 requests (48 rows) the normal path."""
 
     # SGLang's startup line, once per TP rank: every shipped slot built where it was
-    # measured (hop A at batch 1, the fast top-k at batch 1, 2 and 8), every width
+    # measured (hop A at batch 1, the fast top-k at batch 1, 2 and 8, the Engram
+    # prefetch at batch 1 and 2), every width
     ACTIVE = re.compile(
         r"NVIDIA megakernel: active \(DeepSeek-V4\.1: "
-        r"slots \['embed', 'gate', 'hop_a', 'moe'\]; "
-        r"hop A at \[6\] rows, fast gate at \[6, 12, 48\] rows; .*; "
+        r"slots \['embed', 'engram', 'gate', 'hop_a', 'moe'\]; "
+        r"hop A at \[6\] rows, fast gate at \[6, 12, 48\] rows, Engram prefetch at "
+        r"\[6, 12\] rows \(built, checked bit for bit\); .*; "
         r"widths \[6, 12, 18, 24, 30, 36, 42, 48\]; tolerance numerics;"
     )
     # the captured decode graphs of 1 to 8 requests run it

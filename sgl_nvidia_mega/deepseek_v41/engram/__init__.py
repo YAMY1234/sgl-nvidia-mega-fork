@@ -8,9 +8,13 @@
 on the materialized streams and writes its output back as the residual. Stock:
 ``Engram.forward`` (lookup -> WKV -> ``engram_gate``) from its own parts, and the
 DeepSeek-V4.1 image-token rows keep their residual, as SGLang's layer loop does.
+With the ``engram`` slot (``prefetch``), ``hashes`` also issues every layer's lookup
++ WKV on a side stream and ``apply`` only waits for its rows before the gate.
 """
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import torch
 
@@ -34,15 +38,29 @@ SGLANG_READS = {
 }
 
 
+class Bound(NamedTuple):
+    """``st.bound["engram"]``: the prefetch (or None) and why it is off."""
+
+    prefetch: object
+    reason: str
+
+
 def build(model, ctx, group):
-    """The Engram prefetch's buffers and plane, when it applies; ``st.bound["engram"]``."""
-    return None
+    from sgl_nvidia_mega.deepseek_v41 import runtime
+    from sgl_nvidia_mega.deepseek_v41.engram import prefetch
+
+    if "engram" not in runtime.SLOTS:
+        return Bound(None, "stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
+    return Bound(*prefetch.build(model, ctx, group))
 
 
 def hashes(st) -> None:
-    """The step's token hashes [rows, Engram layers, hash columns], or None."""
+    """The step's token hashes [rows, Engram layers, hash columns], or None; with the
+    prefetch, every Engram layer's lookup + WKV issued right after them."""
     hasher = st.model.engram_hasher
     st.hash_ids = hasher(st.input_ids, st.fb) if hasher is not None else None
+    if st.slots.engram_prefetch and st.hash_ids is not None:
+        st.bound["engram"].prefetch.issue(st.hash_ids)
 
 
 def apply(layer, st) -> None:
@@ -51,12 +69,15 @@ def apply(layer, st) -> None:
 
     engram, config = layer.engram, st.model.config
     x = st.state.residual
-    ids = st.hash_ids[:, engram.layer_hash_index]
-    emb = engram.embed(ids, st.fb, cp_all_tokens=False)
-    kv, _ = engram.wkv(emb.flatten(-2))
-    out = engram_gate(
-        x, kv, engram.q_weight, engram.k_weight, engram.eps, engram.clamp_value
-    )
+    if st.slots.engram_prefetch:
+        out = st.bound["engram"].prefetch.gate(st.layer_id, x)
+    else:
+        ids = st.hash_ids[:, engram.layer_hash_index]
+        emb = engram.embed(ids, st.fb, cp_all_tokens=False)
+        kv, _ = engram.wkv(emb.flatten(-2))
+        out = engram_gate(
+            x, kv, engram.q_weight, engram.k_weight, engram.eps, engram.clamp_value
+        )
     if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
         image = st.input_ids == config.image_token_id
         out = torch.where(image[:, None, None], x, out)

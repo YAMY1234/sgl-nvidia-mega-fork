@@ -132,6 +132,36 @@ def test_the_embedding_is_sglangs_unless_its_slot_is_on():
     assert embedding.embed(st) == "stock"
 
 
+def _engram(layout="per_rank", backend="cutedsl", columns=25600):
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+    from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
+
+    method = object.__new__(Fp8LinearMethod)
+    method.use_mxfp8, method.block_fp8_as_mxfp8 = False, True
+    method.mxfp8_dense_backend = Mxfp8DenseGemmBackend(f"flashinfer_{backend}")
+    table = None if layout is None else SimpleNamespace(layout=layout)
+    wkv = SimpleNamespace(
+        quant_method=method,
+        block_fp8_mxfp8_ready=True,
+        weight=torch.empty(columns, 6144, dtype=torch.float8_e4m3fn),
+    )
+    return SimpleNamespace(embed=SimpleNamespace(host_table=table), wkv=wkv)
+
+
+def test_the_engram_prefetch_takes_only_the_per_rank_table():
+    from sgl_nvidia_mega.deepseek_v41.engram import prefetch as ep
+
+    assert ep.reason(_engram(), 4) == ""
+    assert ep.reason(_engram(backend="cutlass"), 4) == ""
+    # the shared table and the device table keep SGLang's inline lookup + WKV
+    for layout in (None, "shared"):
+        assert "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank" in ep.reason(
+            _engram(layout), 4
+        )
+    assert "not a FlashInfer MXFP8" in ep.reason(_engram(backend="trtllm"), 4)
+    assert "scale tiles" in ep.reason(_engram(columns=25600 + 128), 4)
+
+
 def _batch(mode="TARGET_VERIFY"):
     is_verify = mode == "TARGET_VERIFY"
     return SimpleNamespace(

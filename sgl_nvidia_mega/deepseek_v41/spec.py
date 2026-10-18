@@ -92,6 +92,8 @@ NUMERICS = Numerics(
         "wo_b.partial.max_abs": 0.0,
         # the router's expert ids and weights, as moe_fused_gate picks them
         "gate.topk.max_abs": 0.0,
+        # the prefetched Engram WKV rows, as SGLang's inline lookup + WKV writes them
+        "engram.kv.max_abs": 0.0,
         # the Lamport hop's streams and normed row against all-reduce + mHC in torch
         "hop_a.residual.rel": 2e-2,
         "hop_a.normed.rel": 3e-2,

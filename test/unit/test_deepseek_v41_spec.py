@@ -131,11 +131,13 @@ def test_another_flashinfer_low_latency_gemm_is_refused():
 def test_the_slot_plan_follows_the_measured_bounds():
     widths = tuple(range(6, 49, 6))
     assert not any(
-        s.hop_a or s.fast_gate or s.routed or s.embed
+        s.hop_a or s.fast_gate or s.routed or s.embed or s.engram_prefetch
         for s in plan.plan(widths, plan.Facts()).values()
     )
     on = plan.plan(tuple(range(1, 49)), plan.Facts(hop_a=True, routed=True))
     assert [w for w, s in on.items() if s.hop_a] == list(range(1, 9))
     assert [w for w, s in on.items() if s.fast_gate] == [*range(1, 17), 48]
+    engram = plan.plan(tuple(range(1, 49)), plan.Facts(engram_prefetch=True))
+    assert [w for w, s in engram.items() if s.engram_prefetch] == list(range(1, 17))
     with pytest.raises(ValueError):
         plan.slots(49, plan.Facts())

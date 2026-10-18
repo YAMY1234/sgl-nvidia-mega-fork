@@ -11,7 +11,11 @@ import os
 import msgspec
 
 # The kernel slots this package ships; with the megakernel on, all of them run
-SHIPPED_SLOTS = ("hop_a", "moe", "gate", "embed")
+SHIPPED_SLOTS = ("hop_a", "moe", "gate", "embed", "engram")
+# Shipped slots that serve only some setups (the Engram prefetch needs SGLang's
+# per-rank host table): off with the reason logged where they do not apply, unless
+# requested by name
+CONDITIONAL_SLOTS = frozenset({"engram"})
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -118,6 +122,7 @@ def build(model, ctx):
             model.model.embed_tokens, pctx.copies, group
         )
     bound["embedding"] = table
+    engram = bound["engram"]
     # the boundary's hop A (its compiled widths) and the MoE step's GEMM pair, as built
     hop = getattr(bound["boundary"], "hop_a", None)
     facts = slot_plan.Facts(
@@ -125,6 +130,7 @@ def build(model, ctx):
         hop_a_reason=getattr(bound["boundary"], "hop_a_reason", ""),
         routed=bool(getattr(bound["moe"], "slots", None)),
         embed=table is not None,
+        engram_prefetch=engram.prefetch is not None,
     )
     slots = {
         w: msgspec.structs.replace(s, hop_a=s.hop_a and w in hop.rows)
@@ -137,20 +143,28 @@ def build(model, ctx):
         "gate": any(s.fast_gate for s in slots.values())
         and any(slot.gate for slot in getattr(bound["moe"], "slots", {}).values()),
         "embed": table is not None,
+        "engram": engram.prefetch is not None,
     }
     # every package's build agrees across ranks, so this raises on every rank alike
-    missing = sorted(name for name in SLOTS if not built[name])
+    explicit = SLOTS_ENV in os.environ
+    missing = sorted(
+        name
+        for name in SLOTS
+        if not built[name] and (explicit or name not in CONDITIONAL_SLOTS)
+    )
     if missing:
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built at no width "
             f"(hop A: {facts.hop_a_reason or 'built'}; MoE: "
             f"{getattr(bound['moe'], 'reason', '') or 'built'}; embedding: "
-            f"{embed_reason or 'built'})"
+            f"{embed_reason or 'built'}; Engram prefetch: {engram.reason or 'built'})"
         )
     summary = (
         f"slots {sorted(name for name, on in built.items() if on) or 'none (stock)'}; "
         f"hop A at {[w for w, x in slots.items() if x.hop_a]} rows, fast gate at "
-        f"{[w for w, x in slots.items() if x.fast_gate]} rows; weight copies "
+        f"{[w for w, x in slots.items() if x.fast_gate]} rows, Engram prefetch at "
+        f"{[w for w, x in slots.items() if x.engram_prefetch]} rows "
+        f"({engram.reason or 'built, checked bit for bit'}); weight copies "
         + str(
             {
                 k: f"{v.numel() * v.element_size() / 2**20:.1f} MiB"

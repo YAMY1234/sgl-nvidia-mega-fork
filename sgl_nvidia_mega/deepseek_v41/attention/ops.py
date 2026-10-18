@@ -218,12 +218,17 @@ def wo_a(attn, o, positions, fb):
     )
 
 
-def wo_b(attn, o):
+def wo_b(attn, o, publish=None):
     """``MQALayer._project_wo_b(o, defer_all_reduce=True)`` on CUDA: the TP-partial
-    output, whose all-reduce the attention post runs."""
+    output, whose all-reduce the attention post runs. ``publish`` (hop A) runs wo_b
+    itself and stores the rows into the Lamport mailbox the post collects."""
     from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
     from sglang.srt.models import deepseek_v4_mhc as mhc
 
+    if publish is not None:
+        partial = publish(attn.wo_b, o.flatten(1) if isinstance(o, torch.Tensor) else o)
+        if partial is not None:
+            return mhc.AttnOutput(partial)
     defer = attn.attn_tp_size > 1 and not should_skip_mlp_all_reduce()
     out, _ = attn.wo_b(
         o.flatten(1) if isinstance(o, torch.Tensor) else o, skip_all_reduce=defer

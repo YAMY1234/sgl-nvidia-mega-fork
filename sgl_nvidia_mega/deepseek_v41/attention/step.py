@@ -207,9 +207,9 @@ class AttentionStep:
         tp_slice = slice(0, attn.n_local_heads)
         return heads, q_padded, q_padded[:, tp_slice, :], tp_slice
 
-    def run(self, x, positions, fb, x_quant=None) -> Any:
+    def run(self, x, positions, fb, x_quant=None, publish=None) -> Any:
         """The layer's TP-partial attention output (``mhc.AttnOutput``) for input
-        ``x`` (``x_quant``: the same input as MXFP8)."""
+        ``x`` (``x_quant``: the same input as MXFP8); ``publish``: see ``ops.wo_b``."""
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
             get_token_to_kv_pool,
@@ -234,4 +234,4 @@ class AttentionStep:
                 save_kv_cache=False,
             )
             o = o[:, tp_slice, :]
-            return ops.wo_b(attn, ops.wo_a(attn, o, positions, fb))
+            return ops.wo_b(attn, ops.wo_a(attn, o, positions, fb), publish)

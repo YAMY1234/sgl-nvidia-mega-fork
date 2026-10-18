@@ -56,4 +56,6 @@ def step(layer, x, st) -> Any:
     if attention is None:
         with layer.self_attn.maybe_use_decode_attn_tp(st.fb):
             return layer._run_boundary_attention(x, st.positions, st.fb, st.x_quant)
-    return attention.run(x, st.positions, st.fb, st.x_quant)
+    # hop A: wo_b publishes into the mailbox the attention post collects
+    publish = st.bound["boundary"].hop_a.publish_wo_b if st.slots.hop_a else None
+    return attention.run(x, st.positions, st.fb, st.x_quant, publish=publish)

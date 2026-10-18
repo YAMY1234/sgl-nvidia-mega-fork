@@ -410,3 +410,21 @@ def test_row_tile_finalize_relays_the_swizzled_scales(env, early):
         assert torch.equal(tiled.scale[at[:rows]], scales[swz]), f"scales: rows={rows}"
         assert not tiled.scale[at[rows:]].any(), f"pad rows: rows={rows}"
     torch.cuda.synchronize()
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("early", ["end", "poll", "start"])
+def test_wide_mailbox_changes_no_bit_up_to_8_rows(env, early):
+    """The 48-row mailbox serves batch 1 exactly as the 16-row one: hop A and both
+    finalize variants at 1-8 rows, bitwise."""
+    for rows in range(1, 9):
+        inp = _inputs(rows, 500 + rows, env.rank, env.device)
+        for kind in ("aquant", "norm", "quant", "residual"):
+            narrow = _run(env.hops[early], kind, inp)
+            wide = _run(env.wide[early], kind, inp)
+            assert all(_same(a, b) for a, b in zip(narrow, wide)), (kind, rows)
+    torch.cuda.synchronize()
+
+
+if __name__ == "__main__":
+    multigpu_pytest_main(__name__, __file__, num_gpus=(4,), timeout=2400)

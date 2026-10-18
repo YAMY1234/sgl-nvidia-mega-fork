@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Fail-stop waits on 4 SM100-family GPUs (GB300): when one rank never joins a hop, the
-ranks that wait on it fault within their deadline instead of hanging (the Lamport
-consumer of the wo_b publish, 1-8 rows).
+ranks that wait on it fault within their deadline instead of hanging: the Lamport
+consumer of the wo_b publish (1-8 rows) and the two-shot hop (49-384 rows), whose
+deadline comes from its build alone.
 
 Run with ``python test/kernels/test_deepseek_v41_deadline.py``: each case runs its own
 torchrun, since a faulted rank leaves its CUDA context unusable.
@@ -47,6 +48,18 @@ WORKER = textwrap.dedent(
             return hop(x, torch.randn(rows, HC, H, device=dev).bfloat16(),
                        torch.rand(rows, HC, device=dev), torch.rand(rows, HC, HC, device=dev),
                        torch.rand(rows, HC, device=dev), torch.randn(H, device=dev).bfloat16(), 1e-6)
+    elif case == "two_shot":
+        # no set_wait_deadline: the hop's deadline is its build argument only
+        from sgl_nvidia_mega.deepseek_v41.sm103.two_shot_mhc import TwoShotMHC
+        hop = TwoShotMHC(hidden_size=H, hc_mult=HC, max_num_tokens=384, top_k=6, device=dev,
+                         group=tp.device_group, deadline_s=deadline)
+        rows = 64
+        def run():
+            x = torch.randn(rows, H, device=dev).bfloat16()
+            return hop.attn_post(x, torch.randn(rows, HC, H, device=dev).bfloat16(),
+                                 torch.rand(rows, HC, device=dev), torch.rand(rows, HC, HC, device=dev),
+                                 torch.rand(rows, HC, device=dev), torch.randn(H, device=dev).bfloat16(),
+                                 1e-6)
     run(); torch.cuda.synchronize()  # every rank joins once: compiled and healthy
     torch.distributed.barrier(group=tp.cpu_group)
     print(f"RANK{rank} HEALTHY", flush=True)
@@ -73,11 +86,11 @@ def _gpu4() -> bool:
 
 
 @pytest.mark.skipif(not _gpu4(), reason="needs 4 SM100-family GPUs")
-@pytest.mark.parametrize("case", ["lamport"])
+@pytest.mark.parametrize("case", ["lamport", "two_shot"])
 def test_a_missing_rank_faults_its_peers_in_time(case, tmp_path):
     script = tmp_path / "worker.py"
     script.write_text(WORKER)
-    port = 29500 + os.getpid() % 2000
+    port = 29500 + (os.getpid() + 37 * len(case)) % 2000
     t0 = time.time()
     out = subprocess.run(
         [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node=4",

@@ -344,6 +344,14 @@ class Boundaries:
             norm.weight,
             norm.variance_epsilon,
         )
+        from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+            can_fuse_all_reduce,
+        )
+
+        # past SGLang's fused collective its FFN combine norms the streams itself;
+        # the streams match, the in-kernel norm can differ from it by an ULP
+        if not can_fuse_all_reduce(partial.shape[0], layer.hc_cfg.hidden):
+            return mhc.HcState(updated, pre)
         return mhc.HcState(updated, pre, mhc.HcNormed(normed))
 
     def _two_shot_moe(self, layer, out, opened, nxt):

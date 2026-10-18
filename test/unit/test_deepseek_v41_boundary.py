@@ -274,7 +274,13 @@ def test_two_shot_runs_both_posts_and_builds_sglangs_next_input(fake, receiver, 
     st = b.start(streams)
     b.pre(layers[0], "attn", st, object())
     partial = torch.randn(rows, HIDDEN)
-    with patch.object(torch.cuda, "current_stream"):
+    with (
+        patch.object(torch.cuda, "current_stream"),
+        patch(
+            "sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe.can_fuse_all_reduce",
+            side_effect=lambda r, h: r <= 152,
+        ),
+    ):
         b.post(layers[0], "attn", partial, st)
     assert hop.attn_post.call_args.args == (
         partial,
@@ -285,7 +291,11 @@ def test_two_shot_runs_both_posts_and_builds_sglangs_next_input(fake, receiver, 
         norm.weight,
         1e-6,
     )
-    assert isinstance(st.hc.input, mhc.HcNormed)
+    # past SGLang's fused collective its own combine norms the streams
+    if rows <= 152:
+        assert isinstance(st.hc.input, mhc.HcNormed)
+    else:
+        assert st.hc.input is None and st.hc.streams is updated
     fake.run_attn_post.assert_not_called()
 
     b._attn_next[0] = {

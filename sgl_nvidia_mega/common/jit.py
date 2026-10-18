@@ -153,9 +153,14 @@ def null_or_pointer(tensor: Optional[torch.Tensor]) -> ctypes.c_void_p:
 
 
 def launch(
-    kernel: Kernel, grid: tuple[int, int, int], arguments: list, stream: int
+    kernel: Kernel,
+    grid: tuple[int, int, int],
+    arguments: list,
+    stream: int,
+    cluster: Optional[tuple[int, int, int]] = None,
 ) -> None:
-    """Launch with programmatic stream serialization (PDL); graph-capturable."""
+    """Launch with programmatic stream serialization (PDL), in thread-block clusters
+    of ``cluster`` blocks when given; graph-capturable."""
     cu = driver()
     addresses = [
         argument.getPtr()
@@ -174,8 +179,16 @@ def launch(
         cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
     )
     attribute.value.programmaticStreamSerializationAllowed = 1
-    config.attrs = [attribute]
-    config.numAttrs = 1
+    attributes = [attribute]
+    if cluster is not None:
+        dims = cu.CUlaunchAttribute()
+        dims.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+        dims.value.clusterDim.x, dims.value.clusterDim.y, dims.value.clusterDim.z = (
+            cluster
+        )
+        attributes.append(dims)
+    config.attrs = attributes
+    config.numAttrs = len(attributes)
     check(
         cu.cuLaunchKernelEx(
             config, kernel.function, ctypes.addressof(pointer_array), 0

@@ -26,8 +26,8 @@ COMMON = [
     "--mem-fraction-static",
     "0.8",
 ] + os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_EXTRA_ARGS", "").split()
-# DSpark: 8 requests of 6 rows at the largest covered width (48 rows); 16 requests
-# step past it, so the same requests alternate routed and standard steps
+# DSpark: up to 8 requests of 6 rows on the routed pair (48 rows), 9-16 requests on
+# the two-shot hops, so the same requests alternate between the two
 ARGS = COMMON + [
     "--speculative-algorithm",
     "DSPARK",

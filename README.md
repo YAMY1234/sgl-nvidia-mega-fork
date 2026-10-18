@@ -14,7 +14,7 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 
 | Model | GPU | Tensor parallel | Coverage |
 | --- | --- | --- | --- |
-| DeepSeek-V4.1-Flash | GB300 (SM103) | 4 | DSpark target verify steps of 1 to 48 rows (batch 1 to 8 at 6 rows a request) |
+| DeepSeek-V4.1-Flash | GB300 (SM103) | 4 | DSpark target verify steps of 1 to 384 rows (batch 1 to 64 at 6 rows a request) |
 
 Larger verify steps, prefill, extend and the DSpark draft run SGLang's standard path.
 
@@ -27,8 +27,9 @@ The step is the plugin's own code over the weights SGLang loaded (`deepseek_v41/
 | `wo_b` + attention all-reduce + mHC post + next norm (`hop_a`) | 1–8 | `wo_b` GEMM whose epilogue stores its rows into a Lamport mailbox on every rank, and a Lamport consumer that reduces them and runs the mHC post, combine and RMSNorm |
 | Routed experts (`moe`) | 1–48 | A route kernel and a pair of block-scaled tcgen05 GEMMs with 8-row tiles; an expert chosen by more than 8 rows takes several tiles |
 | Router top-k (`gate`) | 1–8, 48 | One CTA per row, bit for bit SGLang's fused gate (including the vision-token routing) |
+| Attention and MoE all-reduce + mHC post + next norm (`two_shot`) | 49–384 | Two-shot exchange: each rank sends row t only to its owner rank (t mod 4), which sums the four partials in rank order and sends the row back; the MoE post also folds the top-k finalize and the shared-expert add, and quantizes the next input to MXFP8 where SGLang's fused post does |
 
-With the megakernel on, every slot above runs. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that for tests and bisecting; empty runs every step function's stock code.
+With the megakernel on, every slot above runs. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that for tests and bisecting; empty runs every step function's stock code. Two more slots run only when listed there: `hop_b` (the MoE post at 1–8 rows on hop A's Lamport mailbox) and `early_trigger` (the Lamport consumer launches its dependents right after its poll); both need `hop_a`.
 
 ### Design
 

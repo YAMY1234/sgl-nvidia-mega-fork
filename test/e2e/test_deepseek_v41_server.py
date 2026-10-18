@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """DeepSeek-V4.1-Flash with --enable-nvidia-megakernel on GB300, TP4, DSpark, across
-the switch point: 8 requests (48 rows) are the largest covered verify step, 12 and
-16 requests step past it and back. Each server's startup lines show the covered
-batches run the plugin; GSM8K runs past the largest width (gross failures); the
+the switch point of the post hops: up to 8 requests (48 rows) the routed-expert pair
+and SGLang's fused posts, from 9 requests (54 rows) the two-shot hops; 12 and 16
+requests step across it and back. Each server's startup lines show the covered
+batches run the plugin; GSM8K runs across the switch point (gross failures); the
 tokens of covered steps are scored again by the normal prefill path (KL
 consistency) on short prompts and on prompts past the indexer's candidate span,
 with a passkey to find there. Fail-stop: a stall or a crash on one rank, inside the
@@ -208,19 +209,23 @@ def _rank_process(process, rank):
 
 
 class TestMegakernelVerify(CustomTestCase):
-    """DSpark verify steps: above 8 requests (48 rows) the normal path."""
+    """DSpark verify steps of 1-64 requests (6-384 rows) run the plugin."""
 
-    # SGLang's startup line, once per TP rank: every shipped slot built where PR #1
-    # measured it (hop A at batch 1, the fast top-k at batch 1 and 8), every width
+    # SGLang's startup line, once per TP rank: every shipped slot built where it was
+    # measured (hop A at batch 1, the fast top-k at batch 1 and 8, the two-shot hops
+    # from batch 9), every width up to 384 rows
     ACTIVE = re.compile(
-        r"NVIDIA megakernel: active \(DeepSeek-V4\.1: slots \['gate', 'hop_a', 'moe'\]; "
-        r"hop A at \[6\] rows, fast gate at \[6, 48\] rows; .*; "
-        r"widths \[6, 12, 18, 24, 30, 36, 42, 48\]; tolerance numerics;"
+        r"NVIDIA megakernel: active \(DeepSeek-V4\.1: slots \['gate', 'hop_a', 'moe', "
+        r"'two_shot'\]; hop A at \[6\] rows, fast gate at \[6, 48\] rows; boundary: "
+        r"hop A at \[6\] rows \(built\); hop B off; two-shot at 49-384 rows "
+        r"\(built\); .*; widths "
+        + re.escape(str(list(range(6, 385, 6))))
+        + r"; tolerance numerics;"
     )
-    # the captured decode graphs of 1 to 8 requests run it
+    # the captured decode graphs of 1 to 16 requests (this server's ceiling) run it
     CAPTURED = re.compile(
         r"NVIDIA megakernel: DeepSeek-V4\.1 runs the decode graphs of batch sizes "
-        r"\[1, [^\]]*\b8\]"
+        r"\[1, [^\]]*\b16\]"
     )
     TP = 4
 
@@ -252,8 +257,9 @@ class TestMegakernelVerify(CustomTestCase):
         self.assertEqual(len(self.ACTIVE.findall(text)), self.TP, text[-4000:])
         self.assertEqual(len(self.CAPTURED.findall(text)), self.TP, text[-4000:])
 
-    def test_gsm8k_past_the_largest_width(self):
-        # 12 and 16 requests: batches move between <= 8 (routed) and >= 9 (standard)
+    def test_gsm8k_across_the_two_shot_switch(self):
+        # 12 and 16 requests: batches move between <= 8 (routed pair, SGLang's fused
+        # posts) and >= 9 (two-shot hops)
         scores = {p: _gsm8k(p)["accuracy"] for p in (12, 16)}
         for parallel, accuracy in scores.items():
             self.assertGreater(accuracy, GSM8K_BOUND, f"parallel {parallel}")

@@ -23,6 +23,8 @@ from sglang.srt.distributed import parallel_state as ps
 from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import publish_build_topology
 
+from sgl_nvidia_mega.deepseek_v41.spec import NUMERICS
+
 HIDDEN, HC, TOP_K, EPS = 5120, 4, 6, 1e-6
 ROWS = (49, 64, 96, 128, 152, 192, 256, 384)
 ONE_SHOT_QUANT_ROWS = (
@@ -314,9 +316,10 @@ def test_two_shot_mhc(rank):
                 if one is None:
                     line += " | one-shot n/a"
                 else:
-                    assert _equal(got[0], one[0]), (
-                        f"streams differ from one-shot: {rows} {variant}"
-                    )
+                    stream_err = (got[0].float() - one[0].float()).abs().max().item()
+                    assert (
+                        stream_err <= NUMERICS.tolerances["two_shot.residual.max_abs"]
+                    ), f"streams differ from one-shot: {rows} {variant}"
                     note = " | one-shot streams bitwise"
                     if len(got) > 1:
                         diff = _bits(got[1]).view(torch.int16) != _bits(one[1]).view(
@@ -324,11 +327,17 @@ def test_two_shot_mhc(rank):
                         )
                         n = int(diff.sum())
                         ulps = _bf16_ulps(got[1], one[1]) if n else 0
-                        assert ulps <= 1, (rows, variant, ulps)
+                        assert ulps <= NUMERICS.tolerances["two_shot.normed.ulp"], (
+                            rows,
+                            variant,
+                            ulps,
+                        )
                         n_all = int(_max_over_ranks(n))
                         note += f", norm {'bitwise' if n_all == 0 else f'{n_all} elems differ (<=1 ulp)'}"
                     if len(got) > 2:
                         q_same = _equal(got[2], one[2]) and _equal(got[3], one[3])
+                        if NUMERICS.tolerances["two_shot.mxfp8.max_abs"] == 0:
+                            assert q_same, (rows, "MXFP8 differs from one-shot")
                         # quant bytes may follow a differing normalized element only
                         if not q_same:
                             rows_diff = diff.any(dim=1)

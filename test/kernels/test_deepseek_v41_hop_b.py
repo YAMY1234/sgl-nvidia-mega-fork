@@ -37,6 +37,7 @@ from sgl_nvidia_mega.common.sync import (
     make_fake_dynamic_compact_tensor,
     to_cute_dynamic,
 )
+from sgl_nvidia_mega.deepseek_v41.spec import NUMERICS
 
 HIDDEN, HC, TOP_K, EPS = 5120, 4, 6, 1e-6
 ROWS = tuple(range(1, 9))
@@ -275,9 +276,14 @@ def test_finalize_matches_sglang_one_shot(env, shared_zero):
     print(f"HOPB r{env.rank} sglang shared_zero={shared_zero} worst={worst}")
     # The mHC post rounds one product in another order than SGLang's: a few
     # stream values per 10^5 differ by an ULP, which moves their row's RMS.
-    assert worst["streams"][0] >= 0.9999 and worst["streams"][1] <= 1, worst
-    assert worst["normed"][0] >= 0.999 and worst["normed"][1] <= 2, worst
-    assert worst["values"][1] <= 1 and worst["scales"][1] == 0, worst
+    assert worst["streams"][0] >= 0.9999, worst
+    assert worst["streams"][1] <= NUMERICS.tolerances["hop_b.residual.ulp"], worst
+    assert worst["normed"][0] >= 0.999, worst
+    assert worst["normed"][1] <= NUMERICS.tolerances["hop_b.normed.ulp"], worst
+    assert worst["values"][1] <= NUMERICS.tolerances["hop_b.mxfp8.ulp"], worst
+    assert worst["scales"][2] <= NUMERICS.tolerances["hop_b.mxfp8_scales.max_abs"], (
+        worst
+    )
 
 
 @torch.inference_mode()

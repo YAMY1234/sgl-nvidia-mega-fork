@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """FlashInfer's ``cutedsl_low_latency`` MXFP8 GEMM as the publishing wo_b uses it:
 whether this GPU has it, and the GB300 tactics pinned for DeepSeek-V4.1-Flash's TP4
-attention projections."""
+attention projections. :func:`linear` launches the compiled kernel directly for wq_b
+at 1-64 rows, past the 8 rows FlashInfer's runner takes."""
 
 from __future__ import annotations
 
@@ -11,6 +12,8 @@ import importlib
 import logging
 from functools import lru_cache
 from typing import Optional
+
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -89,3 +92,161 @@ def pinned_tactics(sm_version: int):
         yield
     finally:
         ll_gemm.autotune_tactics = enumerate_tactics
+
+
+# --- wq_b launched directly, 1-64 rows ---------------------------------------
+
+Tactic = tuple[int, int, int, int]
+# Past 8 rows the kernel runs one CTA per 8-row tile and reads each tile's activation
+# scales from a 128-row atom of its own (q_norm_quant's ``row_tiles`` layout); at 1-8
+# rows that layout is FlashInfer's plain 128x4 swizzle. FlashInfer's runner refuses
+# more than 8 rows (its valid tactics are empty there); the kernel does not.
+WIDE_MAX_ROWS = 64
+# Tactics per (SM, N, K, row bucket) for the buckets PINNED_TACTICS (bucket 8) leaves
+# out; a bucket is the row count rounded up to a power of two.
+# 1 / 2 / 4: the GB300 table chain-picked for SGLang's autotune
+# (flashinfer_autotune_configs/NVIDIA_GB300.json, SGLang 26fd68fcd34, FlashInfer 0.7.2,
+# whose low-latency kernel source equals 0.7.0.post1's). BEST tunes these at boot.
+# 16 / 32 / 64: BEST's row-tile pins (best of 92 / 80 at 12 / 24 / 48 rows, 16 weights
+# streaming from DRAM).
+BUCKET_TACTICS: dict[tuple[int, int, int, int], Tactic] = {
+    (103, 8192, 1280, 1): (128, 8, 1, 1),
+    (103, 8192, 1280, 2): (128, 8, 1, 1),
+    (103, 8192, 1280, 4): (128, 6, 1, 1),
+    (103, 8192, 1280, 16): (128, 6, 1, 1),
+    (103, 8192, 1280, 32): (128, 5, 1, 1),
+    (103, 8192, 1280, 64): (128, 4, 1, 1),
+}
+_COMPILED: dict[tuple[int, Tactic], object] = {}
+
+
+def row_bucket(rows: int) -> int:
+    return 1 << (rows - 1).bit_length()
+
+
+def scale_bytes(rows: int, k: int) -> int:
+    """Activation scale bytes the kernel reads: one 128-row x (K / 32) atom per 8 rows."""
+    return -(-rows // 8) * (k // 128) * 512
+
+
+def offered_tactics(n: int, k: int, rows: int) -> list[Tactic]:
+    """FlashInfer's tactic list for an MXFP8 (N, K) problem, in its default order."""
+    import cutlass
+
+    ll_gemm = importlib.import_module(_GEMM_MODULE)
+    e4m3, e8m0 = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
+    return [
+        tuple(t)
+        for t in ll_gemm.autotune_tactics(
+            (n, rows, k, 1), e4m3, e4m3, e8m0, 32, cutlass.BFloat16
+        )
+    ]
+
+
+@lru_cache(maxsize=None)
+def select_tactic(sm_version: int, n: int, k: int, bucket: int) -> Tactic:
+    """The pinned tactic of this row bucket if FlashInfer offers it, else FlashInfer's
+    default (its first tactic): fixed per bucket, never tuned per process."""
+    pinned = (
+        PINNED_TACTICS.get((sm_version, n, k))
+        if bucket == MAX_ROWS
+        else BUCKET_TACTICS.get((sm_version, n, k, bucket))
+    )
+    offered = offered_tactics(n, k, min(bucket, MAX_ROWS))
+    if pinned in offered:
+        return pinned
+    if pinned is not None:
+        logger.warning(f"Low-latency MXFP8 tactic {pinned} not offered for N={n} K={k}")
+    return offered[0]
+
+
+def _compiled(tactic: Tactic, device: torch.device):
+    key = (device.index, tactic)
+    if key not in _COMPILED:
+        import cutlass
+        import cutlass.cute as cute
+        from cutlass.cute.runtime import make_fake_stream
+
+        ll_gemm = importlib.import_module(_GEMM_MODULE)
+        cta_k, ab_stages, sfb_tmem_stages, split_k = tactic
+        gemm = ll_gemm.LowLatencyBlockscaledGemmKernel(
+            acc_dtype=cutlass.Float32,
+            mma_tiler_mnk=(128, 8, cta_k),
+            num_ab_stage=ab_stages,
+            num_sfb_tmem_stage=sfb_tmem_stages,
+            sf_vec_size=32,
+            use_pdl=True,
+            split_k=split_k,
+        )
+        e4m3, e8m0 = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
+        with torch.accelerator.device_index(device.index):
+            _COMPILED[key] = cute.compile(
+                gemm,
+                _ptr(e4m3, 16, 16),
+                _ptr(e8m0, 32, 32),
+                _ptr(e4m3, 16, 16),
+                _ptr(e8m0, 16, 16),
+                _ptr(cutlass.BFloat16, 16, 16),
+                None,
+                None,
+                tuple(cutlass.Int32(v) for v in (128, 8, cta_k, 1)),
+                make_fake_stream(),
+            )
+    return _COMPILED[key]
+
+
+def _ptr(dtype, address: int, align: int):
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_ptr
+
+    return make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=align)
+
+
+def precompile(weight: torch.Tensor, rows: list[int]) -> None:
+    """Compile the kernels these row counts select; call before CUDA graph capture."""
+    n, k = weight.shape
+    major, minor = torch.cuda.get_device_capability(weight.device)
+    for r in rows:
+        _compiled(select_tactic(major * 10 + minor, n, k, row_bucket(r)), weight.device)
+
+
+def linear(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    tactic: Optional[Tactic] = None,
+) -> torch.Tensor:
+    """``a @ weight.T`` in BF16 for MXFP8 rows ``a`` [M, K] (1 <= M <= 64) with their
+    UE8M0 scales (FlashInfer's 128x4 swizzle up to 8 rows, the row-tile layout above),
+    and an MXFP8 weight [N, K] with its swizzled scales as SGLang loads them
+    (``weight_scale_inv_swizzled``). The tactic is the row bucket's (:func:`select_tactic`)."""
+    from cutlass import BFloat16, Float8E4M3FN, Float8E8M0FNU, Int32
+
+    from sgl_nvidia_mega.common.sync import current_cu_stream
+
+    rows, k = a.shape
+    n = weight.shape[0]
+    assert 0 < rows <= WIDE_MAX_ROWS and k % 128 == 0 and weight.shape[1] == k
+    assert a.is_contiguous() and weight.is_contiguous()
+    assert a_scale.numel() >= scale_bytes(rows, k)
+    if tactic is None:
+        major, minor = torch.cuda.get_device_capability(a.device)
+        tactic = select_tactic(major * 10 + minor, n, k, row_bucket(rows))
+    if out is None:
+        out = torch.empty((rows, n), dtype=torch.bfloat16, device=a.device)
+    assert out.shape == (rows, n) and out.is_contiguous()
+    _compiled(tuple(tactic), a.device)(
+        _ptr(Float8E4M3FN, weight.data_ptr(), 16),
+        _ptr(Float8E8M0FNU, weight_scale.data_ptr(), 32),
+        _ptr(Float8E4M3FN, a.data_ptr(), 16),
+        _ptr(Float8E8M0FNU, a_scale.data_ptr(), 16),
+        _ptr(BFloat16, out.data_ptr(), 16),
+        None,
+        None,
+        (Int32(n), Int32(rows), Int32(k), Int32(1)),
+        current_cu_stream(),
+    )
+    return out

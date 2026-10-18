@@ -249,3 +249,54 @@ def test_the_routed_pair_replaces_only_the_top_k_and_the_routed_call(
     assert ("topk" in names) is not fast_gate
     assert ("shared", "alt", ("x",), (("gemm_output_zero_allocator", None),)) in log
     assert out.routed == "deferred" and out.shared == "shared_out"
+
+
+@pytest.mark.parametrize("fast_gate", [False, True])
+@pytest.mark.parametrize("ready", [None, "event"])
+def test_the_slot_calls_the_pair_with_its_signature(fast_gate, ready):
+    from unittest.mock import create_autospec
+
+    from sgl_nvidia_mega.deepseek_v41.moe import routed
+    from sgl_nvidia_mega.deepseek_v41.sm103.moe.routed_expert_gemm import (
+        RoutedExpertGemm,
+    )
+
+    gemm = create_autospec(RoutedExpertGemm, instance=True)
+    gemm.top_k = 6
+    pair_out = (
+        torch.zeros(3, 4),
+        torch.zeros(3, 6),
+        torch.zeros(18, dtype=torch.int32),
+    )
+    gemm.supports_gate_topk.return_value = True
+    config = SimpleNamespace(
+        routed_scaling_factor=1.5,
+        apply_routed_scaling_factor_on_output=True,
+        correction_bias_for_dtype=lambda dtype: torch.zeros(384, dtype=dtype),
+    )
+    mlp = SimpleNamespace(
+        topk=SimpleNamespace(topk_config=config),
+        gate=SimpleNamespace(e_score_correction_bias_vl=None),
+        experts=SimpleNamespace(quant_method=None),
+    )
+    slot = routed.MoeSlot(mlp, gemm, gate=True)
+    topk = (
+        slot.select(torch.zeros(3, 384), None, None, False)
+        if fast_gate
+        else SimpleNamespace(topk_ids="ids", topk_weights="w")
+    )
+    order = []
+    stream = SimpleNamespace(wait_event=lambda e: order.append(("join", e)))
+    gemm.gate_topk_and_gemms.side_effect = lambda *a, **k: (
+        order.append(("gate", k.get("input_ready"))) or (*pair_out, None)
+    )
+    gemm.side_effect = lambda *a, **k: order.append("pair") or pair_out
+    with patch.object(torch.cuda, "current_stream", return_value=stream):
+        out = slot.run(torch.zeros(3, 4), topk, ("xq", "xs", ready))
+    if fast_gate:
+        # the launcher joins the routed input itself, between the route kernel and GEMM1
+        assert order == [("gate", ready)]
+        assert gemm.gate_topk_and_gemms.call_args.args[5].tolist() == [3]
+    else:
+        assert order == ([("join", ready)] if ready else []) + ["pair"]
+    assert out.top_k == 6 and out.gemm2_out is pair_out[0]

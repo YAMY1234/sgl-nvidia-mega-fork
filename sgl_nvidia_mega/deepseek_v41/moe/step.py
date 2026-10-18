@@ -74,7 +74,7 @@ SGLANG_READS = {
 }
 
 
-def dual_stream(mlp, rows: int) -> bool:
+def dual_stream(mlp: torch.nn.Module, rows: int) -> bool:
     """SGLang's branch for a decode MoE: the dual-stream order at CUDA graph capture."""
     from sglang.srt.model_executor.runner import get_is_capture_mode
     from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -90,7 +90,7 @@ def dual_stream(mlp, rows: int) -> bool:
     )
 
 
-def step(layer, m_in: torch.Tensor, st):
+def step(layer: torch.nn.Module, m_in: torch.Tensor, st) -> object:
     """The FFN of ``layer`` on its input rows ``m_in``, with the operands of the
     layer's MoE transport (``st.transport``, set by ``boundary.post(layer, "attn")``):
     its token ids, whether the shared expert ran on local rows, and whether the sum

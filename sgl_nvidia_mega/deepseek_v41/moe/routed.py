@@ -77,7 +77,7 @@ class MoeSlot:
     """One MoE layer's routed-expert pair: the router's top-k (fast gate) and the
     routed experts, returning SGLang's deferred-finalize output."""
 
-    def __init__(self, mlp, gemm, *, gate: bool):
+    def __init__(self, mlp: torch.nn.Module, gemm, *, gate: bool):
         from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON
 
         self.mlp, self.gemm, self.gate = mlp, gemm, gate
@@ -92,8 +92,12 @@ class MoeSlot:
         self.eps = _RENORMALIZE_SUM_EPSILON
 
     def select(
-        self, router_logits, input_ids_global, num_token_non_padded, use_vision_topk
-    ):
+        self,
+        router_logits: torch.Tensor,
+        input_ids_global: torch.Tensor | None,
+        num_token_non_padded: torch.Tensor | None,
+        use_vision_topk: bool,
+    ) -> _GateTopK:
         if not self.gemm.supports_gate_topk(router_logits, self.bias):
             raise RuntimeError(
                 f"sgl-nvidia-mega: the fast gate cannot take router logits "
@@ -116,7 +120,7 @@ class MoeSlot:
             eps = self.eps
         return _GateTopK(router_logits, self.bias, self.scale, num_valid, alt, eps)
 
-    def run(self, x, topk_output, pre_quant_input):
+    def run(self, x: torch.Tensor, topk_output, pre_quant_input) -> object:
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmDeferredFinalizeOutput,
         )
@@ -167,7 +171,7 @@ class Bound(msgspec.Struct):
     reason: str = ""
 
 
-def gate_applies(mlp) -> bool:
+def gate_applies(mlp: torch.nn.Module) -> bool:
     """The DSV4.1 router gate_topk.cu reproduces bit for bit."""
     config = mlp.topk.topk_config
     bias_vl = getattr(mlp.gate, "e_score_correction_bias_vl", None)
@@ -184,7 +188,7 @@ def gate_applies(mlp) -> bool:
     )
 
 
-def build(model, group, *, gate_topk: bool) -> Bound:
+def build(model: torch.nn.Module, group, *, gate_topk: bool) -> Bound:
     """A routed-expert GEMM pair per MoE layer; every rank agrees, or none is built."""
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         Mxfp4FlashinferTrtllmMoEMethod,

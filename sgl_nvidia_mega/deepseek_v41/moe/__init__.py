@@ -19,7 +19,7 @@ from sgl_nvidia_mega.deepseek_v41.moe.step import step
 logger = logging.getLogger(__name__)
 
 
-def build(model, ctx, group):
+def build(model, ctx, group) -> routed.Bound:
     """The routed-expert GEMM pair of every MoE layer (slot ``moe``; slot ``gate``:
     its fast top-k); the result is ``st.bound["moe"]``."""
     from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS

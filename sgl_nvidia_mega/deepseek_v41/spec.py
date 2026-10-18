@@ -97,6 +97,15 @@ NUMERICS = Numerics(
         "hop_a.normed.rel": 3e-2,
         # the routed experts against FlashInfer's routed MoE: one BF16 rounding
         "moe.routed.rel": 2**-7,
+        # wq_b on the low-latency MXFP8 GEMM against SGLang's MXFP8 GEMM, same input
+        "attn.wq_b.max_abs": 0.0,
+        # the PDL norm's BF16 q-LoRA row against FlashInfer's RMSNorm (reduction order)
+        "attn.q_lora.bf16_ulp": 1,
+        # the fused inverse RoPE + wo_a at 33-48 rows against a float64 reference
+        "attn.wo_a.fp8_steps": 1,
+        # the attention step's wo_b partial against SGLang's, per layer, over the
+        # layer's peak: swap-AB vs FlashMLA at 12-24 rows 1.8e-2, 25-48 rows 6.1e-3
+        "attn.out.rel": 2e-2,
     },
 )
 

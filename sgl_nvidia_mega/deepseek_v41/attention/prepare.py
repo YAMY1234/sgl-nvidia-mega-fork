@@ -13,7 +13,8 @@ the three prepare paths ``MQALayer`` picks between, with their stream order.
 - ``eager`` (``_forward_prepare``): everything else, on one stream.
 
 Each returns the query (written into ``q_out`` when given); every side stream is
-joined before it returns."""
+joined before it returns. ``q_ops`` runs the query and KV-store ops: ``ops`` (SGLang's
+own) or the attention chain's."""
 
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ import torch
 from sgl_nvidia_mega.deepseek_v41.attention import ops
 
 
-def multi_stream(attn, x, positions, fb, attn_backend, q_out, x_quant):
+def multi_stream(attn, x, positions, fb, attn_backend, q_out, x_quant, q_ops=ops):
     current = torch.cuda.current_stream()
     stream_kv, stream_compressor, stream_indexer = attn.alt_streams[:3]
     stream_kv.wait_stream(current)
@@ -34,7 +35,7 @@ def multi_stream(attn, x, positions, fb, attn_backend, q_out, x_quant):
     if attn.fuse_wqa_wkv:
         qkv_a, _ = attn.wqkv_a(x_linear)
         qkv_a_ready = current.record_event()
-    q_lora, q_for_wqb = ops.compute_q_a(attn, x_linear, qkv_a)
+    q_lora, q_for_wqb = q_ops.compute_q_a(attn, x_linear, qkv_a)
     q_lora_ready = current.record_event()
     if attn.indexer is not None:
         with torch.cuda.stream(stream_indexer):
@@ -49,11 +50,11 @@ def multi_stream(attn, x, positions, fb, attn_backend, q_out, x_quant):
     with torch.cuda.stream(stream_kv):
         if qkv_a_ready is not None:
             stream_kv.wait_event(qkv_a_ready)
-        ops.kv_to_cache(attn, x_linear, positions, fb, attn_backend, qkv_a)
+        q_ops.kv_to_cache(attn, x_linear, positions, fb, attn_backend, qkv_a)
     if attn.compressor is not None:
         with torch.cuda.stream(stream_compressor):
             attn_backend.forward_core_compressor(x, fb, attn.layer_id, attn.compressor)
-    q = ops.compute_q_b(attn, q_for_wqb, positions, q_out)
+    q = q_ops.compute_q_b(attn, q_for_wqb, positions, q_out)
     current.wait_stream(stream_kv)
     current.wait_stream(stream_compressor)
     current.wait_stream(stream_indexer)
@@ -61,7 +62,7 @@ def multi_stream(attn, x, positions, fb, attn_backend, q_out, x_quant):
     return q
 
 
-def low_ratio(attn, x, positions, fb, attn_backend, q_out, x_quant):
+def low_ratio(attn, x, positions, fb, attn_backend, q_out, x_quant, q_ops=ops):
     current = torch.cuda.current_stream()
     stream_kv = attn.alt_streams[0]
     stream_sources = attn.alt_streams[-1]
@@ -83,10 +84,10 @@ def low_ratio(attn, x, positions, fb, attn_backend, q_out, x_quant):
                 run_indexer=False,
             )
     stream_kv.wait_stream(current)
-    q_lora, q_for_wqb = ops.compute_q_a(attn, x_linear, qkv_a)
+    q_lora, q_for_wqb = q_ops.compute_q_a(attn, x_linear, qkv_a)
     if attn.indexer is not None:
         stream_sources.wait_stream(current)
-    q = ops.compute_q_b(attn, q_for_wqb, positions, q_out)
+    q = q_ops.compute_q_b(attn, q_for_wqb, positions, q_out)
     if attn.indexer is not None:
         # forked above, right after q_lora; recorded here, after the query chain
         with torch.cuda.stream(stream_sources):
@@ -99,14 +100,14 @@ def low_ratio(attn, x, positions, fb, attn_backend, q_out, x_quant):
                 run_compressor=False,
             )
     with torch.cuda.stream(stream_kv):
-        ops.kv_to_cache(attn, x_linear, positions, fb, attn_backend, qkv_a)
+        q_ops.kv_to_cache(attn, x_linear, positions, fb, attn_backend, qkv_a)
     current.wait_stream(stream_kv)
     if attn.compressor is not None or attn.indexer is not None:
         current.wait_stream(stream_sources)
     return q
 
 
-def eager(attn, x, positions, fb, attn_backend, q_out, x_quant):
+def eager(attn, x, positions, fb, attn_backend, q_out, x_quant, q_ops=ops):
     x_linear = x_quant if x_quant is not None else x
     if attn.fuse_wqa_wkv:
         qkv_a, _ = attn.wqkv_a(x_linear)
@@ -114,9 +115,9 @@ def eager(attn, x, positions, fb, attn_backend, q_out, x_quant):
     else:
         q_lora, _ = attn.wq_a(x_linear)
         qkv_a = None
-    q_lora, q_for_wqb = ops.normalize_q_lora(attn, q_lora)
-    q = ops.compute_q_b(attn, q_for_wqb, positions, q_out)
-    ops.kv_to_cache(attn, x_linear, positions, fb, attn_backend, qkv_a)
+    q_lora, q_for_wqb = q_ops.normalize_q_lora(attn, q_lora)
+    q = q_ops.compute_q_b(attn, q_for_wqb, positions, q_out)
+    q_ops.kv_to_cache(attn, x_linear, positions, fb, attn_backend, qkv_a)
     del qkv_a
     if attn.compress_ratio in (1, 2) and (
         attn.compressor is not None or attn.indexer is not None

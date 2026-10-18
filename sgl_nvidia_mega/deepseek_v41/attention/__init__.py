@@ -12,8 +12,10 @@ the step does not cover runs SGLang's own attention, and build logs why.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from typing import Any
 
+from sgl_nvidia_mega.deepseek_v41.attention import chain
 from sgl_nvidia_mega.deepseek_v41.attention.step import AttentionStep, disable_reason
 
 logger = logging.getLogger(__name__)
@@ -32,21 +34,38 @@ SGLANG_READS = {
 def build(model, ctx, group) -> dict[int, AttentionStep]:
     """Each covered layer's ``AttentionStep`` by layer id; the result is
     ``st.bound["attention"]``."""
+    from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+
     m = model.model
+    chain_on = "attn" in SLOTS
     steps, skipped = {}, []
+    kinds: Counter = Counter()
     for i in range(m.start_layer, m.end_layer):
         attn = m.layers[i].self_attn
         reason = disable_reason(attn)
         if reason:
             skipped.append(reason)
             continue
-        steps[attn.layer_id] = AttentionStep(attn)
+        steps[attn.layer_id] = step_ = AttentionStep(attn, chain_ops=chain_on)
+        if chain_on:
+            chain.precompile(attn, ctx.widths)
+            kinds[_chain_kind(attn, step_)] += 1
     logger.info(
-        "NVIDIA megakernel: attention step in %d layers%s",
+        "NVIDIA megakernel: attention step in %d layers (%s)%s",
         len(steps),
+        "; ".join(f"{n} x {k}" for k, n in sorted(kinds.items())) or "stock",
         f"; SGLang's in the rest ({'; '.join(skipped)})" if skipped else "",
     )
     return steps
+
+
+def _chain_kind(attn, step_: AttentionStep) -> str:
+    """One layer's chain decisions, as build logs them."""
+    parts = [f"ratio {attn.compress_ratio}"]
+    parts.append("wq_b low-latency 1-48" if step_.chain[0].wq_b_ll else "wq_b SGLang's")
+    parts.append("swap-AB 1-24" if step_.swapab else "no swap-AB")
+    parts.append("fused wo_a 1-48" if attn.use_fused_wo_a else "wo_a SGLang's")
+    return ", ".join(parts)
 
 
 def step(layer, x, st) -> Any:

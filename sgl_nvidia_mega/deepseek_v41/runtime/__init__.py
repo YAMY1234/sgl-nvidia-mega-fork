@@ -7,11 +7,12 @@ runs through the spec once the model is prepared and before the KV cache is size
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import msgspec
 
 # The kernel slots this package ships; with the megakernel on, all of them run
-SHIPPED_SLOTS = ("hop_a", "moe", "gate")
+SHIPPED_SLOTS = ("hop_a", "moe", "gate", "attn")
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -87,6 +88,18 @@ def model_disable_reasons(model) -> list[str]:
     return reasons
 
 
+def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
+    """Each shipped slot: whether its build serves at least one width."""
+    return {
+        "hop_a": any(s.hop_a for s in slots.values()),
+        "moe": facts.routed,
+        # the MoE build's own result: a layer's fast top-k may fail to build alone
+        "gate": any(s.fast_gate for s in slots.values())
+        and any(slot.gate for slot in getattr(bound["moe"], "slots", {}).values()),
+        "attn": any(step.chain is not None for step in bound["attention"].values()),
+    }
+
+
 def build(model, ctx):
     """Each package's build (weights bound, buffers allocated, kernels compiled),
     the slot plan per width, and the executor; ``ctx`` is SGLang's BuildContext."""
@@ -122,13 +135,7 @@ def build(model, ctx):
         w: msgspec.structs.replace(s, hop_a=s.hop_a and w in hop.rows)
         for w, s in slot_plan.plan(pctx.widths, facts).items()
     }
-    built = {
-        "hop_a": any(s.hop_a for s in slots.values()),
-        "moe": facts.routed,
-        # the MoE build's own result: a layer's fast top-k may fail to build alone
-        "gate": any(s.fast_gate for s in slots.values())
-        and any(slot.gate for slot in getattr(bound["moe"], "slots", {}).values()),
-    }
+    built = built_slots(slots, bound, facts)
     # every package's build agrees across ranks, so this raises on every rank alike
     missing = sorted(name for name in SLOTS if not built[name])
     if missing:

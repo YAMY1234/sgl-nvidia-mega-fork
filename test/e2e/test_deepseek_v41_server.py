@@ -213,7 +213,7 @@ class TestMegakernelVerify(CustomTestCase):
     # SGLang's startup line, once per TP rank: every shipped slot built where PR #1
     # measured it (hop A at batch 1, the fast top-k at batch 1 and 8), every width
     ACTIVE = re.compile(
-        r"NVIDIA megakernel: active \(DeepSeek-V4\.1: slots \['gate', 'hop_a', 'moe'\]; "
+        r"NVIDIA megakernel: active \(DeepSeek-V4\.1: slots \['attn', 'gate', 'hop_a', 'moe'\]; "
         r"hop A at \[6\] rows, fast gate at \[6, 48\] rows; .*; "
         r"widths \[6, 12, 18, 24, 30, 36, 42, 48\]; tolerance numerics;"
     )

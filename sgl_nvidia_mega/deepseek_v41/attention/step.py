@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from sgl_nvidia_mega.deepseek_v41.attention import ops, prepare
+import torch
+
+from sgl_nvidia_mega.deepseek_v41.attention import chain, ops, prepare
 
 # The SGLang names this package reads, by file under the sglang package (``f(p)``: a
 # parameter); test/unit/test_contract.py pins them.
@@ -150,9 +152,23 @@ def disable_reason(attn) -> str:
 class AttentionStep:
     """One layer's attention in a covered step, over the layer's own modules."""
 
-    def __init__(self, attn):
+    def __init__(self, attn, *, chain_ops: bool = False):
         self.attn = attn
         self.low_ratio = attn.compress_ratio in (1, 2)
+        # the attention chain's query ops, padded / roped query and unroped 16 heads
+        self.chain = None
+        if chain_ops:
+            self.chain = (
+                chain.ChainOps(attn, rope_in_attention=False),
+                chain.ChainOps(attn, rope_in_attention=True),
+            )
+        self.swapab = chain_ops and chain.swapab_applies(attn)
+        # fp32 [positions, 64]: cos, sin interleaved, as the swap-AB query RoPE reads them
+        self.freqs = (
+            torch.view_as_real(attn.freqs_cis).flatten(-2).contiguous()
+            if self.swapab
+            else None
+        )
 
     def _prepare_path(self, rows: int, fb):
         """The prepare ``MQALayer.forward`` picks for this step on CUDA."""
@@ -220,11 +236,24 @@ class AttentionStep:
         attn = self.attn
         attn_backend = get_attn_backend()
         assert not get_token_to_kv_pool().uniform_fp8, "the uniform-FP8 pool"
+        rows = x.shape[0]
+        use_chain = self.chain is not None and rows <= chain.NORM_QUANT_MAX_ROWS
+        swapab = (
+            use_chain and self.swapab and chain.swapab_takes(rows, fb, attn_backend)
+        )
         with attn.maybe_use_decode_attn_tp(fb):
+            path = self._prepare_path(rows, fb)
+            if swapab:
+                # the attention ropes the 16-head query; no 64-head pad
+                q = path(
+                    attn, x, positions, fb, attn_backend, None, x_quant, self.chain[1]
+                )
+                o = chain.sparse_decode(attn, attn_backend, q, positions, self.freqs)
+                return ops.wo_b(attn, chain.wo_a(attn, o, positions, fb), publish)
             heads, q_padded, q_out, tp_slice = self._query_buffer(x, attn_backend)
             attn_sink = attn._local_attn_sink(heads)
-            path = self._prepare_path(x.shape[0], fb)
-            q = path(attn, x, positions, fb, attn_backend, q_out, x_quant)
+            q_ops = self.chain[0] if use_chain else ops
+            q = path(attn, x, positions, fb, attn_backend, q_out, x_quant, q_ops)
             o = attn_backend.forward(
                 q=q_padded if q_padded is not None else q,
                 k=q,
@@ -236,4 +265,5 @@ class AttentionStep:
                 save_kv_cache=False,
             )
             o = o[:, tp_slice, :]
-            return ops.wo_b(attn, ops.wo_a(attn, o, positions, fb), publish)
+            wo_a = chain.wo_a if use_chain else ops.wo_a
+            return ops.wo_b(attn, wo_a(attn, o, positions, fb), publish)

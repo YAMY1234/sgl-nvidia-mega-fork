@@ -26,7 +26,8 @@ The step is the plugin's own code over the weights SGLang loaded (`deepseek_v41/
 | --- | --- | --- |
 | `wo_b` + attention all-reduce + mHC post + next norm (`hop_a`) | 1–8 | `wo_b` GEMM whose epilogue stores its rows into a Lamport mailbox on every rank, and a Lamport consumer that reduces them and runs the mHC post, combine and RMSNorm |
 | Routed experts (`moe`) | 1–48 | A route kernel and a pair of block-scaled tcgen05 GEMMs with 8-row tiles; an expert chosen by more than 8 rows takes several tiles |
-| Router top-k (`gate`) | 1–8, 48 | One CTA per row, bit for bit SGLang's fused gate (including the vision-token routing) |
+| Router top-k (`gate`) | 1–16, 48 | One CTA per row, bit for bit SGLang's fused gate (including the vision-token routing) |
+| Replicated embedding (`embed`) | 1–48 | SGLang's fused lookup on the whole table, all-gathered once at build; no all-reduce |
 
 With the megakernel on, every slot above runs. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that for tests and bisecting; empty runs every step function's stock code.
 

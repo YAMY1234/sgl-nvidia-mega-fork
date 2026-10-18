@@ -293,10 +293,9 @@ def test_the_slot_calls_the_pair_with_its_signature(fast_gate, ready):
     gemm.side_effect = lambda *a, **k: order.append("pair") or pair_out
     with patch.object(torch.cuda, "current_stream", return_value=stream):
         out = slot.run(torch.zeros(3, 4), topk, ("xq", "xs", ready))
+    # the slot joins the routed input before the top-k in both cases
+    first = ("gate", None) if fast_gate else "pair"
+    assert order == ([("join", ready)] if ready else []) + [first]
     if fast_gate:
-        # the launcher joins the routed input itself, between the route kernel and GEMM1
-        assert order == [("gate", ready)]
-        assert gemm.gate_topk_and_gemms.call_args.args[5].tolist() == [3]
-    else:
-        assert order == ([("join", ready)] if ready else []) + ["pair"]
+        assert gemm.gate_topk_and_gemms.call_args.args[5] is None  # no fill kernel
     assert out.top_k == 6 and out.gemm2_out is pair_out[0]

@@ -37,9 +37,10 @@ __device__ __forceinline__ float DivFull(float a, float b) {
 }  // namespace
 
 // grid = rows, block = 384. num_valid: rows >= *num_valid get weight 0 and id -1 (padded
-// graph rows), as moe_fused_gate's num_token_non_padded. With input_ids (int32, or int64 when
-// ids64), a row whose token is alt_token_id ranks with bias_alt instead of bias (DSV4.1 VL
-// routing). eps > 0 normalizes by sum + eps, as renormalize_epsilon; else by the guarded sum.
+// graph rows), as moe_fused_gate's num_token_non_padded; null means every row is valid. With
+// input_ids (int32, or int64 when ids64), a row whose token is alt_token_id ranks with
+// bias_alt instead of bias (DSV4.1 VL routing). eps > 0 normalizes by sum + eps, as
+// renormalize_epsilon; else by the guarded sum.
 extern "C" __global__ __launch_bounds__(kThreads) void dsv41_gate_topk(
     const float* logits, const float* bias, const float* bias_alt, const void* input_ids, int ids64,
     long long alt_token_id, const int* num_valid, float* __restrict__ weights, int* __restrict__ ids,
@@ -56,7 +57,7 @@ extern "C" __global__ __launch_bounds__(kThreads) void dsv41_gate_topk(
   const float b_alt = bias_alt != nullptr ? bias_alt[e] : b_main;
   asm volatile("griddepcontrol.wait;" ::: "memory");
 
-  const int valid = *num_valid;
+  const int valid = num_valid != nullptr ? *num_valid : static_cast<int>(gridDim.x);
   bool alt = false;
   if (input_ids != nullptr && row < valid) {
     const long long token = ids64 ? static_cast<const long long*>(input_ids)[row]

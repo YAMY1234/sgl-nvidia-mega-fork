@@ -78,7 +78,7 @@ class Runner:
         return taken
 
     def add_moe(self, layer_id: int, *, w13, w13_scale, w2, w2_scale, clamp, top_k,
-                max_rows: int, finalize: bool, gate_topk: bool) -> None:  # fmt: skip
+                max_rows: int, gate_topk: bool) -> None:  # fmt: skip
         self.moe[layer_id] = RoutedExpertGemm(
             w13,
             w13_scale,
@@ -87,7 +87,6 @@ class Runner:
             clamp,
             top_k=top_k,
             max_rows=max_rows,
-            finalize=finalize,
             gate_topk=gate_topk,
         )
 

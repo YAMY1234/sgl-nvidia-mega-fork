@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The DeepSeek-V4.1 routed-expert kernels on one SM100-family GPU (GB300):
 
-- the route kernels + GEMM pair + finalize against FlashInfer's routed MoE, as SGLang
-  serves it, on the target layer (384 experts, top-6) at 1-48 rows, including experts
+- the route kernels + GEMM pair against FlashInfer's routed MoE (its deferred-finalize
+  GEMM2 rows), as SGLang serves it, on the target layer (384 experts, top-6) at 1-48 rows, including experts
   chosen by more than 8 rows (several tiles), and on the DSpark draft layer (128
   experts, top-3) at 1-8 rows; eager and replayed from a CUDA graph;
 - gate_topk.cu against SGLang's moe_fused_gate, bit for bit (ids and weights) at 1-64
-  rows, including ties, both softplus branches, NaN logits, padded rows and the
-  vision-token routing.
+  rows, including ties, both softplus branches, NaN logits, padded rows, no padded-row
+  count (every row valid) and the vision-token routing.
 """
 
 import ctypes
@@ -93,9 +93,8 @@ def _routing(rows, distinct, generator, experts, top_k):
     return torch.stack(ids).to(torch.int32)
 
 
-def _flashinfer(x_q, x_s, ids, weights, layer, output=None):
-    """FlashInfer's routed MoE as SGLang serves it: GEMM2 rows and the slot -> row map,
-    or (``output`` given) the finalized output."""
+def _flashinfer(x_q, x_s, ids, weights, layer):
+    """FlashInfer's routed MoE as SGLang serves it: GEMM2 rows and the slot -> row map."""
     from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
@@ -127,13 +126,10 @@ def _flashinfer(x_q, x_s, ids, weights, layer, output=None):
         intermediate_size=reg.PADDED,
         local_expert_offset=0,
         local_num_experts=experts,
-        do_finalize=output is not None,
+        do_finalize=False,
         tune_max_num_tokens=8,
-        output=output,
         enable_pdl=True,
     )
-    if output is not None:
-        return output
     return result[0], result[2].view(ids.shape)
 
 
@@ -156,35 +152,28 @@ def _check_pair(layer, *, top_k, rows, distinct, graph, seed, max_rows):
 
     experts = layer[0].size(0)
     generator = torch.Generator().manual_seed(seed)
-    gemm = reg.RoutedExpertGemm(*layer, top_k=top_k, finalize=True, max_rows=max_rows)
+    gemm = reg.RoutedExpertGemm(*layer, top_k=top_k, max_rows=max_rows)
     x = torch.randn(rows, reg.HIDDEN, generator=generator).to(torch.bfloat16).cuda()
     x_q, x_s = flashinfer_mxfp8_quantize(x, False, alignment=reg.HIDDEN)
     x_s = x_s.view(torch.float8_e4m3fn).reshape(rows, -1)
     ids = _routing(rows, distinct, generator, experts, top_k).cuda()
     weights = torch.softmax(torch.randn(rows, top_k, generator=generator), -1).cuda()
-    output = torch.empty(rows, reg.HIDDEN, dtype=torch.bfloat16, device="cuda")
-
-    def run():
-        routed = gemm(x_q, x_s, ids, weights)
-        gemm.finalize(*routed, output)
-        return routed
 
     if graph:
-        run()  # warm-up outside capture
+        gemm(x_q, x_s, ids, weights)  # warm-up outside capture
         torch.cuda.synchronize()
         captured = torch.cuda.CUDAGraph()
         with torch.cuda.graph(captured):
-            routed = run()
-        output.zero_()
+            routed = gemm(x_q, x_s, ids, weights)
+        routed[0].zero_()
         for _ in range(3):
             captured.replay()
     else:
-        routed = run()
+        routed = gemm(x_q, x_s, ids, weights)
     torch.cuda.synchronize()
 
     rows_out, _, permuted = routed
     want_rows, want_permuted = _flashinfer(x_q, x_s, ids, weights, layer)
-    want = _flashinfer(x_q, x_s, ids, weights, layer, output=torch.empty_like(output))
     torch.cuda.synchronize()
     # Same MMA order, SwiGLU and quantization as the TRT-LLM-gen tactics; one BF16 ulp.
     torch.testing.assert_close(
@@ -193,7 +182,6 @@ def _check_pair(layer, *, top_k, rows, distinct, graph, seed, max_rows):
         rtol=2**-7,
         atol=1e-6,
     )
-    torch.testing.assert_close(output.float(), want.float(), rtol=2**-7, atol=1e-3)
 
 
 @pytest.mark.parametrize("rows", [1, 2, 6, 8, 9, 12, 16, 24, 40, 48])
@@ -227,7 +215,7 @@ def test_draft_pair_matches_flashinfer(draft_layer, rows, graph):
 
 def test_steps_past_the_bound_are_declined(target_layer):
     gemm = reg.RoutedExpertGemm(
-        *target_layer, top_k=TARGET_TOP_K, finalize=True, max_rows=reg.MAX_ROWS
+        *target_layer, top_k=TARGET_TOP_K, max_rows=reg.MAX_ROWS
     )
     assert gemm.route_wide is None
     rows = 9
@@ -284,7 +272,7 @@ def _fast(logits, bias, num_valid, vl=None):
             reg._null_or_pointer(input_ids),
             ctypes.c_int32(input_ids is not None and input_ids.dtype == torch.int64),
             ctypes.c_int64(token),
-            reg._pointer(num_valid),
+            reg._null_or_pointer(num_valid),
             reg._pointer(weights),
             reg._pointer(ids),
             ctypes.c_float(SCALE),
@@ -322,6 +310,8 @@ def test_gate_topk_matches_moe_fused_gate(kind):
             bias = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.05
             valid = rows if trial % 2 == 0 else max(1, rows - 1 - trial)
             num_valid = torch.tensor([valid], dtype=torch.int32, device="cuda")
+            if trial == 2:  # no num_token_non_padded: every row is valid
+                num_valid = None
             sw, sid = _stock(logits, bias, num_valid)
             fw, fid = _fast(logits, bias, num_valid)
             torch.cuda.synchronize()
@@ -330,12 +320,15 @@ def test_gate_topk_matches_moe_fused_gate(kind):
             assert torch.equal(fw.view(torch.int32), sw.view(torch.int32)), where
 
 
-def test_gate_topk_follows_live_inputs_in_a_graph():
-    gen = torch.Generator(device="cuda").manual_seed(7)
-    rows = 6
+@pytest.mark.parametrize("rows", [6, 12, 16, 48])
+@pytest.mark.parametrize("count", [True, False])
+def test_gate_topk_follows_live_inputs_in_a_graph(rows, count):
+    gen = torch.Generator(device="cuda").manual_seed(7 + rows)
     logits = torch.randn((rows, TARGET_EXPERTS), device="cuda", generator=gen)
     bias = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.05
-    num_valid = torch.tensor([rows], dtype=torch.int32, device="cuda")
+    num_valid = (
+        torch.tensor([rows], dtype=torch.int32, device="cuda") if count else None
+    )
     _fast(logits, bias, num_valid)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -353,7 +346,7 @@ def test_gate_topk_follows_live_inputs_in_a_graph():
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
 def test_gate_topk_vision_routing_matches_moe_fused_gate(ids_dtype):
     gen = torch.Generator(device="cuda").manual_seed(99)
-    for rows in [1, 6, 7, 12, 24, 48, 64]:
+    for rows in [1, 6, 7, 12, 16, 24, 48, 64]:
         for trial in range(4):
             logits = _logits("normal", rows, gen).contiguous()
             bias = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.05
@@ -365,6 +358,8 @@ def test_gate_topk_vision_routing_matches_moe_fused_gate(ids_dtype):
             input_ids = input_ids.to(ids_dtype)
             valid = rows if trial % 2 == 0 else max(1, rows - 2)
             num_valid = torch.tensor([valid], dtype=torch.int32, device="cuda")
+            if trial == 2:
+                num_valid = None
             vl = (bias_alt, input_ids, IMAGE_TOKEN)
             sw, sid = _stock(logits, bias, num_valid, vl)
             fw, fid = _fast(logits, bias, num_valid, vl)
@@ -381,15 +376,16 @@ def test_gate_topk_then_pair_matches_the_two_steps(target_layer):
     gemm = reg.RoutedExpertGemm(
         *target_layer,
         top_k=TARGET_TOP_K,
-        finalize=True,
         max_rows=reg.SERVED_MAX_ROWS,
         gate_topk=True,
     )
     gen = torch.Generator(device="cuda").manual_seed(3)
-    for rows in (1, 6, 12, 48):
+    for rows, count in ((1, True), (6, False), (12, False), (16, True), (48, False)):
         logits = torch.randn((rows, TARGET_EXPERTS), device="cuda", generator=gen)
         bias = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.05
-        num_valid = torch.tensor([rows], dtype=torch.int32, device="cuda")
+        num_valid = (
+            torch.tensor([rows], dtype=torch.int32, device="cuda") if count else None
+        )
         x = torch.randn(rows, reg.HIDDEN, device="cuda", generator=gen).to(
             torch.bfloat16
         )

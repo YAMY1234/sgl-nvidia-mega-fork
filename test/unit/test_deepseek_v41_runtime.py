@@ -116,6 +116,22 @@ def test_engram_and_capture_layers_read_the_materialized_streams(calls, monkeypa
     assert len(st.aux) == 1 and torch.equal(st.aux[0], st_residual.mean(dim=1))
 
 
+def test_the_embedding_is_sglangs_unless_its_slot_is_on():
+    from sgl_nvidia_mega.deepseek_v41 import plan
+    from sgl_nvidia_mega.deepseek_v41.runtime import embedding
+
+    looked_up = []
+    st = _state()
+    st.model.embed_tokens = lambda ids: looked_up.append(ids) or "stock"
+    st.slots = plan.slots(6, plan.Facts())
+    st.bound = {"embedding": torch.zeros(4, 4)}
+    assert embedding.embed(st) == "stock" and looked_up == [st.input_ids]
+    # a built table without the slot, or the slot without a table: still stock
+    st.slots = plan.slots(6, plan.Facts(embed=True))
+    st.bound = {"embedding": None}
+    assert embedding.embed(st) == "stock"
+
+
 def _batch(mode="TARGET_VERIFY"):
     is_verify = mode == "TARGET_VERIFY"
     return SimpleNamespace(

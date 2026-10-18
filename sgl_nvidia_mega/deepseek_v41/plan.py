@@ -19,6 +19,9 @@ TWO_SHOT_MIN_ROWS = 49  # measured slower than SGLang's fused kernel at 37 rows
 # hop_a_batch2, 9-16 on the fused wo_a's row-tile scales; the mailbox holds this many rows
 HOP_A_MAX_ROWS = 16
 HOP_A_BATCH1_ROWS = 8
+# hop B (the MoE post): up to the routed pair's widest step; past 8 rows it writes the
+# next input's scales per 8-row tile for wqkv_a's wide low-latency GEMM
+HOP_B_MAX_ROWS = 48
 FAST_GATE_MAX_SMALL_ROWS = 16
 FAST_GATE_ROWS = frozenset(range(1, FAST_GATE_MAX_SMALL_ROWS + 1)) | {ROUTED_MAX_ROWS}
 # slot gate_wide: every routed width, to re-measure the 17-47-row cap (one launch per arm)

@@ -12,6 +12,7 @@ from typing import Optional
 import torch
 
 from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
+from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +20,10 @@ logger = logging.getLogger(__name__)
 class HopA:
     """One rank's mailbox, publishing wo_b GEMM and Lamport consumer."""
 
-    def __init__(self, runner, rows: tuple[int, ...]):
+    def __init__(self, runner, rows: tuple[int, ...], hop_b_rows: tuple[int, ...] = ()):
         self._runner = runner
         self.rows = rows  # the widths the publishing GEMM was compiled for
+        self.hop_b_rows = hop_b_rows  # the widths the MoE post runs on the mailbox
 
     def publish_wo_b(self, wo_b, o) -> Optional[torch.Tensor]:
         """wo_b's TP-partial rows for ``o`` (BF16 [rows, heads * dim], or its MXFP8
@@ -69,6 +71,9 @@ def build(
     wo_b = m.layers[m.start_layer].self_attn.wo_b
     max_rows = slot_plan.hop_a_max_rows(batch2)
     rows = tuple(w for w in ctx.widths if w <= max_rows)
+    hop_b_rows = (
+        tuple(w for w in ctx.widths if w <= slot_plan.HOP_B_MAX_ROWS) if hop_b else ()
+    )
     if not rows:
         return None, f"no width up to {max_rows} rows"
     runner = Runner(device=wo_b.weight.device, rank=group.rank_in_group)
@@ -79,11 +84,12 @@ def build(
             hidden=cfg.hidden_size,
             hc_mult=cfg.hc_mult,
             top_k=cfg.num_experts_per_tok,
-            hop_a_rows=max_rows,
+            hop_a_rows=max(rows + hop_b_rows),
             deadline_s=ctx.deadline_s,
             hop_b=hop_b,
             early_trigger=early_trigger,
             hop_b_start_trigger=hop_b_start_trigger,
+            row_tile_layer_input=any(w > mxfp8_ll.MAX_ROWS for w in hop_b_rows),
         )
         taken = tuple(runner.precompile_publish(wo_b, list(rows)))
     except Exception as e:  # gathered, then raised on every rank
@@ -101,4 +107,4 @@ def build(
         )
     if not taken:
         return None, "wo_b is not an MXFP8 linear the low-latency GEMM takes"
-    return HopA(runner, taken), ""
+    return HopA(runner, taken, hop_b_rows), ""

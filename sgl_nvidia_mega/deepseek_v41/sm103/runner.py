@@ -54,6 +54,7 @@ class Runner:
         hop_b: bool = False,
         early_trigger: bool = False,
         hop_b_start_trigger: bool = False,
+        row_tile_layer_input: bool = False,
     ) -> None:
         """The Lamport mailbox (collective over ``group``) and the publishing GEMM;
         with ``hop_b`` also the MoE finalize's quantized and streams-only consumers."""
@@ -70,6 +71,7 @@ class Runner:
             residual_only=hop_b,
             early_trigger=early_trigger,
             hop_b_start_trigger=hop_b_start_trigger,
+            row_tile_layer_input=row_tile_layer_input,
         )
         self.publisher = PublishingMxfp8Linear(self.hop)
 

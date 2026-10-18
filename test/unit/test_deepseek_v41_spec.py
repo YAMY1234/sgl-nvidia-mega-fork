@@ -139,3 +139,10 @@ def test_the_slot_plan_follows_the_measured_bounds():
     assert [w for w, s in on.items() if s.fast_gate] == [*range(1, 9), 48]
     with pytest.raises(ValueError):
         plan.slots(49, plan.Facts())
+    # the two-shot slot alone covers the widths past the routed pair
+    wide = plan.plan(tuple(range(6, 385, 6)), plan.Facts(routed=True, two_shot=True))
+    assert [w for w, s in wide.items() if s.two_shot] == list(range(54, 385, 6))
+    assert [w for w, s in wide.items() if s.routed] == list(range(6, 49, 6))
+    with pytest.raises(ValueError):
+        plan.slots(385, plan.Facts(two_shot=True))
+    assert spec.SPEC.max_rows == plan.max_rows("two_shot" in runtime.SLOTS)

@@ -11,7 +11,9 @@ import os
 import msgspec
 
 # The kernel slots this package ships; with the megakernel on, all of them run
-SHIPPED_SLOTS = ("hop_a", "moe", "gate")
+SHIPPED_SLOTS = ("hop_a", "moe", "gate", "two_shot")
+# Slots that run only when requested, until a step-level A/B books them
+OPT_IN_SLOTS = ("hop_b", "early_trigger")
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -29,12 +31,18 @@ SLOTS = _requested_slots()
 
 def slot_reasons() -> list[str]:
     """Why the requested slots cannot be served ([] when they can)."""
+    known = (*SHIPPED_SLOTS, *OPT_IN_SLOTS)
     reasons = [
-        f"{SLOTS_ENV}: unknown slot {name!r} (shipped: {', '.join(SHIPPED_SLOTS)})"
-        for name in sorted(SLOTS - set(SHIPPED_SLOTS))
+        f"{SLOTS_ENV}: unknown slot {name!r} (known: {', '.join(known)})"
+        for name in sorted(SLOTS - set(known))
     ]
-    if "gate" in SLOTS and "moe" not in SLOTS:
-        reasons.append(f"{SLOTS_ENV}: slot 'gate' needs slot 'moe'")
+    for slot, needs in (
+        ("gate", "moe"),
+        ("hop_b", "hop_a"),
+        ("early_trigger", "hop_a"),
+    ):
+        if slot in SLOTS and needs not in SLOTS:
+            reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
     return reasons
 
 
@@ -117,6 +125,7 @@ def build(model, ctx):
         hop_a=hop is not None,
         hop_a_reason=getattr(bound["boundary"], "hop_a_reason", ""),
         routed=bool(getattr(bound["moe"], "slots", None)),
+        two_shot=getattr(bound["boundary"], "two_shot", None) is not None,
     )
     slots = {
         w: msgspec.structs.replace(s, hop_a=s.hop_a and w in hop.rows)
@@ -128,6 +137,9 @@ def build(model, ctx):
         # the MoE build's own result: a layer's fast top-k may fail to build alone
         "gate": any(s.fast_gate for s in slots.values())
         and any(slot.gate for slot in getattr(bound["moe"], "slots", {}).values()),
+        "two_shot": any(s.two_shot for s in slots.values()),
+        "hop_b": bound["boundary"].hop_b,
+        "early_trigger": "early_trigger" in SLOTS and facts.hop_a,
     }
     # every package's build agrees across ranks, so this raises on every rank alike
     missing = sorted(name for name in SLOTS if not built[name])
@@ -140,7 +152,8 @@ def build(model, ctx):
     summary = (
         f"slots {sorted(name for name, on in built.items() if on) or 'none (stock)'}; "
         f"hop A at {[w for w, x in slots.items() if x.hop_a]} rows, fast gate at "
-        f"{[w for w, x in slots.items() if x.fast_gate]} rows; weight copies "
+        f"{[w for w, x in slots.items() if x.fast_gate]} rows; boundary: "
+        f"{bound['boundary'].summary()}; weight copies "
         + str(
             {
                 k: f"{v.numel() * v.element_size() / 2**20:.1f} MiB"

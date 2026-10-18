@@ -132,6 +132,20 @@ def test_only_verify_steps_of_built_widths_are_covered():
     assert decode.plan(ids, _batch(), None, pp_proxy_tensors=object()) is None
 
 
+def test_a_two_shot_width_is_a_covered_step():
+    """With the two-shot slot built, a 384-row verify step (64 requests) runs the
+    executor, whose boundary then takes the two-shot posts at that width."""
+    from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
+
+    widths = tuple(range(6, slot_plan.max_rows(True) + 1, 6))
+    decode = executor.MegakernelDecode(None, {}, {}, widths)
+    ids = torch.zeros(384, dtype=torch.int64)
+    assert decode.plan(ids, _batch()) == Step(mode="target_verify", rows=384)
+    assert slot_plan.slots(384, slot_plan.Facts(two_shot=True)).two_shot
+    narrow = executor.MegakernelDecode(None, {}, {}, tuple(range(6, 49, 6)))
+    assert narrow.plan(ids, _batch()) is None
+
+
 def test_slot_selection_is_validated(monkeypatch):
     from sgl_nvidia_mega.deepseek_v41 import runtime
 
@@ -144,8 +158,13 @@ def test_slot_selection_is_validated(monkeypatch):
     for raw, want in (
         ("moe,gatee", "unknown slot 'gatee'"),
         ("gate", "needs slot 'moe'"),
+        ("moe,hop_b", "needs slot 'hop_a'"),
+        ("early_trigger", "needs slot 'hop_a'"),
     ):
         monkeypatch.setattr(runtime, "SLOTS", frozenset(raw.split(",")))
         assert any(want in r for r in runtime.slot_reasons()), raw
     monkeypatch.setattr(runtime, "SLOTS", frozenset(runtime.SHIPPED_SLOTS))
+    assert runtime.slot_reasons() == []
+    opt_in = frozenset(runtime.SHIPPED_SLOTS) | set(runtime.OPT_IN_SLOTS)
+    monkeypatch.setattr(runtime, "SLOTS", opt_in)
     assert runtime.slot_reasons() == []

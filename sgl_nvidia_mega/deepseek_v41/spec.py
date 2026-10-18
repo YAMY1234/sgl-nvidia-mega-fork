@@ -22,7 +22,8 @@ from sglang.srt.megakernels.spec import (
 )
 
 from sgl_nvidia_mega.deepseek_v41 import HF_CONFIG
-from sgl_nvidia_mega.deepseek_v41.plan import MAX_ROWS
+from sgl_nvidia_mega.deepseek_v41.plan import max_rows
+from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -97,6 +98,17 @@ NUMERICS = Numerics(
         "hop_a.normed.rel": 3e-2,
         # the routed experts against FlashInfer's routed MoE: one BF16 rounding
         "moe.routed.rel": 2**-7,
+        # the two-shot hops against SGLang's fused all-reduce + mHC kernels (streams,
+        # normed row, MXFP8 next input at up to 128 rows): the same rank-order sum
+        "two_shot.residual.max_abs": 0.0,
+        "two_shot.normed.ulp": 0,
+        "two_shot.mxfp8.max_abs": 0.0,
+        # hop B against SGLang's fused MoE post: the Lamport consumer's mHC-post
+        # rounding order, as hop A's; an MXFP8 value follows its normed element
+        "hop_b.residual.ulp": 1,
+        "hop_b.normed.ulp": 2,
+        "hop_b.mxfp8.ulp": 1,
+        "hop_b.mxfp8_scales.max_abs": 0.0,
     },
 )
 
@@ -155,7 +167,8 @@ SPEC = MegakernelSpec(
     requires=REQUIREMENTS,
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     numerics=NUMERICS,
-    max_rows=MAX_ROWS,
+    # the two-shot slot alone covers the widths past the routed-expert pair
+    max_rows=max_rows("two_shot" in SLOTS),
     build=_build,
     api_version=API_VERSION,
     model_disable_reasons=_model_disable_reasons,

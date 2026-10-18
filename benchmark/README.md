@@ -47,6 +47,6 @@ Protocol:
 
 `test/e2e/test_deepseek_v41_server.py` runs GSM8K-200 past the largest covered width, KL
 of covered steps against the normal prefill path, and a passkey past the indexer's
-candidate span. With `SGL_NVIDIA_MEGA_E2E_URL` set it tests a running server, so the
+candidate span. With `SGLANG_NVIDIA_MEGAKERNEL_E2E_URL` set it tests a running server, so the
 same checks run against the switch-off arm; judge the switch-on numbers against that
 arm's own band.

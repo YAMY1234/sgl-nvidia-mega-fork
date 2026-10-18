@@ -10,7 +10,7 @@ with a passkey to find there. Fail-stop: a stall or a crash on one rank, inside 
 plugin's hop or anywhere else in the routed step, stops every rank and no token of
 the failed step reaches the client; the tests print the time to stop.
 
-SGL_NVIDIA_MEGA_E2E_URL runs the serving tests against a server that is already up, so
+SGLANG_NVIDIA_MEGAKERNEL_E2E_URL runs the serving tests against a server that is already up, so
 the same checks also score the switch-off arm."""
 
 import json
@@ -48,7 +48,7 @@ from sgl_nvidia_mega.plugin import ENABLE_ENV
 LAUNCH_TIMEOUT = 3600
 # Few-shot GSM8K-200 (8 shots, 512 new tokens), for gross failures only; compare with
 # the switch-off arm's own band for anything finer
-GSM8K_BOUND = float(os.environ.get("SGL_NVIDIA_MEGA_E2E_GSM8K_BOUND", "0.85"))
+GSM8K_BOUND = float(os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_GSM8K_BOUND", "0.85"))
 # Decode or verify against prefill, mean KL over 8 LongBench-v2 prompts
 KL_BOUND = 0.03
 # Prompts past the candidate span (2048 blocks of 8 positions): every verify step's
@@ -61,8 +61,8 @@ WATCHDOG_S = 20
 FAULT_PROMPT = "Write a long essay about lighthouses."
 URL_ = URL or DEFAULT_URL_FOR_TEST
 # A prepared LongBench-v2 prompt cache, for hosts without the dataset or with a read-only SGLang tree
-if os.environ.get("SGL_NVIDIA_MEGA_E2E_LONGBENCH_CACHE"):
-    kl_test_utils.CACHE_DIR = os.environ["SGL_NVIDIA_MEGA_E2E_LONGBENCH_CACHE"]
+if os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_LONGBENCH_CACHE"):
+    kl_test_utils.CACHE_DIR = os.environ["SGLANG_NVIDIA_MEGAKERNEL_E2E_LONGBENCH_CACHE"]
 
 
 def _logprobs(*, input_ids, max_new_tokens, logprob_start_len):
@@ -123,7 +123,7 @@ def _gsm8k(parallel):
     host, port = re.match(r"https?://([^:/]+):(\d+)", URL_).groups()
     args = SimpleNamespace(
         num_shots=8,
-        data_path=os.environ.get("SGL_NVIDIA_MEGA_E2E_GSM8K"),
+        data_path=os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_GSM8K"),
         num_questions=200,
         parallel=parallel,
         max_new_tokens=512,
@@ -232,7 +232,7 @@ class TestMegakernelVerify(CustomTestCase):
 
     def test_the_tested_batches_run_the_plugin(self):
         # routing is fixed at startup; without this the other tests could pass on the normal path alone
-        log = os.environ.get("SGL_NVIDIA_MEGA_E2E_LOG")
+        log = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_LOG")
         text = (
             Path(log).read_text()
             if log
@@ -312,7 +312,7 @@ class TestMegakernelFault(CustomTestCase):
 
     # "off" runs the stall and crash cases without the megakernel: the baseline for the
     # time to full exit when a rank stops outside the plugin's own waits
-    SWITCH_ON = os.environ.get("SGL_NVIDIA_MEGA_E2E_SWITCH", "on") != "off"
+    SWITCH_ON = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_SWITCH", "on") != "off"
 
     def _serve(self, extra_env=None, extra_args=()):
         out, err = (
@@ -387,7 +387,7 @@ class TestMegakernelFault(CustomTestCase):
         if not self.SWITCH_ON:
             self.skipTest("the plugin's own hop needs the plugin")
         process, logs = self._serve(
-            {"SGLANG_NVIDIA_MEGA_FAULT_INJECT": "1:hop_a:5000"},
+            {"SGLANG_NVIDIA_MEGAKERNEL_FAULT_INJECT": "1:hop_a:5000"},
             ["--disable-decode-cuda-graph"],
         )
         control = self._control(32)

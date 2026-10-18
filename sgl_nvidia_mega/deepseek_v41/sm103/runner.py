@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # rank:site:after — that rank skips its publish at the given site after that many
 # calls, so its peers' waits must end at their deadline (eager steps only: a
 # captured graph replays without this counter)
-FAULT_INJECT = os.environ.get("SGLANG_NVIDIA_MEGA_FAULT_INJECT", "")
+FAULT_INJECT = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_FAULT_INJECT", "")
 
 
 def _fault_inject(rank: int, site: str) -> Optional[int]:

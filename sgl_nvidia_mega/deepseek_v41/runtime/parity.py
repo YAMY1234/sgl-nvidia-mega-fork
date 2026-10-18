@@ -33,7 +33,7 @@ SORT_TOPK = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK", "0") == 
 
 def install_sorted_topk() -> None:
     """Test only: sort each decode or verify row's valid sparse indices in place
-    before SGLang's DSV4 attention reads them (``SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK``)."""
+    before SGLang's DSV4 attention reads them (``SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK``)."""
     import functools
 
     from sglang.srt.layers.attention.deepseek_v4_backend import (

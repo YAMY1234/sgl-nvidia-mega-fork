@@ -10,7 +10,7 @@ MODEL = os.environ.get(
     "DEEPSEEK_V41_FLASH_MODEL_PATH", "deepseek-ai/DeepSeek-V4.1-Flash"
 )
 # An already running server, so the same checks can score the switch-off arm
-URL = os.environ.get("SGL_NVIDIA_MEGA_E2E_URL")
+URL = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_URL")
 ENV = {}
 COMMON = [
     "--trust-remote-code",
@@ -25,7 +25,7 @@ COMMON = [
     "flashmla",
     "--mem-fraction-static",
     "0.8",
-] + os.environ.get("SGL_NVIDIA_MEGA_E2E_EXTRA_ARGS", "").split()
+] + os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_EXTRA_ARGS", "").split()
 # DSpark: 8 requests of 6 rows at the largest covered width (48 rows); 16 requests
 # step past it, so the same requests alternate routed and standard steps
 ARGS = COMMON + [

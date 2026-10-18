@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The megakernel's hook into SGLang (registered by ``sgl_nvidia_mega.plugin``).
 
-``after_initialize`` runs once a model runner has loaded and prepared its model
-(after the post-load transforms, before SGLang sizes the KV cache). For the
-DeepSeek-V4.1 target it checks the setup on every rank, builds the executor, and
-installs the megakernel's forward on that model instance only: a covered step runs
-the executor, every other step the model's own forward.
+``after_initialize`` runs once a model runner has loaded and prepared its model (after
+the post-load transforms, before SGLang sizes the KV cache). On a server started with
+``--enable-nvidia-megakernel``, for the DeepSeek-V4.1 target, it checks the setup on
+every rank, builds the executor, and installs the megakernel's forward on that model
+instance only: a covered step runs the executor, every other step the model's own
+forward. Without the flag it returns at once.
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ import functools
 import logging
 
 import torch
+
+from sgl_nvidia_mega.plugin import FLAG, FLAG_CLI
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +40,7 @@ SGLANG_READS = {
 
 # What SGLang's weight updater reports instead of refreshing the derived state
 WEIGHT_UPDATE_ERROR = (
-    "Online weight updates are not supported with SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1: "
+    "Online weight updates are not supported with --enable-nvidia-megakernel: "
     "the megakernel's buffers and captured graphs keep state derived from the weights"
 )
 
@@ -46,6 +49,8 @@ def after_initialize(result, runner, *args, **kwargs):
     """Build and install the megakernel for the DeepSeek-V4.1 target this runner
     prepared; raise on every rank, with every rank's reasons, if any rank cannot
     serve the setup."""
+    if not getattr(runner.server_args, FLAG, False):
+        return result
     from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
     from sglang.srt.runtime_context import get_parallel
 
@@ -69,8 +74,7 @@ def after_initialize(result, runner, *args, **kwargs):
     failed = [f"rank {r}: {why}" for r, rs in enumerate(gathered) for why in rs]
     if failed:
         raise ValueError(
-            "SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1 cannot run this setup:\n  - "
-            + "\n  - ".join(failed)
+            f"{FLAG_CLI} cannot run this setup:\n  - " + "\n  - ".join(failed)
         )
     executor = runtime.build(model, resolved)
     install(model, executor)

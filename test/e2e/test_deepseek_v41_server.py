@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""DeepSeek-V4.1-Flash with SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1 on GB300, TP4, DSpark, across
+"""DeepSeek-V4.1-Flash with --enable-nvidia-megakernel on GB300, TP4, DSpark, across
 the switch point: 8 requests (48 rows) are the largest covered verify step, 12 and
 16 requests step past it and back. Each server's startup lines show the covered
 batches run the plugin; GSM8K runs past the largest width (gross failures); the
@@ -44,7 +44,7 @@ from sglang.test.test_utils import (
 )
 
 from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS_ENV
-from sgl_nvidia_mega.plugin import ENABLE_ENV
+from sgl_nvidia_mega.plugin import FLAG_CLI
 
 LAUNCH_TIMEOUT = 3600
 # Few-shot GSM8K-200 (8 shots, 512 new tokens), for gross failures only; compare with
@@ -108,14 +108,13 @@ def _launch(args=ARGS, extra_env=None, extra_args=(), log=None, backend=True):
     env = {
         **{k: v for k, v in os.environ.items() if k != SLOTS_ENV},
         **ENV,
-        ENABLE_ENV: "1" if backend else "0",
         **(extra_env or {}),
     }
     return popen_launch_server(
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=args + list(extra_args),
+        other_args=args + ([FLAG_CLI] if backend else []) + list(extra_args),
         env=env,
         return_stdout_stderr=log,
     )

@@ -26,11 +26,10 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-from sgl_nvidia_mega.plugin import ENABLE_ENV
+from sgl_nvidia_mega.plugin import FLAG_CLI
 
 LAUNCH_TIMEOUT = 3600
 PARITY_ENV = {
-    ENABLE_ENV: "1",
     "SGLANG_NVIDIA_MEGAKERNEL_SLOTS": "",
     "SGLANG_NVIDIA_MEGAKERNEL_PARITY": "1",
     "SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK": "1",
@@ -54,7 +53,7 @@ class TestStockStepIsSGLangs(CustomTestCase):
             DEFAULT_URL_FOR_TEST,
             timeout=LAUNCH_TIMEOUT,
             # eager verify steps: the parity check runs outside CUDA graphs only
-            other_args=ARGS + ["--disable-decode-cuda-graph"],
+            other_args=ARGS + [FLAG_CLI, "--disable-decode-cuda-graph"],
             env={**os.environ, **ENV, **PARITY_ENV},
             return_stdout_stderr=cls.logs,
         )

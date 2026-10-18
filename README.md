@@ -4,7 +4,7 @@
 
 **SGLang-NVIDIA-Mega** holds the NVIDIA megakernels of the [SGLang](https://github.com/sgl-project/sglang) framework: for each model it covers, the code of its small-batch decode step and the kernels that only make sense inside such a step, which hand their outputs to each other through mailboxes and programmatic dependent launch instead of through per-op boundaries.
 
-The package loads as an SGLang [general plugin](https://github.com/sgl-project/sglang/blob/main/docs/docs/hardware-platforms/plugin.mdx) (the `sglang.srt.plugins` entry point) and needs no change to SGLang. With `SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1` it registers one hook, after SGLang's model runner has prepared a covered model (before the KV cache is sized): it checks the setup, builds the megakernel and replaces that model instance's `forward`, which runs each covered step itself and leaves every other step to the model's own forward. Every rank then logs `NVIDIA megakernel: active (…)`. Without the variable the package registers nothing.
+The package loads as an SGLang [general plugin](https://github.com/sgl-project/sglang/blob/main/docs/docs/hardware-platforms/plugin.mdx) (the `sglang.srt.plugins` entry point) and is turned on with SGLang's `--enable-nvidia-megakernel` server flag. After SGLang's model runner has prepared a covered model (before the KV cache is sized), it checks the setup, builds the megakernel and replaces that model instance's `forward`, which runs each covered step itself and leaves every other step to the model's own forward. Every rank then logs `NVIDIA megakernel: active (…)`. Without the flag, SGLang runs untouched.
 
 > **Experimental:** the kernels, the models and setups they cover, and the switch may change.
 
@@ -56,7 +56,6 @@ pip install -e .
 ### Usage
 
 ```bash
-SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1 \
 python -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4.1-Flash \
   --tp 4 \
@@ -64,7 +63,8 @@ python -m sglang.launch_server \
   --kv-cache-dtype fp8_e4m3 \
   --dsv4-attn-backend flashmla \
   --speculative-algorithm DSPARK \
-  --speculative-dspark-block-size 5
+  --speculative-dspark-block-size 5 \
+  --enable-nvidia-megakernel
 ```
 
 ## Repository Structure

@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The SGLang plugin entry point: the switch and the hooks it registers."""
+"""The SGLang plugin entry point: the hooks it registers and the server flag that
+turns the megakernel on."""
 
 from __future__ import annotations
 
 import os
 
-# The switch: "1" enables the NVIDIA megakernel; anything else registers nothing
-ENABLE_ENV = "SGLANG_ENABLE_NVIDIA_MEGAKERNEL"
+# The switch: SGLang's server flag (a ServerArgs field); without it, or on an SGLang
+# that has no such flag, the hooks return at once and SGLang runs untouched
+FLAG = "enable_nvidia_megakernel"
+FLAG_CLI = "--enable-nvidia-megakernel"
 
 # SGLang targets the megakernel hooks, by dotted path, with the hook type and the
 # plugin function (test/unit/test_contract.py resolves each target). The model's
@@ -43,14 +46,9 @@ SGLANG_READS = {
 }
 
 
-def enabled() -> bool:
-    return os.environ.get(ENABLE_ENV, "") == "1"
-
-
 def register() -> None:
-    """SGLang's plugin loader calls this in every process, before any model is built."""
-    if not enabled():
-        return
+    """SGLang's plugin loader calls this in every process, before any model is built.
+    The hooks act only on a server started with ``FLAG_CLI``."""
     import pkgutil
 
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType

@@ -16,7 +16,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# The slots build may fill (comma-separated: moe, gate); empty = every
+# The slots build may fill (comma-separated: hop_a, moe, gate); empty = every
 # step function runs its stock code. The per-slot off switch, and the tests' baseline.
 SLOTS = frozenset(os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_SLOTS", "").split(",")) - {
     ""
@@ -100,18 +100,27 @@ def build(model, server_args):
     start, free = time.perf_counter(), torch.cuda.mem_get_info()[0]
     bound = {name: pkg.build(model, ctx, group) for name, pkg in PACKAGES.items()}
     # the MoE step's build result names the layers whose GEMM pair built
+    # the boundary's hop A (its compiled widths) and the MoE step's GEMM pair, as built
+    hop = getattr(bound["boundary"], "hop_a", None)
     facts = slot_plan.Facts(
+        hop_a=hop is not None,
+        hop_a_reason=getattr(bound["boundary"], "hop_a_reason", ""),
         routed=bool(getattr(bound["moe"], "slots", None)),
     )
-    slots = slot_plan.plan(ctx.widths, facts)
+    slots = {
+        w: msgspec.structs.replace(s, hop_a=s.hop_a and w in hop.rows)
+        for w, s in slot_plan.plan(ctx.widths, facts).items()
+    }
     logger.info(
         "NVIDIA megakernel: DeepSeek-V4.1 verify steps of %s rows built in %.1f s, "
-        "%.1f MiB; slots %s; wait "
+        "%.1f MiB; slots %s; hop A at %s rows (%s); wait "
         "deadline %.0f s; weight copies %s",
         list(ctx.widths),
         time.perf_counter() - start,
         (free - torch.cuda.mem_get_info()[0]) / 2**20,
         sorted(SLOTS) or "none (every step function stock)",
+        [w for w, x in slots.items() if x.hop_a],
+        facts.hop_a_reason or ("built" if hop else "off"),
         ctx.deadline_s,
         {
             k: f"{v.numel() * v.element_size() / 2**20:.1f} MiB"

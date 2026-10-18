@@ -96,7 +96,8 @@ def build(model, server_args):
         deadline_s=requirements.deadline_s(server_args.watchdog_timeout),
         copies={},
     )
-    start, memory = time.perf_counter(), torch.cuda.memory_allocated()
+    # free device memory, not memory_allocated: symmetric memory bypasses the allocator
+    start, free = time.perf_counter(), torch.cuda.mem_get_info()[0]
     bound = {name: pkg.build(model, ctx, group) for name, pkg in PACKAGES.items()}
     # the MoE step's build result names the layers whose GEMM pair built
     facts = slot_plan.Facts(
@@ -109,7 +110,7 @@ def build(model, server_args):
         "deadline %.0f s; weight copies %s",
         list(ctx.widths),
         time.perf_counter() - start,
-        (torch.cuda.memory_allocated() - memory) / 2**20,
+        (free - torch.cuda.mem_get_info()[0]) / 2**20,
         sorted(SLOTS) or "none (every step function stock)",
         ctx.deadline_s,
         {

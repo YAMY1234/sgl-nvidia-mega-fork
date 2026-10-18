@@ -211,6 +211,7 @@ class TestMegakernelVerify(CustomTestCase):
 
     RUNS = (
         "NVIDIA megakernel: DeepSeek-V4.1 verify steps of [6, 12, 18, 24, 30, 36, 42, 48] rows built",
+        "NVIDIA megakernel: active (DeepSeek-V4.1 verify steps of [6, 12, 18, 24, 30, 36, 42, 48] rows)",
     )
 
     @classmethod

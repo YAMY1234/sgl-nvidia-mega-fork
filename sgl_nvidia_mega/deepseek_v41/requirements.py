@@ -43,7 +43,17 @@ SGLANG_READS = {
         "enable_encoder_swa_bounded_replay",
         "startup_weight_load_mode",
         "watchdog_timeout",
+        "enable_deterministic_inference",
+        "enable_hisparse",
+        "cuda_graph_config",
     ),
+    "srt/model_executor/cuda_graph_config.py": (
+        "decode",
+        "backend",
+        '"full"',
+        '"disabled"',
+    ),
+    "srt/environ.py": ("envs", "SGLANG_RAGGED_VERIFY_MODE"),
     "srt/model_executor/model_runner.py": ("server_args", "model_config", "model"),
     "srt/configs/model_config.py": ("hf_config", "dtype"),
 }
@@ -96,7 +106,11 @@ FEATURES = {
     "hierarchical KV cache": lambda a: bool(a.enable_hierarchical_cache),
     "memory saver": lambda a: bool(a.enable_memory_saver),
     "torch.compile": lambda a: bool(a.enable_torch_compile),
+    "deterministic inference": lambda a: bool(a.enable_deterministic_inference),
+    "hierarchical sparse attention": lambda a: bool(a.enable_hisparse),
 }
+# Decode CUDA graphs the covered step is tested with (eager steps are covered too)
+DECODE_GRAPH_BACKENDS = {"full", "disabled"}
 
 # Per kernel output against SGLang's op on the same GPU (test/kernels); the
 # tolerances are the measured ones
@@ -124,7 +138,18 @@ def deadline_s(watchdog_timeout) -> float:
 
 def disable_reasons(server_args, model_config) -> list[str]:
     """Every reason the megakernel cannot serve this setup ([] when it can)."""
+    from sglang.srt.environ import envs
+
     reasons = [f"{name} is in use" for name, on in FEATURES.items() if on(server_args)]
+    decode_graphs = server_args.cuda_graph_config.decode.backend
+    if decode_graphs not in DECODE_GRAPH_BACKENDS:
+        reasons.append(
+            f"decode CUDA graphs {decode_graphs!r} are not one of "
+            f"{sorted(DECODE_GRAPH_BACKENDS)}"
+        )
+    ragged = envs.SGLANG_RAGGED_VERIFY_MODE.get()
+    if ragged.lower() != "static":
+        reasons.append(f"SGLANG_RAGGED_VERIFY_MODE {ragged!r} is not 'static'")
     for arg, allowed in SERVER_ARGS.items():
         value = getattr(server_args, arg)
         if value not in allowed:

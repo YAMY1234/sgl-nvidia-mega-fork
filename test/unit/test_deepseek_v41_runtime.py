@@ -4,6 +4,7 @@
 functions, which every package codes against."""
 
 import contextlib
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -131,3 +132,28 @@ def test_only_verify_steps_of_built_widths_are_covered():
     assert decode.plan(torch.zeros(18, dtype=torch.int64), _batch()) is None
     assert decode.plan(ids, _batch("DECODE")) is None
     assert decode.plan(ids, _batch(), None, pp_proxy_tensors=object()) is None
+
+
+def test_the_forward_is_replaced_on_the_instance_only():
+    from sgl_nvidia_mega.deepseek_v41.runtime import hooks
+
+    class _Model:
+        def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+            return "sglang"
+
+    class _Executor:
+        def plan(self, input_ids, forward_batch, *args, **kwargs):
+            return "step" if forward_batch == "covered" else None
+
+        def forward(self, step, original, *args, **kwargs):
+            return ("megakernel", original(*args, **kwargs))
+
+    model, other = _Model(), _Model()
+    hooks.install(model, _Executor())
+    assert "forward" in vars(model) and "forward" not in vars(other)
+    assert other.forward(1, 2, "covered") == "sglang"
+    assert model.forward(1, 2, "other") == "sglang"
+    assert model.forward(1, 2, "covered") == ("megakernel", "sglang")
+    # SGLang reads the forward's parameters (pipeline-parallel support)
+    params = inspect.signature(model.forward).parameters
+    assert list(params) == ["input_ids", "positions", "forward_batch", "input_embeds"]

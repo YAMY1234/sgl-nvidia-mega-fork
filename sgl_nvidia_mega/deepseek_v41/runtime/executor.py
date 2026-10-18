@@ -121,7 +121,8 @@ class MegakernelDecode:
         input_embeds=None,
         pp_proxy_tensors=None,
     ):
-        """The covered step (``original``: SGLang's forward, for the parity check)."""
+        """The covered step (``original``: the model's own forward, bound, for the
+        parity check)."""
         if PARITY and not torch.cuda.is_current_stream_capturing():
             return self._with_parity(
                 step, original, input_ids, positions, forward_batch, input_embeds
@@ -204,11 +205,10 @@ class MegakernelDecode:
     ):
         """SGLang's forward, then the executor's, on the same step; logs the largest
         difference of the logits and the auxiliary hidden states."""
-        lm = self.lm
-        want = original(lm, input_ids, positions, forward_batch, input_embeds)
+        want = original(input_ids, positions, forward_batch, input_embeds)
         want = (_clone(want.next_token_logits), _clone(want.hidden_states))
         if PARITY_MODE == "control":
-            got = original(lm, input_ids, positions, forward_batch, input_embeds)
+            got = original(input_ids, positions, forward_batch, input_embeds)
         else:
             got = self._forward(step, input_ids, positions, forward_batch, input_embeds)
         diffs = [

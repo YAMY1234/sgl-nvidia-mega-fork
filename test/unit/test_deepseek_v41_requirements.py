@@ -35,18 +35,24 @@ DOCUMENTED = dict(
     enable_encoder_swa_bounded_replay=False,
     startup_weight_load_mode="serial",
     watchdog_timeout=300,
+    enable_deterministic_inference=False,
+    enable_hisparse=False,
+    cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(backend="full")),
 )
 
 
-def _reasons(dtype="torch.bfloat16", hf=None, **args):
+def _reasons(dtype="torch.bfloat16", hf=None, ragged="static", **args):
     server_args = SimpleNamespace(**{**DOCUMENTED, **args})
     hf_config = SimpleNamespace(
         **{**HF_CONFIG, "model_type": "deepseek_v41", **(hf or {})}
     )
     model_config = SimpleNamespace(dtype=dtype, hf_config=hf_config)
+    from sglang.srt.environ import envs
+
     with (
         patch.object(requirements, "device_reasons", return_value=[]),
         patch.object(requirements, "toolchain_reasons", return_value=[]),
+        patch.object(envs.SGLANG_RAGGED_VERIFY_MODE, "get", return_value=ragged),
     ):
         return requirements.disable_reasons(server_args, model_config)
 
@@ -74,6 +80,17 @@ def test_the_documented_setup_is_accepted():
         (dict(dtype="torch.float16"), "dtype 'float16'"),
         (dict(hf=dict(hidden_size=7168)), "config.hidden_size 7168"),
         (dict(hf=dict(model_type="deepseek_v4")), "config.model_type"),
+        (dict(enable_deterministic_inference=True), "deterministic inference"),
+        (dict(enable_hisparse=True), "hierarchical sparse attention"),
+        (dict(ragged="dynamic"), "SGLANG_RAGGED_VERIFY_MODE 'dynamic'"),
+        (
+            dict(
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(backend="breakable")
+                )
+            ),
+            "decode CUDA graphs 'breakable'",
+        ),
     ],
 )
 def test_each_refusal_names_its_reason(kw, want):

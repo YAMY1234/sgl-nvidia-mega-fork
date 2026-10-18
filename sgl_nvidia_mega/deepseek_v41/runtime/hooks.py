@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The megakernel's two hooks into SGLang (registered by ``sgl_nvidia_mega.plugin``).
+"""The megakernel's hook into SGLang (registered by ``sgl_nvidia_mega.plugin``).
 
-``after_load_model`` runs when a model runner has loaded its model: for the
-DeepSeek-V4.1 target it checks the setup on every rank, then builds the executor
-before SGLang sizes the KV cache. ``around_forward`` wraps the target's ``forward``:
-a covered step runs the executor, every other step SGLang's own forward.
+``after_initialize`` runs once a model runner has loaded and prepared its model
+(after the post-load transforms, before SGLang sizes the KV cache). For the
+DeepSeek-V4.1 target it checks the setup on every rank, builds the executor, and
+installs the megakernel's forward on that model instance only: a covered step runs
+the executor, every other step the model's own forward.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 
 import torch
@@ -22,16 +24,22 @@ SGLANG_READS = {
     "srt/model_executor/model_runner.py": ("model", "server_args", "model_config"),
     "srt/runtime_context.py": ("get_parallel", '"tp_group"'),
     "srt/distributed/parallel_state.py": ("world_size", "cpu_group"),
+    "srt/model_executor/model_runner_components/weight_updater.py": (
+        '"_derived_weight_cache_error"',
+    ),
 }
 
-# Where the built executor rides on the model (not setattr: an nn.Module attribute
-# would join the state dict)
-EXECUTOR = "_nvidia_megakernel"
+# What SGLang's weight updater reports instead of refreshing the derived state
+WEIGHT_UPDATE_ERROR = (
+    "Online weight updates are not supported with SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1: "
+    "the megakernel's buffers and captured graphs keep state derived from the weights"
+)
 
 
-def after_load_model(result, runner, *args, **kwargs):
-    """Build the megakernel for the DeepSeek-V4.1 target this runner loaded; raise on
-    every rank, with every rank's reasons, if any rank cannot serve the setup."""
+def after_initialize(result, runner, *args, **kwargs):
+    """Build and install the megakernel for the DeepSeek-V4.1 target this runner
+    prepared; raise on every rank, with every rank's reasons, if any rank cannot
+    serve the setup."""
     from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
     from sglang.srt.runtime_context import get_parallel
 
@@ -42,6 +50,8 @@ def after_load_model(result, runner, *args, **kwargs):
         return result
     reasons = requirements.disable_reasons(runner.server_args, runner.model_config)
     reasons += runtime.model_disable_reasons(model)
+    if "forward" in model.__dict__:
+        reasons.append("the model's forward is already replaced on this instance")
     group = get_parallel().tp_group
     gathered = [None] * group.world_size
     torch.distributed.all_gather_object(gathered, reasons, group=group.cpu_group)
@@ -51,20 +61,28 @@ def after_load_model(result, runner, *args, **kwargs):
             "SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1 cannot run this setup:\n  - "
             + "\n  - ".join(failed)
         )
-    model.__dict__[EXECUTOR] = runtime.build(model, runner.server_args)
+    executor = runtime.build(model, runner.server_args)
+    install(model, executor)
+    model._derived_weight_cache_error = WEIGHT_UPDATE_ERROR
+    logger.info(
+        "NVIDIA megakernel: active (DeepSeek-V4.1 verify steps of %s rows)",
+        sorted(executor.widths),
+    )
     return result
 
 
-def around_forward(original, lm, input_ids, positions, forward_batch, *args, **kwargs):
-    """The executor for a covered step, else SGLang's ``forward``."""
-    executor = lm.__dict__.get(EXECUTOR)
-    step = (
-        None
-        if executor is None
-        else executor.plan(input_ids, forward_batch, *args, **kwargs)
-    )
-    if step is None:
-        return original(lm, input_ids, positions, forward_batch, *args, **kwargs)
-    return executor.forward(
-        step, original, input_ids, positions, forward_batch, *args, **kwargs
-    )
+def install(model, executor) -> None:
+    """Replace ``model.forward`` on this instance: a step ``executor.plan`` covers
+    runs the executor, every other step the model's own forward."""
+    original = model.forward  # bound to this instance
+
+    @functools.wraps(original)
+    def forward(input_ids, positions, forward_batch, *args, **kwargs):
+        step = executor.plan(input_ids, forward_batch, *args, **kwargs)
+        if step is None:
+            return original(input_ids, positions, forward_batch, *args, **kwargs)
+        return executor.forward(
+            step, original, input_ids, positions, forward_batch, *args, **kwargs
+        )
+
+    model.forward = forward

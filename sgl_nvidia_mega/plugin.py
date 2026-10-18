@@ -10,17 +10,13 @@ import os
 ENABLE_ENV = "SGLANG_ENABLE_NVIDIA_MEGAKERNEL"
 
 # SGLang targets the megakernel hooks, by dotted path, with the hook type and the
-# plugin function (test/unit/test_contract.py resolves each target)
+# plugin function (test/unit/test_contract.py resolves each target). The model's
+# forward is replaced per instance by the build, not on SGLang's class.
 HOOKS = (
     (
-        "sglang.srt.model_executor.model_runner.ModelRunner.load_model",
+        "sglang.srt.model_executor.model_runner.ModelRunner.initialize",
         "AFTER",
-        "sgl_nvidia_mega.deepseek_v41.runtime.hooks:after_load_model",
-    ),
-    (
-        "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.forward",
-        "AROUND",
-        "sgl_nvidia_mega.deepseek_v41.runtime.hooks:around_forward",
+        "sgl_nvidia_mega.deepseek_v41.runtime.hooks:after_initialize",
     ),
 )
 
@@ -31,7 +27,6 @@ SGLANG_READS = {
         "HookType",
         "register",
         "AFTER",
-        "AROUND",
     ),
 }
 

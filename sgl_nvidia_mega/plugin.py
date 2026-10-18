@@ -15,7 +15,11 @@ logger = logging.getLogger(__name__)
 FLAG_CLI = "--enable-nvidia-megakernel"
 
 # HF architecture -> its spec, by "module:attribute" (imported only with the flag)
-SPECS = (("DeepseekV4ForCausalLM", "sgl_nvidia_mega.deepseek_v41.spec:SPEC"),)
+SPECS = (
+    ("DeepseekV4ForCausalLM", "sgl_nvidia_mega.deepseek_v41.spec:SPEC"),
+    # the DSpark draft: SGLang's forward, the megakernel's folded proposal
+    ("DeepseekV4ForCausalLMDSpark", "sgl_nvidia_mega.deepseek_v41.draft:SPEC"),
+)
 
 # Test only: with SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1, the composition check
 # sorts the sparse attention indices in both forwards (their emission order varies)

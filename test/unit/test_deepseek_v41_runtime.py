@@ -144,6 +144,7 @@ def test_slot_selection_is_validated(monkeypatch):
     for raw, want in (
         ("moe,gatee", "unknown slot 'gatee'"),
         ("gate", "needs slot 'moe'"),
+        ("draft_lm_head", "needs slot 'markov'"),
     ):
         monkeypatch.setattr(runtime, "SLOTS", frozenset(raw.split(",")))
         assert any(want in r for r in runtime.slot_reasons()), raw

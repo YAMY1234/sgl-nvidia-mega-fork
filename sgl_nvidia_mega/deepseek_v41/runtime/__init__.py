@@ -11,7 +11,7 @@ import os
 import msgspec
 
 # The kernel slots this package ships; with the megakernel on, all of them run
-SHIPPED_SLOTS = ("hop_a", "moe", "gate")
+SHIPPED_SLOTS = ("hop_a", "moe", "gate", "markov", "draft_lm_head")
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -35,6 +35,8 @@ def slot_reasons() -> list[str]:
     ]
     if "gate" in SLOTS and "moe" not in SLOTS:
         reasons.append(f"{SLOTS_ENV}: slot 'gate' needs slot 'moe'")
+    if "draft_lm_head" in SLOTS and "markov" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'draft_lm_head' needs slot 'markov'")
     return reasons
 
 
@@ -130,7 +132,8 @@ def build(model, ctx):
         and any(slot.gate for slot in getattr(bound["moe"], "slots", {}).values()),
     }
     # every package's build agrees across ranks, so this raises on every rank alike
-    missing = sorted(name for name in SLOTS if not built[name])
+    # the draft's slots (markov, draft_lm_head) build with the draft spec
+    missing = sorted(name for name in SLOTS & built.keys() if not built[name])
     if missing:
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built at no width "

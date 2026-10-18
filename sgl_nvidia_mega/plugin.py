@@ -30,7 +30,13 @@ TEST_HOOKS = (
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/megakernels/spec.py": ("register", "register(architecture)", "register(path)"),
+    # the entry point name pyproject.toml declares (test/unit/test_plugin.py)
+    "srt/megakernels/spec.py": (
+        '"nvidia_megakernel"',
+        "register",
+        "register(architecture)",
+        "register(path)",
+    ),
     "srt/plugins/hook_registry.py": ("HookRegistry", "HookType", "register", "AROUND"),
 }
 

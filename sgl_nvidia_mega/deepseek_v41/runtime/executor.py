@@ -41,7 +41,17 @@ logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/megakernels/spec.py": ("Step", "mode", "rows"),
+    # Step, and the BuiltMegakernel members SGLang reads
+    "srt/megakernels/spec.py": (
+        "Step",
+        "mode",
+        "rows",
+        "widths",
+        "draft_sampler",
+        "summary",
+        "plan",
+        "forward",
+    ),
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
     "srt/layers/layer_boundary/adapters/attention.py": (
         "get_attn_tp_context",

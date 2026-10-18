@@ -35,3 +35,21 @@ def test_the_parity_sort_hook_registers_only_for_its_test(hooks, monkeypatch):
     monkeypatch.setenv(plugin.PARITY_SORT_ENV, "1")
     plugin.register()
     assert hooks == [target for target, _, _ in plugin.TEST_HOOKS]
+
+
+def test_the_entry_point_is_the_one_sglang_checks():
+    import tomllib
+    from pathlib import Path
+
+    project = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text())
+    entry_points = project["project"]["entry-points"]["sglang.srt.plugins"]
+    assert entry_points == {registry.ENTRY_POINT: "sgl_nvidia_mega.plugin:register"}
+
+
+def test_an_sglang_without_the_framework_registers_nothing(hooks, monkeypatch, caplog):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "sglang.srt.megakernels.spec", None)
+    plugin.register()
+    assert registry._REGISTRY == {} and hooks == []
+    assert "has no sglang.srt.megakernels" in caplog.text

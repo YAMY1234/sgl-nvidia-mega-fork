@@ -1,20 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The DeepSeek-V4.1 spec through SGLang's startup checks on CPU: the documented
-setup passes, and every other setup is refused with each reason named."""
+"""The DeepSeek-V4.1 spec through SGLang's startup checks on CPU, as the plugin
+registers it: the documented setup passes, and every other setup is refused at
+argument resolution with each reason named."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from sglang.srt.environ import envs
 from sglang.srt.megakernels import guards
-from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
+from sglang.srt.megakernels import spec as registry
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    default_cuda_graph_config,
+    with_phase,
+)
 from sglang.srt.server_args import ServerArgs
 
-from sgl_nvidia_mega.deepseek_v41 import HF_CONFIG, plan, spec
+from sgl_nvidia_mega import plugin
+from sgl_nvidia_mega.deepseek_v41 import HF_CONFIG, plan, runtime, spec
 
 DOCUMENTED = dict(
     model_path="dummy",
+    enable_nvidia_megakernel=True,
     tp_size=4,
     kv_cache_dtype="fp8_e4m3",
     speculative_algorithm="DSPARK",
@@ -24,24 +34,42 @@ DOCUMENTED = dict(
 )
 
 
-def _reasons(hf=None, **args):
+@pytest.fixture(autouse=True)
+def registered(monkeypatch):
+    monkeypatch.setattr(registry, "_REGISTRY", {})
+    monkeypatch.delenv(plugin.PARITY_SORT_ENV, raising=False)
+    plugin.register()
+
+
+def _refusal(hf=None, dtype="bfloat16", isa="sm_103", **args) -> str:
+    """SGLang's resolution step on these arguments: "" when it accepts them, else
+    its error message."""
     hf_config = SimpleNamespace(
         architectures=[spec.ARCHITECTURE],
         **{**HF_CONFIG, "model_type": "deepseek_v41", **(hf or {})},
     )
     with (
-        patch.object(guards, "find_spec", return_value=(spec.SPEC, "")),
+        patch.object(guards, "plugin_reasons", return_value=[]),
+        patch.object(guards, "device_isa", return_value=isa),
+        patch.object(guards, "model_config_of") as model_config,
         patch.object(spec, "flashinfer_ll_gemm_digest", return_value=None),
-        patch("importlib.util.find_spec", return_value=object()),
+        patch.object(spec.importlib.util, "find_spec", return_value=object()),
     ):
-        _, reasons = guards.megakernel_disable_reasons(
-            cfg=ServerArgs(**{**DOCUMENTED, **args}), hf_config=hf_config, isa="sm_103"
-        )
-    return reasons
+        model_config.return_value = SimpleNamespace(hf_config=hf_config, dtype=dtype)
+        try:
+            guards.handle_nvidia_megakernel(ServerArgs(**{**DOCUMENTED, **args}))
+        except ValueError as e:
+            return str(e)
+    return ""
 
 
 def test_the_documented_setup_is_accepted():
-    assert _reasons() == []
+    assert _refusal() == ""
+
+
+BREAKABLE = with_phase(
+    default_cuda_graph_config(), Phase.DECODE, backend=Backend.BREAKABLE
+)
 
 
 @pytest.mark.parametrize(
@@ -51,16 +79,38 @@ def test_the_documented_setup_is_accepted():
         (dict(pp_size=2), "pipeline parallelism is in use"),
         (dict(kv_cache_dtype="auto"), "kv_cache_dtype 'auto'"),
         (dict(speculative_algorithm="EAGLE"), "speculative_algorithm 'EAGLE'"),
+        (dict(speculative_algorithm=None), "speculative_algorithm None"),
         (dict(dsv4_attn_backend="flashmla_mega"), "dsv4_attn_backend 'flashmla_mega'"),
         (dict(moe_a2a_backend="deepep"), "moe_a2a_backend 'deepep'"),
         (dict(enable_encoder_swa_bounded_replay=True), "enable_encoder_swa_bounded"),
+        (
+            dict(startup_weight_load_mode="overlap"),
+            "startup_weight_load_mode 'overlap'",
+        ),
+        (dict(cuda_graph_config=BREAKABLE), "decode CUDA graphs"),
         (dict(hf=dict(hidden_size=7168)), "config.hidden_size 7168"),
         (dict(hf=dict(model_type="deepseek_v4")), "config.model_type"),
+        (dict(dtype="float16"), "dtype 'float16'"),
+        (dict(isa="sm_100"), "not sm_100"),
     ],
 )
 def test_each_refusal_names_its_reason(kw, want):
-    reasons = _reasons(**kw)
-    assert any(want in r for r in reasons), (want, reasons)
+    assert want in _refusal(**kw)
+
+
+def test_ragged_verify_is_refused():
+    with envs.SGLANG_RAGGED_VERIFY_MODE.override("dynamic"):
+        assert "SGLANG_RAGGED_VERIFY_MODE" in _refusal()
+
+
+def test_a_bad_slot_list_is_refused_before_the_load(monkeypatch):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"gate"}))
+    assert "slot 'gate' needs slot 'moe'" in _refusal()
+
+
+def test_every_reason_is_listed_at_once():
+    message = _refusal(tp_size=8, kv_cache_dtype="auto", pp_size=2)
+    assert message.count("\n  - ") == 3, message
 
 
 def test_the_toolchain_reasons_name_what_is_missing():

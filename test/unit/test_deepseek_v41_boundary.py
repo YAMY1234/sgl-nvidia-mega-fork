@@ -14,6 +14,8 @@ mhc = pytest.importorskip("sglang.srt.models.deepseek_v4_mhc")
 from sgl_nvidia_mega.deepseek_v41.boundary.boundaries import Boundaries  # noqa: E402
 
 ROWS, HC, HIDDEN = 6, 4, 8
+# the fixture stubs defers_sum; the tests of its two-shot widths restore this one
+REAL_DEFERS_SUM = Boundaries.defers_sum
 
 
 def _layer(layer_id, *, engram=None, mxfp8=True):
@@ -23,6 +25,8 @@ def _layer(layer_id, *, engram=None, mxfp8=True):
         engram=engram,
         boundary_mhc_fusions=True,
         boundary_pre_from_prev=True,
+        _can_fuse_attn_mhc=True,
+        _can_fuse_ffn_mhc=True,
         hc_stats_stream=object(),
         hc_cfg=SimpleNamespace(hidden=HIDDEN),
         attn_hc=SimpleNamespace(name=f"attn{layer_id}"),
@@ -216,4 +220,144 @@ def test_hop_a_collects_a_published_partial_with_sglangs_triplet_and_norm(fake):
     b.post(layers[0], "ffn", object(), st)
     b.pre(layers[0], "attn", st, object())
     b.post(layers[0], "attn", torch.randn(ROWS, HIDDEN), st)
+    fake.run_attn_post.assert_called_once()
+
+
+def _deferred(rows, *, replicated=False):
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        FlashInferTrtllmDeferredFinalizeOutput,
+    )
+    from sglang.srt.models.deepseek_v2 import MoEOutput
+
+    routed = FlashInferTrtllmDeferredFinalizeOutput(
+        torch.ones(rows * 6, HIDDEN), torch.ones(rows, 6), torch.zeros(rows, 6), 6
+    )
+    return MoEOutput(routed, torch.ones(rows, HIDDEN), None, 1.0, replicated)
+
+
+def _hop_boundary(fake, rows, **kw):
+    """A boundary at ``rows`` with SGLang's triplet and next-input types real."""
+    triplet = (torch.ones(rows, HC), torch.ones(rows, HC), torch.ones(rows, HC, HC))
+    fake.mix_stats.return_value = triplet
+    fake.HcNormed, fake.HcQuantized = mhc.HcNormed, mhc.HcQuantized
+    fake.is_deferred_finalize = mhc.is_deferred_finalize
+    layers = [_layer(0), _layer(1)]
+    with patch("sglang.srt.models.deepseek_v4_mhc", fake):
+        b = Boundaries(layers, **kw)
+    norm = SimpleNamespace(weight=torch.ones(HIDDEN), variance_epsilon=1e-6)
+    b._ffn_next[0] = SimpleNamespace(norm=norm)
+    return b, layers, triplet, norm
+
+
+@pytest.mark.parametrize(
+    "receiver,rows",
+    [("closed", 64), ("unfusable", 64), ("normed", 64), ("mxfp8", 64), ("mxfp8", 192)],
+)
+def test_two_shot_runs_both_posts_and_builds_sglangs_next_input(fake, receiver, rows):
+    """Both posts take the two-shot hop; the MoE post hands on what SGLang's
+    post would: MXFP8 only where its fused quant runs (up to 128 rows), else the
+    streams only, for the next combine to collapse."""
+    updated, normed = torch.zeros(rows, HC, HIDDEN), torch.ones(rows, HIDDEN)
+    hop = SimpleNamespace(
+        fits=lambda r, h: r >= 49 and h == HIDDEN,
+        attn_post=Mock(return_value=(updated, normed)),
+        moe_post=Mock(return_value=(updated, normed)),
+        moe_post_only=Mock(return_value=updated),
+        scale_bytes=lambda r: 160 * 128,
+    )
+    with patch.object(Boundaries, "defers_sum", REAL_DEFERS_SUM):
+        b, layers, triplet, norm = _hop_boundary(fake, rows, two_shot=hop)
+        assert b.defers_sum(layers[0], "attn", rows)
+        assert b.defers_sum(layers[0], "ffn", rows)
+    pre, post_mix, comb = triplet
+    streams = torch.randn(rows, HC, HIDDEN)
+    st = b.start(streams)
+    b.pre(layers[0], "attn", st, object())
+    partial = torch.randn(rows, HIDDEN)
+    with patch.object(torch.cuda, "current_stream"):
+        b.post(layers[0], "attn", partial, st)
+    assert hop.attn_post.call_args.args == (
+        partial,
+        streams,
+        post_mix,
+        comb,
+        pre,
+        norm.weight,
+        1e-6,
+    )
+    assert isinstance(st.hc.input, mhc.HcNormed)
+    fake.run_attn_post.assert_not_called()
+
+    b._attn_next[0] = {
+        "closed": None,
+        "unfusable": SimpleNamespace(norm=norm, norm_fusable=False, accepts_mxfp8=True),
+        "normed": SimpleNamespace(norm=norm, norm_fusable=True, accepts_mxfp8=False),
+        "mxfp8": SimpleNamespace(norm=norm, norm_fusable=True, accepts_mxfp8=True),
+    }[receiver]
+    b.pre(layers[0], "ffn", st, object())
+    out = _deferred(rows)
+    with patch.object(torch.cuda, "current_stream"):
+        b.post(layers[0], "ffn", out, st)
+    fake.run_moe_post.assert_not_called()
+    if receiver != "mxfp8" or rows > 128:
+        assert hop.moe_post_only.call_args.args[4] is out.shared
+        assert st.hc.input is None
+        hop.moe_post.assert_not_called()
+    else:
+        q, sf = hop.moe_post.call_args.kwargs["mxfp8_out"]
+        assert q.shape == (rows, HIDDEN) and sf.numel() == 160 * 128
+        assert st.hc.input.swizzled.data is q
+
+
+def test_hop_b_takes_the_moe_post_only_where_sglang_would_fuse_it(fake):
+    """Hop B mirrors SGLang's one-shot post at hop-A widths: MXFP8 only for an
+    MXFP8 receiver whose norm folds, else the streams; a replicated shared expert
+    stays on SGLang's post (the finalize would add it on every rank)."""
+    rows = 6
+    updated = torch.zeros(rows, HC, HIDDEN)
+    hop_a = SimpleNamespace(
+        rows=(6,),
+        published=lambda t: False,
+        finalize=Mock(return_value=(updated, torch.ones(rows, HIDDEN))),
+    )
+    b, layers, triplet, norm = _hop_boundary(fake, rows, hop_a=hop_a, hop_b=True)
+    fused = SimpleNamespace(norm=norm, norm_fusable=True, accepts_mxfp8=True)
+    st = b.start(torch.randn(rows, HC, HIDDEN))
+    for nxt, quant in ((None, False), (fused, True)):
+        b._attn_next[0] = nxt
+        b.pre(layers[0], "ffn", st, object())
+        with patch.object(torch.cuda, "current_stream"):
+            b.post(layers[0], "ffn", _deferred(rows), st)
+        call = hop_a.finalize.call_args
+        assert ("mxfp8_out" in call.kwargs) is quant
+        assert (
+            isinstance(st.hc.input, mhc.HcQuantized) if quant else st.hc.input is None
+        )
+    fake.run_moe_post.assert_not_called()
+    b.pre(layers[0], "ffn", st, object())
+    b.post(layers[0], "ffn", _deferred(rows, replicated=True), st)
+    fake.run_moe_post.assert_called_once()
+
+
+def test_two_shot_needs_sglangs_static_fusion_gate(fake):
+    """A layer SGLang would not fuse keeps SGLang's post at two-shot widths."""
+    hop = SimpleNamespace(fits=lambda r, h: True, attn_post=Mock())
+    with patch.object(Boundaries, "defers_sum", REAL_DEFERS_SUM):
+        b, layers, _, _ = _hop_boundary(fake, 64, two_shot=hop)
+        layers[0]._can_fuse_attn_mhc = False
+        with patch(
+            "sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe.can_fuse_all_reduce",
+            return_value=False,
+        ):
+            assert not b.defers_sum(layers[0], "attn", 64)
+    st = b.start(torch.randn(64, HC, HIDDEN))
+    b.pre(layers[0], "attn", st, object())
+    with patch(
+        "sglang.srt.runtime_context.get_parallel",
+        return_value=SimpleNamespace(
+            attn_tp_group=SimpleNamespace(all_reduce=lambda t: t)
+        ),
+    ):
+        b.post(layers[0], "attn", torch.randn(64, HIDDEN), st)
+    hop.attn_post.assert_not_called()
     fake.run_attn_post.assert_called_once()

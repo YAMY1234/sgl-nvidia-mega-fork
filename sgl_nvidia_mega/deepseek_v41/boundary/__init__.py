@@ -18,6 +18,7 @@ layers.
 from __future__ import annotations
 
 import msgspec
+import torch
 
 from sgl_nvidia_mega.deepseek_v41.boundary.boundaries import Boundaries, BoundaryState
 
@@ -53,12 +54,53 @@ def build(model, ctx, group) -> Boundaries:
     m = model.model
     hop, reason = None, "stock (slot off)"
     if "hop_a" in runtime.SLOTS:
-        hop, reason = hop_a.build(model, ctx, group)
+        hop, reason = hop_a.build(
+            model,
+            ctx,
+            group,
+            hop_b="hop_b" in runtime.SLOTS,
+            early_trigger="early_trigger" in runtime.SLOTS,
+        )
+    two_shot, two_shot_reason = None, "stock (slot off)"
+    if "two_shot" in runtime.SLOTS:
+        two_shot, two_shot_reason = _build_two_shot(model, ctx, group)
     return Boundaries(
         [m.layers[i] for i in range(m.start_layer, m.end_layer)],
         hop_a=hop,
         hop_a_reason=reason,
+        two_shot=two_shot,
+        two_shot_reason=two_shot_reason,
+        hop_b="hop_b" in runtime.SLOTS,
     )
+
+
+def _build_two_shot(model, ctx, group):
+    """(the two-shot hops, "") or (None, why not); a failure on any rank raises
+    on every rank."""
+    from sgl_nvidia_mega.deepseek_v41.sm103.two_shot_mhc import MAX_ROWS, TwoShotMHC
+
+    cfg, m = model.config, model.model
+    error, hop = "", None
+    try:
+        hop = TwoShotMHC(
+            hidden_size=cfg.hidden_size,
+            hc_mult=cfg.hc_mult,
+            max_num_tokens=MAX_ROWS,
+            top_k=cfg.num_experts_per_tok,
+            device=m.layers[m.start_layer].self_attn.wo_b.weight.device,
+            group=group.device_group,
+            deadline_s=ctx.deadline_s,
+        )
+    except Exception as e:  # gathered, then raised on every rank
+        error = f"{type(e).__name__}: {e}"
+    errors = [None] * group.world_size
+    torch.distributed.all_gather_object(errors, error, group=group.cpu_group)
+    failed = [f"rank {r}: {e}" for r, e in enumerate(errors) if e]
+    if failed:
+        raise RuntimeError(
+            "NVIDIA megakernel: the two-shot build failed: " + "; ".join(failed)
+        )
+    return hop, ""
 
 
 def _state(st) -> BoundaryState:

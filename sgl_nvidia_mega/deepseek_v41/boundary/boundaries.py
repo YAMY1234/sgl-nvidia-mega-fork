@@ -3,7 +3,9 @@
 # Adapted from SGLang (Apache-2.0, SGLang Team):
 # python/sglang/srt/models/deepseek_v4_mhc.py and deepseek_v4_boundary.py (the decode stage boundaries).
 """The mHC boundaries of a covered step: SGLang's stock decode boundary, with
-hop A's Lamport collect as the attention post where wo_b published.
+hop A's Lamport collect as the attention post where wo_b published, the
+two-shot hops as both posts from 49 rows, and hop B (the Lamport MoE finalize)
+as the MoE post at hop-A widths.
 
 Between two sublayers, SGLang's stage boundary for DeepSeek-V4.1 with the mHC
 pre-mix carried from the previous sublayer:
@@ -18,16 +20,20 @@ pre-mix carried from the previous sublayer:
    norm, MXFP8 at up to 128 rows, after the MoE).
 
 Each step calls SGLang's own mHC functions with the arguments its stage boundary
-passes, so with hop A off the streams, inputs and coefficients are SGLang's bit
-for bit. Hop A (``hop_a.py``) replaces only the attention post's collective.
+passes, so with every hop off the streams, inputs and coefficients are SGLang's
+bit for bit. A hop replaces only a post's collective kernel: the triplet, the next
+boundary and the next input's form stay SGLang's.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import msgspec
 import torch
+
+logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads, by file under the sglang package;
 # test/unit/test_contract.py pins them.
@@ -39,6 +45,11 @@ SGLANG_READS = {
         "use_stats_stream",
         "mix_stats",
         "HcNormed",
+        "HcQuantized",
+        "is_deferred_finalize",
+        "norm",
+        "norm_fusable",
+        "accepts_mxfp8",
         "fork_stats_stream",
         "combine",
         "run_attn_post",
@@ -67,7 +78,20 @@ SGLANG_READS = {
         "mhc",
     ),
     "srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py": ("can_fuse_all_reduce",),
-    "srt/models/deepseek_v2.py": ("tp_size",),
+    "srt/models/deepseek_v2.py": (
+        "tp_size",
+        "MoEOutput",
+        "routed",
+        "shared",
+        "shared_is_replicated",
+    ),
+    "srt/layers/quantization/mxfp8_input.py": ("Mxfp8SwizzledInput",),
+    "srt/layers/moe/moe_runner/flashinfer_trtllm.py": (
+        "gemm2_out",
+        "expanded_idx_to_permuted_idx",
+        "expert_weights",
+        "top_k",
+    ),
     "srt/runtime_context.py": ("get_parallel", '"attn_tp_group"'),
 }
 
@@ -94,7 +118,15 @@ class Boundaries:
     model: each layer's next-sublayer boundaries are load-time facts."""
 
     def __init__(
-        self, layers, *, cross_layer: bool = True, hop_a=None, hop_a_reason=""
+        self,
+        layers,
+        *,
+        cross_layer: bool = True,
+        hop_a=None,
+        hop_a_reason: str = "",
+        two_shot=None,
+        two_shot_reason: str = "",
+        hop_b: bool = False,
     ):
         from sglang.srt.models import deepseek_v4_mhc as mhc
 
@@ -102,6 +134,10 @@ class Boundaries:
         self.cross_layer = cross_layer
         self.hop_a = hop_a  # hop_a.HopA, or None
         self.hop_a_reason = hop_a_reason
+        self.two_shot = two_shot  # sm103.two_shot_mhc.TwoShotMHC, or None
+        self.two_shot_reason = two_shot_reason
+        self.hop_b = hop_b and hop_a is not None  # the MoE post on hop A's mailbox
+        self._served: set = set()
         self._attn_mxfp8 = {}
         self._ffn_next = {}  # the attention post's next: the FFN norm
         self._attn_next = {}  # the next layer's attention boundary (None: closed)
@@ -179,6 +215,9 @@ class Boundaries:
             if self.hop_a is not None and self.hop_a.published(partial):
                 st.hc = self._collect_hop_a(layer, partial, opened)
                 return
+            if self._two_shot_fits(partial.shape[0], layer, kind):
+                st.hc = self._two_shot_attn(layer, partial, opened)
+                return
             if self.defers_sum(layer, kind, partial.shape[0]):
                 out = mhc.AttnOutput(partial)
             else:
@@ -196,7 +235,21 @@ class Boundaries:
                 precomputed=opened.stats,
             )
             return
+        from sglang.srt.models.deepseek_v2 import MoEOutput
+
         nxt = self._attn_next[layer.layer_id] if self.cross_layer else None
+        if isinstance(partial, MoEOutput) and mhc.is_deferred_finalize(partial.routed):
+            rows = partial.routed.expert_weights.shape[0]
+            # the two-shot adds a TP-partial shared expert before the sum
+            if (
+                self._two_shot_fits(rows, layer, kind)
+                and not partial.shared_is_replicated
+            ):
+                st.hc = self._two_shot_moe(layer, partial, opened, nxt)
+                return
+            if self._hop_b_takes(rows, partial):
+                st.hc = self._hop_b_moe(layer, partial, opened, nxt)
+                return
         st.hc = mhc.run_moe_post(
             layer.ffn_hc,
             partial,
@@ -212,15 +265,19 @@ class Boundaries:
         into the mailbox; None when hop A is off or its GEMM cannot take them."""
         return None if self.hop_a is None else self.hop_a.publish_wo_b(wo_b, o)
 
+    def _triplet(self, hc, opened):
+        """(pre, post, comb) as SGLang's post computes them: on the stats stream
+        beside the sublayer, joined before the post reads them."""
+        coefficients = self._mhc.mix_stats(hc, opened.streams, opened.stats_stream)
+        if opened.stats_stream is not None:
+            torch.cuda.current_stream().wait_stream(opened.stats_stream)
+        return coefficients
+
     def _collect_hop_a(self, layer, partial, opened):
         """``run_attn_post`` with the Lamport collect in place of SGLang's fused
         collective: the same triplet on the stats stream and the same FFN norm."""
         mhc = self._mhc
-        pre, post_mix, comb = mhc.mix_stats(
-            layer.attn_hc, opened.streams, opened.stats_stream
-        )
-        if opened.stats_stream is not None:
-            torch.cuda.current_stream().wait_stream(opened.stats_stream)
+        pre, post_mix, comb = self._triplet(layer.attn_hc, opened)
         norm = self._ffn_next[layer.layer_id].norm
         updated, normed = self.hop_a.collect(
             partial,
@@ -233,23 +290,115 @@ class Boundaries:
         )
         return mhc.HcState(updated, pre, mhc.HcNormed(normed))
 
-    @staticmethod
-    def defers_sum(layer, kind: str, rows: int) -> bool:
-        """Whether SGLang's transport leaves this sublayer's TP sum to the fused
-        post at ``rows`` (the MoE then returns its finalize deferred)."""
+    def defers_sum(self, layer, kind: str, rows: int) -> bool:
+        """Whether the sublayer leaves its TP sum to the post at ``rows`` (the MoE
+        then returns its finalize deferred): SGLang's transport check, or a
+        two-shot width."""
         from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
             can_fuse_all_reduce,
         )
 
-        fusable = (
-            layer._can_fuse_attn_mhc if _attention(kind) else layer._can_fuse_ffn_mhc
+        return _fusable(layer, kind) and (
+            self._two_shot_fits(rows, layer, kind)
+            or can_fuse_all_reduce(rows, layer.hc_cfg.hidden)
+        )
+
+    def _two_shot_fits(self, rows: int, layer, kind: str) -> bool:
+        return (
+            self.two_shot is not None
+            and self.two_shot.fits(rows, layer.hc_cfg.hidden)
+            and _fusable(layer, kind)
+        )
+
+    def summary(self) -> str:
+        """The hops this boundary built, for the startup line."""
+        hop_a = f"at {list(self.hop_a.rows)} rows" if self.hop_a else "off"
+        two_shot = (
+            f"at {MIN_TWO_SHOT_ROWS}-{self.two_shot.capacity} rows"
+            if self.two_shot
+            else "off"
         )
         return (
-            layer.boundary_mhc_fusions
-            and layer.boundary_pre_from_prev
-            and fusable
-            and can_fuse_all_reduce(rows, layer.hc_cfg.hidden)
+            f"hop A {hop_a} ({self.hop_a_reason or 'built'}); "
+            f"hop B {'on' if self.hop_b else 'off'}; "
+            f"two-shot {two_shot} ({self.two_shot_reason or 'built'})"
         )
+
+    def _log_served(self, hop: str, rows: int) -> None:
+        # engagement, from the step itself: once per (hop, width) on every rank
+        if (hop, rows) not in self._served:
+            self._served.add((hop, rows))
+            logger.info("NVIDIA megakernel: %s serves %d rows", hop, rows)
+
+    def _two_shot_attn(self, layer, partial, opened):
+        self._log_served("two-shot attention post", partial.shape[0])
+        mhc = self._mhc
+        pre, post_mix, comb = self._triplet(layer.attn_hc, opened)
+        norm = self._ffn_next[layer.layer_id].norm
+        updated, normed = self.two_shot.attn_post(
+            partial,
+            opened.streams,
+            post_mix,
+            comb,
+            pre,
+            norm.weight,
+            norm.variance_epsilon,
+        )
+        return mhc.HcState(updated, pre, mhc.HcNormed(normed))
+
+    def _two_shot_moe(self, layer, out, opened, nxt):
+        """The two-shot MoE post; the next input as SGLang's MoE post builds it:
+        MXFP8 where its fused quant would (an MXFP8 receiver whose norm folds, at
+        up to 128 rows), else the streams only."""
+        self._log_served("two-shot MoE post", out.routed.expert_weights.shape[0])
+        mhc = self._mhc
+        pre, post_mix, comb = self._triplet(layer.ffn_hc, opened)
+        r = out.routed
+        args = (r.gemm2_out, r.expanded_idx_to_permuted_idx, r.expert_weights, r.top_k)
+        args += (out.shared, opened.streams, post_mix, comb)
+        rows = r.expert_weights.shape[0]
+        if not (nxt is not None and _quantizes(nxt, rows)):
+            return mhc.HcState(self.two_shot.moe_post_only(*args), pre)
+        norm = (pre, nxt.norm.weight, nxt.norm.variance_epsilon)
+        q, sf = _mxfp8_buffers(
+            r.expert_weights, opened.streams, self.two_shot.scale_bytes
+        )
+        updated, normed = self.two_shot.moe_post(*args, *norm, mxfp8_out=(q, sf))
+        return mhc.HcState(updated, pre, _quantized(normed, q, sf))
+
+    def _hop_b_takes(self, rows: int, out) -> bool:
+        # the Lamport finalize adds a TP-partial shared expert before the sum
+        return (
+            self.hop_b
+            and rows in self.hop_a.rows
+            and out.shared is not None
+            and not out.shared_is_replicated
+        )
+
+    def _hop_b_moe(self, layer, out, opened, nxt):
+        """Hop B: the Lamport MoE finalize; the next input as SGLang's post builds
+        it at these widths: MXFP8 for an MXFP8 receiver whose norm folds, else the
+        streams only."""
+        from sgl_nvidia_mega.deepseek_v41.sm103.all_reduce_mhc import mxfp8_scale_bytes
+
+        self._log_served("hop B MoE post", out.routed.expert_weights.shape[0])
+        mhc = self._mhc
+        pre, post_mix, comb = self._triplet(layer.ffn_hc, opened)
+        r = out.routed
+        rows = r.expert_weights.shape[0]
+        args = (r.gemm2_out, r.expert_weights, r.expanded_idx_to_permuted_idx)
+        args += (out.shared, opened.streams, post_mix, comb)
+        if not (nxt is not None and _quantizes(nxt, rows)):
+            updated, _ = self.hop_a.finalize(*args, None, None, 0.0)
+            return mhc.HcState(updated, pre)
+        hidden = opened.streams.shape[-1]
+        q, sf = _mxfp8_buffers(
+            r.expert_weights, opened.streams, lambda m: mxfp8_scale_bytes(m, hidden)
+        )
+        updated, normed = self.hop_a.finalize(
+            *args, pre, nxt.norm.weight, nxt.norm.variance_epsilon, mxfp8_out=(q, sf)
+        )
+        return mhc.HcState(updated, pre, _quantized(normed, q, sf))
 
     @staticmethod
     def residual(st: BoundaryState) -> torch.Tensor:
@@ -259,6 +408,36 @@ class Boundaries:
     def with_residual(self, st: BoundaryState, streams: torch.Tensor) -> None:
         """Replace the streams (an Engram injection); the pre-mix survives."""
         st.hc = st.hc.with_residual(streams)
+
+
+# SGLang's fused MoE post quantizes the next input up to one 128-row scale tile
+SGLANG_QUANT_MAX_ROWS = 128
+MIN_TWO_SHOT_ROWS = 49
+
+
+def _quantizes(nxt, rows: int) -> bool:
+    return nxt.accepts_mxfp8 and nxt.norm_fusable and rows <= SGLANG_QUANT_MAX_ROWS
+
+
+def _fusable(layer, kind: str) -> bool:
+    """The static half of SGLang's fusion gate (load-time facts of the layer)."""
+    fusable = layer._can_fuse_attn_mhc if _attention(kind) else layer._can_fuse_ffn_mhc
+    return layer.boundary_mhc_fusions and layer.boundary_pre_from_prev and fusable
+
+
+def _mxfp8_buffers(weights, streams, scale_bytes):
+    """Empty [rows, hidden] E4M3 values and swizzled 128x4 UE8M0 scales."""
+    rows, hidden = weights.shape[0], streams.shape[-1]
+    q = torch.empty((rows, hidden), dtype=torch.float8_e4m3fn, device=streams.device)
+    sf = torch.empty(scale_bytes(rows), dtype=torch.uint8, device=streams.device)
+    return q, sf
+
+
+def _quantized(normed, q, sf):
+    from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+    from sglang.srt.models import deepseek_v4_mhc as mhc
+
+    return mhc.HcQuantized(normed, Mxfp8SwizzledInput(q, sf))
 
 
 def _attention(kind: str) -> bool:

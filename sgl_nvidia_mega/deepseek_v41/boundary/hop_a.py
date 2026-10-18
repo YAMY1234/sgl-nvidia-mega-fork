@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Hop A: wo_b publishes its rows into a Lamport mailbox on every rank, and the
-attention post collects them with the all-reduce + mHC post + FFN norm fused."""
+attention post collects them with the all-reduce + mHC post + FFN norm fused.
+Hop B reuses the mailbox for the MoE post (the Lamport MoE finalize)."""
 
 from __future__ import annotations
 
@@ -36,15 +37,23 @@ class HopA:
             partial, residual, post_mix, comb, pre, norm_weight, eps
         )
 
+    def finalize(self, *args, mxfp8_out=None):
+        """Hop B: ``AllReduceMHC.finalize`` of a deferred MoE output on this mailbox."""
+        return self._runner.hop.finalize(*args, mxfp8_out=mxfp8_out)
+
     def check_consumed(self) -> None:
         """Raise on the host if a publish was not collected: it would leave the
         mailbox generation it wrote dirty."""
         self._runner.check_consumed()
 
 
-def build(model, ctx, group) -> tuple[Optional[HopA], str]:
+def build(
+    model, ctx, group, *, hop_b: bool = False, early_trigger: bool = False
+) -> tuple[Optional[HopA], str]:
     """(the hop, "") or (None, why not). Collective over the TP group: a failure on
-    any rank raises on every rank; an unsupported wo_b leaves the hop off."""
+    any rank raises on every rank; an unsupported wo_b leaves the hop off. ``hop_b``
+    also compiles the MoE finalize's consumers; ``early_trigger`` launches the
+    consumer's dependents right after its poll."""
     from sgl_nvidia_mega.deepseek_v41.sm103.runner import Runner
 
     m = model.model
@@ -63,6 +72,8 @@ def build(model, ctx, group) -> tuple[Optional[HopA], str]:
             top_k=cfg.num_experts_per_tok,
             hop_a_rows=slot_plan.HOP_A_MAX_ROWS,
             deadline_s=ctx.deadline_s,
+            hop_b=hop_b,
+            early_trigger=early_trigger,
         )
         taken = tuple(runner.precompile_publish(wo_b, list(rows)))
     except Exception as e:  # gathered, then raised on every rank

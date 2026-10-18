@@ -35,13 +35,13 @@ With the megakernel on, every slot above runs. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` 
 - **Built at load.** Buffers, kernels and tactics for every covered width are allocated and compiled when the model is loaded, before the KV cache is sized. Nothing is compiled or allocated inside a step.
 - **Graph-safe coverage.** A step is covered by its forward mode and row count alone, so every rank decides the same and a captured graph replays the decision made at capture.
 - **Fail-stop synchronization.** Every wait on another GPU has a deadline below SGLang's watchdog. A rank that misses it faults at address 0x0, so no token from a failed step is returned.
-- **No silent fallback.** With the switch on, an unsupported setup stops the server at startup on every rank, listing every reason.
+- **No silent fallback.** With `--enable-nvidia-megakernel`, an unsupported setup stops the server at startup, before the weights load, listing every reason; a model the loaded weights do not fit stops every rank after the load.
 
 ## Quick Start
 
 ### Requirements
 
-- SGLang main; tested with SGLang `5cbe2371a53`
+- An SGLang with the megakernels framework (`sglang.srt.megakernels`, `--enable-nvidia-megakernel`)
 - SGLang's CUDA 13 image: FlashInfer (its low-latency block-scaled GEMM as in 0.7.0 to 0.7.2), CuTe DSL (`nvidia-cutlass-dsl`) and the CUDA Python bindings
 - 4 x GB300
 
@@ -72,12 +72,12 @@ python -m sglang.launch_server \
 ```text
 sgl-nvidia-mega/
 ├── sgl_nvidia_mega/
-│   ├── plugin.py          # the switch and the hooks it registers
+│   ├── plugin.py          # registers the specs with SGLang's megakernels framework
 │   ├── common/            # NVRTC builds and PDL launches; CuTe DSL sync primitives
 │   └── deepseek_v41/
-│       ├── requirements.py  # the setups it serves; the startup refusals
+│       ├── spec.py          # the spec: the setups it serves and its build
 │       ├── plan.py          # which kernel fills each slot, per width
-│       ├── runtime/         # the hooks, the executor and its per-step state, the embedding
+│       ├── runtime/         # the build, the executor and its per-step state, the embedding
 │       ├── boundary/        # the mHC between sublayers
 │       ├── attention/       # the attention step
 │       ├── moe/             # the MoE step

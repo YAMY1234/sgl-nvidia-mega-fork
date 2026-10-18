@@ -4,10 +4,10 @@
 kernels that only make sense inside a fused step.
 
 SGLang loads the package as a general plugin (``pyproject.toml``: the
-``sglang.srt.plugins`` entry point, ``plugin.register``). With SGLang's
-``--enable-nvidia-megakernel`` flag, the megakernel builds after SGLang prepares the
-model and replaces that model's ``forward``; without the flag its hook returns at
-once. The shared CUDA runtime is in ``common``; each model's step code and kernels per
+``sglang.srt.plugins`` entry point, ``plugin.register``), which registers each model's
+spec with ``sglang.srt.megakernels``. With SGLang's ``--enable-nvidia-megakernel``
+flag, SGLang checks the setup, builds the spec after it prepares the model, and
+routes covered steps through it; without the flag nothing of the package runs. The shared CUDA runtime is in ``common``; each model's step code and kernels per
 ISA are in ``<model>/``.
 """
 

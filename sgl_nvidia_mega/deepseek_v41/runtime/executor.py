@@ -30,8 +30,8 @@ from __future__ import annotations
 import logging
 import os
 
-import msgspec
 import torch
+from sglang.srt.megakernels.spec import Step
 
 from sgl_nvidia_mega.deepseek_v41 import attention, boundary, engram, logits, moe
 from sgl_nvidia_mega.deepseek_v41.runtime import embedding
@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
+    "srt/megakernels/spec.py": ("Step", "mode", "rows"),
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
     "srt/layers/layer_boundary/adapters/attention.py": (
         "get_attn_tp_context",
@@ -86,20 +87,23 @@ PACKAGES = {
 }
 
 
-class Step(msgspec.Struct, frozen=True):
-    """A covered step: its forward mode and rows."""
-
-    mode: str
-    rows: int
-
-
 class MegakernelDecode:
     """One rank's covered steps: the model, each width's slots and each package's
     build result."""
 
-    def __init__(self, lm, slots: dict, bound: dict, widths: tuple[int, ...]):
+    # the target offers no draft sampler (BuiltMegakernel)
+    draft_sampler = None
+
+    def __init__(
+        self, lm, slots: dict, bound: dict, widths: tuple[int, ...], summary: str = ""
+    ):
         self.lm, self.slots, self.bound = lm, slots, bound
-        self.widths = frozenset(widths)
+        self.widths = tuple(sorted(widths))
+        self._summary = summary
+
+    def summary(self) -> str:
+        """What was built, for SGLang's startup line."""
+        return self._summary
 
     def plan(
         self, input_ids, forward_batch, input_embeds=None, pp_proxy_tensors=None
@@ -109,7 +113,7 @@ class MegakernelDecode:
         rows = int(input_ids.shape[0])
         if pp_proxy_tensors is not None or not mode.is_target_verify():
             return None
-        return Step(mode.name, rows) if rows in self.widths else None
+        return Step(mode="target_verify", rows=rows) if rows in self.widths else None
 
     def forward(
         self,

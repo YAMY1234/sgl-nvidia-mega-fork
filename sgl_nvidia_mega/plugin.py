@@ -1,27 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The SGLang plugin entry point: the hooks it registers and the server flag that
-turns the megakernel on."""
+"""The SGLang plugin entry point: it registers the megakernel specs with SGLang's
+``sglang.srt.megakernels``, which runs them on a server started with
+``--enable-nvidia-megakernel``."""
 
 from __future__ import annotations
 
+import logging
 import os
 
-# The switch: SGLang's server flag (a ServerArgs field); without it, or on an SGLang
-# that has no such flag, the hooks return at once and SGLang runs untouched
-FLAG = "enable_nvidia_megakernel"
+logger = logging.getLogger(__name__)
+
+# SGLang's server flag that turns the megakernel on
 FLAG_CLI = "--enable-nvidia-megakernel"
 
-# SGLang targets the megakernel hooks, by dotted path, with the hook type and the
-# plugin function (test/unit/test_contract.py resolves each target). The model's
-# forward is replaced per instance by the build, not on SGLang's class.
-HOOKS = (
-    (
-        "sglang.srt.model_executor.model_runner.ModelRunner.initialize",
-        "AFTER",
-        "sgl_nvidia_mega.deepseek_v41.runtime.hooks:after_initialize",
-    ),
-)
+# HF architecture -> its spec, by "module:attribute" (imported only with the flag)
+SPECS = (("DeepseekV4ForCausalLM", "sgl_nvidia_mega.deepseek_v41.spec:SPEC"),)
 
 # Test only: with SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1, the composition check
 # sorts the sparse attention indices in both forwards (their emission order varies)
@@ -36,23 +30,24 @@ TEST_HOOKS = (
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/plugins/hook_registry.py": (
-        "HookRegistry",
-        "HookType",
-        "register",
-        "AFTER",
-        "AROUND",
-    ),
+    "srt/megakernels/spec.py": ("register", "register(architecture)", "register(path)"),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType", "register", "AROUND"),
 }
 
 
 def register() -> None:
-    """SGLang's plugin loader calls this in every process, before any model is built.
-    The hooks act only on a server started with ``FLAG_CLI``."""
-    import pkgutil
+    """SGLang's plugin loader calls this in every process, before any model is built."""
+    try:
+        import sglang.srt.megakernels.spec as megakernels
+    except ImportError:
+        logger.warning("sgl-nvidia-mega: this SGLang has no sglang.srt.megakernels")
+        return
+    for architecture, path in SPECS:
+        megakernels.register(architecture=architecture, path=path)
+    if os.environ.get(PARITY_SORT_ENV) == "1":
+        import pkgutil
 
-    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    hooks = HOOKS + (TEST_HOOKS if os.environ.get(PARITY_SORT_ENV) == "1" else ())
-    for target, kind, hook in hooks:
-        HookRegistry.register(target, pkgutil.resolve_name(hook), HookType[kind])
+        for target, kind, hook in TEST_HOOKS:
+            HookRegistry.register(target, pkgutil.resolve_name(hook), HookType[kind])

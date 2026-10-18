@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The SGLang names this package reads and the SGLang targets it hooks, pinned on
-CPU against the installed SGLang.
+"""The SGLang names this package reads and the SGLang target its parity test hooks,
+pinned on CPU against the installed SGLang.
 
-The megakernel lives outside SGLang, so it reads SGLang by name and hooks SGLang
-functions by dotted path (``plugin.HOOKS``). Every module that imports from
+The megakernel lives outside SGLang, so it reads SGLang by name (its specs plug into
+``sglang.srt.megakernels``) and its parity test hooks one SGLang function by dotted
+path (``plugin.TEST_HOOKS``). Every module that imports from
 ``sglang`` lists what it reads in ``SGLANG_READS``. A refactor that renames one fails here, naming the file to
 repair, instead of failing at a GPU server's startup. The checks are static
 (AST): no module of this package is imported. Run it against each SGLang this
@@ -106,19 +107,13 @@ def test_sglang_provides_what_the_plugin_reads(path):
 
 
 def _hook_targets() -> list:
-    """``plugin.HOOKS`` and ``plugin.TEST_HOOKS``' SGLang targets, read from the
-    source (no import)."""
-    hooks, test_hooks = None, []
+    """``plugin.TEST_HOOKS``' SGLang targets, read from the source (no import)."""
     for node in _tree(PACKAGE / "plugin.py").body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "HOOKS" for t in node.targets
-        ):
-            hooks = [target for target, _, _ in ast.literal_eval(node.value)]
         if isinstance(node, ast.Assign) and any(
             isinstance(t, ast.Name) and t.id == "TEST_HOOKS" for t in node.targets
         ):
-            test_hooks = [target for target, _, _ in ast.literal_eval(node.value)]
-    return hooks + test_hooks
+            return [target for target, _, _ in ast.literal_eval(node.value)]
+    return []
 
 
 @pytest.mark.parametrize("target", _hook_targets())

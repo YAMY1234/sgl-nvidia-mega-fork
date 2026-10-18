@@ -38,14 +38,11 @@ class StepState:
         self.input_ids_global = input_ids_global
         self.slots = slots  # plan.Slots: which kernels fill this width's steps
         self.bound: dict[str, Any] = bound  # package -> its build() result
-        # the residual streams between sublayers, in the boundary's representation:
-        # ``hidden`` is what the next boundary call reads; ``state`` the materialized
-        # streams (residual + pre-mix) where a reader needs them (Engram, capture)
-        self.hidden: Any = None
+        # the materialized residual streams (residual + pre-mix) where a reader needs
+        # them between layers (Engram, the draft's capture); the boundary keeps them
         self.state: Any = None
         # per layer
         self.layer_id: int = -1
-        self.layer = None
         # the sublayer input's MXFP8 pair, when the boundary wrote one
         self.x_quant: Any = None
         self.transport: Any = None  # the MoE operand transport of this layer

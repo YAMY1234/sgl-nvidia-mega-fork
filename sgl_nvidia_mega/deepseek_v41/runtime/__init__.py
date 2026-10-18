@@ -137,7 +137,9 @@ def build(model, server_args):
     built = {
         "hop_a": any(s.hop_a for s in slots.values()),
         "moe": facts.routed,
-        "gate": any(s.fast_gate for s in slots.values()),
+        # the MoE build's own result: a layer's fast top-k may fail to build alone
+        "gate": any(s.fast_gate for s in slots.values())
+        and any(slot.gate for slot in getattr(bound["moe"], "slots", {}).values()),
     }
     # every package's build agrees across ranks, so this raises on every rank alike
     missing = sorted(name for name in SLOTS if not built[name])

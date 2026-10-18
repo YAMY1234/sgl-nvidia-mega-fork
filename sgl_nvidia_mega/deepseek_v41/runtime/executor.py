@@ -182,7 +182,7 @@ class MegakernelDecode:
         recorder = get_global_expert_distribution_recorder()
         for i in range(m.start_layer, m.end_layer):
             layer = m.layers[i]
-            st.layer_id, st.layer = i, layer
+            st.layer_id = i
             if layer.engram is not None or i in capture:
                 boundary.materialize(layer, st)
             if layer.engram is not None:

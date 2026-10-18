@@ -69,12 +69,12 @@ def start(st, x) -> None:
     """Open the residual streams from the broadcast embedding ``x`` [rows, hc, dim]."""
     bs = st.bound["boundary"].start(x)
     st.scratch["boundary.state"] = bs
-    st.state = st.hidden = bs.hc
+    st.state = bs.hc
 
 
 def materialize(layer, st):
     """The streams as an ``HcState`` before ``layer`` (for Engram and the capture)."""
-    st.state = st.hidden = _state(st).hc
+    st.state = _state(st).hc
     return st.state
 
 
@@ -82,7 +82,7 @@ def set_residual(st, residual) -> None:
     """Replace the materialized streams' residual (Engram's output)."""
     bs = _state(st)
     st.bound["boundary"].with_residual(bs, residual)
-    st.state = st.hidden = bs.hc
+    st.state = bs.hc
 
 
 def pre(layer, sublayer: str, st):
@@ -100,7 +100,7 @@ def post(layer, sublayer: str, out, st):
     if boundaries.hop_a is not None and sublayer == "attn":
         boundaries.hop_a.check_consumed()
     if sublayer == "ffn":
-        st.state = st.hidden = bs.hc
+        st.state = bs.hc
         return None
     x, st.x_quant = boundaries.pre(layer, "ffn", bs, st.fb)
     st.transport = MoeOperands(

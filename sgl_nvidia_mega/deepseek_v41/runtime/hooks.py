@@ -21,7 +21,13 @@ logger = logging.getLogger(__name__)
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     "srt/models/deepseek_v4.py": ("DeepseekV4ForCausalLM",),
-    "srt/model_executor/model_runner.py": ("model", "server_args", "model_config"),
+    "srt/model_executor/model_runner.py": (
+        "model",
+        "server_args",
+        "model_config",
+        "token_to_kv_pool",
+        "decode_cuda_graph_runner",
+    ),
     "srt/runtime_context.py": ("get_parallel", '"tp_group"'),
     "srt/distributed/parallel_state.py": ("world_size", "cpu_group"),
     "srt/model_executor/model_runner_components/weight_updater.py": (
@@ -53,6 +59,10 @@ def after_initialize(result, runner, *args, **kwargs):
     reasons += runtime.slot_reasons() + runtime.model_disable_reasons(model)
     if "forward" in model.__dict__:
         reasons.append("the model's forward is already replaced on this instance")
+    # the build must come before SGLang sizes the KV cache and captures the graphs
+    for late in ("token_to_kv_pool", "decode_cuda_graph_runner"):
+        if getattr(runner, late, None) is not None:
+            reasons.append(f"the model runner already has its {late}")
     group = get_parallel().tp_group
     gathered = [None] * group.world_size
     torch.distributed.all_gather_object(gathered, reasons, group=group.cpu_group)

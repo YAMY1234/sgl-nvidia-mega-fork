@@ -325,6 +325,7 @@ class _QuadFinalizePublishDeviceKernel:
         enable_pdl: bool,
         prefetch_group: int,
         fp32_weights: bool = False,
+        round_routed: bool = False,
     ) -> None:
         if hidden <= 0 or hidden % QUAD_BF16:
             raise ValueError("hidden must be a positive multiple of 4")
@@ -343,6 +344,7 @@ class _QuadFinalizePublishDeviceKernel:
         self.prefetch_group = prefetch_group
         self.prefetch_groups = (top_k + prefetch_group - 1) // prefetch_group
         self.fp32_weights = fp32_weights
+        self.round_routed = round_routed
 
     def smem_size_in_bytes(self) -> int:
         return self.top_k * 8
@@ -393,6 +395,9 @@ class _QuadFinalizePublishDeviceKernel:
         smem = cutlass.utils.SmemAllocator()
         staged_indices = smem.allocate_array(Int32, self.top_k)
         staged_weights = smem.allocate_array(Float32, self.top_k)
+        if cutlass.const_expr(self.enable_pdl):
+            # the routing metadata comes from the kernels this one depends on
+            cute.arch.griddepcontrol_wait()
         metadata_index = Int32(tidx)
         while metadata_index < Int32(self.top_k):
             element = Int64(token) * self.top_k + Int64(metadata_index)
@@ -443,9 +448,6 @@ class _QuadFinalizePublishDeviceKernel:
                     shared_values.store(
                         packed_u32x2_to_bf16x4(load_global_u32x2(shared_pointer))
                     )
-
-        if cutlass.const_expr(self.enable_pdl):
-            cute.arch.griddepcontrol_wait()
 
         if cutlass.const_expr(  # noqa: SIM102
             self.include_shared_expert and not self.load_shared_expert_before_pdl
@@ -540,6 +542,8 @@ class _QuadFinalizePublishDeviceKernel:
                                 )
                             )
             result = accumulator.load()
+            if cutlass.const_expr(self.round_routed):
+                result = result.to(BFloat16).to(Float32)
             if cutlass.const_expr(self.include_shared_expert):
                 result = result + shared_values.load().to(Float32)
             result_packed = bf16x4_to_packed_u32x2(result.to(BFloat16))
@@ -571,7 +575,8 @@ class _LamportMHCDeviceKernel:
     is also written as MXFP8 with swizzled 128x4 UE8M0 scales, including the
     zero scales of the padding rows up to a multiple of 128. With
     ``residual_only``, only the residual output is written: the pre-mix, the
-    norm weight and the normalized output are not touched.
+    norm weight and the normalized output are not touched. With
+    ``early_trigger``, dependents launch once the poll has seen every rank.
     """
 
     def __init__(
@@ -588,6 +593,7 @@ class _LamportMHCDeviceKernel:
         quantize: bool = False,
         residual_only: bool = False,
         deadline_ns: int = 0,
+        early_trigger: bool = False,
     ) -> None:
         if rank_lanes not in (1, 2, 4, 8):
             raise ValueError("rank_lanes must be 1, 2, 4, or 8")
@@ -620,6 +626,7 @@ class _LamportMHCDeviceKernel:
         self.warps = threads // WARP_SIZE
         self.rank_waves = tp // rank_lanes
         self.deadline_ns = deadline_ns
+        self.early_trigger = early_trigger
 
     def smem_size_in_bytes(self) -> int:
         return (self.warps + self.cluster_size) * 4
@@ -805,6 +812,12 @@ class _LamportMHCDeviceKernel:
                         dirty = dirty | fragment_has_negative_zero(packed)
                         for word in cutlass.range_constexpr(4):
                             lane_packed[wave, word] = packed[word]
+            # Dependents only start their prologues: their griddepcontrol.wait
+            # still waits for this whole grid, epilogue and sentinels included.
+            if cutlass.const_expr(
+                self.enable_pdl and self.early_trigger and trip == self.trips - 1
+            ):
+                cute.arch.griddepcontrol_launch_dependents()
 
             lane_sum = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
             lane_sum.fill(Float32(0.0))
@@ -861,7 +874,7 @@ class _LamportMHCDeviceKernel:
                 stage_state.iterator + NEXT_STAGE,
                 (active_stage + Uint32(1)) % Uint32(LAMPORT_GENERATIONS),
             )
-        if cutlass.const_expr(self.enable_pdl):
+        if cutlass.const_expr(self.enable_pdl and not self.early_trigger):
             cute.arch.griddepcontrol_launch_dependents()
 
         for trip in cutlass.range_constexpr(self.trips):
@@ -1003,7 +1016,9 @@ class AllReduceMHC:
     group. With ``quantize_layer_input``, both also accept ``mxfp8_out`` buffers
     that receive the normalized collapse as MXFP8. With ``residual_only``, both
     also accept ``pre`` and ``norm_weight`` of None and then write only the
-    post-mixed streams, for a consumer that collapses them itself.
+    post-mixed streams, for a consumer that collapses them itself. With
+    ``early_trigger``, the consumer lets the next kernel launch right after its
+    poll instead of after its epilogue.
     """
 
     def __init__(
@@ -1017,6 +1032,7 @@ class AllReduceMHC:
         group: dist.ProcessGroup,
         quantize_layer_input: bool = False,
         residual_only: bool = False,
+        early_trigger: bool = False,
     ) -> None:
         self.hidden_size = hidden = hidden_size
         self.hc_mult = hc = hc_mult
@@ -1070,6 +1086,9 @@ class AllReduceMHC:
                     enable_pdl=True,
                     prefetch_group=top_k,
                     fp32_weights=True,
+                    # SGLang's order: the routed sum rounds to BF16 before the
+                    # shared-expert add, as its unfused finalize returns it.
+                    round_routed=True,
                 ),
                 make_fake_dynamic_compact_tensor(
                     BFloat16, alignment=16, divisibility=hidden
@@ -1121,6 +1140,7 @@ class AllReduceMHC:
                         quantize=quantize,
                         residual_only=residual_only,
                         deadline_ns=WAIT_DEADLINE_NS,
+                        early_trigger=early_trigger,
                     ),
                     make_fake_compact_tensor(
                         BFloat16,

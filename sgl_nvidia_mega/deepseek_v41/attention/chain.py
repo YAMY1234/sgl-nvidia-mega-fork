@@ -48,6 +48,7 @@ SGLANG_READS = {
         "fuse_wqa_wkv",
     ),
     "srt/layers/layernorm.py": ("weight", "variance_epsilon"),
+    "kernels/ops/attention/dsv4/__init__.py": ("fused_q_norm_rope",),
     "srt/layers/quantization/fp8.py": ("weight_scale_inv_swizzled",),
     "srt/layers/quantization/mxfp8_input.py": ("Mxfp8SwizzledInput",),
     "srt/layers/attention/deepseek_v4_backend.py": (

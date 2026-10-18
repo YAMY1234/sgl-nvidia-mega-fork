@@ -24,7 +24,13 @@ SLOTS = frozenset(os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_SLOTS", "").split(","
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/runtime_context.py": ("get_parallel", '"tp_group"', '"attn_dp_size"'),
+    "srt/runtime_context.py": (
+        "get_parallel",
+        "get_spec",
+        '"tp_group"',
+        '"attn_dp_size"',
+    ),
+    "srt/arg_groups/fields/spec.py": ("speculative_num_draft_tokens",),
     "srt/models/deepseek_v4.py": (
         "DeepseekV4CudaDecoderLayer",
         "hc_pre_from_prev_sublayer",
@@ -69,7 +75,7 @@ def model_disable_reasons(model) -> list[str]:
 def build(model, server_args):
     """Each package's build (weights bound, buffers allocated, kernels compiled),
     the slot plan per width, and the executor."""
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import get_parallel, get_spec
 
     from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
     from sgl_nvidia_mega.deepseek_v41 import requirements
@@ -82,7 +88,8 @@ def build(model, server_args):
     if parity.SORT_TOPK:
         parity.install_sorted_topk()
     group = get_parallel().tp_group
-    tokens = int(server_args.speculative_num_draft_tokens)
+    # resolved at startup (DSpark: block size + 1); the server argument may be unset
+    tokens = int(get_spec().speculative_num_draft_tokens)
     ctx = BuildContext(
         widths=tuple(range(tokens, slot_plan.MAX_ROWS + 1, tokens)),
         tokens_per_request=tokens,

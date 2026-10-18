@@ -105,7 +105,7 @@ class Runner:
                               device=self.device)  # fmt: skip
             self.hop.mark_published(out)
             logger.warning(
-                "sgl-nvidia-mega: injected hop_a fault on rank %d", self.rank
+                "NVIDIA megakernel: injected hop_a fault on rank %d", self.rank
             )
             return out
         return self.publisher(wo_b, prepared)
@@ -116,7 +116,7 @@ class Runner:
         if self.hop._published is not None:
             self.hop._published = None
             raise RuntimeError(
-                "sgl-nvidia-mega: published wo_b rows were not reduced by the hop; "
+                "NVIDIA megakernel: published wo_b rows were not reduced by the hop; "
                 "the attention post did not take the fused reduction"
             )
 

@@ -30,7 +30,6 @@ DOCUMENTED = dict(
     enable_torch_compile=False,
     kv_cache_dtype="fp8_e4m3",
     speculative_algorithm="DSPARK",
-    speculative_num_draft_tokens=6,
     moe_a2a_backend="none",
     dsv4_attn_backend="flashmla",
     enable_encoder_swa_bounded_replay=False,

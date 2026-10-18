@@ -38,7 +38,6 @@ SGLANG_READS = {
         "enable_torch_compile",
         "kv_cache_dtype",
         "speculative_algorithm",
-        "speculative_num_draft_tokens",
         "moe_a2a_backend",
         "dsv4_attn_backend",
         "enable_encoder_swa_bounded_replay",

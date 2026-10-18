@@ -30,7 +30,7 @@ The step is the plugin's own code over the weights SGLang loaded (`deepseek_v41/
 | Replicated embedding (`embed`) | 1–48 | SGLang's fused lookup on the whole table, all-gathered once at build; no all-reduce |
 | Engram prefetch (`engram`) | 1–16 | Every Engram layer's lookup and WKV on a side stream, with their all-reduces on a push-only plane of their own |
 
-With the megakernel on, every slot above runs. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that for tests and bisecting; empty runs every step function's stock code.
+With the megakernel on, every slot above runs except `engram`, which is opt-in: its side-stream all-reduces can deadlock against the main stream's collectives until it is redesigned. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) names the slots to build instead, for tests, bisecting and the opt-in ones; empty runs every step function's stock code.
 
 ### Design
 

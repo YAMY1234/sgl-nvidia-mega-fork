@@ -11,11 +11,10 @@ import os
 import msgspec
 
 # The kernel slots this package ships; with the megakernel on, all of them run
-SHIPPED_SLOTS = ("hop_a", "moe", "gate", "embed", "engram")
-# Shipped slots that serve only some setups (the Engram prefetch needs SGLang's
-# per-rank host table): off with the reason logged where they do not apply, unless
-# requested by name
-CONDITIONAL_SLOTS = frozenset({"engram"})
+SHIPPED_SLOTS = ("hop_a", "moe", "gate", "embed")
+# Built only when named in SLOTS_ENV. The Engram prefetch's side-stream all-reduces can
+# deadlock against the main stream's collectives, so it stays opt-in until redesigned.
+OPT_IN_SLOTS = ("engram",)
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -33,9 +32,10 @@ SLOTS = _requested_slots()
 
 def slot_reasons() -> list[str]:
     """Why the requested slots cannot be served ([] when they can)."""
+    known = (*SHIPPED_SLOTS, *OPT_IN_SLOTS)
     reasons = [
-        f"{SLOTS_ENV}: unknown slot {name!r} (shipped: {', '.join(SHIPPED_SLOTS)})"
-        for name in sorted(SLOTS - set(SHIPPED_SLOTS))
+        f"{SLOTS_ENV}: unknown slot {name!r} (known: {', '.join(known)})"
+        for name in sorted(SLOTS - set(known))
     ]
     if "gate" in SLOTS and "moe" not in SLOTS:
         reasons.append(f"{SLOTS_ENV}: slot 'gate' needs slot 'moe'")
@@ -146,12 +146,7 @@ def build(model, ctx):
         "engram": engram.prefetch is not None,
     }
     # every package's build agrees across ranks, so this raises on every rank alike
-    explicit = SLOTS_ENV in os.environ
-    missing = sorted(
-        name
-        for name in SLOTS
-        if not built[name] and (explicit or name not in CONDITIONAL_SLOTS)
-    )
+    missing = sorted(name for name in SLOTS if not built[name])
     if missing:
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built at no width "

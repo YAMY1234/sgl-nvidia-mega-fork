@@ -195,3 +195,15 @@ def test_slot_selection_is_validated(monkeypatch):
         assert any(want in r for r in runtime.slot_reasons()), raw
     monkeypatch.setattr(runtime, "SLOTS", frozenset(runtime.SHIPPED_SLOTS))
     assert runtime.slot_reasons() == []
+
+
+def test_the_engram_prefetch_is_built_only_when_named(monkeypatch):
+    """The Engram prefetch never turns on from SGLang's host-table settings alone: its
+    side-stream all-reduces can deadlock against the main stream's collectives."""
+    from sgl_nvidia_mega.deepseek_v41 import runtime
+
+    monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    assert "engram" not in runtime._requested_slots()
+    monkeypatch.setenv(runtime.SLOTS_ENV, "moe,engram")
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    assert "engram" in runtime.SLOTS and runtime.slot_reasons() == []

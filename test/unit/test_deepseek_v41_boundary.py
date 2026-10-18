@@ -11,7 +11,7 @@ import torch
 
 mhc = pytest.importorskip("sglang.srt.models.deepseek_v4_mhc")
 
-from sgl_nvidia_mega.deepseek_v41.boundary.stock import StockBoundaries  # noqa: E402
+from sgl_nvidia_mega.deepseek_v41.boundary.boundaries import Boundaries  # noqa: E402
 
 ROWS, HC, HIDDEN = 6, 4, 8
 
@@ -42,7 +42,7 @@ def _boundary(fake, layers, **kw):
 
     fake.make_boundary.side_effect = make_boundary
     with patch("sglang.srt.models.deepseek_v4_mhc", fake):
-        return StockBoundaries(layers, **kw)
+        return Boundaries(layers, **kw)
 
 
 @pytest.fixture
@@ -65,7 +65,7 @@ def fake():
     m.run_moe_post.side_effect = lambda *a, **k: mhc.HcState(torch.zeros(1), "pre")
     m.calls = calls
     # the fused collective's widths unless a test says otherwise
-    with patch.object(StockBoundaries, "defers_sum", return_value=True):
+    with patch.object(Boundaries, "defers_sum", return_value=True):
         yield m
 
 
@@ -163,7 +163,7 @@ def test_past_the_push_plane_the_attention_sum_runs_before_a_plain_post(fake):
     partial, summed = torch.randn(200, HIDDEN), torch.randn(200, HIDDEN)
     group = SimpleNamespace(all_reduce=Mock(return_value=summed))
     with (
-        patch.object(StockBoundaries, "defers_sum", return_value=False) as defers,
+        patch.object(Boundaries, "defers_sum", return_value=False) as defers,
         patch(
             "sglang.srt.runtime_context.get_parallel",
             return_value=SimpleNamespace(attn_tp_group=group),
@@ -173,3 +173,47 @@ def test_past_the_push_plane_the_attention_sum_runs_before_a_plain_post(fake):
     defers.assert_called_once_with(layers[0], "attn", 200)
     group.all_reduce.assert_called_once_with(partial)
     assert fake.run_attn_post.call_args.args[1] is summed
+
+
+def test_hop_a_collects_a_published_partial_with_sglangs_triplet_and_norm(fake):
+    """A published wo_b partial is collected by the Lamport consumer with the
+    triplet SGLang's post would compute and the FFN norm; anything else takes
+    SGLang's post."""
+    triplet = (torch.ones(ROWS, HC), torch.ones(ROWS, HC), torch.ones(ROWS, HC, HC))
+    fake.mix_stats.return_value = triplet
+    fake.HcNormed = mhc.HcNormed
+    updated, normed = torch.zeros(ROWS, HC, HIDDEN), torch.ones(ROWS, HIDDEN)
+    published = torch.randn(ROWS, HIDDEN)
+    hop = SimpleNamespace(
+        published=lambda t: t is published,
+        collect=Mock(return_value=(updated, normed)),
+    )
+    layers = [_layer(0)]
+    with patch("sglang.srt.models.deepseek_v4_mhc", fake):
+        b = Boundaries(layers, hop_a=hop)
+    fake.make_boundary.return_value = None
+    b._ffn_next[0] = SimpleNamespace(
+        norm=SimpleNamespace(weight=torch.ones(HIDDEN), variance_epsilon=1e-6)
+    )
+    streams = torch.randn(ROWS, HC, HIDDEN)
+    st = b.start(streams)
+    b.pre(layers[0], "attn", st, object())
+    with patch.object(torch.cuda, "current_stream") as current:
+        b.post(layers[0], "attn", mhc.AttnOutput(published), st)
+    current.return_value.wait_stream.assert_called_once_with(layers[0].hc_stats_stream)
+    fake.mix_stats.assert_called_once_with(
+        layers[0].attn_hc, streams, layers[0].hc_stats_stream
+    )
+    args = hop.collect.call_args.args
+    assert args[0] is published and args[1] is streams
+    assert args[2:5] == (triplet[1], triplet[2], triplet[0])
+    assert args[6] == 1e-6
+    assert st.hc.streams is updated and st.hc.input.rows is normed
+    assert st.hc.pre is triplet[0]
+    fake.run_attn_post.assert_not_called()
+
+    b.pre(layers[0], "ffn", st, object())
+    b.post(layers[0], "ffn", object(), st)
+    b.pre(layers[0], "attn", st, object())
+    b.post(layers[0], "attn", torch.randn(ROWS, HIDDEN), st)
+    fake.run_attn_post.assert_called_once()

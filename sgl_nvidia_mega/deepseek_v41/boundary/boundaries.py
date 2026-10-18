@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The mHC boundaries of a covered step, as SGLang's stock decode runs them.
+"""The mHC boundaries of a covered step: SGLang's stock decode boundary, with
+hop A's Lamport collect as the attention post where wo_b published.
 
 Between two sublayers, SGLang's stage boundary for DeepSeek-V4.1 with the mHC
 pre-mix carried from the previous sublayer:
@@ -15,7 +16,8 @@ pre-mix carried from the previous sublayer:
    norm, MXFP8 at up to 128 rows, after the MoE).
 
 Each step calls SGLang's own mHC functions with the arguments its stage boundary
-passes, so the streams, inputs and coefficients are SGLang's bit for bit.
+passes, so with hop A off the streams, inputs and coefficients are SGLang's bit
+for bit. Hop A (``hop_a.py``) replaces only the attention post's collective.
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ SGLANG_READS = {
         "AttnOutput",
         "make_boundary",
         "use_stats_stream",
+        "mix_stats",
+        "HcNormed",
         "fork_stats_stream",
         "combine",
         "run_attn_post",
@@ -83,15 +87,19 @@ class BoundaryState(msgspec.Struct):
     open: Optional[Open] = None
 
 
-class StockBoundaries:
+class Boundaries:
     """The boundaries of the target model's layers, built once from the loaded
     model: each layer's next-sublayer boundaries are load-time facts."""
 
-    def __init__(self, layers, *, cross_layer: bool = True):
+    def __init__(
+        self, layers, *, cross_layer: bool = True, hop_a=None, hop_a_reason=""
+    ):
         from sglang.srt.models import deepseek_v4_mhc as mhc
 
         self._mhc = mhc
         self.cross_layer = cross_layer
+        self.hop_a = hop_a  # hop_a.HopA, or None
+        self.hop_a_reason = hop_a_reason
         self._attn_mxfp8 = {}
         self._ffn_next = {}  # the attention post's next: the FFN norm
         self._attn_next = {}  # the next layer's attention boundary (None: closed)
@@ -166,6 +174,9 @@ class StockBoundaries:
         if _attention(kind):
             if isinstance(partial, mhc.AttnOutput):  # SGLang's attention defers on TP
                 partial = partial.partial
+            if self.hop_a is not None and self.hop_a.published(partial):
+                st.hc = self._collect_hop_a(layer, partial, opened)
+                return
             if self.defers_sum(layer, kind, partial.shape[0]):
                 out = mhc.AttnOutput(partial)
             else:
@@ -193,6 +204,32 @@ class StockBoundaries:
             world_size=layer.mlp.tp_size,
             precomputed=opened.stats,
         )
+
+    def publish_wo_b(self, wo_b, o):
+        """For the attention step at a hop-A width: wo_b's partial rows, published
+        into the mailbox; None when hop A is off or its GEMM cannot take them."""
+        return None if self.hop_a is None else self.hop_a.publish_wo_b(wo_b, o)
+
+    def _collect_hop_a(self, layer, partial, opened):
+        """``run_attn_post`` with the Lamport collect in place of SGLang's fused
+        collective: the same triplet on the stats stream and the same FFN norm."""
+        mhc = self._mhc
+        pre, post_mix, comb = mhc.mix_stats(
+            layer.attn_hc, opened.streams, opened.stats_stream
+        )
+        if opened.stats_stream is not None:
+            torch.cuda.current_stream().wait_stream(opened.stats_stream)
+        norm = self._ffn_next[layer.layer_id].norm
+        updated, normed = self.hop_a.collect(
+            partial,
+            opened.streams,
+            post_mix,
+            comb,
+            pre,
+            norm.weight,
+            norm.variance_epsilon,
+        )
+        return mhc.HcState(updated, pre, mhc.HcNormed(normed))
 
     @staticmethod
     def defers_sum(layer, kind: str, rows: int) -> bool:

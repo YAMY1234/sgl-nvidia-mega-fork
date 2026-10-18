@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import msgspec
 
-from sgl_nvidia_mega.deepseek_v41.boundary.stock import BoundaryState, StockBoundaries
+from sgl_nvidia_mega.deepseek_v41.boundary.boundaries import Boundaries, BoundaryState
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -44,10 +44,21 @@ class MoeOperands(msgspec.Struct, frozen=True):
     return_moe_output: bool  # the MoE leaves its finalize to the post
 
 
-def build(model, ctx, group):
-    """Bind weights, allocate buffers, compile; the result is ``st.bound["boundary"]``."""
+def build(model, ctx, group) -> Boundaries:
+    """Bind weights, allocate buffers, compile; the result is ``st.bound["boundary"]``.
+    Its ``hop_a`` / ``hop_a_reason`` / ``hop_a.rows`` say where hop A serves."""
+    from sgl_nvidia_mega.deepseek_v41 import runtime
+    from sgl_nvidia_mega.deepseek_v41.boundary import hop_a
+
     m = model.model
-    return StockBoundaries([m.layers[i] for i in range(m.start_layer, m.end_layer)])
+    hop, reason = None, "stock (slot off)"
+    if "hop_a" in runtime.SLOTS:
+        hop, reason = hop_a.build(model, ctx, group)
+    return Boundaries(
+        [m.layers[i] for i in range(m.start_layer, m.end_layer)],
+        hop_a=hop,
+        hop_a_reason=reason,
+    )
 
 
 def _state(st) -> BoundaryState:
@@ -86,6 +97,8 @@ def post(layer, sublayer: str, out, st):
     returns the MoE input (and sets ``st.transport``); after "ffn" returns None."""
     boundaries, bs = st.bound["boundary"], _state(st)
     boundaries.post(layer, sublayer, out, bs)
+    if boundaries.hop_a is not None and sublayer == "attn":
+        boundaries.hop_a.check_consumed()
     if sublayer == "ffn":
         st.state = st.hidden = bs.hc
         return None

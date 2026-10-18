@@ -1,6 +1,6 @@
 # Overall owners: every path without a more specific line below.
 * @YAMY1234
 
-# Per model: one owner for its spec, forward, kernels and tests. Each new
-# model's PR adds its line.
+# Per model: one owner for its step code, kernels and tests. Each new model's PR
+# adds its line.
 **/*deepseek_v41* @YAMY1234

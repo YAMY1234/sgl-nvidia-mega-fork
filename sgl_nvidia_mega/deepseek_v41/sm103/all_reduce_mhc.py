@@ -87,7 +87,7 @@ def mxfp8_scale_bytes(tokens: int, width: int) -> int:
     return -(-tokens // 128) * 128 * -(-(width // 32) // 4) * 4
 
 
-# The consumer's poll deadline in ns (0: none), set by the monokernel build before any
+# The consumer's poll deadline in ns (0: none), set by the megakernel build before any
 # kernel compiles; a peer that misses it faults the consumer at address 0x0
 WAIT_DEADLINE_NS = 0
 # Polls between two reads of the global timer, so a poll that succeeds exits as before

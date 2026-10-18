@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Test-only switches of the composition check (``SGLANG_NVIDIA_MEGA_PARITY``).
+"""Test-only switches of the composition check (``SGLANG_NVIDIA_MEGAKERNEL_PARITY``).
 
-``SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK=1`` sorts each row's sparse attention indices
+``SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1`` sorts each row's sparse attention indices
 before FlashMLA in both forwards, so the indexer top-k's emission order (atomic
 arrival order) does not change the attention's accumulation order between them.
 """
@@ -28,7 +28,7 @@ SGLANG_READS = {
     ),
 }
 
-SORT_TOPK = os.environ.get("SGLANG_NVIDIA_MEGA_PARITY_SORT_TOPK", "0") == "1"
+SORT_TOPK = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK", "0") == "1"
 
 
 def install_sorted_topk() -> None:
@@ -70,4 +70,4 @@ def install_sorted_topk() -> None:
 
     forward._sgl_mega_sorted = True
     DeepseekV4AttnBackend.forward = forward
-    logger.warning("sgl-nvidia-mega: test-only sorted sparse indices are on")
+    logger.warning("NVIDIA megakernel: test-only sorted sparse indices are on")

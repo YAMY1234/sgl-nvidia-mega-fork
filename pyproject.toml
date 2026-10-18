@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sgl-nvidia-mega"
 version = "0.1.0.dev0"
-description = "Monokernels for SGLang on NVIDIA GPUs"
+description = "NVIDIA megakernels for SGLang"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
@@ -13,9 +13,10 @@ requires-python = ">=3.10"
 # SGLang's CUDA image
 dependencies = []
 
-# SGLang loads the package as a general plugin, which registers its specs
+# SGLang loads the package as a general plugin; with SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1
+# it registers the megakernel's hooks
 [project.entry-points."sglang.srt.plugins"]
-sgl_nvidia_mega = "sgl_nvidia_mega:register_specs"
+nvidia_megakernel = "sgl_nvidia_mega.plugin:register"
 
 [tool.setuptools.packages.find]
 include = ["sgl_nvidia_mega*"]

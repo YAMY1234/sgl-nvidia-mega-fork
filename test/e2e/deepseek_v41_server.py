@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The DeepSeek-V4.1-Flash servers the serving tests launch: GB300, TP4, DSpark
-(verify steps of 6 rows a request). Without --monokernel-backend, so a test can
-launch the normal path too."""
+(verify steps of 6 rows a request). The megakernel switch is set per launch, so a
+test can launch the normal path too."""
 
 import os
 

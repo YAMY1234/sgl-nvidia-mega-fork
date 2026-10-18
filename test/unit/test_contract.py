@@ -1,19 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The SGLang names this package reads, pinned on CPU against the
-installed SGLang.
+"""The SGLang names this package reads and the SGLang targets it hooks, pinned on
+CPU against the installed SGLang.
 
-The specs and kernels live outside SGLang, so they read SGLang by name: the
-monokernel framework (``sglang.srt.monokernels``) and SGLang internals.
-Every module that imports from ``sglang`` lists what it reads in
-``SGLANG_READS``. A refactor that renames one fails here, naming the file to
+The megakernel lives outside SGLang, so it reads SGLang by name and hooks SGLang
+functions by dotted path (``plugin.HOOKS``). Every module that imports from
+``sglang`` lists what it reads in ``SGLANG_READS``. A refactor that renames one fails here, naming the file to
 repair, instead of failing at a GPU server's startup. The checks are static
 (AST): no module of this package is imported. Run it against each SGLang this
 package supports, and nightly against SGLang main.
 """
 
 import ast
-import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -107,29 +105,23 @@ def test_sglang_provides_what_the_plugin_reads(path):
     )
 
 
-def _seams(path: Path) -> dict:
-    """The module's ``SGLANG_SEAMS``: SGLang names a slot probes for at build."""
-    for node in _tree(path).body:
+def _hook_targets() -> list:
+    """``plugin.HOOKS``' SGLang targets, read from the source (no import)."""
+    for node in _tree(PACKAGE / "plugin.py").body:
         if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "SGLANG_SEAMS" for t in node.targets
+            isinstance(t, ast.Name) and t.id == "HOOKS" for t in node.targets
         ):
-            return ast.literal_eval(node.value)
-    return {}
+            return [target for target, _, _ in ast.literal_eval(node.value)]
+    raise AssertionError("plugin.py has no HOOKS")
 
 
-SEAM_READERS = [p for p in sorted(PACKAGE.rglob("*.py")) if _seams(p)]
-
-
-@pytest.mark.skipif(
-    os.environ.get("SGL_MEGA_REQUIRE_SEAMS") != "1",
-    reason="the slots' SGLang seams are optional; set SGL_MEGA_REQUIRE_SEAMS=1 "
-    "against an SGLang that has them",
-)
-@pytest.mark.parametrize("path", SEAM_READERS, ids=_id)
-def test_sglang_provides_the_seams_the_slots_use(path):
-    missing = []
-    for pattern, names in _seams(path).items():
-        files = sorted(ROOT.glob(pattern))
-        provided = frozenset().union(*map(_provided, files))
-        missing += [f"{pattern}: {n}" for n in names if n not in provided]
-    assert not missing, f"{_id(path)}: this SGLang lacks " + ", ".join(missing)
+@pytest.mark.parametrize("target", _hook_targets())
+def test_every_hook_target_resolves(target):
+    """``module.Class.function``: the class in that module defines the function."""
+    module, owner, name = target.rsplit(".", 2)
+    path = ROOT / Path(*module.split(".")[1:]).with_suffix(".py")
+    assert path.is_file(), f"{target}: no {path.relative_to(ROOT.parent)}"
+    classes = {n.name: n for n in _tree(path).body if isinstance(n, ast.ClassDef)}
+    assert owner in classes, f"{target}: no class {owner}"
+    defined = {n.name for n in classes[owner].body if isinstance(n, ast.FunctionDef)}
+    assert name in defined, f"{target}: {owner} does not define {name}"

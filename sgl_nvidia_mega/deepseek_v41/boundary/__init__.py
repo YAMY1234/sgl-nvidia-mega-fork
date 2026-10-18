@@ -42,6 +42,10 @@ SGLANG_READS = {
         "hc_cfg",
         "end_layer",
         "layers",
+        # the module aliases SGLang's DSV4 model imports too
+        "hc_boundary",
+        "mhc",
+        "residual_batch",
     ),
     "srt/layers/layer_boundary/stage.py": (
         "prepare",

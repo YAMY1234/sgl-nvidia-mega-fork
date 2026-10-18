@@ -2,11 +2,11 @@
 
 ## Introduction
 
-**SGLang-NVIDIA-Mega** is the monokernel library of the [SGLang](https://github.com/sgl-project/sglang) framework for NVIDIA GPUs. It holds the kernels of a decode or speculative-verify step that only make sense inside a fused step: kernels that hand their outputs to each other through mailboxes and programmatic dependent launch instead of through SGLang's per-op boundaries.
+**SGLang-NVIDIA-Mega** holds the NVIDIA megakernels of the [SGLang](https://github.com/sgl-project/sglang) framework: for each model it covers, the code of its small-batch decode step and the kernels that only make sense inside such a step, which hand their outputs to each other through mailboxes and programmatic dependent launch instead of through per-op boundaries.
 
-The library implements SGLang's monokernel interface (`sglang.srt.monokernels`) and loads as an SGLang [general plugin](https://github.com/sgl-project/sglang/blob/main/docs/docs/hardware-platforms/plugin.mdx) (the `sglang.srt.plugins` entry point), which registers each model's spec under the monokernel backend `nvidia`. With `--monokernel-backend nvidia`, every step that a spec serves runs on its kernels, and every other step runs SGLang's standard path. Without the flag, nothing in this package is imported beyond its entry point.
+The package loads as an SGLang [general plugin](https://github.com/sgl-project/sglang/blob/main/docs/docs/hardware-platforms/plugin.mdx) (the `sglang.srt.plugins` entry point) and needs no change to SGLang. With `SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1` it registers two hooks: after SGLang loads a covered model, it checks the setup and builds the megakernel (before the KV cache is sized); around the model's `forward`, it runs each covered step itself and leaves every other step to SGLang. Without the variable it registers nothing.
 
-> **Experimental:** `--monokernel-backend` is an experimental SGLang feature. The kernels, the models and setups they cover, and the plugin interface may change.
+> **Experimental:** the kernels, the models and setups they cover, and the switch may change.
 
 ## Features
 
@@ -14,34 +14,33 @@ The library implements SGLang's monokernel interface (`sglang.srt.monokernels`) 
 
 | Model | GPU | Tensor parallel | Coverage |
 | --- | --- | --- | --- |
-| DeepSeek-V4.1-Flash | GB300 (SM103) | 4 | DSpark verify steps of 1 to 48 rows (batch 1 to 8 at 6 rows a request), and the DSpark draft stages |
+| DeepSeek-V4.1-Flash | GB300 (SM103) | 4 | DSpark target verify steps of 1 to 48 rows (batch 1 to 8 at 6 rows a request) |
 
-Steps past 48 rows, prefill and extend steps run SGLang's standard path.
+Larger verify steps, prefill, extend and the DSpark draft run SGLang's standard path.
 
-### What a routed step runs
+### What a covered step runs
 
-A routed step is SGLang's own step, rebuilt from SGLang's modules, with three slots filled by this package:
+The step is the plugin's own code over the weights SGLang loaded (`deepseek_v41/runtime`): the embedding and the Engram hashes, then per layer the mHC boundary (`boundary/`), the attention (`attention/`), the MoE (`moe/`) and Engram (`engram/`), then the head and the logits (`logits/`). Each package has a stock implementation that reproduces SGLang's decode step bit for bit, and puts this package's kernels in where the slot plan (`plan.py`) gives them a width:
 
 | Slot | Rows | Kernel |
 | --- | --- | --- |
-| `wo_b` + attention all-reduce + mHC post + next norm | 1–8 | `wo_b` GEMM whose epilogue stores its rows into a Lamport mailbox on every rank, and a Lamport consumer that reduces them and runs the mHC post, combine and RMSNorm |
-| Router top-k | 1–8, 48 | One CTA per row, bit for bit SGLang's fused gate (including the vision-token routing) |
-| Routed experts | 1–48 | A route kernel and a pair of block-scaled tcgen05 GEMMs with 8-row tiles; an expert chosen by more than 8 rows takes several tiles |
+| Routed experts (`moe`) | 1–48 | A route kernel and a pair of block-scaled tcgen05 GEMMs with 8-row tiles; an expert chosen by more than 8 rows takes several tiles |
+| Router top-k (`gate`) | 1–8, 48 | One CTA per row, bit for bit SGLang's fused gate (including the vision-token routing) |
 
-Every other kernel is SGLang's. The kernels stay separate launches chained with programmatic dependent launch: on GB300 a kernel boundary with PDL costs less than an exchange between all blocks of one persistent grid.
+`SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) selects the slots; empty runs every step function's stock code.
 
 ### Design
 
-- **Built at startup.** The mailbox, the kernels for every routed width and their tactics are allocated and compiled when the server starts, before the KV cache is sized. Nothing is compiled or allocated inside a step.
-- **Graph-safe routing.** Each step is routed by its CUDA graph key alone, so every rank makes the same decision and a captured graph replays the decision made at capture.
+- **Built at load.** Buffers, kernels and tactics for every covered width are allocated and compiled when the model is loaded, before the KV cache is sized. Nothing is compiled or allocated inside a step.
+- **Graph-safe coverage.** A step is covered by its forward mode and row count alone, so every rank decides the same and a captured graph replays the decision made at capture.
 - **Fail-stop synchronization.** Every wait on another GPU has a deadline below SGLang's watchdog. A rank that misses it faults at address 0x0, so no token from a failed step is returned.
-- **In-place weights.** The kernels read the weights SGLang loaded; nothing is copied.
+- **No silent fallback.** With the switch on, an unsupported setup stops the server at startup on every rank, listing every reason.
 
 ## Quick Start
 
 ### Requirements
 
-- SGLang with the monokernel interface (`sglang.srt.monokernels`); tested with SGLang `b62a48ee15b`
+- SGLang main; tested with SGLang `5cbe2371a53`
 - SGLang's CUDA 13 image: FlashInfer (its low-latency block-scaled GEMM as in 0.7.0 to 0.7.2), CuTe DSL (`nvidia-cutlass-dsl`) and the CUDA Python bindings
 - 4 x GB300
 
@@ -56,6 +55,8 @@ pip install -e .
 ### Usage
 
 ```bash
+SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1 \
+SGLANG_NVIDIA_MEGAKERNEL_SLOTS=moe,gate \
 python -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4.1-Flash \
   --tp 4 \
@@ -63,27 +64,29 @@ python -m sglang.launch_server \
   --kv-cache-dtype fp8_e4m3 \
   --dsv4-attn-backend flashmla \
   --speculative-algorithm DSPARK \
-  --speculative-dspark-block-size 5 \
-  --monokernel-backend nvidia
+  --speculative-dspark-block-size 5
 ```
-
-If the model, GPU or configuration is not supported, the server refuses to start and lists every reason.
 
 ## Repository Structure
 
 ```text
 sgl-nvidia-mega/
 ├── sgl_nvidia_mega/
+│   ├── plugin.py          # the switch and the hooks it registers
 │   ├── common/            # NVRTC builds and PDL launches; CuTe DSL sync primitives
 │   └── deepseek_v41/
-│       ├── spec.py        # target model: spec and refusals
-│       ├── draft.py       # DSpark draft model: spec
-│       ├── plan.py        # which kernel fills each slot, per width
-│       ├── forward.py     # the routed target and draft steps (SGLang glue)
-│       └── sm103/         # kernels and the build-time runner; no SGLang imports
+│       ├── requirements.py  # the setups it serves; the startup refusals
+│       ├── plan.py          # which kernel fills each slot, per width
+│       ├── runtime/         # the hooks, the executor and its per-step state, the embedding
+│       ├── boundary/        # the mHC between sublayers
+│       ├── attention/       # the attention step
+│       ├── moe/             # the MoE step
+│       ├── engram/          # the Engram layers
+│       ├── logits/          # the head and the logits
+│       └── sm103/           # kernels and the build-time runner; no SGLang imports
 ├── benchmark/             # the static decode table behind the speed numbers
 └── test/
-    ├── unit/              # CPU: the specs, the slot plan and the SGLang interface contract
+    ├── unit/              # CPU: the plugin, the setup checks, the step loop and the SGLang contract
     ├── kernels/           # GPU: each kernel against SGLang's or FlashInfer's op, fail-stop
     └── e2e/               # GPU: serving accuracy, KL, passkey and fail-stop, switch on and off
 ```

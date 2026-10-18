@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""DeepSeek-V4.1-Flash with --monokernel-backend nvidia on GB300, TP4, DSpark, across
+"""DeepSeek-V4.1-Flash with SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1 on GB300, TP4, DSpark, across
 the switch point: 8 requests (48 rows) are the largest covered verify step, 12 and
 16 requests step past it and back. Each server's startup lines show the covered
 batches run the plugin; GSM8K runs past the largest width (gross failures); the
@@ -43,7 +43,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-from sgl_nvidia_mega import BACKEND
+from sgl_nvidia_mega.plugin import ENABLE_ENV
 
 LAUNCH_TIMEOUT = 3600
 # Few-shot GSM8K-200 (8 shots, 512 new tokens), for gross failures only; compare with
@@ -103,14 +103,17 @@ def _long_prompts():
 
 
 def _launch(args=ARGS, extra_env=None, extra_args=(), log=None, backend=True):
-    env = {**os.environ, **ENV, **(extra_env or {})}
+    env = {
+        **os.environ,
+        **ENV,
+        ENABLE_ENV: "1" if backend else "0",
+        **(extra_env or {}),
+    }
     return popen_launch_server(
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=args
-        + (["--monokernel-backend", BACKEND] if backend else [])
-        + list(extra_args),
+        other_args=args + list(extra_args),
         env=env,
         return_stdout_stderr=log,
     )
@@ -203,12 +206,11 @@ def _rank_process(process, rank):
     raise AssertionError(f"no scheduler_TP{rank} process")
 
 
-class TestMonokernelVerify(CustomTestCase):
+class TestMegakernelVerify(CustomTestCase):
     """DSpark verify steps: above 8 requests (48 rows) the normal path."""
 
     RUNS = (
-        "monokernel deepseek_v41_nvidia on sm_103 runs target_verify steps of batch size [1, 2, 3, 4, 5, 6, 7, 8] x 6 tokens",
-        "monokernel deepseek_v41_dspark_draft_nvidia on sm_103 runs",
+        "NVIDIA megakernel: DeepSeek-V4.1 verify steps of [6, 12, 18, 24, 30, 36, 42, 48] rows built",
     )
 
     @classmethod
@@ -303,12 +305,12 @@ class TestMonokernelVerify(CustomTestCase):
         self.assertIn(PASSKEY, text)
 
 
-class TestMonokernelFault(CustomTestCase):
+class TestMegakernelFault(CustomTestCase):
     """One rank fails during routed verify steps (batch 1, 6 rows: every slot of the
     plugin runs); every rank must stop, and the client must get no token of the failed
     step: what it received is a prefix of a fault-free run of the same greedy request."""
 
-    # "off" runs the stall and crash cases without --monokernel-backend: the baseline for the
+    # "off" runs the stall and crash cases without the megakernel: the baseline for the
     # time to full exit when a rank stops outside the plugin's own waits
     SWITCH_ON = os.environ.get("SGL_NVIDIA_MEGA_E2E_SWITCH", "on") != "off"
 

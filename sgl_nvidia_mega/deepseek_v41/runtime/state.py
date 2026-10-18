@@ -39,7 +39,7 @@ class StepState:
         self.input_ids = input_ids
         self.input_ids_global = input_ids_global
         self.rows = int(input_ids.shape[0])
-        self.plan = plan  # the framework's plan: plan.key (forward mode, rows)
+        self.plan = plan  # the covered step: its forward mode and rows
         self.slots = slots  # plan.Slots: which kernels fill this width's steps
         self.bound: dict[str, Any] = bound  # package -> its build() result
         self.streams: dict[str, torch.cuda.Stream] = streams  # side streams, by name

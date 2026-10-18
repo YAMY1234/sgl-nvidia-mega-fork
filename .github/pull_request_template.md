@@ -15,11 +15,11 @@ Examples: [Fix] deepseek_v41: Fix the pad-row KV write; [Perf] [GB300] deepseek_
 
 ## Accuracy Tests
 
-<!-- If this pull request changes kernel or forward code, give accuracy results with the monokernels on and off, on the same server. -->
+<!-- If this pull request changes kernel or forward code, give accuracy results with the megakernel on and off, on the same server. -->
 
 ## Speed Tests and Profiling
 
-<!-- If this pull request affects speed, give per-user decode results with the monokernels on and off, including past the largest width. -->
+<!-- If this pull request affects speed, give per-user decode results with the megakernel on and off, including past the largest width. -->
 
 ## Checklist
 

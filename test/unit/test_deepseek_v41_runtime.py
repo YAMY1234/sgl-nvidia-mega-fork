@@ -87,7 +87,9 @@ LAYER = [
 
 
 def test_each_layer_runs_pre_attention_post_moe_post(calls):
-    out = executor.Executor(None, {}, {}, {})._layers(_state(), torch.zeros(6, 4, 8))
+    out = executor.MegakernelDecode(None, {}, {}, {}, ())._layers(
+        _state(), torch.zeros(6, 4, 8)
+    )
     assert out == (1, 2)
     assert calls[:2] == [("engram.hashes", None, None), ("boundary.start", None, None)]
     body = [(name, sub) for name, _, sub in calls[2:-1]]
@@ -105,7 +107,7 @@ def test_engram_and_capture_layers_read_the_materialized_streams(calls, monkeypa
         st.state = SimpleNamespace(residual=st_residual)
 
     monkeypatch.setattr(executor.boundary, "materialize", materialize)
-    executor.Executor(None, {}, {}, {})._layers(st, torch.zeros(6, 4, 8))
+    executor.MegakernelDecode(None, {}, {}, {}, ())._layers(st, torch.zeros(6, 4, 8))
     names = [(name, i) for name, i, _ in calls]
     # Engram before layer 1's attention; the capture before layer 2's
     assert names.index(("boundary.materialize", 1)) < names.index(("engram.apply", 1))
@@ -113,3 +115,19 @@ def test_engram_and_capture_layers_read_the_materialized_streams(calls, monkeypa
     assert names.index(("boundary.materialize", 2)) < names.index(("boundary.pre", 2))
     assert ("engram.apply", 2) not in names and ("boundary.materialize", 0) not in names
     assert len(st.aux) == 1 and torch.equal(st.aux[0], st_residual.mean(dim=1))
+
+
+def _batch(mode="TARGET_VERIFY"):
+    is_verify = mode == "TARGET_VERIFY"
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(name=mode, is_target_verify=lambda: is_verify)
+    )
+
+
+def test_only_verify_steps_of_built_widths_are_covered():
+    decode = executor.MegakernelDecode(None, {}, {}, {}, (6, 12, 48))
+    ids = torch.zeros(12, dtype=torch.int64)
+    assert decode.plan(ids, _batch()) == executor.Step("TARGET_VERIFY", 12)
+    assert decode.plan(torch.zeros(18, dtype=torch.int64), _batch()) is None
+    assert decode.plan(ids, _batch("DECODE")) is None
+    assert decode.plan(ids, _batch(), None, pp_proxy_tensors=object()) is None

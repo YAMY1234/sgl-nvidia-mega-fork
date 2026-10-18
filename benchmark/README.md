@@ -7,24 +7,24 @@
 
 `static_table.py` measures tokens per second per user at each batch size: ISL 8K, OSL 1K,
 batch 1–64, one fresh server launch per arm. The two arms differ only by
-`--monokernel-backend nvidia`.
+`SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1` (with the same `SGLANG_NVIDIA_MEGAKERNEL_SLOTS`).
 
 Server (GB300, TP4, DSpark):
 
 ```
+[SGLANG_ENABLE_NVIDIA_MEGAKERNEL=1 SGLANG_NVIDIA_MEGAKERNEL_SLOTS=moe,gate] \
 SGLANG_SIMULATE_ACC_LEN=3.51 SGLANG_SIMULATE_ACC_METHOD=match-expected \
 SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token \
 python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V4.1-Flash --trust-remote-code \
   --tp 4 --ep-size 1 --kv-cache-dtype fp8_e4m3 --dsv4-attn-backend flashmla --mem-fraction-static 0.8 \
   --speculative-algorithm DSPARK --speculative-dspark-block-size 5 \
   --cuda-graph-max-bs-decode 64 --max-running-requests 256 --chunked-prefill-size 8192 \
-  --enable-decoder-swa-bounded-replay \
-  [--monokernel-backend nvidia]
+  --enable-decoder-swa-bounded-replay
 ```
 
 The three `SGLANG_SIMULATE_ACC_*` variables fix the acceptance length at 3.51, so both arms
 run the same number of verify steps; never set them for an accuracy run. With DSpark
-block 5 a verify step has 6 rows per request, so batch 1–8 runs the plugin and batch
+block 5 a verify step has 6 rows per request, so batch 1–8 runs the megakernel and batch
 16–64 runs SGLang's standard path in both arms.
 
 Client, two passes per launch:
@@ -40,7 +40,7 @@ Protocol:
 - Both arms on one node.
 - At least 2 fresh launches per arm, in palindrome order (on, off, off, on).
 - Diff the two launch commands and environments before reading a number.
-- Check the startup line `monokernel deepseek_v41_nvidia on sm_103 runs target_verify steps of batch size [1, …, 8] x 6 tokens` in the switch-on arm.
+- Check the startup line `NVIDIA megakernel: DeepSeek-V4.1 verify steps of [6, 12, …, 48] rows built` in the switch-on arm.
 - A difference inside the run-to-run band (≈ 1.5 % at batch 1 and 4, ≈ 1 % elsewhere) is not a result.
 
 ## Accuracy

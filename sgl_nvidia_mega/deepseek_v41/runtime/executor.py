@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The executor: one covered decode step of the DeepSeek-V4.1 target.
 
-``Executor.forward`` takes and returns what ``DeepseekV4ForCausalLM.forward`` does.
+``MegakernelDecode.plan`` decides from host state alone, identical on every rank,
+whether a step is covered (a DSpark verify step of a built width).
+``MegakernelDecode.forward`` takes and returns what ``DeepseekV4ForCausalLM.forward``
+does.
 It runs the step from the plugin's step functions over SGLang's loaded modules and
 weights, never through a model-level or decoder-layer ``forward``:
 
@@ -15,8 +18,8 @@ weights, never through a model-level or decoder-layer ``forward``:
    ``boundary.post(layer, "ffn", out, st)``;
 3. ``boundary.final``, the head combine + norm and the logits (``logits``).
 
-``SGLANG_NVIDIA_MEGA_PARITY`` (test only) runs SGLang's own forward on the same eager
-step first and logs the largest difference of the logits and auxiliary hidden states
+``SGLANG_NVIDIA_MEGAKERNEL_PARITY`` (test only) runs SGLang's own forward on the same
+eager step first and logs the largest difference of the logits and auxiliary hidden states
 ("control": SGLang's forward twice, the run-to-run floor).
 """
 
@@ -25,6 +28,7 @@ from __future__ import annotations
 import logging
 import os
 
+import msgspec
 import torch
 
 from sgl_nvidia_mega.deepseek_v41 import attention, boundary, engram, logits, moe
@@ -68,7 +72,7 @@ SGLANG_READS = {
 }
 
 # Composition parity (test only), see the module docstring
-PARITY_MODE = os.environ.get("SGLANG_NVIDIA_MEGA_PARITY", "0")
+PARITY_MODE = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_PARITY", "0")
 PARITY = PARITY_MODE in ("1", "control")
 
 PACKAGES = {
@@ -80,23 +84,51 @@ PACKAGES = {
 }
 
 
-class Executor:
-    """One rank's covered step: the model, each width's slots, each package's
+class Step(msgspec.Struct, frozen=True):
+    """A covered step: its forward mode and rows."""
+
+    mode: str
+    rows: int
+
+
+class MegakernelDecode:
+    """One rank's covered steps: the model, each width's slots, each package's
     build result and the side streams."""
 
-    def __init__(self, lm, slots: dict, bound: dict, streams: dict):
+    def __init__(
+        self, lm, slots: dict, bound: dict, streams: dict, widths: tuple[int, ...]
+    ):
         self.lm, self.slots, self.bound, self.streams = lm, slots, bound, streams
+        self.widths = frozenset(widths)
+
+    def plan(
+        self, input_ids, forward_batch, input_embeds=None, pp_proxy_tensors=None
+    ) -> Step | None:
+        """The step if this forward is covered, else None (SGLang's forward runs)."""
+        mode = forward_batch.forward_mode
+        rows = int(input_ids.shape[0])
+        if pp_proxy_tensors is not None or not mode.is_target_verify():
+            return None
+        return Step(mode.name, rows) if rows in self.widths else None
 
     def forward(
-        self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
+        self,
+        step: Step,
+        original,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        pp_proxy_tensors=None,
     ):
+        """The covered step (``original``: SGLang's forward, for the parity check)."""
         if PARITY and not torch.cuda.is_current_stream_capturing():
             return self._with_parity(
-                plan, input_ids, positions, forward_batch, input_embeds
+                step, original, input_ids, positions, forward_batch, input_embeds
             )
-        return self._forward(plan, input_ids, positions, forward_batch, input_embeds)
+        return self._forward(step, input_ids, positions, forward_batch, input_embeds)
 
-    def _forward(self, plan, input_ids, positions, forward_batch, input_embeds):
+    def _forward(self, step, input_ids, positions, forward_batch, input_embeds):
         """``DeepseekV4ForCausalLM.forward`` for a covered step."""
         from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
@@ -110,8 +142,8 @@ class Executor:
             positions=positions,
             input_ids=input_ids,
             input_ids_global=getattr(forward_batch, "input_ids_global", input_ids),
-            plan=plan,
-            slots=self.slots[plan.key.rows],
+            plan=step,
+            slots=self.slots[step.rows],
             bound=self.bound,
             streams=self.streams,
         )
@@ -167,27 +199,27 @@ class Executor:
                 boundary.post(layer, "ffn", out, st)
         return boundary.final(st)
 
-    def _with_parity(self, plan, input_ids, positions, forward_batch, input_embeds):
+    def _with_parity(
+        self, step, original, input_ids, positions, forward_batch, input_embeds
+    ):
         """SGLang's forward, then the executor's, on the same step; logs the largest
         difference of the logits and the auxiliary hidden states."""
         lm = self.lm
-        want = type(lm).forward(lm, input_ids, positions, forward_batch, input_embeds)
+        want = original(lm, input_ids, positions, forward_batch, input_embeds)
         want = (_clone(want.next_token_logits), _clone(want.hidden_states))
         if PARITY_MODE == "control":
-            got = type(lm).forward(
-                lm, input_ids, positions, forward_batch, input_embeds
-            )
+            got = original(lm, input_ids, positions, forward_batch, input_embeds)
         else:
-            got = self._forward(plan, input_ids, positions, forward_batch, input_embeds)
+            got = self._forward(step, input_ids, positions, forward_batch, input_embeds)
         diffs = [
             _max_abs(a, b)
             for a, b in zip(want, (got.next_token_logits, got.hidden_states))
         ]
         logger.info(
-            "sgl-nvidia-mega parity%s %s rows=%d logits_max_abs=%s hidden_max_abs=%s",
+            "NVIDIA megakernel parity%s %s rows=%d logits_max_abs=%s hidden_max_abs=%s",
             " control" if PARITY_MODE == "control" else "",
-            plan.key.forward_mode,
-            plan.key.rows,
+            step.mode,
+            step.rows,
             *diffs,
         )
         return got

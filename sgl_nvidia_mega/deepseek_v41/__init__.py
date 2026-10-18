@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""DeepSeek-V4.1-Flash monokernels: the spec (``spec``), the slot plan (``plan``),
-the executor of a covered decode step (``runtime``) and its step code per package
-(``boundary``, ``attention``, ``moe``, ``engram``, ``logits``), and the SM103
-(GB300) kernels (``sm103``). The DSpark draft runs SGLang's own path."""
+"""DeepSeek-V4.1-Flash megakernel: the setups it serves (``requirements``), the slot
+plan (``plan``), the executor of a covered decode step and its hooks (``runtime``),
+the step code per package (``boundary``, ``attention``, ``moe``, ``engram``,
+``logits``), and the SM103 (GB300) kernels (``sm103``). The DSpark draft runs
+SGLang's own forward."""
 
 # DeepSeek-V4.1-Flash's shapes, routing and activation, which the kernels build in
 HF_CONFIG = dict(

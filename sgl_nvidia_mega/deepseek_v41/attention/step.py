@@ -9,6 +9,8 @@ SGLang's decode attention; the plugin's kernels replace single ops in it."""
 
 from __future__ import annotations
 
+from typing import Any
+
 from sgl_nvidia_mega.deepseek_v41.attention import ops, prepare
 
 # The SGLang names this package reads, by file under the sglang package (``f(p)``: a
@@ -134,6 +136,8 @@ def disable_reason(attn) -> str:
         return f"layer {attn.layer_id}: compress ratio {attn.compress_ratio}"
     if _wo_a_fp8_mxscale is not None or _wo_a_fp8_mxscale_fused_invrope is not None:
         return "the ROCm wo_a kernels are loaded"
+    if attn.use_npu_arch35_mxfp8_wo_a:
+        return f"layer {attn.layer_id}: the NPU wo_a"
     if is_unified_kv_triton():
         return "the unified KV cache"
     if not hasattr(attn.wo_a, "weight"):
@@ -203,7 +207,7 @@ class AttentionStep:
         tp_slice = slice(0, attn.n_local_heads)
         return heads, q_padded, q_padded[:, tp_slice, :], tp_slice
 
-    def run(self, x, positions, fb, x_quant=None):
+    def run(self, x, positions, fb, x_quant=None) -> Any:
         """The layer's TP-partial attention output (``mhc.AttnOutput``) for input
         ``x`` (``x_quant``: the same input as MXFP8)."""
         from sglang.srt.model_executor.forward_context import (

@@ -12,6 +12,7 @@ the step does not cover runs SGLang's own attention, and build logs why.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from sgl_nvidia_mega.deepseek_v41.attention.step import AttentionStep, disable_reason
 
@@ -28,7 +29,7 @@ SGLANG_READS = {
 }
 
 
-def build(model, ctx, group):
+def build(model, ctx, group) -> dict[int, AttentionStep]:
     """Each covered layer's ``AttentionStep`` by layer id; the result is
     ``st.bound["attention"]``."""
     m = model.model
@@ -48,7 +49,7 @@ def build(model, ctx, group):
     return steps
 
 
-def step(layer, x, st):
+def step(layer, x, st) -> Any:
     """``layer``'s attention on the normed input ``x`` [rows, dim]; reads
     ``st.x_quant``, ``st.positions``, ``st.fb``."""
     attention = st.bound["attention"].get(layer.self_attn.layer_id)

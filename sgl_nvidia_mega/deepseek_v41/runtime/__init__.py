@@ -1,0 +1,326 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""The megakernel runtime: the executor of a covered decode step (``executor``), its
+per-step state (``state``), the embedding (``embedding``), and ``build``, which SGLang
+runs through the spec once the model is prepared and before the KV cache is sized."""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+import msgspec
+
+# The kernel slots this package ships; with the megakernel on, all of them run. The
+# Engram prefetch needs SGLang's per-rank Engram host table (spec.REQUIREMENTS).
+SHIPPED_SLOTS = (
+    "hop_a",
+    "moe",
+    "gate",
+    "attn",
+    "embed",
+    "two_shot",
+    "markov",
+    "draft_lm_head",
+    # aux_mean_stats: the DSpark capture layers' streams mean on the mHC stats stream,
+    # beside the attention instead of on the main stream before it (bitwise)
+    "aux_mean_stats",
+    # gate_wide: the fast gate top-k at every routed width (1-48), target and draft
+    "gate_wide",
+    # hop_a_batch2: hop A at 9-16 rows (batch 2) on the fused wo_a's row-tile scales
+    "hop_a_batch2",
+    "engram",
+    "attn_qkv_a",
+    "attn_qkv_a_bf16",
+    # index_q_mxfp8_in: the indexer wq_b reads the chain's q_lora quant (bitwise)
+    "index_q_mxfp8_in",
+    # hc_prenorm: the mHC coefficients from DeepGEMM's TF32 prenorm (not bitwise)
+    "hc_prenorm",
+    "hop_b",
+    "early_trigger",
+    # hop_b_start_trigger: the MoE post's Lamport consumer lets the next layer's
+    # first GEMM launch at its start, so its weight loads overlap the poll (bitwise)
+    "hop_b_start_trigger",
+    "draft",
+    "draft_moe",
+    "draft_gate",
+    "draft_tail",
+    "draft_post",
+    "draft_seam",
+    "draft_attn",
+    "draft_qfront",
+    "draft_wo_a",
+    "draft_swapab",
+    "draft_qkv_a",
+    "draft_prenorm",
+    "draft_qkv_a_ll",
+    "draft_wo_b_ll",
+    "sched_ahead",
+    "req_pos_once",
+    "kv_before_wait",
+)
+# the draft's slots, which build with the draft spec
+DRAFT_SLOTS = frozenset(
+    {
+        "markov",
+        "draft_lm_head",
+        "draft",
+        "draft_moe",
+        "draft_gate",
+        "draft_tail",
+        "draft_post",
+        "draft_seam",
+        "draft_attn",
+        "draft_qfront",
+        "draft_wo_a",
+        "draft_swapab",
+        "draft_qkv_a",
+        "draft_embed",
+        "draft_prenorm",
+        "draft_qkv_a_ll",
+        "draft_wo_b_ll",
+    }
+)
+# draft_embed: the draft's tokens from the target's gathered table; runs only when listed
+OPT_IN_SLOTS = ("draft_embed",)
+SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
+
+
+def _requested_slots() -> frozenset:
+    """``SLOTS_ENV`` (comma-separated; for tests and bisecting: "" runs every step
+    function's stock code), else every shipped slot."""
+    raw = os.environ.get(SLOTS_ENV)
+    if raw is None:
+        return frozenset(SHIPPED_SLOTS)
+    return frozenset(name.strip() for name in raw.split(",")) - {""}
+
+
+SLOTS = _requested_slots()
+
+
+def slot_reasons() -> list[str]:
+    """Why the requested slots cannot be served ([] when they can)."""
+    known = (*SHIPPED_SLOTS, *OPT_IN_SLOTS)
+    reasons = [
+        f"{SLOTS_ENV}: unknown slot {name!r} (known: {', '.join(known)})"
+        for name in sorted(SLOTS - set(known))
+    ]
+    for slot, needs in (
+        ("gate", "moe"),
+        ("gate_wide", "gate"),
+        ("hop_a_batch2", "hop_a"),
+        ("attn_qkv_a", "attn"),
+        ("attn_qkv_a_bf16", "attn_qkv_a"),
+        ("index_q_mxfp8_in", "attn"),
+        ("hop_b", "hop_a"),
+        ("early_trigger", "hop_a"),
+        ("hop_b_start_trigger", "hop_b"),
+        ("draft_lm_head", "markov"),
+        ("kv_before_wait", "attn"),
+        ("draft_moe", "draft"),
+        ("draft_gate", "draft_moe"),
+        ("draft_tail", "draft"),
+        ("draft_post", "draft"),
+        ("draft_seam", "draft_post"),
+        ("draft_attn", "draft"),
+        ("draft_qfront", "draft_attn"),
+        ("draft_wo_a", "draft_attn"),
+        ("draft_swapab", "draft_attn"),
+        ("draft_qkv_a", "draft_attn"),
+        ("draft_embed", "draft"),
+        ("draft_embed", "embed"),
+        ("draft_prenorm", "draft"),
+        ("draft_qkv_a_ll", "draft_qkv_a"),
+        ("draft_wo_b_ll", "draft_wo_a"),
+    ):
+        if slot in SLOTS and needs not in SLOTS:
+            reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
+    return reasons
+
+
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/runtime_context.py": (
+        "get_parallel",
+        '"tp_group"',
+        '"attn_dp_size"',
+    ),
+    "srt/megakernels/spec.py": ("widths", "tokens_per_request", "deadline_s"),
+    "srt/models/deepseek_v4.py": (
+        "DeepseekV4CudaDecoderLayer",
+        "hc_pre_from_prev_sublayer",
+        "model",
+        "start_layer",
+        "end_layer",
+        "layers",
+    ),
+}
+
+
+class PackageContext(msgspec.Struct, frozen=True):
+    """What every package's ``build(model, ctx, group)`` gets."""
+
+    widths: tuple[int, ...]  # the covered steps' rows (requests x rows a request)
+    tokens_per_request: int
+    deadline_s: float  # each cross-GPU wait's deadline
+    copies: dict  # (kind, name) -> tensor: weight copies the packages keep
+    # SGLang's runtime state for this model (megakernels/binding.py), or None
+    binding: Any = None
+
+
+def model_disable_reasons(model) -> list[str]:
+    """What the server arguments do not show: the layer loop the executor follows."""
+    from sglang.srt.models.deepseek_v4 import DeepseekV4CudaDecoderLayer
+    from sglang.srt.runtime_context import get_parallel
+
+    m = model.model
+    reasons = []
+    if not m.hc_pre_from_prev_sublayer:
+        reasons.append("needs the mHC pre-mix carried from the previous sublayer")
+    if get_parallel().attn_dp_size > 1:
+        reasons.append("attention DP: the covered step reads replicated token ids")
+    other = [
+        i
+        for i in range(m.start_layer, m.end_layer)
+        if not isinstance(m.layers[i], DeepseekV4CudaDecoderLayer)
+    ]
+    if other:
+        reasons.append(f"layers {other}: not SGLang's CUDA decoder layer")
+    return reasons
+
+
+def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
+    """Each shipped slot: whether its build serves at least one width."""
+    return {
+        "hop_a": any(s.hop_a for s in slots.values()),
+        "moe": facts.routed,
+        # the MoE build's own result: a layer's fast top-k may fail to build alone
+        "gate": any(s.fast_gate for s in slots.values())
+        and any(slot.gate for slot in getattr(bound["moe"], "slots", {}).values()),
+        "attn": any(step.chain is not None for step in bound["attention"].values()),
+        "embed": bound["embedding"] is not None,
+        "engram": bound["engram"].prefetch is not None,
+    }
+
+
+def attn_qkv_a_built(attention: dict, widths) -> bool:
+    """Slot attn_qkv_a serves a width: a layer's chain runs wqkv_a on the low-latency
+    GEMM, which takes 1-8 rows."""
+    from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+
+    return any(w <= mxfp8_ll.MAX_ROWS for w in widths) and any(
+        step.chain is not None and step.chain[0].qkv_a_ll for step in attention.values()
+    )
+
+
+def build(model, ctx):
+    """Each package's build (weights bound, buffers allocated, kernels compiled),
+    the slot plan per width, and the executor; ``ctx`` is SGLang's BuildContext."""
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
+    from sgl_nvidia_mega.deepseek_v41.attention.chain import SWAPAB_MAX_ROWS
+    from sgl_nvidia_mega.deepseek_v41.runtime import embedding
+    from sgl_nvidia_mega.deepseek_v41.runtime.executor import (
+        PACKAGES,
+        MegakernelDecode,
+    )
+
+    group = get_parallel().tp_group
+    if not ctx.widths:
+        raise RuntimeError(
+            f"NVIDIA megakernel: {ctx.tokens_per_request} rows a request leave no "
+            "covered width"
+        )
+    pctx = PackageContext(
+        widths=ctx.widths,
+        tokens_per_request=ctx.tokens_per_request,
+        deadline_s=ctx.deadline_s,
+        copies={},
+        binding=getattr(ctx, "binding", None),
+    )
+    bound = {name: pkg.build(model, pctx, group) for name, pkg in PACKAGES.items()}
+    table, embed_reason = None, "not requested"
+    if "embed" in SLOTS:
+        table, embed_reason = embedding.replicate(
+            model.model.embed_tokens, pctx.copies, group
+        )
+    bound["embedding"] = table
+    engram = bound["engram"]
+    # the boundary's hop A (its compiled widths) and the MoE step's GEMM pair, as built
+    hop = getattr(bound["boundary"], "hop_a", None)
+    facts = slot_plan.Facts(
+        hop_a=hop is not None,
+        hop_a_reason=getattr(bound["boundary"], "hop_a_reason", ""),
+        routed=bool(getattr(bound["moe"], "slots", None)),
+        embed=table is not None,
+        engram_prefetch=engram.prefetch is not None,
+        two_shot=getattr(bound["boundary"], "two_shot", None) is not None,
+        fast_gate_wide="gate_wide" in SLOTS,
+    )
+    slots = {
+        w: msgspec.structs.replace(s, hop_a=s.hop_a and w in hop.rows)
+        for w, s in slot_plan.plan(pctx.widths, facts).items()
+    }
+    built = {
+        **built_slots(slots, bound, facts),
+        "two_shot": any(s.two_shot for s in slots.values()),
+        "hop_b": bound["boundary"].hop_b,
+        "attn_qkv_a": attn_qkv_a_built(bound["attention"], pctx.widths),
+        "attn_qkv_a_bf16": attn_qkv_a_built(bound["attention"], pctx.widths)
+        and any(
+            step.chain is not None and step.chain[0].qkv_a_bf16
+            for step in bound["attention"].values()
+        ),
+        "hc_prenorm": bound["boundary"].prenorm,
+        "early_trigger": "early_trigger" in SLOTS and facts.hop_a,
+        "hop_a_batch2": any(
+            s.hop_a and w > slot_plan.HOP_A_BATCH1_ROWS for w, s in slots.items()
+        ),
+        "hop_b_start_trigger": "hop_b_start_trigger" in SLOTS
+        and bound["boundary"].hop_b,
+        # step-head work that needs no build: on when requested
+        "sched_ahead": "sched_ahead" in SLOTS,
+        # swap-AB serves 1-24 rows on low-ratio layers: built when a covered width is
+        "kv_before_wait": "kv_before_wait" in SLOTS
+        and any(w <= SWAPAB_MAX_ROWS for w in pctx.widths)
+        and any(a.swapab and a.low_ratio for a in bound["attention"].values()),
+        "aux_mean_stats": "aux_mean_stats" in SLOTS,
+        # built when the fast top-k serves a width past the default rows
+        "gate_wide": any(
+            s.fast_gate and w not in slot_plan.FAST_GATE_ROWS for w, s in slots.items()
+        ),
+        "req_pos_once": "req_pos_once" in SLOTS,
+        # the indexer wq_b on the chain's q_lora quant: indexer layers, 1-8 rows
+        "index_q_mxfp8_in": any(w <= 8 for w in pctx.widths)
+        and any(
+            a.chain is not None and a.chain[0].index_q_mxfp8_in
+            for a in bound["attention"].values()
+        ),
+    }
+    # every package's build agrees across ranks, so this raises on every rank alike
+    missing = sorted(name for name in SLOTS & built.keys() if not built[name])
+    if missing:
+        raise RuntimeError(
+            f"NVIDIA megakernel: requested slots {missing} built at no width "
+            f"(hop A: {facts.hop_a_reason or 'built'}; MoE: "
+            f"{getattr(bound['moe'], 'reason', '') or 'built'}; embedding: "
+            f"{embed_reason or 'built'}; Engram prefetch: {engram.reason or 'built'})"
+        )
+    summary = (
+        f"slots {sorted(name for name, on in built.items() if on) or 'none (stock)'}; "
+        f"hop A at {[w for w, x in slots.items() if x.hop_a]} rows, fast gate at "
+        f"{[w for w, x in slots.items() if x.fast_gate]} rows, Engram prefetch at "
+        f"{[w for w, x in slots.items() if x.engram_prefetch]} rows "
+        f"({engram.reason or 'built, checked bit for bit'}); boundary: "
+        f"{bound['boundary'].summary()}; weight copies "
+        + str(
+            {
+                k: f"{v.numel() * v.element_size() / 2**20:.1f} MiB"
+                for k, v in pctx.copies.items()
+            }
+        )
+    )
+    return MegakernelDecode(
+        model, slots, bound, widths=pctx.widths, summary=summary, binding=ctx.binding
+    )

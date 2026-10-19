@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sgl-nvidia-mega"
+version = "0.1.0.dev0"
+description = "NVIDIA megakernels for SGLang"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+# SGLang, torch, FlashInfer, CuTe DSL and the CUDA Python bindings come from
+# SGLang's CUDA image
+dependencies = []
+
+# SGLang loads the package as a general plugin; --enable-nvidia-megakernel turns the
+# megakernel on
+[project.entry-points."sglang.srt.plugins"]
+nvidia_megakernel = "sgl_nvidia_mega.plugin:register"
+
+[tool.setuptools.packages.find]
+include = ["sgl_nvidia_mega*"]
+
+# the kernels' CUDA sources and launch tables ship with the package
+[tool.setuptools.package-data]
+"*" = ["*.cu", "*.cuh", "*.json"]

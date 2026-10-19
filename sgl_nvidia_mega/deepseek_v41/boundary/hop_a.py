@@ -12,7 +12,6 @@ from typing import Optional
 import torch
 
 from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
-from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +38,10 @@ class HopA:
             partial, residual, post_mix, comb, pre, norm_weight, eps
         )
 
-    def finalize(self, *args, mxfp8_out=None):
-        """Hop B: ``AllReduceMHC.finalize`` of a deferred MoE output on this mailbox."""
-        return self._runner.hop.finalize(*args, mxfp8_out=mxfp8_out)
+    def finalize(self, *args, rows: int, mxfp8_out=None):
+        """Hop B: ``AllReduceMHC.finalize`` of a deferred MoE output of ``rows`` rows, on
+        the hop A mailbox or, past its capacity, slot hop_b_wide's."""
+        return self._runner.hop_for(rows).finalize(*args, mxfp8_out=mxfp8_out)
 
     def check_consumed(self) -> None:
         """Raise on the host if a publish was not collected: it would leave the
@@ -71,12 +71,12 @@ def build(
     m = model.model
     cfg = model.config
     wo_b = m.layers[m.start_layer].self_attn.wo_b
-    max_rows = slot_plan.hop_a_max_rows(batch2)
-    rows = tuple(w for w in ctx.widths if w <= max_rows)
-    hop_b_max = slot_plan.hop_b_max_rows(hop_b_wide, max_rows)
-    hop_b_rows = tuple(w for w in ctx.widths if w <= hop_b_max) if hop_b else ()
+    lay = slot_plan.hop_layout(
+        ctx.widths, hop_b=hop_b, batch2=batch2, hop_b_wide=hop_b_wide
+    )
+    rows, hop_b_rows = lay.hop_a_rows, lay.hop_b_rows
     if not rows:
-        return None, f"no width up to {max_rows} rows"
+        return None, f"no width up to {lay.capacity} rows"
     runner = Runner(device=wo_b.weight.device, rank=group.rank_in_group)
     error, taken = "", ()
     try:
@@ -85,12 +85,14 @@ def build(
             hidden=cfg.hidden_size,
             hc_mult=cfg.hc_mult,
             top_k=cfg.num_experts_per_tok,
-            hop_a_rows=max(rows + hop_b_rows),
+            hop_a_rows=lay.capacity,
+            hop_b_wide_rows=lay.wide_capacity,
             deadline_s=ctx.deadline_s,
             hop_b=hop_b,
             early_trigger=early_trigger,
             hop_b_start_trigger=hop_b_start_trigger,
-            row_tile_layer_input=any(w > mxfp8_ll.MAX_ROWS for w in hop_b_rows),
+            row_tile_layer_input=lay.row_tiles,
+            wide_row_tile_layer_input=lay.wide_row_tiles,
         )
         taken = tuple(runner.precompile_publish(wo_b, list(rows)))
     except Exception as e:  # gathered, then raised on every rank

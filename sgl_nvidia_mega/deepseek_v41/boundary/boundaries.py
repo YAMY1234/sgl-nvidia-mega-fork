@@ -475,7 +475,7 @@ class Boundaries:
         args = (r.gemm2_out, r.expert_weights, r.expanded_idx_to_permuted_idx)
         args += (out.shared, opened.streams, post_mix, comb)
         if not (nxt is not None and _quantizes(nxt, rows)):
-            updated, _ = self.hop_a.finalize(*args, None, None, 0.0)
+            updated, _ = self.hop_a.finalize(*args, None, None, 0.0, rows=rows)
             return mhc.HcState(updated, pre)
         hidden = opened.streams.shape[-1]
         row_tiles = self._row_tiles(layer.layer_id, rows)
@@ -485,7 +485,12 @@ class Boundaries:
         )
         out = mxfp8_ll.RowTileMxfp8(q, sf) if row_tiles else (q, sf)
         updated, normed = self.hop_a.finalize(
-            *args, pre, nxt.norm.weight, nxt.norm.variance_epsilon, mxfp8_out=out
+            *args,
+            pre,
+            nxt.norm.weight,
+            nxt.norm.variance_epsilon,
+            rows=rows,
+            mxfp8_out=out,
         )
         return mhc.HcState(updated, pre, _quantized(normed, q, sf, row_tiles))
 

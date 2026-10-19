@@ -450,7 +450,7 @@ def precompile(attn, widths, *, qkv_a_ll: bool = False) -> None:
 
     if qkv_a_ll and qkv_a_ll_applies(attn):
         ll_rows = [w for w in widths if w <= mxfp8_ll.MAX_ROWS]
-        if "hop_b" in SLOTS:
+        if "hop_b_wide" in SLOTS:
             # hop B's row-tile rows past 8 rows (plan.HOP_B_MAX_ROWS)
             ll_rows += [
                 w for w in widths if mxfp8_ll.MAX_ROWS < w <= slot_plan.HOP_B_MAX_ROWS

@@ -58,12 +58,14 @@ def build(
     early_trigger: bool = False,
     hop_b_start_trigger: bool = False,
     batch2: bool = False,
+    hop_b_wide: bool = False,
 ) -> tuple[Optional[HopA], str]:
     """(the hop, "") or (None, why not). Collective over the TP group: a failure on
     any rank raises on every rank; an unsupported wo_b leaves the hop off. ``hop_b``
     also compiles the MoE finalize's consumers; ``early_trigger`` launches the
     consumer's dependents right after its poll, ``hop_b_start_trigger`` the MoE
-    finalize's at its start; ``batch2`` (slot hop_a_batch2) adds 9-16 rows."""
+    finalize's at its start; ``batch2`` (slot hop_a_batch2) adds 9-16 rows; ``hop_b_wide``
+    runs hop B at every width up to plan.HOP_B_MAX_ROWS, not only hop A's."""
     from sgl_nvidia_mega.deepseek_v41.sm103.runner import Runner
 
     m = model.model
@@ -71,9 +73,8 @@ def build(
     wo_b = m.layers[m.start_layer].self_attn.wo_b
     max_rows = slot_plan.hop_a_max_rows(batch2)
     rows = tuple(w for w in ctx.widths if w <= max_rows)
-    hop_b_rows = (
-        tuple(w for w in ctx.widths if w <= slot_plan.HOP_B_MAX_ROWS) if hop_b else ()
-    )
+    hop_b_max = slot_plan.HOP_B_MAX_ROWS if hop_b_wide else max_rows
+    hop_b_rows = tuple(w for w in ctx.widths if w <= hop_b_max) if hop_b else ()
     if not rows:
         return None, f"no width up to {max_rows} rows"
     runner = Runner(device=wo_b.weight.device, rank=group.rank_in_group)

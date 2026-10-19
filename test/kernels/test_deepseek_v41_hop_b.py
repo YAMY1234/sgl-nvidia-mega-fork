@@ -490,8 +490,6 @@ def test_pdl_dependent_reads_final_outputs(env):
     print(f"HOPB r{env.rank} read-before-wait control, stale buffers of 48: {controls}")
 
 
-
-
 @torch.inference_mode()
 @pytest.mark.parametrize("early", ["end", "poll", "start"])
 def test_row_tile_finalize_relays_the_swizzled_scales(env, early):

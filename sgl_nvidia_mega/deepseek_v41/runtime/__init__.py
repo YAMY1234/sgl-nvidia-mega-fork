@@ -92,8 +92,9 @@ DRAFT_SLOTS = frozenset(
 )
 # Slots that run only when listed (draft_embed: the draft's tokens from the target's
 # gathered table; hop_b_cap16: hop_b_wide's row tiles at 9-16 rows only, no 48-row
-# mailbox, which measured +16 us on the batch-1 verify graph)
-OPT_IN_SLOTS = ("draft_embed", "hop_b_cap16")
+# mailbox, which measured +16 us on the batch-1 verify graph; target_lm_head: the
+# target's LM head on FlashInfer's low-M kernel at 1-16 rows, not bitwise)
+OPT_IN_SLOTS = ("draft_embed", "hop_b_cap16", "target_lm_head")
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -232,6 +233,7 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
             for slot in getattr(bound["moe"], "slots", {}).values()
         ),
         "engram": bound["engram"].prefetch is not None,
+        "target_lm_head": bound.get("logits") is not None,
     }
 
 

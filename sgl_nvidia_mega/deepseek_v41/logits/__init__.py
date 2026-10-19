@@ -8,7 +8,7 @@ head and logits (``logits``, SGLang's logits processor). Stock: the tail of
 
 Slot target_lm_head (``build``): the logits processor gets a stand-in for the LM head
 whose quant method runs the shard on FlashInfer's low-M BF16 kernel at
-1-LM_HEAD_MAX_ROWS rows and SGLang's own matmul otherwise; the TP gather, the logit
+1-TARGET_MAX_ROWS rows (batch 1) and SGLang's own matmul otherwise; the TP gather, the logit
 scale and the output fields stay SGLang's."""
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import torch
 
 from sgl_nvidia_mega.deepseek_v41.sampler import (
     LM_HEAD_BACKEND,
-    LM_HEAD_MAX_ROWS,
     low_m_lm_head_supported,
 )
 
@@ -47,11 +46,14 @@ SGLANG_READS = {
     ),
     "srt/distributed/parallel_state.py": ("world_size", "cpu_group"),
 }
+# GB300 TP4 shard, SGLang's matmul vs the low-M kernel: 55.4 vs 47.5 us at 6 rows, but
+# 51.4 vs 50.8 us at 12 (cuBLAS is fast there), so batch 2 up keeps SGLang's bitwise
+TARGET_MAX_ROWS = 8
 # FlashInfer's token buckets: tuned at these, the low-M kernel is at least as fast at
-# the verify rows (6, 12) as tuned at them (GB300 TP4 shard, 47.4 vs 55.4 us at 6 rows)
-TUNING_ROWS = (1, 2, 4, 8, 16)
+# the verify rows as tuned at them
+TUNING_ROWS = (1, 2, 4, 8)
 # build checks the logits against SGLang's head at these rows (spec.NUMERICS)
-CHECK_ROWS = (1, 2, 4, 6, 8, 12, 16)
+CHECK_ROWS = (1, 2, 4, 6, 8)
 
 
 class LowMLmHeadMethod:
@@ -69,7 +71,7 @@ class LowMLmHeadMethod:
         return (
             bias is None
             and x.dim() == 2
-            and 1 <= x.shape[0] <= LM_HEAD_MAX_ROWS
+            and 1 <= x.shape[0] <= TARGET_MAX_ROWS
             and x.dtype == torch.bfloat16
             and x.is_contiguous()
         )

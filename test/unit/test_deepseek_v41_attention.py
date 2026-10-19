@@ -100,7 +100,11 @@ def test_wo_b_publishes_at_hop_a_widths_and_falls_back_otherwise():
 # and its slot reported as built.
 
 # the embedding and Engram builds, both built
-OTHERS = {"embedding": object(), "engram": SimpleNamespace(prefetch=object())}
+OTHERS = {
+    "embedding": object(),
+    "engram": SimpleNamespace(prefetch=object()),
+    "logits": object(),
+}
 
 
 def _pool(*, window=None, width=584):
@@ -154,7 +158,16 @@ def test_every_shipped_slot_reports_its_build():
     )
     # the slots this table reports; the boundary build reports two_shot and the
     # hops, the DSpark step its own slots
-    target = {"hop_a", "moe", "gate", "attn", "embed", "engram", "shared_ll"}
+    target = {
+        "hop_a",
+        "moe",
+        "gate",
+        "attn",
+        "embed",
+        "engram",
+        "shared_ll",
+        "target_lm_head",
+    }
     assert set(built) == target and all(built.values())
     stock = {0: SimpleNamespace(chain=None)}
     assert not runtime.built_slots(

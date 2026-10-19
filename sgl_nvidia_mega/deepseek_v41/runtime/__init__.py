@@ -27,6 +27,9 @@ SHIPPED_SLOTS = (
     "aux_mean_stats",
     # gate_wide: the fast gate top-k at every routed width (1-48), target and draft
     "gate_wide",
+    # shared_ll: the shared expert's gate_up on the low-latency GEMM, quantized at the
+    # MoE fork on the alternate stream (moe/shared_ll.py; not bitwise: summation order)
+    "shared_ll",
     # hop_a_batch2: hop A at 9-16 rows (batch 2) on the fused wo_a's row-tile scales
     "hop_a_batch2",
     "engram",
@@ -111,6 +114,7 @@ def slot_reasons() -> list[str]:
     ]
     for slot, needs in (
         ("gate", "moe"),
+        ("shared_ll", "moe"),
         ("gate_wide", "gate"),
         ("hop_a_batch2", "hop_a"),
         ("attn_qkv_a", "attn"),
@@ -204,6 +208,10 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
         and any(slot.gate for slot in getattr(bound["moe"], "slots", {}).values()),
         "attn": any(step.chain is not None for step in bound["attention"].values()),
         "embed": bound["embedding"] is not None,
+        "shared_ll": any(
+            slot.shared is not None
+            for slot in getattr(bound["moe"], "slots", {}).values()
+        ),
         "engram": bound["engram"].prefetch is not None,
     }
 
@@ -313,7 +321,8 @@ def build(model, ctx):
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built at no width "
             f"(hop A: {facts.hop_a_reason or 'built'}; MoE: "
-            f"{getattr(bound['moe'], 'reason', '') or 'built'}; embedding: "
+            f"{getattr(bound['moe'], 'reason', '') or 'built'}; shared_ll: "
+            f"{getattr(bound['moe'], 'shared_reason', '') or 'built'}; embedding: "
             f"{embed_reason or 'built'}; Engram prefetch: {engram.reason or 'built'})"
         )
     summary = (

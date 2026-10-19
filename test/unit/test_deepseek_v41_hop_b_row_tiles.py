@@ -47,7 +47,9 @@ def test_wide_wqkv_a_compiles_only_with_hop_b_wide(monkeypatch, slots, wide):
     monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
     monkeypatch.setattr(chain, "qkv_a_ll_applies", lambda attn: True)
     monkeypatch.setattr(chain, "wq_b_ll_applies", lambda attn: False)
-    monkeypatch.setattr(chain.mxfp8_ll, "precompile", lambda w, rows: calls.append(rows))
+    monkeypatch.setattr(
+        chain.mxfp8_ll, "precompile", lambda w, rows: calls.append(rows)
+    )
     attn = SimpleNamespace(wqkv_a=SimpleNamespace(weight="w"), use_fused_wo_a=False)
     chain.precompile(attn, (6, 12, 48, 96), qkv_a_ll=True)
     assert calls == [[6, 12, 48] if wide else [6]]

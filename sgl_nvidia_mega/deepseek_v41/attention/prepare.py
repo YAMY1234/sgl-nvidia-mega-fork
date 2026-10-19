@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import torch
 
-from sgl_nvidia_mega.deepseek_v41.attention import ops
+from sgl_nvidia_mega.deepseek_v41.attention import indexer, ops
 
 
 def multi_stream(attn, x, positions, fb, view, q_out, x_quant, q_ops=ops):
@@ -85,26 +85,67 @@ def low_ratio(attn, x, positions, fb, view, q_out, x_quant, q_ops=ops):
             )
     stream_kv.wait_stream(current)
     q_lora, q_for_wqb = q_ops.compute_q_a(attn, x_linear, qkv_a)
+    # slot attn_indexer: the index query on the second stream, beside the query chain
+    plugin_index = _plugin_index(attn, q_ops, q_for_wqb, x, fb, view)
+    if plugin_index is not None:
+        stream_query = attn.alt_streams[1]
+        stream_query.wait_stream(current)
+        req, pos = indexer.request_rows(view, fb, x.shape[0])
+        with torch.cuda.stream(stream_query):
+            index_q = plugin_index.query(
+                attn, q_for_wqb, x, indexer.positions_for(pos, positions)
+            )
+        for t in index_q:
+            t.record_stream(stream_sources)
     if attn.indexer is not None:
         stream_sources.wait_stream(current)
     q = q_ops.compute_q_b(attn, q_for_wqb, positions, q_out)
+
+    def sglang_index():
+        view.low_ratio_sources(
+            layer=attn,
+            x=x,
+            q_lora=q_ops.index_q_input(attn, q_lora, q_for_wqb),
+            positions=positions,
+            forward_batch=fb,
+            run_compressor=False,
+        )
+
     if attn.indexer is not None:
         # forked above, right after q_lora; recorded here, after the query chain
         with torch.cuda.stream(stream_sources):
-            view.low_ratio_sources(
-                layer=attn,
-                x=x,
-                q_lora=q_ops.index_q_input(attn, q_lora, q_for_wqb),
-                positions=positions,
-                forward_batch=fb,
-                run_compressor=False,
-            )
+            if plugin_index is None:
+                sglang_index()
+            else:
+                stream_sources.wait_stream(stream_query)
+                plugin_index.topk(attn, index_q, req, view)
+                if plugin_index.check:
+                    plugin_index.compare(attn, view, sglang_index)
     with torch.cuda.stream(stream_kv):
         q_ops.kv_to_cache(attn, x_linear, positions, fb, view, qkv_a)
     current.wait_stream(stream_kv)
     if attn.compressor is not None or attn.indexer is not None:
         current.wait_stream(stream_sources)
+    if plugin_index is not None:
+        current.wait_stream(stream_query)
     return q
+
+
+def _plugin_index(attn, q_ops, q_for_wqb, x, fb, view):
+    """The process's plugin indexer when it takes this layer's step, else None: the
+    layer is one it took at build, the chain quantized q_lora, and the step's metadata
+    is one it scores (``StepIndexer.serves``)."""
+    from sgl_nvidia_mega.deepseek_v41.attention.chain import Mxfp8Rows
+
+    plugin = getattr(q_ops, "indexer", None)
+    if (
+        plugin is None
+        or attn.indexer is None
+        or not isinstance(q_for_wqb, Mxfp8Rows)
+        or not plugin.serves(view, x.shape[0], fb)
+    ):
+        return None
+    return plugin
 
 
 def eager(attn, x, positions, fb, view, q_out, x_quant, q_ops=ops):

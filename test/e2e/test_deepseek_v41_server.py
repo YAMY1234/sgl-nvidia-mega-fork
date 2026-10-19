@@ -221,7 +221,7 @@ class TestMegakernelVerify(CustomTestCase):
         r"'embed', 'engram', 'gate', 'gate_wide', 'hc_prenorm', 'hop_a', "
         r"'hop_a_batch2', 'hop_b', 'hop_b_start_trigger', 'index_q_mxfp8_in', "
         r"'kv_before_wait', 'moe', 'req_pos_once', "
-        r"'sched_ahead', 'two_shot'\]; "
+        r"'sched_ahead', 'shared_ll', 'two_shot'\]; "
         r"hop A at \[6, 12\] rows, fast gate at \[6, 12, 18, 24, 30, 36, 42, 48\] rows, "
         r"Engram prefetch at \[6\] rows \(built, checked bit for bit\); boundary: "
         r"hop A at \[6, 12\] rows \(built\); hop B on; two-shot at 49-384 rows "

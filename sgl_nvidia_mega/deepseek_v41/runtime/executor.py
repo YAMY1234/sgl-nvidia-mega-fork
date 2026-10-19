@@ -128,9 +128,13 @@ class MegakernelDecode:
         self, input_ids, forward_batch, input_embeds=None, pp_proxy_tensors=None
     ) -> Step | None:
         """The step if this forward is covered, else None (SGLang's forward runs)."""
+        from sgl_nvidia_mega.deepseek_v41.spec import serves_this_step
+
         mode = forward_batch.forward_mode
         rows = int(input_ids.shape[0])
         if pp_proxy_tensors is not None or not mode.is_target_verify():
+            return None
+        if not serves_this_step():
             return None
         return Step(mode="target_verify", rows=rows) if rows in self.widths else None
 

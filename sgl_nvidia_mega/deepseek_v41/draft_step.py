@@ -173,7 +173,9 @@ class DraftDecode(DraftProposal):
     def plan(self, input_ids, forward_batch, *args, **kwargs):
         from sglang.srt.megakernels.spec import Step
 
-        if not forward_batch.forward_mode.is_target_verify():
+        from sgl_nvidia_mega.deepseek_v41.spec import serves_this_step
+
+        if not forward_batch.forward_mode.is_target_verify() or not serves_this_step():
             return None
         rows = int(input_ids.shape[0])
         return Step(mode="target_verify", rows=rows) if rows in self.widths else None

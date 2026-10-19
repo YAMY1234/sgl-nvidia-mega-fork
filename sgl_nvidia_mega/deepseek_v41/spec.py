@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
 
 from sglang.srt.megakernels.spec import (
@@ -36,8 +37,13 @@ SGLANG_READS = {
         "TOLERANCE",
         "Requirements",
         "decode_graph_backends",
+        "config_disable_reasons",
     ),
+    # the decode CUDA graph backend _config_disable_reasons reads
+    "srt/model_executor/cuda_graph_config.py": ("decode", "backend", '"disabled"'),
+    "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
     "srt/arg_groups/fields/*.py": (
+        "cuda_graph_config",
         "kv_cache_dtype",
         "speculative_algorithm",
         "moe_a2a_backend",
@@ -57,6 +63,34 @@ FLASHINFER_LL_GEMM_SHA256 = frozenset(
     {"118744bf9553da5fcbf6504739d499ec208dcf2034d473799ec11661e1313280"}
 )
 
+# Test-only switches that run the covered step eagerly: the composition check
+# (runtime/parity.py) and the injected hop fault (sm103/runner.py)
+EAGER_TEST_SWITCHES = (
+    "SGLANG_NVIDIA_MEGAKERNEL_PARITY",
+    "SGLANG_NVIDIA_MEGAKERNEL_FAULT_INJECT",
+)
+
+
+def eager_steps_allowed() -> bool:
+    """Decode without CUDA graphs is refused (the eager forward loses long-context
+    accuracy) except under a test-only switch."""
+    return any(os.environ.get(k, "") not in ("", "0") for k in EAGER_TEST_SWITCHES)
+
+
+def serves_this_step() -> bool:
+    """A covered step runs the megakernel only while SGLang captures its decode CUDA
+    graphs (their warm-up runs included), or eagerly under a test-only switch; any
+    other step, e.g. an eager fallback under FULL graphs, runs SGLang's forward."""
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+    return get_is_capture_mode() or eager_steps_allowed()
+
+
+def decode_graph_backends() -> frozenset:
+    """FULL decode CUDA graphs; eager steps too under a test-only switch."""
+    return frozenset({"full", "disabled"} if eager_steps_allowed() else {"full"})
+
+
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_103"}),
     tp_sizes=frozenset({4}),
@@ -64,8 +98,7 @@ REQUIREMENTS = Requirements(
     # GB300's 152 SMs
     resident_blocks=152,
     dtypes=frozenset({"bfloat16"}),
-    # the decode CUDA graphs the covered step is tested with (eager steps too)
-    decode_graph_backends=frozenset({"full", "disabled"}),
+    decode_graph_backends=decode_graph_backends(),
     server_args={
         "kv_cache_dtype": frozenset({"fp8_e4m3"}),
         # DSpark's target steps are uniform verify steps
@@ -205,7 +238,13 @@ def flashinfer_ll_gemm_digest():
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sgl_nvidia_mega.deepseek_v41 import runtime
 
-    return toolchain_reasons() + runtime.slot_reasons()
+    reasons = toolchain_reasons() + runtime.slot_reasons()
+    if cfg.cuda_graph_config.decode.backend == "disabled" and not eager_steps_allowed():
+        reasons.append(
+            "decode CUDA graphs are disabled: the eager forward is not supported yet; "
+            "enable decode CUDA graphs"
+        )
+    return reasons
 
 
 def _model_disable_reasons(model, hf_config) -> list[str]:

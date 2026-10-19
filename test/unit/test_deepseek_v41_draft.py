@@ -47,7 +47,10 @@ def _step(mode, rows):
     "mode, rows, covered",
     [("target_verify", 10, True), ("target_verify", 12, False), ("idle", 10, False)],
 )
-def test_the_draft_covers_whole_blocks_of_its_widths(mode, rows, covered):
+def test_the_draft_covers_whole_blocks_of_its_widths(monkeypatch, mode, rows, covered):
+    import sglang.srt.model_executor.runner as runner
+
+    monkeypatch.setattr(runner, "get_is_capture_mode", lambda: True)
     d, _ = _decode([])
     fb, ids = _step(mode, rows)
     step = d.plan(ids, fb)

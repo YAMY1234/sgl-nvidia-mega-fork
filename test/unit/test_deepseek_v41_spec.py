@@ -109,6 +109,44 @@ def test_each_refusal_names_its_reason(kw, want):
     assert want in _refusal(**kw)
 
 
+DISABLED = with_phase(
+    default_cuda_graph_config(), Phase.DECODE, backend=Backend.DISABLED
+)
+
+
+def test_decode_without_cuda_graphs_is_refused_with_its_reason():
+    """The eager forward loses long-context accuracy, so a launch without decode CUDA
+    graphs is refused, saying why."""
+    message = _refusal(cuda_graph_config=DISABLED)
+    assert "decode CUDA graphs 'disabled' is not one of ['full']" in message, message
+    assert (
+        "the eager forward is not supported yet; enable decode CUDA graphs" in message
+    )
+
+
+@pytest.mark.parametrize(
+    "switch, value",
+    [
+        ("SGLANG_NVIDIA_MEGAKERNEL_PARITY", "1"),
+        ("SGLANG_NVIDIA_MEGAKERNEL_FAULT_INJECT", "1:hop_a:5000"),
+    ],
+)
+def test_a_test_only_switch_runs_eager_steps(monkeypatch, switch, value):
+    """The stock-parity and hop-fault serving tests step eagerly; only their switches
+    let a launch without decode CUDA graphs through."""
+    assert switch in spec.EAGER_TEST_SWITCHES
+    monkeypatch.setenv(switch, value)
+    assert spec.decode_graph_backends() == {"full", "disabled"}
+    # SPEC's requirements are read at import, under the server's environment
+    requires = msgspec.structs.replace(
+        spec.SPEC.requires, decode_graph_backends=spec.decode_graph_backends()
+    )
+    monkeypatch.setattr(
+        spec, "SPEC", msgspec.structs.replace(spec.SPEC, requires=requires)
+    )
+    assert _refusal(cuda_graph_config=DISABLED) == ""
+
+
 def test_ragged_verify_is_refused():
     with envs.SGLANG_RAGGED_VERIFY_MODE.override("dynamic"):
         assert "SGLANG_RAGGED_VERIFY_MODE" in _refusal()

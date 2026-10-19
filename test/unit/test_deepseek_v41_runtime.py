@@ -21,7 +21,7 @@ from scheduler_init import (  # noqa: E402
 )
 from sglang.srt.megakernels.spec import Step  # noqa: E402
 
-from sgl_nvidia_mega.deepseek_v41 import runtime  # noqa: E402
+from sgl_nvidia_mega.deepseek_v41 import runtime, spec  # noqa: E402
 from sgl_nvidia_mega.deepseek_v41.engram import prefetch  # noqa: E402
 from sgl_nvidia_mega.deepseek_v41.runtime import executor  # noqa: E402
 from sgl_nvidia_mega.deepseek_v41.runtime import state  # noqa: E402
@@ -199,7 +199,14 @@ def _batch(mode="TARGET_VERIFY"):
     )
 
 
-def test_only_verify_steps_of_built_widths_are_covered():
+def _capturing(monkeypatch, on=True):
+    import sglang.srt.model_executor.runner as runner
+
+    monkeypatch.setattr(runner, "get_is_capture_mode", lambda: on)
+
+
+def test_only_verify_steps_of_built_widths_are_covered(monkeypatch):
+    _capturing(monkeypatch)
     decode = executor.MegakernelDecode(None, {}, {}, (6, 12, 48))
     ids = torch.zeros(12, dtype=torch.int64)
     assert decode.plan(ids, _batch()) == Step(mode="target_verify", rows=12)
@@ -208,10 +215,42 @@ def test_only_verify_steps_of_built_widths_are_covered():
     assert decode.plan(ids, _batch(), None, pp_proxy_tensors=object()) is None
 
 
-def test_a_two_shot_width_is_a_covered_step():
+@pytest.mark.parametrize("which", ["target", "draft"])
+@pytest.mark.parametrize(
+    "capturing, switch, served",
+    [
+        (False, None, False),
+        (True, None, True),
+        (False, ("SGLANG_NVIDIA_MEGAKERNEL_PARITY", "1"), True),
+        (False, ("SGLANG_NVIDIA_MEGAKERNEL_FAULT_INJECT", "1:hop_a:5000"), True),
+    ],
+)
+def test_only_captured_steps_are_served(monkeypatch, which, capturing, switch, served):
+    """Under FULL decode CUDA graphs SGLang may still step eagerly (an uncaptured
+    batch); such a step runs SGLang's forward, and only the graph capture (its
+    warm-up runs included) or a test-only switch runs the covered step."""
+    from sgl_nvidia_mega.deepseek_v41 import draft_step
+
+    _capturing(monkeypatch, capturing)
+    for name in spec.EAGER_TEST_SWITCHES:
+        monkeypatch.delenv(name, raising=False)
+    if switch:
+        monkeypatch.setenv(*switch)
+    if which == "target":
+        built = executor.MegakernelDecode(None, {}, {}, (6, 12))
+    else:
+        built = draft_step.DraftDecode.__new__(draft_step.DraftDecode)
+        built.widths = (6, 12)
+    step = built.plan(torch.zeros(12, dtype=torch.int64), _batch())
+    assert step == (Step(mode="target_verify", rows=12) if served else None)
+
+
+def test_a_two_shot_width_is_a_covered_step(monkeypatch):
     """With the two-shot slot built, a 384-row verify step (64 requests) runs the
     executor, whose boundary then takes the two-shot posts at that width."""
     from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
+
+    _capturing(monkeypatch)
 
     widths = tuple(range(6, slot_plan.max_rows(True) + 1, 6))
     decode = executor.MegakernelDecode(None, {}, {}, widths)

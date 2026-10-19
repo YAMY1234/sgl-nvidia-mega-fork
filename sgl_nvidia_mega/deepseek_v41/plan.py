@@ -63,6 +63,11 @@ def hop_a_max_rows(batch2: bool) -> int:
     return HOP_A_MAX_ROWS if batch2 else HOP_A_BATCH1_ROWS
 
 
+def hop_b_max_rows(wide: bool, hop_a_rows: int) -> int:
+    """Hop B's widest step: hop A's, or with slot hop_b_wide the routed pair's."""
+    return HOP_B_MAX_ROWS if wide else hop_a_rows
+
+
 def fast_gate_rows(wide: bool) -> frozenset:
     return FAST_GATE_WIDE_ROWS if wide else FAST_GATE_ROWS
 

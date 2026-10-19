@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Hop B at 9-48 rows: it writes the next input's scales per 8-row tile only for a next
+"""Hop B at 9-48 rows (slot hop_b_wide): it writes the next input's scales per 8-row tile only for a next
 layer whose chain runs wqkv_a on the wide low-latency GEMM; SGLang's wqkv_a never
 receives them."""
 
@@ -28,6 +28,29 @@ def _rows(rows):
 def test_hop_b_spans_batch_2_to_8_below_the_two_shot():
     assert plan.HOP_A_MAX_ROWS < plan.HOP_B_MAX_ROWS < plan.TWO_SHOT_MIN_ROWS
     assert plan.HOP_B_MAX_ROWS == plan.ROUTED_MAX_ROWS
+
+
+@pytest.mark.parametrize("hop_a_rows", [8, 16])
+def test_hop_b_goes_past_hop_a_only_with_the_slot(hop_a_rows):
+    assert plan.hop_b_max_rows(False, hop_a_rows) == hop_a_rows
+    assert plan.hop_b_max_rows(True, hop_a_rows) == plan.HOP_B_MAX_ROWS
+
+
+@pytest.mark.parametrize(
+    "slots, wide",
+    [({"hop_a", "hop_b", "hop_b_wide"}, True), ({"hop_a", "hop_b"}, False)],
+)
+def test_wide_wqkv_a_compiles_only_with_hop_b_wide(monkeypatch, slots, wide):
+    from sgl_nvidia_mega.deepseek_v41 import runtime
+
+    calls = []
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
+    monkeypatch.setattr(chain, "qkv_a_ll_applies", lambda attn: True)
+    monkeypatch.setattr(chain, "wq_b_ll_applies", lambda attn: False)
+    monkeypatch.setattr(chain.mxfp8_ll, "precompile", lambda w, rows: calls.append(rows))
+    attn = SimpleNamespace(wqkv_a=SimpleNamespace(weight="w"), use_fused_wo_a=False)
+    chain.precompile(attn, (6, 12, 48, 96), qkv_a_ll=True)
+    assert calls == [[6, 12, 48] if wide else [6]]
 
 
 def test_row_tiles_only_past_8_rows_for_a_reading_chain():

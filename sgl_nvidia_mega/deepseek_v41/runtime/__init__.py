@@ -106,6 +106,18 @@ def _requested_slots() -> frozenset:
 SLOTS = _requested_slots()
 
 
+def row_tile_layers(attention: dict, slots: frozenset) -> frozenset:
+    """Slot hop_b_wide: the layers whose chain runs wqkv_a on the low-latency GEMM, for
+    which hop B writes row-tile scales past 8 rows (none without the slot)."""
+    if "hop_b_wide" not in slots:
+        return frozenset()
+    return frozenset(
+        lid
+        for lid, step in attention.items()
+        if step.chain is not None and step.chain[0].qkv_a_ll
+    )
+
+
 def slot_reasons() -> list[str]:
     """Why the requested slots cannot be served ([] when they can)."""
     known = (*SHIPPED_SLOTS, *OPT_IN_SLOTS)
@@ -256,14 +268,7 @@ def build(model, ctx):
         binding=getattr(ctx, "binding", None),
     )
     bound = {name: pkg.build(model, pctx, group) for name, pkg in PACKAGES.items()}
-    # slot hop_b_wide: hop B writes row-tile scales past 8 rows only for the chains that
-    # read them
-    if "hop_b_wide" in SLOTS:
-        bound["boundary"].row_tile_layers = frozenset(
-            lid
-            for lid, step in bound["attention"].items()
-            if step.chain is not None and step.chain[0].qkv_a_ll
-        )
+    bound["boundary"].row_tile_layers = row_tile_layers(bound["attention"], SLOTS)
     table, embed_reason = None, "not requested"
     if "embed" in SLOTS:
         table, embed_reason = embedding.replicate(

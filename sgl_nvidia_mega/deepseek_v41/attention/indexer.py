@@ -12,7 +12,8 @@ SGLang's backend computes the index query (wq_b, RoPE + fp4 pack, head weights) 
 ``forward_low_ratio_sources`` on the sources stream, after the main query chain is
 launched. Here the query is the indexer wq_b on the low-latency GEMM fed the chain's
 q_lora quant, with SGLang's RoPE + pack, on ``alt_streams[1]`` beside the main query
-chain; the scoring and selection are SGLang's kernel ops on the sources stream, as
+chain; the head weights read only the layer input, so they start on that stream before
+q_lora. The scoring and selection are SGLang's kernel ops on the sources stream, as
 SGLang's three decode paths run them:
 
 - a candidate source: paged MQA logits, the paged top-k, then the block selection and
@@ -198,7 +199,13 @@ class StepIndexer:
                 self._log_declined(rows, "chunked metadata")
         return self._serves
 
-    def query(self, attn, q_quant, x, positions) -> Query:
+    @staticmethod
+    def head_weights(attn, x) -> torch.Tensor:
+        """The index heads' weights (``head_weights_raw``): they read only the layer
+        input, so they run before q_lora is ready."""
+        return attn.indexer.head_weights_raw(x)
+
+    def query(self, attn, q_quant, head_weights, positions) -> Query:
         """``_index_q_and_weights`` with the wq_b on the low-latency GEMM (the chain's
         q_lora quant: 128x4 scales to 8 rows, row tiles past)."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
@@ -207,7 +214,7 @@ class StepIndexer:
 
         indexer = attn.indexer
         wq_b = indexer.wq_b
-        rows, heads = x.shape[0], indexer.n_local_heads
+        rows, heads = head_weights.shape[0], indexer.n_local_heads
         q = mxfp8_ll.linear(
             q_quant.quant, q_quant.scale, wq_b.weight, wq_b.weight_scale_inv_swizzled
         )
@@ -215,7 +222,7 @@ class StepIndexer:
             q.view(rows, heads, indexer.index_head_dim),
             torch.view_as_real(attn.freqs_cis).flatten(-2),
             positions,
-            indexer.head_weights_raw(x),
+            head_weights,
             indexer.head_weight_scale,
         )
         return Query(q_fp4.view(rows, 1, heads, 64), q_sf.view(rows, 1, heads), weights)

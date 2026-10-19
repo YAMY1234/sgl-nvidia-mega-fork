@@ -70,6 +70,14 @@ def low_ratio(attn, x, positions, fb, view, q_out, x_quant, q_ops=ops):
 
     if attn.compressor is not None:
         stream_sources.wait_stream(current)
+    # slot attn_indexer: the index head weights read only x, so the second stream forks
+    # here; the index query joins it once q_lora is quantized
+    plugin_index = _plugin_index(attn, q_ops, x, fb, view)
+    if plugin_index is not None:
+        stream_query = attn.alt_streams[1]
+        stream_query.wait_stream(current)
+        with torch.cuda.stream(stream_query):
+            head_weights = plugin_index.head_weights(attn, x)
     qkv_a = None
     if attn.fuse_wqa_wkv:
         qkv_a = q_ops.qkv_a(attn, x_linear)
@@ -85,15 +93,13 @@ def low_ratio(attn, x, positions, fb, view, q_out, x_quant, q_ops=ops):
             )
     stream_kv.wait_stream(current)
     q_lora, q_for_wqb = q_ops.compute_q_a(attn, x_linear, qkv_a)
-    # slot attn_indexer: the index query on the second stream, beside the query chain
-    plugin_index = _plugin_index(attn, q_ops, q_for_wqb, x, fb, view)
+    # the index query on the second stream, beside the query chain
     if plugin_index is not None:
-        stream_query = attn.alt_streams[1]
         stream_query.wait_stream(current)
         req, pos = indexer.request_rows(view, fb, x.shape[0])
         with torch.cuda.stream(stream_query):
             index_q = plugin_index.query(
-                attn, q_for_wqb, x, indexer.positions_for(pos, positions)
+                attn, q_for_wqb, head_weights, indexer.positions_for(pos, positions)
             )
         for t in index_q:
             t.record_stream(stream_sources)
@@ -131,17 +137,16 @@ def low_ratio(attn, x, positions, fb, view, q_out, x_quant, q_ops=ops):
     return q
 
 
-def _plugin_index(attn, q_ops, q_for_wqb, x, fb, view):
+def _plugin_index(attn, q_ops, x, fb, view):
     """The process's plugin indexer when it takes this layer's step, else None: the
-    layer is one it took at build, the chain quantized q_lora, and the step's metadata
-    is one it scores (``StepIndexer.serves``)."""
-    from sgl_nvidia_mega.deepseek_v41.attention.chain import Mxfp8Rows
-
+    layer is one it took at build, the chain quantizes q_lora (``wq_b_ll``: its norm
+    returns ``Mxfp8Rows``), and the step's metadata is one it scores
+    (``StepIndexer.serves``)."""
     plugin = getattr(q_ops, "indexer", None)
     if (
         plugin is None
         or attn.indexer is None
-        or not isinstance(q_for_wqb, Mxfp8Rows)
+        or not getattr(q_ops, "wq_b_ll", False)
         or not plugin.serves(view, x.shape[0], fb)
     ):
         return None

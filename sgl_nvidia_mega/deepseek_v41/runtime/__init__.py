@@ -81,8 +81,14 @@ DRAFT_SLOTS = frozenset(
         "draft_wo_b_ll",
     }
 )
-# draft_embed: the draft's tokens from the target's gathered table; runs only when listed
-OPT_IN_SLOTS = ("draft_embed",)
+# Slots that run only when listed (draft_embed: the draft's tokens from the target's
+# gathered table)
+OPT_IN_SLOTS = (
+    "draft_embed",
+    # attn_indexer: a covered step's indexer top-k in the plugin's forward, the index
+    # query on the layer's second stream (attention/indexer.py; bitwise)
+    "attn_indexer",
+)
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -110,6 +116,7 @@ def slot_reasons() -> list[str]:
         ("gate_wide", "gate"),
         ("hop_a_batch2", "hop_a"),
         ("attn_qkv_a", "attn"),
+        ("attn_indexer", "attn"),
         ("attn_qkv_a_bf16", "attn_qkv_a"),
         ("index_q_mxfp8_in", "attn"),
         ("hop_b", "hop_a"),
@@ -291,6 +298,10 @@ def build(model, ctx):
             s.fast_gate and w not in slot_plan.FAST_GATE_ROWS for w, s in slots.items()
         ),
         "req_pos_once": "req_pos_once" in SLOTS,
+        "attn_indexer": any(
+            a.chain is not None and a.chain[0].indexer is not None
+            for a in bound["attention"].values()
+        ),
         # the indexer wq_b on the chain's q_lora quant: indexer layers, 1-8 rows
         "index_q_mxfp8_in": any(w <= 8 for w in pctx.widths)
         and any(

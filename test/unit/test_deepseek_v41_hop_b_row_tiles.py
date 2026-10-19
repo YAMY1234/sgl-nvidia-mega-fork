@@ -104,3 +104,45 @@ def test_sglangs_wqkv_a_never_takes_row_tile_scales():
     with pytest.raises(RuntimeError, match="row-tile MXFP8 scales"):
         ops.qkv_a(attn, _rows(12))
     attn.wqkv_a.assert_not_called()
+
+
+WIDTHS = (6, 12, 18, 24, 48)
+
+
+def test_hop_layout_keeps_hop_a_widths_on_the_small_mailbox():
+    off = plan.hop_layout(WIDTHS, hop_b=True, batch2=True, hop_b_wide=False)
+    assert (off.hop_a_rows, off.hop_b_rows) == ((6, 12), (6, 12))
+    assert (off.capacity, off.wide_capacity) == (16, 0)
+    assert (
+        not off.row_tiles and not off.wide_row_tiles
+    )  # no row-tile kernel without the slot
+    on = plan.hop_layout(WIDTHS, hop_b=True, batch2=True, hop_b_wide=True)
+    assert (on.hop_a_rows, on.hop_b_rows) == ((6, 12), WIDTHS)
+    assert (on.capacity, on.wide_capacity) == (16, 48)
+    assert (
+        on.row_tiles and on.wide_row_tiles
+    )  # 12 rows on the small one, 18-48 on the wide
+    b1 = plan.hop_layout(WIDTHS, hop_b=True, batch2=False, hop_b_wide=True)
+    assert (b1.capacity, b1.wide_capacity, b1.row_tiles) == (8, 48, False)
+
+
+def test_batch_1_and_2_hops_touch_only_the_small_mailbox():
+    """Hop B at hop A's widths runs on hop A's 16-row mailbox; only past it on the
+    48-row one (a wider mailbox measured +11.6 us/step at batch 1)."""
+    from sgl_nvidia_mega.deepseek_v41.boundary.hop_a import HopA
+    from sgl_nvidia_mega.deepseek_v41.sm103.runner import Runner
+
+    calls = []
+    runner = Runner.__new__(Runner)
+    runner.hop = SimpleNamespace(
+        capacity=16, finalize=lambda *a, **k: calls.append("small")
+    )
+    runner.hop_wide = SimpleNamespace(
+        capacity=48, finalize=lambda *a, **k: calls.append("wide")
+    )
+    hop = HopA(runner, (6, 12), WIDTHS)
+    for rows in WIDTHS:
+        hop.finalize("args", rows=rows)
+    assert calls == ["small", "small", "wide", "wide", "wide"]
+    runner.hop_wide = None
+    assert runner.hop_for(48) is runner.hop

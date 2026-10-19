@@ -73,7 +73,7 @@ def build(
     wo_b = m.layers[m.start_layer].self_attn.wo_b
     max_rows = slot_plan.hop_a_max_rows(batch2)
     rows = tuple(w for w in ctx.widths if w <= max_rows)
-    hop_b_max = slot_plan.HOP_B_MAX_ROWS if hop_b_wide else max_rows
+    hop_b_max = slot_plan.hop_b_max_rows(hop_b_wide, max_rows)
     hop_b_rows = tuple(w for w in ctx.widths if w <= hop_b_max) if hop_b else ()
     if not rows:
         return None, f"no width up to {max_rows} rows"

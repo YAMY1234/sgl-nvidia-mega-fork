@@ -336,6 +336,8 @@ def test_slot_selection_is_validated(monkeypatch):
         ("early_trigger", "needs slot 'hop_a'"),
         ("hop_a_batch2", "needs slot 'hop_a'"),
         ("hop_a,hop_b_start_trigger", "needs slot 'hop_b'"),
+        ("hop_a,hop_b_wide", "needs slot 'hop_b'"),
+        ("hop_a,hop_b,hop_b_wide", "needs slot 'attn_qkv_a'"),
     ):
         monkeypatch.setattr(runtime, "SLOTS", frozenset(raw.split(",")))
         assert any(want in r for r in runtime.slot_reasons()), raw

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Slot target_lm_head through SGLang's own LogitsProcessor._compute_lm_head: the
-stand-in's quant method runs the low-M kernel at 1-16 rows and SGLang's matmul bit for
+stand-in's quant method runs the low-M kernel at 1-8 rows and SGLang's matmul bit for
 bit above; build refuses the heads SGLang would compute another way."""
 
 import logging
@@ -68,15 +68,15 @@ def test_sglang_routes_the_stand_in_to_its_quant_method_and_its_own_head_not():
     assert not should_apply_lm_head_quant_method(head, head.quant_method)
 
 
-@pytest.mark.parametrize("rows", [1, 6, 12, 16, 17, 24])
-def test_the_low_m_kernel_serves_1_to_16_rows_and_sglangs_matmul_above(low_m, rows):
+@pytest.mark.parametrize("rows", [1, 6, 8, 9, 12, 16, 24])
+def test_the_low_m_kernel_serves_1_to_8_rows_and_sglangs_matmul_above(low_m, rows):
     model = _model()
     stand_in = logits.TargetLmHead(model.lm_head)
     x = torch.randn(rows, DIM).to(torch.bfloat16)
     ours = model.logits_processor._compute_lm_head(x, stand_in)
     theirs = model.logits_processor._compute_lm_head(x, model.lm_head)
     assert ours.dtype == theirs.dtype and ours.shape == theirs.shape
-    if rows <= 16:
+    if rows <= 8:
         assert low_m == [rows]
         torch.testing.assert_close(ours.float(), theirs.float(), rtol=2**-7, atol=0.1)
     else:
@@ -131,13 +131,13 @@ def test_build_refuses_logits_outside_the_tolerance(low_m, monkeypatch, caplog):
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"target_lm_head"}))
     good = sys.modules["flashinfer"].mm_bf16
 
-    def off_at_12(x, weight_t, **kw):
+    def off_at_6(x, weight_t, **kw):
         out = good(x, weight_t, **kw)
-        return out * 1.05 if x.shape[0] == 12 else out
+        return out * 1.05 if x.shape[0] == 6 else out
 
-    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_bf16=off_at_12))
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_bf16=off_at_6))
     assert logits.build(_model(), None, None) is None
-    assert "at 12 rows" in caplog.text
+    assert "at 6 rows" in caplog.text
 
 
 @pytest.mark.parametrize("others_ok", [True, False])
@@ -164,14 +164,14 @@ def test_a_capture_logs_each_row_count_once_and_tuning_none(low_m, monkeypatch, 
     caplog.set_level(logging.INFO, logger=logits.__name__)
     method.tune()
     monkeypatch.setattr(logits, "_capturing", lambda: True)
-    for rows in (6, 6, 12, 24):
+    for rows in (6, 6, 8, 12):
         method.apply(None, torch.zeros(rows, DIM, dtype=torch.bfloat16))
     lines = [
         r.getMessage() for r in caplog.records if "target_lm_head" in r.getMessage()
     ]
     assert lines == [
         "NVIDIA megakernel: target_lm_head captured at 6 rows",
-        "NVIDIA megakernel: target_lm_head captured at 12 rows",
+        "NVIDIA megakernel: target_lm_head captured at 8 rows",
     ]
 
 

@@ -34,6 +34,9 @@ SHIPPED_SLOTS = (
     "attn_qkv_a_bf16",
     # index_q_mxfp8_in: the indexer wq_b reads the chain's q_lora quant (bitwise)
     "index_q_mxfp8_in",
+    # attn_indexer: a covered step's indexer top-k in the plugin's forward, the index
+    # query and head weights on the layer's second stream (attention/indexer.py; bitwise)
+    "attn_indexer",
     # hc_prenorm: the mHC coefficients from DeepGEMM's TF32 prenorm (not bitwise)
     "hc_prenorm",
     "hop_b",
@@ -83,12 +86,7 @@ DRAFT_SLOTS = frozenset(
 )
 # Slots that run only when listed (draft_embed: the draft's tokens from the target's
 # gathered table)
-OPT_IN_SLOTS = (
-    "draft_embed",
-    # attn_indexer: a covered step's indexer top-k in the plugin's forward, the index
-    # query on the layer's second stream (attention/indexer.py; bitwise)
-    "attn_indexer",
-)
+OPT_IN_SLOTS = ("draft_embed",)
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 

@@ -119,10 +119,44 @@ def test_build_tunes_and_returns_the_stand_in_only_when_listed(low_m, monkeypatc
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"target_lm_head"}))
     head = logits.build(model, None, None)
     assert isinstance(head, logits.TargetLmHead) and head.lm_head is model.lm_head
-    # the tuning rows, then build's check through SGLang's _compute_lm_head
-    assert low_m == [*logits.TUNING_ROWS, 1]
+    # the tuning rows, then build's value check through SGLang's _compute_lm_head
+    assert low_m == [*logits.TUNING_ROWS, *logits.CHECK_ROWS]
     model.logits_processor.use_fp32_lm_head = True
     assert logits.build(model, None, None) is None
+
+
+def test_build_refuses_logits_outside_the_tolerance(low_m, monkeypatch, caplog):
+    """Values, not only dtype and shape: a kernel off by more than spec.NUMERICS at
+    any served row count is refused (zeros would match on both heads)."""
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"target_lm_head"}))
+    good = sys.modules["flashinfer"].mm_bf16
+
+    def off_at_12(x, weight_t, **kw):
+        out = good(x, weight_t, **kw)
+        return out * 1.05 if x.shape[0] == 12 else out
+
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_bf16=off_at_12))
+    assert logits.build(_model(), None, None) is None
+    assert "at 12 rows" in caplog.text
+
+
+@pytest.mark.parametrize("others_ok", [True, False])
+def test_every_rank_agrees_on_the_verdict(low_m, monkeypatch, others_ok):
+    """A rank whose own check passes still refuses when another rank's failed."""
+    import torch.distributed as dist
+
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"target_lm_head"}))
+    groups = []
+
+    def all_reduce(flag, op, group):
+        groups.append((op, group))
+        flag.fill_(int(bool(flag.item()) and others_ok))
+
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    tp = SimpleNamespace(world_size=4, cpu_group="cpu")
+    head = logits.build(_model(), None, tp)
+    assert (head is not None) == others_ok
+    assert groups == [(dist.ReduceOp.MIN, "cpu")]
 
 
 def test_a_capture_logs_each_row_count_once_and_tuning_none(low_m, monkeypatch, caplog):

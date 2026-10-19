@@ -45,10 +45,13 @@ SGLANG_READS = {
         "should_apply_lm_head_quant_method(quant_method)",
         "_UNQUANTIZED_LM_HEAD_METHODS",
     ),
+    "srt/distributed/parallel_state.py": ("world_size", "cpu_group"),
 }
-# FlashInfer's token buckets: tuned at these, the low-M kernel is at least as fast at the
-# verify rows (6, 12) as tuned at them (GB300 TP4 shard, 47.4 vs 55.4 us at 6 rows)
+# FlashInfer's token buckets: tuned at these, the low-M kernel is at least as fast at
+# the verify rows (6, 12) as tuned at them (GB300 TP4 shard, 47.4 vs 55.4 us at 6 rows)
 TUNING_ROWS = (1, 2, 4, 8, 16)
+# build checks the logits against SGLang's head at these rows (spec.NUMERICS)
+CHECK_ROWS = (1, 2, 4, 6, 8, 12, 16)
 
 
 class LowMLmHeadMethod:
@@ -145,22 +148,55 @@ def build(model, ctx, group):
         return None
     head = TargetLmHead(model.lm_head)
     head.quant_method.tune()
-    # the logits after either head feed the same logit scale, TP gather and buffers
-    w = head.weight
-    x = torch.zeros(1, w.shape[1], dtype=torch.bfloat16, device=w.device)
-    ours = model.logits_processor._compute_lm_head(x, head)
-    theirs = model.logits_processor._compute_lm_head(x, model.lm_head)
-    if ours.dtype != theirs.dtype or ours.shape != theirs.shape:
+    error = check_against_sglang(model, head)
+    if not _all_ranks_true(group, not error):
         logger.warning(
-            "NVIDIA megakernel: target LM head not built: it gives %s %s, SGLang's "
-            "head %s %s",
-            ours.dtype,
-            tuple(ours.shape),
-            theirs.dtype,
-            tuple(theirs.shape),
+            "NVIDIA megakernel: target LM head not built: %s",
+            error or "another rank's logits differ from SGLang's head",
         )
         return None
     return head
+
+
+def check_against_sglang(model, head) -> str:
+    """The stand-in's logits against SGLang's head through SGLang's own
+    ``_compute_lm_head`` on seeded random rows at every served row count ("" when
+    within spec.NUMERICS); the logit scale, TP gather and buffers follow either."""
+    from sgl_nvidia_mega.deepseek_v41.spec import NUMERICS
+
+    tol = NUMERICS.tolerances["target_lm_head.logits.rel"]
+    proc, w = model.logits_processor, head.weight
+    gen = torch.Generator(device=w.device).manual_seed(0)
+    for rows in CHECK_ROWS:
+        x = torch.randn(rows, w.shape[1], generator=gen, device=w.device)
+        x = x.to(torch.bfloat16)
+        ours = proc._compute_lm_head(x, head)
+        theirs = proc._compute_lm_head(x, model.lm_head)
+        if ours.dtype != theirs.dtype or ours.shape != theirs.shape:
+            return (
+                f"it gives {ours.dtype} {tuple(ours.shape)}, SGLang's head "
+                f"{theirs.dtype} {tuple(theirs.shape)} at {rows} rows"
+            )
+        rel = (
+            (ours.float() - theirs.float()).abs().max() / theirs.float().abs().max()
+        ).item()
+        if not rel <= tol:
+            return (
+                f"its logits differ by {rel:.2e} of SGLang's peak at {rows} rows "
+                f"(> {tol:.2e})"
+            )
+    return ""
+
+
+def _all_ranks_true(group, value: bool) -> bool:
+    """``value`` on every rank of SGLang's TP ``group`` (None or one rank: this one)."""
+    if group is None or group.world_size == 1:
+        return value
+    flag = torch.tensor([int(value)], dtype=torch.int32)
+    torch.distributed.all_reduce(
+        flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+    )
+    return bool(flag.item())
 
 
 def head(st, residual, pre):

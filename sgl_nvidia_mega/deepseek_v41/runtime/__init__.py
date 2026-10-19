@@ -43,6 +43,9 @@ SHIPPED_SLOTS = (
     # hc_prenorm: the mHC coefficients from DeepGEMM's TF32 prenorm (not bitwise)
     "hc_prenorm",
     "hop_b",
+    # hop_b_wide: hop B (the MoE post) at 9-48 rows on a mailbox of its own, writing
+    # row-tile scales for wqkv_a on the wide low-latency GEMM (not bitwise past 8 rows)
+    "hop_b_wide",
     "early_trigger",
     # hop_b_start_trigger: the MoE post's Lamport consumer lets the next layer's
     # first GEMM launch at its start, so its weight loads overlap the poll (bitwise)
@@ -88,9 +91,7 @@ DRAFT_SLOTS = frozenset(
     }
 )
 # draft_embed: the draft's tokens from the target's gathered table; runs only when listed
-# hop_b_wide: hop B (the MoE post) at 9-48 rows, writing row-tile scales for wqkv_a on
-# the wide low-latency GEMM (not bitwise past 8 rows)
-OPT_IN_SLOTS = ("draft_embed", "hop_b_wide")
+OPT_IN_SLOTS = ("draft_embed",)
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 

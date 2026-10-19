@@ -53,6 +53,19 @@ def test_wide_wqkv_a_compiles_only_with_hop_b_wide(monkeypatch, slots, wide):
     assert calls == [[6, 12, 48] if wide else [6]]
 
 
+def test_row_tile_layers_only_with_hop_b_wide():
+    from sgl_nvidia_mega.deepseek_v41 import runtime
+
+    ll, dense = (SimpleNamespace(qkv_a_ll=q) for q in (True, False))
+    attention = {
+        3: SimpleNamespace(chain=(ll,)),
+        4: SimpleNamespace(chain=(dense,)),
+        5: SimpleNamespace(chain=None),
+    }
+    assert runtime.row_tile_layers(attention, frozenset({"hop_b_wide"})) == {3}
+    assert runtime.row_tile_layers(attention, frozenset({"hop_b"})) == frozenset()
+
+
 def test_row_tiles_only_past_8_rows_for_a_reading_chain():
     b = boundaries.Boundaries.__new__(boundaries.Boundaries)
     b._next_layer, b.row_tile_layers = {3: 4, 4: 5}, frozenset({4})

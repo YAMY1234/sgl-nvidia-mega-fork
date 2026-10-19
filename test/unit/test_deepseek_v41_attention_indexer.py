@@ -224,7 +224,8 @@ def _low_ratio(plugin, log, *, quant=True):
     q_for_wqb = chain.Mxfp8Rows(torch.zeros(6, 4), torch.zeros(4)) if quant else "bf16"
     q_ops = SimpleNamespace(
         indexer=plugin,
-        compute_q_a=lambda attn, x, qkv_a: ("q_lora", q_for_wqb),
+        wq_b_ll=quant,
+        compute_q_a=lambda attn, x, qkv_a: log.append("q_a") or ("q_lora", q_for_wqb),
         compute_q_b=lambda *a: log.append("q_b") or "q",
         index_q_input=lambda attn, q_lora, q: "index_input",
         kv_to_cache=lambda *a: log.append("kv"),
@@ -272,13 +273,20 @@ def test_a_taken_step_replaces_sglangs_index_query():
         or indexer.Query(torch.zeros(1), torch.zeros(1), torch.zeros(1))
     )
     plugin.topk.side_effect = lambda *a: log.append("plugin_topk")
+    plugin.head_weights.side_effect = lambda attn, x: log.append(
+        ("head_weights", torch.cuda.current_stream().name)
+    )
     _low_ratio(plugin, log)
     assert "plugin_query" in log and "plugin_topk" in log
     # SGLang's sources call (and its _index_q_and_weights) does not run for the indexer
     assert not [e for e in log if isinstance(e, tuple) and e[0] == "sglang_sources"]
-    # the query forks off the main stream before the query chain, and the scorer waits
-    # for it on the sources stream; the main stream joins the query stream at the end
-    assert log.index(("wait", "query", "main")) < log.index("q_b")
+    # the head weights fork with the layer, before q_lora; the query waits for q_lora
+    # and runs before the query chain; the scorer waits for it on the sources stream and
+    # the main stream joins the query stream at the end
+    fork = [i for i, e in enumerate(log) if e == ("wait", "query", "main")]
+    assert len(fork) == 2
+    assert fork[0] < log.index(("head_weights", "query")) < log.index("q_a") < fork[1]
+    assert fork[1] < log.index("plugin_query") < log.index("q_b")
     assert ("wait", "sources", "query") in log and ("wait", "main", "query") in log
 
 
@@ -288,6 +296,7 @@ def test_a_declined_step_keeps_sglangs_call(serves, quant):
     plugin = mock.Mock(check=False)
     plugin.serves.return_value = serves
     _low_ratio(plugin, log, quant=quant)
+    plugin.head_weights.assert_not_called()
     plugin.query.assert_not_called()
     plugin.topk.assert_not_called()
     assert ("sglang_sources", False) in log

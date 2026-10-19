@@ -170,6 +170,57 @@ def test_the_layer_runs_sglangs_path_for_its_role(
     assert (p._table is not None) is (source and not skip_filter and not skip_all)
 
 
+def _attrs(obj):
+    """Every attribute of SGLang's objects the indexer reads, by identity."""
+    return {k: id(v) for k, v in vars(obj).items()}
+
+
+@pytest.mark.parametrize("role", ["source", "consumer", "full"])
+def test_a_served_layer_leaves_sglangs_state_as_it_found_it(role):
+    """A layer the plugin serves writes its selection into SGLang's buffer and nothing
+    else: no attribute of the view, the metadata (candidate_metadata included), the
+    paged metadata or the pool is set, replaced or added, so a later step on SGLang's
+    own path (a declined width, another captured graph) sees what it would without
+    the slot."""
+    p = _plugin()
+    view = _view(_paged(), _paged())
+    meta = view.metadata
+    objs = (view, meta, meta.core_metadata, meta.c1_indexer_metadata, view.kv_pool)
+    before = [_attrs(o) for o in objs]
+    attn = SimpleNamespace(
+        compress_ratio=1,
+        layer_id=7,
+        indexer=SimpleNamespace(
+            is_candidate_source=role == "source", uses_candidates=role == "consumer"
+        ),
+    )
+    data = indexer.Query(
+        torch.zeros(6, 1, 4, 64), torch.zeros(6, 1, 4), torch.zeros(6, 4)
+    )
+    with (
+        _ops_modules([]),
+        mock.patch(
+            "sglang.srt.model_executor.runner_utils.capture_mode.skip_low_ratio_indexer",
+            return_value=False,
+        ),
+        mock.patch(
+            "sglang.srt.model_executor.runner_utils.capture_mode.skip_candidate_filtering",
+            return_value=False,
+        ),
+        mock.patch.object(torch.cuda, "current_stream"),
+        mock.patch.object(torch.cuda, "stream", lambda s: nullcontext()),
+        mock.patch.object(torch.cuda, "Event"),
+        mock.patch.object(torch.Tensor, "record_stream", lambda self, s: None),
+    ):
+        p.stream = mock.Mock()
+        p.serves(view, 6, _fb())
+        if role == "consumer":  # the step's source published it
+            p._table = indexer.Table(torch.zeros(1, 4), "s", "pb", "vl", "ready")
+        p.topk(attn, data, torch.zeros(6, dtype=torch.int64), view)
+    assert [_attrs(o) for o in objs] == before
+    assert not hasattr(meta, "candidate_metadata")
+
+
 def test_a_consumer_reads_the_sources_table():
     log = []
     p = _plugin()

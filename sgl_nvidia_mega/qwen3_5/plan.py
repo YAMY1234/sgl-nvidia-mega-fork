@@ -7,7 +7,10 @@ inside its row bounds; every other op is SGLang's own. ``route`` (the router
 GEMM and the routed experts' NVFP4 input in one launch) and ``mkm`` (on its outputs, the
 top-10 and both expert GEMMs in one launch, up to 7 rows) cover every width, as do
 ``gdn_verify`` (the GatedDeltaNet verify chain with its launch choices changed) and
-``hop`` (the boundary's fused all-reduce points on the decode hop).
+``hop`` (the boundary's fused all-reduce points on the decode hop). ``skv2`` runs the
+full attention's core through our 2.2 branch's split-KV attention, ``mka`` the fused
+attention prologue and epilogue around it, and ``mka_push`` (with ``hop``) has the
+epilogue push its rows into the hop.
 """
 
 from __future__ import annotations
@@ -27,6 +30,9 @@ class Slots(msgspec.Struct, frozen=True):
     gdn_verify: bool = False  # the GDN verify chain's launch choices (gdn/verify.py)
     gdn_pdl: bool = False  # its ReplaySSM verify launched dependent on the conv
     hop: bool = False  # the boundary's fused all-reduce points (boundary/hop.py)
+    skv2: bool = False  # the full attention's core through SKV2 (attention/split_kv.py)
+    mka: bool = False  # the fused attention prologue and epilogue (attention/mka.py)
+    mka_push: bool = False  # the epilogue pushes its rows into the hop
 
 
 class Facts(msgspec.Struct, frozen=True):
@@ -38,6 +44,9 @@ class Facts(msgspec.Struct, frozen=True):
     gdn_verify: bool = False  # the GDN verify slot built for every GDN layer
     gdn_pdl: bool = False  # with its dependent verify launch
     hop: bool = False  # the decode hop, built for the widest covered step
+    skv2: bool = False  # SKV2 for every full-attention layer
+    mka: bool = False  # the fused prologue and epilogue for every full-attention layer
+    mka_push: bool = False  # with the epilogue's push into the hop
 
 
 def slots(rows: int, facts: Facts) -> Slots:
@@ -49,6 +58,9 @@ def slots(rows: int, facts: Facts) -> Slots:
         gdn_verify=facts.gdn_verify,
         gdn_pdl=facts.gdn_verify and facts.gdn_pdl,
         hop=facts.hop,
+        skv2=facts.skv2,
+        mka=facts.mka,
+        mka_push=facts.mka and facts.mka_push and facts.hop,
     )
 
 

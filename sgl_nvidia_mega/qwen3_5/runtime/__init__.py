@@ -14,7 +14,16 @@ import msgspec
 # The kernel slots that run by default, and the ones that run only when requested
 # (until step-level timing and accuracy runs move them to the default list)
 SHIPPED_SLOTS: tuple[str, ...] = ()
-OPT_IN_SLOTS: tuple[str, ...] = ("route", "mkm", "gdn_verify", "gdn_pdl", "hop")
+OPT_IN_SLOTS: tuple[str, ...] = (
+    "route",
+    "mkm",
+    "gdn_verify",
+    "gdn_pdl",
+    "hop",
+    "skv2",
+    "mka",
+    "mka_push",
+)
 # The EAGLE entries (spec.ENTRIES) offered only when requested in the same variable;
 # verify_sample has no step at any size, so it turns on SGLang's post-verify graphs
 # with SGLang's own sampling
@@ -47,6 +56,11 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_pdl' launches slot 'gdn_verify''s verify"
         )
+    if "mka_push" in SLOTS and not {"mka", "hop"} <= SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'mka_push' pushes slot 'mka''s epilogue into slot "
+            "'hop''s mailbox"
+        )
     return reasons
 
 
@@ -74,7 +88,7 @@ def build(model, ctx):
     SGLang's BuildContext."""
     import torch
 
-    from sgl_nvidia_mega.qwen3_5 import boundary, gdn, moe
+    from sgl_nvidia_mega.qwen3_5 import attention, boundary, gdn, moe
     from sgl_nvidia_mega.qwen3_5 import plan as slot_plan
     from sgl_nvidia_mega.qwen3_5.runtime import parity
     from sgl_nvidia_mega.qwen3_5.runtime.executor import Qwen35Verify
@@ -93,6 +107,7 @@ def build(model, ctx):
         "moe": moe.build(model, pctx),
         "gdn": gdn.build(model, pctx),
         "boundary": boundary.build(model, pctx),
+        "attention": attention.build(model, pctx),
     }
     facts = slot_plan.Facts(
         route=bound["moe"].route,
@@ -100,6 +115,9 @@ def build(model, ctx):
         gdn_verify=bound["gdn"].gdn_verify,
         gdn_pdl=bound["gdn"].gdn_pdl,
         hop=bound["boundary"].hop is not None,
+        skv2=bound["attention"].skv2,
+        mka=bound["attention"].mka,
+        mka_push=bound["attention"].mka_push,
     )
     slots = slot_plan.plan(pctx.widths, facts)
     built = msgspec.structs.asdict(facts)
@@ -110,7 +128,8 @@ def build(model, ctx):
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built no width (MoE: "
             f"{bound['moe'].reason or 'built'}; GDN: {bound['gdn'].reason or 'built'}; "
-            f"boundary: {bound['boundary'].reason or 'built'})"
+            f"boundary: {bound['boundary'].reason or 'built'}; "
+            f"attention: {bound['attention'].reason or 'built'})"
         )
     checker = (
         parity.Parity(pctx.widths, torch.cuda.current_device(), model)

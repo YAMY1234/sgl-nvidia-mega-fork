@@ -162,11 +162,18 @@ def core(attn, q, st):
         )
     if not split:
         return attn(q, None, None, st.fb)
+    return skv2(attn, q, st.view.kv, st.view.attn)
+
+
+def skv2(attn, q, kv, meta):
+    """SKV2 on one request's 7 FP8 query rows ``q`` of ``attn`` over the pool ``kv``
+    (KvPoolBuffers) at ``meta``'s pages and lengths (AttnStepMetadata), whose rows for
+    this step are written: [rows, heads * head_dim] in bf16. The draft extend's
+    attention (``EXTEND``'s route) runs it on the draft's pool too."""
     from sglang.kernels.ops.attention.utils import canonicalize_stride
 
     from sgl_nvidia_mega.qwen3_5.sm103.attention.skv2 import StockSplitPlan
 
-    kv = st.view.kv
     i = kv.layer_ids.index(attn.layer_id)
     # the pool's NHD rows as HND pages, as TRT-LLM MHA hands them to its decode kernel
     caches = tuple(
@@ -176,7 +183,7 @@ def core(attn, q, st):
         for buf, heads in ((kv.k[i], attn.tp_k_head_num), (kv.v[i], attn.tp_v_head_num))
     )
     q = q.reshape(-1, attn.tp_q_head_num, attn.head_dim)
-    table, lengths = st.view.attn.page_table, st.view.attn.cache_seqlens
+    table, lengths = meta.page_table, meta.cache_seqlens
     key = (q.shape, caches[0].shape, table.shape, table.stride(), lengths.shape)
     plan = _PLANS.get(key)
     if plan is None:

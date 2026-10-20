@@ -1284,6 +1284,65 @@ def test_the_mka_slot_runs_the_prologue_the_attention_and_the_epilogue(skv2):
     assert out.shape == (7, 4096) and out.dtype == torch.bfloat16
 
 
+@pytest.mark.parametrize("consumes", [False, True])
+def test_the_mka_push_slot_pushes_where_the_moe_input_only_consumes(consumes):
+    from sgl_nvidia_mega.qwen3_5.attention import mka
+    from sgl_nvidia_mega.qwen3_5.boundary import hop as boundary_hop
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import mka as kernels
+
+    log = _log()
+    attn, st = _skv2_setup(log, k_scale=torch.full((1,), 0.75))
+    layer = _mka_layer(log, attn)
+    x = torch.zeros(7, 4096, dtype=torch.bfloat16)
+    st.positions = torch.zeros(3, 7, dtype=torch.int64)
+    st.slots = plan.Slots(skv2=True, mka=True, mka_push=True, hop=True)
+    hop = SimpleNamespace(
+        site="site", mark_pushed=lambda t: log.append(("mark_pushed", log.tag(t)))
+    )
+    st.bound = {"boundary": SimpleNamespace(hop=hop)}
+    mka.WEIGHTS[7] = ("w_qkv", "w_o")
+
+    def epilogue(**kw):
+        log.known["out"] = kw["out"]
+        log.append(("epilogue", kw["site"]))
+
+    def takes(hop_, layer_, st_, rows):
+        log.append(("takes_moe_input", hop_ is hop, layer_ is layer, rows))
+        return consumes
+
+    @contextlib.contextmanager
+    def symmetric(group, disabled=False):
+        yield
+
+    with (
+        patch.object(kernels, "prologue", lambda **kw: None),
+        patch.object(kernels, "epilogue", epilogue),
+        patch(
+            "sgl_nvidia_mega.qwen3_5.attention.split_kv.core",
+            lambda *a: torch.zeros(7, 1024, dtype=torch.bfloat16),
+        ),
+        patch.object(boundary_hop, "takes_moe_input", takes),
+        patch(
+            "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
+            symmetric,
+        ),
+        patch("sglang.srt.layers.dp_attention.is_allocation_symmetric", lambda: True),
+        patch(
+            "sglang.srt.runtime_context.get_parallel",
+            lambda: SimpleNamespace(tp_group="tp"),
+        ),
+    ):
+        out = attention.step(layer, x, st)
+    del mka.WEIGHTS[7]
+    assert log[0] == ("takes_moe_input", True, True, 7)
+    if consumes:
+        # the epilogue pushes through the hop's site, and its all-reduce only consumes
+        assert log[1:] == [("epilogue", "site"), ("mark_pushed", "out(7, 4096)")]
+    else:
+        assert log[1:] == [("epilogue", None)]
+    assert out is log.known["out"]
+
+
 @pytest.mark.parametrize(
     "kw, want",
     [

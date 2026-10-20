@@ -89,7 +89,7 @@ def build(model, ctx) -> Bound:
     if "mka" in SLOTS:
         for _, layer in layers:
             mka.pack(layer)
-    return Bound(skv2="skv2" in SLOTS, mka="mka" in SLOTS)
+    return Bound(skv2="skv2" in SLOTS, mka="mka" in SLOTS, mka_push="mka_push" in SLOTS)
 
 
 def pool_reasons(view, binding, skv2: bool = True, mka: bool = False) -> list[str]:

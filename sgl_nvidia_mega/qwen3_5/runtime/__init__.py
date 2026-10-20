@@ -22,6 +22,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "hop",
     "gdn_push",
     "gdn_front",
+    "route_shared",
 )
 # The EAGLE entries (spec.ENTRIES) offered only when requested in the same variable;
 # verify_sample has no step at any size, so it turns on SGLang's post-verify graphs
@@ -51,6 +52,10 @@ def slot_reasons() -> list[str]:
     ]
     if "mkm" in SLOTS and "route" not in SLOTS:
         reasons.append(f"{SLOTS_ENV}: slot 'mkm' runs on slot 'route''s outputs")
+    if "route_shared" in SLOTS and "route" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'route_shared' runs in slot 'route''s launch"
+        )
     if "gdn_push" in SLOTS and not {"gdn_verify", "hop"} <= SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_push' pushes slot 'gdn_verify''s out_proj into "
@@ -119,6 +124,7 @@ def build(model, ctx):
         hop=bound["boundary"].hop is not None,
         gdn_push=bool(bound["gdn"].packed),
         gdn_front=bool(bound["gdn"].front),
+        route_shared=bound["moe"].shared,
     )
     slots = slot_plan.plan(pctx.widths, facts)
     built = msgspec.structs.asdict(facts)

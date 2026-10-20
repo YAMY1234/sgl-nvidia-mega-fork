@@ -302,6 +302,147 @@ def test_the_route_slot_replaces_only_the_gate_and_the_routed_experts(capture):
     assert got_out == stock_out == "handoff"
 
 
+class _GateUp:
+    """The shared gate/up rows the router front returns, logging the stream they are
+    recorded on."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def record_stream(self, stream):
+        self.log.append(("record_stream", stream.name))
+
+
+def test_the_route_shared_slot_starts_the_shared_expert_after_the_router_launch():
+    """Slot route_shared at graph capture with the deferred finalize: the router launch
+    also computes the shared gate/up; the alternate stream waits for that launch only (an
+    event recorded right after it), then runs the activation, down_proj and the gate,
+    while the routed experts run on the main stream."""
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    x = torch.zeros(7, 4)
+    log = _log(x=x)
+    mlp = _moe_block(log, x)
+    _, front, context = _router_front(log, mlp)
+    k = log.known
+    k.update(
+        # ModelOpt keeps the weight as the [K, N] transpose of a row-major [N, K]
+        sh_w=torch.zeros(256, 4096, dtype=torch.float8_e4m3fn).t(),
+        sh_in=torch.ones(()),
+        sh_ws=torch.ones(()),
+    )
+    gate_up = _GateUp(log)
+    k["gate_up"] = gate_up
+    mlp.shared_expert = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(
+            weight=k["sh_w"], input_scale=k["sh_in"], weight_scale=k["sh_ws"]
+        ),
+        _enable_silu_fp4_quant_fusion=False,
+        act_fn=log.op("act", "act_out"),
+        down_proj=log.op("down_proj", ("down_out", None)),
+    )
+    k["act_out"] = "act_out"
+
+    def front_shared(x_, w, scale, sh_w, sh_in, sh_ws):
+        log.op("router_front_shared")(x_, w, scale, sh_w, sh_in, sh_ws)
+        assert sh_w.shape == (256, 4096) and sh_w.is_contiguous()
+        assert sh_in.shape == sh_ws.shape == (1,)
+        return k["logits"], k["x_fp4"], k["x_sf"], gate_up
+
+    class _Event:
+        def record(self):
+            log.append(("event_record", log.stream))
+
+    def wait_event(self, event):
+        self.log.append(("wait_event", self.name))
+
+    with (
+        _streams(log, True),
+        _moe_kernels(log),
+        front,
+        context,
+        patch.object(router, "router_gemm_quant_shared", front_shared),
+        patch.object(torch.cuda, "Event", _Event),
+        patch.object(_Stream, "wait_event", wait_event, create=True),
+    ):
+        st = SimpleNamespace(slots=plan.Slots(route=True, route_shared=True))
+        out = moe.step(SimpleNamespace(mlp=mlp), x, st, defer=True)
+    assert log.tag(out) == "handoff"
+    ops = [(e[0], e[1]) for e in log]
+    assert ops == [
+        ("wait", "alt"),
+        ("router_front_shared", "main"),
+        ("event_record", "main"),
+        ("topk", "main"),
+        ("dispatch", "main"),
+        ("replace", "main"),
+        ("deferred_context", "main"),
+        ("run_moe_core", "main"),
+        ("combine", "main"),
+        ("record_stream", "alt"),
+        ("wait_event", "alt"),
+        ("act", "alt"),
+        ("down_proj", "alt"),
+        ("gate_mul", "alt"),
+        ("wait", "main"),
+        ("deferred_finalize", "main"),
+    ]
+    assert log[1][2] == (
+        "x(7, 4)",
+        "gate_w(512, 4096)",
+        "scale(1,)",
+        "sh_w(256, 4096)",
+        "sh_in(1,)",
+        "sh_ws(1,)",
+    )
+    assert log[11][2] == ("gate_up",) and log[12][2] == ("act_out",)
+
+
+def test_the_router_fronts_shared_stage_fits_shared_memory():
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    # GemvSmem<max_m, true>::kBytes: + 8 and max_m e4m3 rows of 4112 B, 2 KiB of
+    # partials and a third mbarrier
+    assert router.shared_bytes(8) == 131328 + 1024 + 16
+    assert router.shared_bytes(8, shared=True) == 200216
+    assert router.shared_bytes(1, shared=True) == 113976
+
+
+@pytest.mark.parametrize(
+    "change, want",
+    [
+        ({}, ""),
+        ({"act_fn": object()}, "shared expert activation object"),
+        ({"bias": torch.zeros(256)}, "not a static per-tensor FP8 linear"),
+        ({"rows": 1024}, "not a static per-tensor FP8 linear"),
+    ],
+)
+def test_the_route_shared_slot_names_what_a_layer_lacks(change, want):
+    from sglang.srt.layers.activation import SiluAndMul
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    method = object.__new__(ModelOptFp8LinearMethod)
+    method.use_marlin = method.use_sm120_fp8 = False
+    expert = qwen2_moe.Qwen2MoeMLP.__new__(qwen2_moe.Qwen2MoeMLP)
+    torch.nn.Module.__init__(expert)
+    rows = change.get("rows", 256)
+    expert.__dict__.update(
+        gate_up_proj=SimpleNamespace(
+            quant_method=method,
+            bias=change.get("bias"),
+            weight=torch.zeros(rows, 4096, dtype=torch.float8_e4m3fn).t(),
+            input_scale=torch.ones(1),
+            weight_scale=torch.ones(1),
+        ),
+        act_fn=change.get("act_fn", object.__new__(SiluAndMul)),
+    )
+    mlp = SimpleNamespace(shared_expert=expert, shared_expert_gate="gate")
+    got = route.shared_unsupported(mlp)
+    assert (want in got) if want else got == ""
+
+
 @pytest.mark.parametrize("capture", [False, True])
 def test_the_mkm_slot_runs_the_routed_experts_on_the_router_fronts_outputs(capture):
     """Slot mkm: the router front, then one fused launch whose rows and weights reach

@@ -50,6 +50,7 @@ These slots change the arithmetic (numeric: each sums in another order than SGLa
 | --- | --- | --- |
 | `gdn_push` (with `gdn_verify`, `hop`) | 7 | The GatedDeltaNet `out_proj` as the hop's GEMM, whose epilogue pushes the partial into the hop's mailbox |
 | `gdn_front` (with `gdn_verify`, `gdn_pdl`) | 7 (one request) | The GatedDeltaNet `in_proj_qkvz` (static FP8) and `in_proj_ba` (BF16) projections, the conv update and an L2 prefetch of the verify's state in one launch, then the ReplaySSM verify and the gated norm writing `out_proj`'s FP8 input, each launched dependent on the one before |
+| `route_shared` (with `route`) | 1–8 | The shared expert's static-FP8 gate/up in the router front's launch, so the shared expert on the alternate stream waits for that launch only |
 
 `verify_sample` in the same variable offers SGLang's EAGLE entry with no step at any batch size, so SGLang's post-verify graphs run with SGLang's own sampling.
 

@@ -20,8 +20,36 @@ from __future__ import annotations
 
 import torch
 
-# the KV-length graph variant below 2.2's Q1 threshold (graph_variants.Q1_STOCK)
-Q1_STOCK = "q1_stock"
+# the KV-length graph variants of the draft loop (2.2's graph_variants.Q1_STOCK /
+# Q1_LONG): trtllm-gen below Q1_MIN_LENGTH, SKV2-Q1 from it (2.2's
+# SGLANG_Q35MF_MKA_Q1_MIN_LENGTH default; the TP8 production run leaves it unset)
+Q1_STOCK, Q1_LONG = "q1_stock", "q1_long"
+Q1_MIN_LENGTH = 16384
+
+
+class Q1Variants:
+    """The draft loop's graph variants (SGLang's AttentionGraphVariants), as 2.2's
+    Q1GraphVariants: SKV2-Q1 from a host-only KV length lower bound."""
+
+    # stock first, as 2.2 captures them (variants share a graph memory pool)
+    capture_labels = (Q1_STOCK, Q1_LONG)
+
+    def __init__(self, min_length: int = Q1_MIN_LENGTH):
+        self.min_length = min_length
+
+    def select(self, forward_batch) -> str:
+        if forward_batch.batch_size != 1:
+            return Q1_STOCK
+        length = getattr(forward_batch, "attention_kv_len_lower_bound", None)
+        if length is None:
+            lengths = forward_batch.seq_lens_cpu
+            if (
+                lengths is not None
+                and lengths.device.type == "cpu"
+                and lengths.numel() == 1
+            ):
+                length = int(lengths[0])
+        return Q1_LONG if length is not None and length >= self.min_length else Q1_STOCK
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {

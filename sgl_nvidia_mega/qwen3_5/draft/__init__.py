@@ -111,6 +111,13 @@ class MtpDraft:
         self.draft_extend: Optional[Callable] = (
             self._draft_extend if "draft_extend" in slots else None
         )
+        # the KV-length graph variants by runner kind, for an SGLang that captures them
+        # (2.2 routes the draft steps' q1 decode by KV length)
+        self.graph_variants = None
+        if "draft_loop" in slots and "draft_q1" in slots:
+            from sgl_nvidia_mega.qwen3_5.draft.attention import Q1Variants
+
+            self.graph_variants = {"draft_loop": Q1Variants()}
 
     def summary(self) -> str:
         entries = [

@@ -28,6 +28,7 @@ DRAFT_SLOTS: tuple[str, ...] = (
     "draft_xchg",
     "draft_hop",
     "draft_front",
+    "draft_skv2",
 )
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
@@ -57,11 +58,13 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_pdl' launches slot 'gdn_verify''s verify"
         )
-    for name in sorted(SLOTS & set(DRAFT_SLOTS)):
+    for name in sorted(SLOTS & set(DRAFT_SLOTS) - {"draft_skv2"}):
         if "draft_loop" not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {name!r} runs inside entry 'draft_loop'")
     if "draft_hop" in SLOTS and "hop" not in SLOTS:
         reasons.append(f"{SLOTS_ENV}: slot 'draft_hop' runs on slot 'hop''s mailbox")
+    if "draft_skv2" in SLOTS and "draft_extend" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'draft_skv2' runs inside entry 'draft_extend'")
     return reasons
 
 

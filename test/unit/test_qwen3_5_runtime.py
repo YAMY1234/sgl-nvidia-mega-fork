@@ -245,14 +245,32 @@ def test_trace_names_the_first_module_call_that_differs(eager, monkeypatch, capl
 def test_graph_parity_counts_are_logged_once_each(eager, caplog):
     checker = parity.Parity((7,), "cpu")
     checker.counters[7] += torch.tensor([3, 0, 5, 63, 0])
+    checker.distance[7] += torch.tensor(
+        [21.0, 2.0, 0.42, 0.25, 0.5], dtype=torch.float64
+    )
     with caplog.at_level("INFO"):
         checker.flush()
         checker.flush()
     lines = [r.message for r in caplog.records if "parity graph" in r.message]
     assert lines == [
         "NVIDIA megakernel parity graph target_verify rows=7 steps=3 "
-        "logits_differ=0 hidden_differ=5 logits_compared=63 hidden_compared=0"
+        "logits_differ=0 hidden_differ=5 logits_compared=63 hidden_compared=0 "
+        "rows_compared=21 top1_differ=2 dlp_mean=0.02 dlp_max=0.25 hidden_dist_max=0.5"
     ]
+    # the distance restarts with every flush
+    assert checker.distance[7].tolist() == [0.0] * 5
+
+
+def test_the_parity_distance_reads_top1_flips_and_log_prob_gaps():
+    a = torch.tensor([[2.0, 0.0, 0.0], [0.0, 3.0, 0.0]])
+    b = torch.tensor([[2.0, 0.0, 0.0], [0.0, 1.0, 2.0]])  # row 1's top-1 moves
+    rows, top1, total, worst, hidden = parity.distance(
+        a, b, torch.zeros(2, 4), torch.full((2, 4), 0.25)
+    ).tolist()
+    gap = torch.log_softmax(a[1], -1)[1] - torch.log_softmax(b[1], -1)[1]
+    assert (rows, top1, hidden) == (2.0, 1.0, 0.25)
+    assert total == pytest.approx(gap.item()) and worst == pytest.approx(gap.item())
+    assert parity.distance(None, None, None, None) is None
 
 
 def test_the_step_state_carries_the_binding():

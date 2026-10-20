@@ -1,0 +1,1630 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""The Qwen3.5 megakernel on CPU: its spec through SGLang's startup checks, the steps
+it covers, and its stock step against SGLang's own forward on stubbed modules (the
+same ops in the same order, on the same streams, with the same arguments), for the
+decoder layers, the GatedDeltaNet, the attention, the MoE and the layer loop."""
+
+import contextlib
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+import torch
+from sglang.srt.megakernels import guards
+from sglang.srt.megakernels import spec as registry
+from sglang.srt.megakernels.spec import Step
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    default_cuda_graph_config,
+    with_phase,
+)
+from sglang.srt.models import qwen2_moe, qwen3_5
+from sglang.srt.server_args import ServerArgs
+
+from sgl_nvidia_mega import plugin
+from sgl_nvidia_mega.qwen3_5 import (
+    TEXT_CONFIG,
+    attention,
+    gdn,
+    moe,
+    plan,
+    runtime,
+    spec,
+)
+from sgl_nvidia_mega.qwen3_5.boundary import hop as boundary_hop
+from sgl_nvidia_mega.qwen3_5.runtime import executor, parity
+from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
+
+# The measured TP8 server (the speculative algorithm as resolved: NEXTN is EAGLE)
+DOCUMENTED = dict(
+    model_path="dummy",
+    enable_nvidia_megakernel=True,
+    tp_size=8,
+    nnodes=2,
+    kv_cache_dtype="fp8_e4m3",
+    speculative_algorithm="EAGLE",
+    speculative_num_steps=6,
+    speculative_eagle_topk=1,
+    speculative_num_draft_tokens=7,
+    moe_runner_backend="flashinfer_trtllm",
+    flashinfer_allreduce_fusion_backend="cutedsl",
+    attention_backend="trtllm_mha",
+    linear_attn_decode_backend="triton",
+    enable_linear_replayssm_spec=True,
+    mamba_ssm_dtype="bfloat16",
+    enable_hierarchical_cache=True,
+    cuda_graph_config=default_cuda_graph_config(),
+)
+
+
+@pytest.fixture(autouse=True)
+def registered(monkeypatch):
+    monkeypatch.setattr(registry, "_REGISTRY", {})
+    monkeypatch.delenv(plugin.PARITY_SORT_ENV, raising=False)
+    plugin.register()
+
+
+def _refusal(text=None, dtype="bfloat16", isa="sm_103", **args) -> str:
+    """SGLang's resolution step on these arguments: "" when it accepts them, else its
+    error message."""
+    hf_config = SimpleNamespace(
+        architectures=[spec.ARCHITECTURE],
+        model_type="qwen3_5_moe",
+        text_config=SimpleNamespace(**{**TEXT_CONFIG, **(text or {})}),
+    )
+    with (
+        patch.object(guards, "plugin_reasons", return_value=[]),
+        patch.object(guards, "device_isa", return_value=isa),
+        patch.object(guards, "model_config_of") as model_config,
+    ):
+        model_config.return_value = SimpleNamespace(hf_config=hf_config, dtype=dtype)
+        try:
+            guards.handle_nvidia_megakernel(ServerArgs(**{**DOCUMENTED, **args}))
+        except ValueError as e:
+            return str(e)
+    return ""
+
+
+def test_the_documented_setup_is_accepted():
+    assert _refusal() == ""
+
+
+BREAKABLE = with_phase(
+    default_cuda_graph_config(), Phase.DECODE, backend=Backend.BREAKABLE
+)
+
+
+@pytest.mark.parametrize(
+    "kw, want",
+    [
+        (dict(tp_size=4), "tp_size 4"),
+        (dict(pp_size=2), "pipeline parallelism is in use"),
+        (dict(enable_dp_attention=True, dp_size=8), "DP attention is in use"),
+        (dict(kv_cache_dtype="auto"), "kv_cache_dtype 'auto'"),
+        (dict(speculative_algorithm=None), "speculative_algorithm None"),
+        (dict(speculative_eagle_topk=4), "speculative_eagle_topk 4"),
+        (
+            dict(speculative_use_rejection_sampling=True),
+            "speculative_use_rejection_sampling True",
+        ),
+        (dict(moe_runner_backend="flashinfer_cutedsl"), "moe_runner_backend"),
+        (dict(flashinfer_allreduce_fusion_backend=None), "flashinfer_allreduce_fusion"),
+        (dict(attention_backend="triton"), "attention_backend 'triton'"),
+        (dict(linear_attn_decode_backend="flashinfer"), "linear_attn_decode_backend"),
+        (dict(enable_linear_replayssm_spec=False), "enable_linear_replayssm_spec"),
+        (dict(mamba_ssm_dtype="float32"), "mamba_ssm_dtype 'float32'"),
+        (dict(startup_weight_load_mode="overlap"), "startup_weight_load_mode"),
+        (dict(cuda_graph_config=BREAKABLE), "decode CUDA graphs"),
+        (dict(text=dict(num_experts=256)), "config.text_config.num_experts 256"),
+        (dict(text=dict(hidden_size=5120)), "config.text_config.hidden_size 5120"),
+        (dict(dtype="float16"), "dtype 'float16'"),
+        (dict(isa="sm_100"), "not sm_100"),
+    ],
+)
+def test_each_refusal_names_its_reason(kw, want):
+    assert want in _refusal(**kw)
+
+
+def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
+    # an import of this name now raises ImportError
+    monkeypatch.setitem(sys.modules, "sglang.srt.megakernels.eagle_binding", None)
+    assert "this SGLang has no EAGLE forward view" in _refusal()
+
+
+@pytest.mark.parametrize(
+    "slots, want",
+    [
+        ({"hop2"}, "unknown slot 'hop2'"),
+        ({"mkm"}, "slot 'mkm' runs on slot 'route''s outputs"),
+        ({"gdn_pdl"}, "slot 'gdn_pdl' launches slot 'gdn_verify''s verify"),
+    ],
+)
+def test_a_slot_set_that_cannot_run_is_refused_before_the_load(
+    monkeypatch, slots, want
+):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
+    assert want in _refusal()
+
+
+def test_every_reason_is_listed_at_once():
+    message = _refusal(tp_size=4, kv_cache_dtype="auto", pp_size=2)
+    assert message.count("\n  - ") == 3, message
+
+
+def test_the_slot_plan_covers_one_request_of_7_rows():
+    assert plan.plan((7,), plan.Facts()) == {7: plan.Slots()}
+    assert plan.plan((7,), plan.Facts(route=True)) == {7: plan.Slots(route=True)}
+    assert plan.plan((7,), plan.Facts(route=True, mkm=True)) == {
+        7: plan.Slots(route=True, mkm=True)
+    }
+    assert plan.plan((7,), plan.Facts(hop=True)) == {7: plan.Slots(hop=True)}
+    with pytest.raises(ValueError):
+        plan.slots(plan.MAX_ROWS + 1, plan.Facts())
+
+
+# ---------------------------------------------------------------- the covered steps
+
+
+def _verify(widths=(7,), binding="binding"):
+    """An executor over a model with no layers (plan reads only host state), built
+    with SGLang's EAGLE binding."""
+    lm = SimpleNamespace(model=SimpleNamespace(start_layer=0, end_layer=0, layers=[]))
+    return executor.Qwen35Verify(lm, {}, {}, widths, binding=binding)
+
+
+def _batch(verify=True):
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(is_target_verify=lambda: verify)
+    )
+
+
+def test_only_target_verify_steps_of_built_widths_are_covered():
+    built = _verify()
+    ids = torch.zeros(7, dtype=torch.int64)
+    assert built.plan(ids, _batch()) == Step(mode="target_verify", rows=7)
+    assert built.plan(ids, _batch(), pp_proxy_tensors=None) == Step(
+        mode="target_verify", rows=7
+    )
+    assert built.plan(torch.zeros(14, dtype=torch.int64), _batch()) is None
+    assert built.plan(ids, _batch(verify=False)) is None
+    assert built.plan(ids, _batch(), get_embedding=True) is None
+    assert built.plan(ids, _batch(), pp_proxy_tensors=object()) is None
+    # an argument the executor does not know leaves the step to SGLang
+    assert built.plan(ids, _batch(), input_embeds=None) is None
+
+
+def test_the_build_hands_over_the_binding_and_every_entry_stays_sglangs():
+    from sglang.srt.megakernels.spec import ENTRIES
+
+    from sgl_nvidia_mega.qwen3_5 import draft
+
+    built = _verify()
+    assert built.binding == "binding"
+    # covered from the first step on: the binding comes with the build
+    ids = torch.zeros(7, dtype=torch.int64)
+    assert built.plan(ids, _batch()) == Step(mode="target_verify", rows=7)
+    target, mtp = built, draft.SPEC.build("lm", None, None)
+    assert [n for n in ENTRIES if getattr(target, n, None) is not None] == []
+    assert [n for n in ENTRIES if getattr(mtp, n, None) is not None] == []
+
+
+def test_the_verify_sample_entry_is_offered_only_on_request(monkeypatch):
+    from sglang.srt.megakernels.spec import ENTRIES
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    ctx = SimpleNamespace(
+        widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
+    )
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"verify_sample"}))
+    assert runtime.slot_reasons() == []
+    built = runtime.build(model, ctx)
+    assert [n for n in ENTRIES if getattr(built, n, None) is not None] == [
+        "verify_sample"
+    ]
+    assert built.summary() == "slots none (stock); entries ['verify_sample']"
+    # SGLang calls the factory once and asks it for every batch size
+    steps = built.verify_sample(
+        tokens_per_request=7, max_bs=4, noise_key=1, noise_offset=None
+    )
+    assert [steps(bs) for bs in range(1, 5)] == [None] * 4
+
+
+def test_the_runtime_gives_the_executor_the_build_contexts_binding(monkeypatch):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset())
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    ctx = SimpleNamespace(
+        widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
+    )
+    built = runtime.build(model, ctx)
+    assert built.binding == "EagleBinding" and built.summary() == "slots none (stock)"
+
+
+def test_the_mtp_draft_covers_no_step():
+    from sgl_nvidia_mega.qwen3_5 import draft
+
+    built = draft.SPEC.build("lm", None, None)
+    assert (
+        draft.SPEC.max_rows == 0 and built.widths == () and built.draft_sampler is None
+    )
+    assert built.plan(torch.zeros(7, dtype=torch.int64), _batch()) is None
+    assert (draft.ARCHITECTURE, "sgl_nvidia_mega.qwen3_5.draft:SPEC") in plugin.SPECS
+
+
+# ------------------------------------------------- the stock step against SGLang's
+
+
+class _Log(list):
+    def tag(self, value):
+        """A short stand-in for a value: a known tensor's name and the shape it is
+        viewed in, a known object's name, or the value itself."""
+        if isinstance(value, torch.Tensor):
+            for name, known in self.known.items():
+                if (
+                    isinstance(known, torch.Tensor)
+                    and value.data_ptr() == known.data_ptr()
+                ):
+                    return f"{name}{tuple(value.shape)}"
+            return f"?{tuple(value.shape)}"
+        for name, known in self.known.items():
+            if value is known:
+                return name
+        return value if isinstance(value, (str, bool, int, type(None))) else "?"
+
+    def op(self, name, out=None):
+        def run(*args, **kwargs):
+            kw = tuple(sorted((k, self.tag(v)) for k, v in kwargs.items()))
+            self.append((name, self.stream, tuple(map(self.tag, args)), kw))
+            return out
+
+        return run
+
+
+def _log(**known):
+    log = _Log()
+    log.known, log.stream = dict(known), "main"
+    return log
+
+
+class _Stream:
+    def __init__(self, name, log):
+        self.name, self.log = name, log
+
+    def wait_stream(self, other):
+        self.log.append(("wait", self.name, other.name))
+
+
+@contextlib.contextmanager
+def _streams(log, capture):
+    main = _Stream("main", log)
+
+    @contextlib.contextmanager
+    def on(stream):
+        prev, log.stream = log.stream, stream.name
+        try:
+            yield
+        finally:
+            log.stream = prev
+
+    with (
+        patch.object(torch.cuda, "current_stream", return_value=main),
+        patch.object(torch.cuda, "stream", side_effect=on),
+        patch.object(qwen2_moe, "get_is_capture_mode", return_value=capture),
+        patch(
+            "sglang.srt.model_executor.runner.get_is_capture_mode", return_value=capture
+        ),
+    ):
+        yield
+
+
+class _Callable:
+    def __init__(self, fn, **attrs):
+        self._fn = fn
+        self.__dict__.update(attrs)
+
+    def __call__(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
+def _moe_block(log, x, *, alt_stream=True, shared=True, deferred_ok=True):
+    """A Qwen2MoeSparseMoeBlock whose gate, top-k, experts and shared expert log."""
+    mlp = qwen2_moe.Qwen2MoeSparseMoeBlock.__new__(qwen2_moe.Qwen2MoeSparseMoeBlock)
+    torch.nn.Module.__init__(mlp)
+    bypassed = SimpleNamespace(format="bypassed")
+    routed = torch.zeros(7, 4)
+    log.known["routed"] = routed
+    experts = _Callable(
+        log.op("experts", routed),
+        supports_deferred_finalize=deferred_ok,
+        forward_deferred_finalize=log.op("experts_deferred", "routed_d"),
+    )
+    mlp.__dict__.update(
+        alt_stream=_Stream("alt", log) if alt_stream else None,
+        reduce_results=False,
+        enable_shared_expert_fusion=False,
+        _use_mega_moe=False,
+        layer_id=3,
+        gate=_Callable(log.op("gate", ("logits", None))),
+        topk=_Callable(log.op("topk", bypassed)),
+        experts=experts,
+        shared_expert=_Callable(log.op("shared", "shared_out")) if shared else None,
+        shared_expert_gate=_Callable(
+            log.op("shared_gate", "gate_out"), weight=torch.ones(1, 4)
+        ),
+    )
+    return mlp
+
+
+@contextlib.contextmanager
+def _moe_kernels(log):
+    with (
+        patch.object(
+            qwen2_moe, "fused_gate_sigmoid_mul", log.op("gate_mul", "gated_shared")
+        ),
+        patch.object(qwen2_moe, "fused_gate_sigmoid_mul_add", log.op("gate_mul_add")),
+        patch(
+            "sglang.kernels.ops.elementwise.elementwise.fused_gate_sigmoid_mul_add",
+            log.op("gate_mul_add"),
+        ),
+        patch.object(qwen2_moe, "is_npu", return_value=False),
+        # SGLang pages experts on one GPU only, never under the spec's TP8
+        patch.object(
+            qwen2_moe,
+            "get_exec",
+            return_value=SimpleNamespace(
+                moe=SimpleNamespace(enable_paged_experts=False)
+            ),
+        ),
+        patch.object(qwen2_moe, "use_intel_amx_backend", return_value=False),
+        patch.object(qwen2_moe, "_use_aiter", False),
+        patch.object(qwen2_moe.TopKOutputChecker, "format_is_bypassed", lambda o: True),
+        patch.object(
+            qwen2_moe.TopKOutputChecker, "format_is_standard", lambda o: False
+        ),
+        patch(
+            "sglang.srt.layers.layer_boundary.fusions.cutedsl.MoeDeferredFinalize."
+            "from_flashinfer",
+            log.op("deferred_finalize", "handoff"),
+        ),
+        patch.object(
+            qwen2_moe, "get_moe_a2a_backend", return_value=_Callable(None, **_NO_A2A)
+        ),
+    ):
+        yield
+
+
+_NO_A2A = {
+    name: (lambda: False)
+    for name in ("is_deepep", "is_deepep_v2", "is_mori", "is_ascend_fuseep")
+}
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("defer", [False, True])
+@pytest.mark.parametrize("alt_stream", [False, True])
+def test_the_moe_step_issues_what_sglang_issues(capture, defer, alt_stream):
+    runs = []
+    for which in ("sglang", "plugin"):
+        x = torch.zeros(7, 4)
+        log = _log(x=x)
+        mlp = _moe_block(log, x, alt_stream=alt_stream)
+        with _streams(log, capture), _moe_kernels(log):
+            if which == "sglang":
+                out = mlp.forward(x, None, defer_finalize=defer)
+            else:
+                out = moe.step(SimpleNamespace(mlp=mlp), x, _st(), defer=defer)
+        runs.append((log, log.tag(out) if not isinstance(out, torch.Tensor) else out))
+    (want_log, want), (got_log, got) = runs
+    assert got_log == want_log
+    assert want == got if not isinstance(want, torch.Tensor) else torch.equal(want, got)
+
+
+def _st(route=False):
+    return SimpleNamespace(slots=plan.Slots(route=route))
+
+
+def _router_front(log, mlp):
+    """The block's experts as the route slot reads them (the dispatcher, the runner
+    core, the input scale), and its router front's outputs."""
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    class _Dispatched:
+        def _replace(self, **kwargs):
+            return log.op("replace", "dispatched_fp4")(**kwargs)
+
+    log.known.update(
+        gate_w=torch.zeros(router.EXPERTS, router.HIDDEN, dtype=torch.bfloat16),
+        scale=torch.ones(()),
+        logits=torch.zeros(7, router.EXPERTS, dtype=torch.bfloat16),
+        x_fp4=torch.zeros(7, router.HIDDEN // 2, dtype=torch.uint8),
+        x_sf=torch.zeros(7, router.HIDDEN // 16, dtype=torch.uint8),
+    )
+    k = log.known
+    mlp.gate.weight = k["gate_w"]
+    mlp.experts.__dict__.update(
+        w13_input_scale_quant=k["scale"],
+        dispatcher=SimpleNamespace(
+            dispatch=log.op("dispatch", _Dispatched()),
+            combine=log.op("combine", "routed_d"),
+        ),
+        run_moe_core=log.op("run_moe_core", "combine_input"),
+    )
+
+    @contextlib.contextmanager
+    def deferred():
+        log.append(("deferred_context", log.stream))
+        yield
+
+    def front(x, w, scale):
+        log.op("router_front")(x, w, scale)
+        assert scale.shape == (1,) and scale.data_ptr() == k["scale"].data_ptr()
+        return k["logits"], k["x_fp4"], k["x_sf"]
+
+    return (
+        contextlib.ExitStack(),
+        patch.object(router, "router_gemm_quant", front),
+        patch(
+            "sglang.srt.layers.moe.moe_runner.flashinfer_trtllm."
+            "flashinfer_trtllm_deferred_finalize_context",
+            deferred,
+        ),
+    )
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_the_route_slot_replaces_only_the_gate_and_the_routed_experts(capture):
+    """Slot route: the router front in place of the gate, then FusedMoE's
+    deferred-finalize path on its quantized input; every other op is the stock one."""
+    runs = []
+    for route in (False, True):
+        x = torch.zeros(7, 4)
+        log = _log(x=x)
+        mlp = _moe_block(log, x)
+        _, front, context = _router_front(log, mlp)
+        with _streams(log, capture), _moe_kernels(log), front, context:
+            out = moe.step(SimpleNamespace(mlp=mlp), x, _st(route), defer=True)
+        runs.append((log, log.tag(out)))
+    (stock, stock_out), (got, got_out) = runs
+    start = [e[0] for e in stock].index("gate")
+    assert [e[0] for e in stock[start : start + 3]] == [
+        "gate",
+        "topk",
+        "experts_deferred",
+    ]
+    on_front = [
+        ("router_front", "main", ("x(7, 4)", "gate_w(512, 4096)", "scale(1,)"), ()),
+        ("topk", "main", ("x(7, 4)", "logits(7, 512)"), ()),
+        ("dispatch", "main", (), (("hidden_states", "x(7, 4)"), ("topk_output", "?"))),
+        (
+            "replace",
+            "main",
+            (),
+            (
+                ("hidden_states", "x_fp4(7, 2048)"),
+                ("hidden_states_scale", "x_sf(7, 256)"),
+            ),
+        ),
+        ("deferred_context", "main"),
+        ("run_moe_core", "main", (), (("dispatch_output", "dispatched_fp4"),)),
+        ("combine", "main", (), (("combine_input", "combine_input"),)),
+    ]
+    assert got == stock[:start] + on_front + stock[start + 3 :]
+    assert got_out == stock_out == "handoff"
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_the_mkm_slot_runs_the_routed_experts_on_the_router_fronts_outputs(capture):
+    """Slot mkm: the router front, then one fused launch whose rows and weights reach
+    the deferred finalize in expert order; every other op is the stock one."""
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm as kernel
+
+    runs = []
+    for slots in (plan.Slots(), plan.Slots(route=True, mkm=True)):
+        x = torch.zeros(7, 4)
+        log = _log(x=x)
+        mlp = _moe_block(log, x)
+        _, front, context = _router_front(log, mlp)
+        k = log.known
+        k.update(
+            w13_sf=torch.zeros(4, dtype=torch.float8_e4m3fn),
+            w2_sf=torch.zeros(8, dtype=torch.float8_e4m3fn),
+            g1=torch.ones(512),
+            c=torch.ones(512),
+            g2=torch.ones(512),
+            rows=torch.zeros(70, 4, dtype=torch.bfloat16),
+            weights=torch.zeros(7, 10, dtype=torch.bfloat16),
+        )
+        mlp.experts.__dict__.update(
+            w13_weight_scale=k["w13_sf"],
+            w2_weight_scale=k["w2_sf"],
+            g1_alphas=k["g1"],
+            g1_scale_c=k["c"],
+            g2_alphas=k["g2"],
+        )
+        combined = []
+
+        def combine(combine_input, log=log, combined=combined):
+            log.append(("combine", log.stream))
+            combined.append(combine_input)
+            return "routed_d"
+
+        mlp.experts.dispatcher.combine = combine
+        bound = SimpleNamespace(
+            mkm={3: "maps"}, identity=torch.arange(70, dtype=torch.int32)
+        )
+        st = SimpleNamespace(slots=slots, bound={"moe": bound})
+        fused = patch.object(
+            kernel, "mkm_moe", log.op("mkm", (k["rows"], k["weights"]))
+        )
+        with _streams(log, capture), _moe_kernels(log), front, context, fused:
+            out = moe.step(SimpleNamespace(mlp=mlp), x, st, defer=True)
+        runs.append((log, log.tag(out), combined))
+    (stock, stock_out, _), (got, got_out, combined) = runs
+    start = [e[0] for e in stock].index("gate")
+    assert [e[0] for e in stock[start : start + 3]] == [
+        "gate",
+        "topk",
+        "experts_deferred",
+    ]
+    on_mkm = [
+        ("router_front", "main", ("x(7, 4)", "gate_w(512, 4096)", "scale(1,)"), ()),
+        (
+            "mkm",
+            "main",
+            (
+                "maps",
+                "logits(7, 512)",
+                "x_fp4(7, 2048)",
+                "x_sf(7, 256)",
+                "w13_sf(4,)",
+                "w2_sf(8,)",
+                "g1(512,)",
+                "c(512,)",
+                "g2(512,)",
+            ),
+            (),
+        ),
+        ("combine", "main"),
+    ]
+    assert got == stock[:start] + on_mkm + stock[start + 3 :]
+    assert got_out == stock_out == "handoff"
+    (deferred,) = (c.hidden_states for c in combined)
+    assert deferred.gemm2_out is log.known["rows"]
+    assert deferred.expert_weights is log.known["weights"]
+    assert torch.equal(
+        deferred.expanded_idx_to_permuted_idx, torch.arange(70, dtype=torch.int32)
+    )
+    assert deferred.top_k == 10
+
+
+def test_the_mkm_slot_names_what_a_layer_lacks():
+    from sglang.srt.layers.moe.utils import RoutingMethodType
+
+    from sgl_nvidia_mega.qwen3_5.moe import mkm
+
+    def meta(dtype, *shape):
+        return torch.empty(shape, dtype=dtype, device="meta")
+
+    fp8 = torch.float8_e4m3fn
+    experts = SimpleNamespace(
+        w13_weight=meta(torch.uint8, 512, 256, 2048),
+        w2_weight=meta(torch.uint8, 512, 4096, 64),
+        w13_weight_scale=meta(fp8, 512, 256, 256),
+        w2_weight_scale=meta(fp8, 512, 4096, 8),
+        g1_alphas=meta(torch.float32, 512),
+        g1_scale_c=meta(torch.float32, 512),
+        g2_alphas=meta(torch.float32, 512),
+        num_experts=512,
+        num_local_experts=512,
+        moe_ep_rank=0,
+        top_k=10,
+        routing_method_type=RoutingMethodType.RenormalizeNaive,
+        moe_runner_config=SimpleNamespace(
+            activation="silu",
+            is_gated=True,
+            routed_scaling_factor=None,
+            gemm1_alpha=None,
+            gemm1_clamp_limit=None,
+            swiglu_limit=None,
+        ),
+    )
+    cfg = SimpleNamespace(
+        top_k=10,
+        renormalize=True,
+        scoring_func="softmax",
+        correction_bias=None,
+        use_grouped_topk=False,
+        num_fused_shared_experts=0,
+    )
+    mlp = SimpleNamespace(experts=experts, topk=SimpleNamespace(topk_config=cfg))
+    assert mkm.unsupported(mlp) == ""
+    experts.w13_weight = meta(torch.uint8, 512, 512, 2048)  # TP4's intermediate
+    assert mkm.unsupported(mlp) == "w13_weight torch.uint8 (512, 512, 2048)"
+    experts.w13_weight = meta(torch.uint8, 512, 256, 2048)
+    cfg.scoring_func = "sigmoid"
+    assert mkm.unsupported(mlp).startswith("routing other than")
+    cfg.scoring_func = "softmax"
+    experts.moe_runner_config.swiglu_limit = 7.0
+    assert mkm.unsupported(mlp).startswith("an expert activation")
+
+
+def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    mlp = _moe_block(_log(), torch.zeros(7, 4))
+    mlp.gate.weight = torch.zeros(512, 4096, dtype=torch.float16)
+    layers = [SimpleNamespace(mlp=mlp)]
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=1, layers=layers)
+    )
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"route"}))
+    ctx = SimpleNamespace(widths=(7,), tokens_per_request=7, deadline_s=60.0)
+    want = "layer 0: router gate torch.float16 (512, 4096)"
+    assert route.build(model, 7, fused=False).reason == want
+    with pytest.raises(
+        RuntimeError, match="requested slots \\['route'\\] built no width"
+    ):
+        runtime.build(model, ctx)
+
+
+def _gdn_module(log, x):
+    """A Qwen3_5GatedDeltaNet whose projections, backend call, norm and out_proj log."""
+    mod = qwen3_5.Qwen3_5GatedDeltaNet.__new__(qwen3_5.Qwen3_5GatedDeltaNet)
+    torch.nn.Module.__init__(mod)
+    qkvz, ba = torch.zeros(7, 10), torch.zeros(7, 2)
+    z = torch.zeros(7, 2, 3)
+    core = torch.zeros(7, 2, 3)
+    log.known.update(qkvz=qkvz, ba=ba, z=z, core=core)
+    mod.__dict__.update(
+        num_k_heads=16,
+        num_v_heads=64,
+        attn_tp_size=8,
+        head_k_dim=128,
+        head_v_dim=128,
+        _forward_input_proj=log.op("in_proj", (qkvz, ba)),
+        attn=log.op("linear_attention", core),
+        norm=log.op("gated_norm", torch.ones(14, 3)),
+        out_proj=log.op("out_proj", ("out", None)),
+    )
+    split = log.op("split", ("mixed", z, "b", "a"))
+    return mod, split
+
+
+@pytest.mark.parametrize("packed_verify", [False, True])
+def test_the_gdn_step_issues_what_sglang_issues(packed_verify):
+    runs = []
+    for which in ("sglang", "plugin"):
+        x = torch.zeros(7, 4)
+        log = _log(x=x)
+        mod, split = _gdn_module(log, x)
+        backend = SimpleNamespace(
+            linear_attn_backend=SimpleNamespace(supports_packed_verify=packed_verify)
+        )
+        mode = SimpleNamespace(
+            is_target_verify=lambda: True,
+            is_decode=lambda: False,
+            is_extend_without_speculative=lambda: False,
+        )
+        # a verify batch is never relabeled: its logical mode is its label
+        batch = SimpleNamespace(forward_mode=mode, logical_forward_mode=mode)
+        with (
+            patch.object(qwen3_5, "_is_xpu", False),
+            patch.object(qwen3_5, "_is_cpu", False),
+            patch.object(qwen3_5, "_is_cuda", True),
+            patch.object(qwen3_5, "_gdn_decode_fused_proj_conv", True),
+            patch.object(qwen3_5, "fused_qkvzba_split_reshape_cat_contiguous", split),
+            patch(
+                "sglang.kernels.ops.attention.triton_gdn_fused_proj."
+                "fused_qkvzba_split_reshape_cat_contiguous",
+                split,
+            ),
+            patch.object(qwen3_5, "_fp8_tuple_input", return_value=False),
+            patch(
+                "sglang.srt.model_executor.forward_context.get_attn_backend",
+                return_value=backend,
+            ),
+        ):
+            try:
+                if which == "sglang":
+                    out = mod.forward(x, batch)
+                else:
+                    st = SimpleNamespace(fb=batch, slots=plan.Slots())
+                    out = gdn.step(SimpleNamespace(linear_attn=mod), x, st)
+            except (NotImplementedError, RuntimeError, AttributeError) as e:
+                out = type(e).__name__
+        runs.append((log, out))
+    (want_log, want), (got_log, got) = runs
+    if packed_verify:
+        # SGLang folds the split and conv into such a backend; the step refuses it
+        assert got == "NotImplementedError" and want != got
+        return
+    assert got_log == want_log and want == got == "out"
+
+
+def _gdn_verify_setup(log, *, ring_len=16, temporal_dtype=torch.bfloat16, draft=7):
+    """A GatedDeltaNet whose projections, norm and out_proj log, and the binding of a
+    one-request verify step (layer 2 is the pools' third GDN layer)."""
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+
+    H, K, HV, V = 2, 4, 4, 4
+    D = 2 * H * K + HV * V
+    k = log.known
+    k.update(
+        qkvz=torch.zeros(draft, D + HV * V),
+        ba=torch.zeros(draft, 2 * HV),
+        scale=torch.ones(1),
+        states=torch.tensor([5]),
+        inter=torch.tensor([0]),
+        qsl=torch.tensor([0, draft]),
+        req=torch.tensor([3]),
+        conv=torch.zeros(4, 9, D, 3),
+        window=torch.zeros(4, 9, draft, D, 3),
+        temporal=torch.zeros(4, 9, HV, K, V, dtype=temporal_dtype),
+        ring_d=torch.zeros(4, 9, HV, ring_len, V),
+        ring_k=torch.zeros(4, 9, H, ring_len, K),
+        ring_g=torch.zeros(4, 9, HV, ring_len),
+        write_pos=torch.zeros(9, dtype=torch.int32),
+        cache_base=torch.zeros(9, dtype=torch.int32),
+        is_flush=torch.zeros(9, dtype=torch.int32),
+    )
+    # layer 2's slices: the pools' third GDN layer
+    k.update({f"{n}2": k[n][2] for n in ("conv", "window", "temporal", "ring_d")})
+    attn = SimpleNamespace(
+        layer_id=2,
+        conv_weights=torch.zeros(D, 4),
+        bias=None,
+        activation="silu",
+        q_dim=H * K,
+        k_dim=H * K,
+        v_dim=HV * V,
+        num_q_heads=H,
+        num_k_heads=H,
+        num_v_heads=HV,
+        head_q_dim=K,
+        head_k_dim=K,
+        head_v_dim=V,
+        A_log=torch.zeros(HV),
+        dt_bias=torch.zeros(HV),
+    )
+    norm = SimpleNamespace(weight=torch.ones(V), eps=1e-6, activation="silu")
+    k.update(out_w=torch.zeros(HV * V, 8), out_s=torch.ones(1))
+    out_proj = SimpleNamespace(
+        weight=k["out_w"], weight_scale=k["out_s"], input_scale=k["scale"]
+    )
+    gdn = SimpleNamespace(
+        attn=attn,
+        norm=norm,
+        out_proj=out_proj,
+        num_k_heads=H,
+        num_v_heads=HV,
+        attn_tp_size=1,
+        head_k_dim=K,
+        head_v_dim=V,
+        _forward_input_proj=lambda x: (k["qkvz"], k["ba"]),
+    )
+    meta = SimpleNamespace(
+        state_indices=k["states"],
+        intermediate_indices=k["inter"],
+        query_start_loc=k["qsl"],
+    )
+    pools = SimpleNamespace(
+        layer_ids=(0, 1, 2, 4),
+        conv=(k["conv"],),
+        intermediate_conv_window=(k["window"],),
+        temporal=k["temporal"],
+        ring_d=k["ring_d"],
+        ring_k=k["ring_k"],
+        ring_g=k["ring_g"],
+        ring_rawv=None,
+        ring_rawk=None,
+        ring_beta=None,
+        ring_write_pos=k["write_pos"],
+        ring_cache_base=k["cache_base"],
+        ring_is_flush=k["is_flush"],
+    )
+    st = SimpleNamespace(
+        fb=SimpleNamespace(req_pool_indices=k["req"]),
+        binding=SimpleNamespace(tokens_per_request=draft),
+        view=SimpleNamespace(gdn=meta, mamba=pools),
+        scratch={},
+    )
+    return verify, gdn, st
+
+
+def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows():
+    from sgl_nvidia_mega.qwen3_5.gdn import conv, norm_fp8, replayssm
+
+    log = _log()
+    verify, gdn, st = _gdn_verify_setup(log)
+    k = log.known
+
+    def views(qkvz, ba, nk, nv, hk, hv):
+        log.append(("views", log.tag(qkvz), log.tag(ba), nk, nv, hk, hv))
+        return qkvz[:, :32], qkvz[:, 32:].view(7, nv, hv), ba[:, :4], ba[:, 4:]
+
+    def conv_update(x, state, weight, bias, act, states, window, inter, **kw):
+        log.append(
+            (
+                "conv",
+                tuple(x.shape),
+                log.tag(state),
+                log.tag(states),
+                log.tag(window),
+                log.tag(inter),
+                tuple(sorted(kw.items())),
+            )
+        )
+        return torch.zeros(1, 7, 32).transpose(1, 2)
+
+    names = (
+        "q",
+        "k",
+        "v",
+        "a",
+        "b",
+        "A_log",
+        "dt_bias",
+        "out",
+        "checkpoint_state",
+        "d_cache",
+        "k_cache",
+        "g_cache",
+        "rawv_cache",
+        "rawk_cache",
+        "beta_cache",
+        "query_start_loc",
+        "ssm_state_indices",
+        "replay_indices",
+        "write_pos",
+        "cache_base",
+        "is_flush",
+    )
+
+    def spec_decode(*args, **kw):
+        tags = {n: log.tag(v) for n, v in zip(names, args)}
+        log.append(("verify", tags, kw))
+
+    def norm(x, weight, eps, z, scale, **kw):
+        log.append(
+            (
+                "norm_fp8",
+                tuple(x.shape),
+                tuple(z.shape),
+                log.tag(scale),
+                tuple(sorted(kw.items())),
+            )
+        )
+        return torch.zeros(28, 4)
+
+    @contextlib.contextmanager
+    def symmetric(group, disabled=False):
+        log.append(("symmetric",))
+        yield
+
+    with (
+        patch(
+            "sglang.kernels.ops.attention.triton_gdn_fused_proj.qwen3_5_gdn_prefill_projection_views",
+            views,
+        ),
+        patch.object(conv, "conv_update", conv_update),
+        patch.object(replayssm, "verify", spec_decode),
+        patch.object(norm_fp8, "rms_norm_gated_fp8", norm),
+        patch(
+            "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
+            symmetric,
+        ),
+        patch("sglang.srt.layers.dp_attention.is_allocation_symmetric", lambda: True),
+        patch(
+            "sglang.srt.runtime_context.get_parallel",
+            lambda: SimpleNamespace(tp_group="tp"),
+        ),
+        patch(
+            "sglang.srt.layers.quantization.fp8_utils.flashinfer_bmm_fp8",
+            log.op("bmm_fp8"),
+            create=True,
+        ),
+    ):
+        for _ in range(2):  # two layers of one step
+            verify.step(gdn, torch.zeros(7, 8), st)
+    one_layer = ["conv", "verify", "norm_fp8", "symmetric", "bmm_fp8", "views"]
+    assert [e[0] for e in log] == ["views", *one_layer, *one_layer[:-1]]
+    _, shape, state, states, window, inter, kw = log[1]
+    assert (shape, states, inter) == ((1, 32, 7), "states(1,)", "inter(1,)")
+    assert state == "conv2(9, 32, 3)" and window == "window2(9, 7, 32, 3)"
+    assert dict(kw) == {"block_n": 128, "token_major_out": True}
+    tags, options = log[2][1], log[2][2]
+    assert (
+        tags["ssm_state_indices"] == "states(1,)"
+        and tags["replay_indices"] == "req(1,)"
+    )
+    assert tags["query_start_loc"] == "qsl(2,)" and tags["write_pos"] == "write_pos(9,)"
+    assert (
+        tags["rawv_cache"] is None
+        and tags["checkpoint_state"] == "temporal2(9, 4, 4, 4)"
+    )
+    assert tags["d_cache"] == "ring_d2(9, 4, 16, 4)"
+    assert options == dict(
+        max_cache_len=16,
+        max_spec_len=7,
+        scale=0.5,
+        null_block_id=-1,
+        block_v=32,
+        num_warps=2,
+        pdl=False,
+    )
+    assert log[3] == (
+        "norm_fp8",
+        (28, 4),
+        (7, 4, 4),
+        "scale(1,)",
+        (("activation", "silu"),),
+    )
+    # out_proj's BMM on the FP8 rows with its static input scale, output in the activation dtype
+    assert log[5] == (
+        "bmm_fp8",
+        "main",
+        ("?(7, 16)", "out_w(16, 8)", "scale(1,)", "out_s(1,)", "?"),
+        (),
+    )
+
+
+@pytest.mark.parametrize(
+    "kw, want",
+    [
+        (dict(ring_len=8), "ring length 8"),
+        (dict(temporal_dtype=torch.float32), "torch.float32 checkpoints"),
+        (dict(draft=9), "9 rows a request"),
+    ],
+)
+def test_the_gdn_verify_slot_names_the_pools_it_cannot_serve(kw, want):
+    verify, _, st = _gdn_verify_setup(_log(), **kw)
+    assert verify.pool_reasons(st.view.mamba, st.binding.tokens_per_request) == [want]
+    # the first covered step refuses, before it runs anything
+    built = _verify(binding=st.binding)
+    built.slots = {7: plan.Slots(gdn_verify=True)}
+    step = Step(mode="target_verify", rows=7, view=st.view)
+    with pytest.raises(RuntimeError, match=f"slot gdn_verify cannot run: {want}"):
+        built.forward(step, None, torch.zeros(7, dtype=torch.int64), None, None)
+
+
+def test_the_pools_are_checked_once_at_the_first_covered_step(monkeypatch):
+    verify, _, st = _gdn_verify_setup(_log())
+    built = _verify(binding=st.binding)
+    built.slots = {7: plan.Slots(gdn_verify=True)}
+    checks = []
+    real = verify.pool_reasons
+    monkeypatch.setattr(verify, "pool_reasons", lambda *a: checks.append(a) or real(*a))
+    monkeypatch.setattr(built, "_forward", lambda *a: "logits")
+    step = Step(mode="target_verify", rows=7, view=st.view)
+    for _ in range(2):
+        assert built.forward(step, None, "ids", "pos", "fb") == "logits"
+    assert checks == [(st.view.mamba, 7)]
+
+
+def _attention_layer(log, x):
+    layer = qwen3_5.Qwen3_5AttentionDecoderLayer.__new__(
+        qwen3_5.Qwen3_5AttentionDecoderLayer
+    )
+    torch.nn.Module.__init__(layer)
+    q, k, v, gate, o = (torch.zeros(7, 4) for _ in range(5))
+    log.known.update(q=q, k=k, v=v, gate=gate, o=o)
+    layer.__dict__.update(
+        attn_output_gate=True,
+        forward_prepare_cuda_fused=log.op("prepare", (q, k, v, gate)),
+        attn=log.op("attention", o),
+        o_proj=log.op("o_proj", ("out", None)),
+    )
+    return layer
+
+
+def test_the_attention_step_issues_what_sglang_issues():
+    runs = []
+    for which in ("sglang", "plugin"):
+        x = torch.zeros(7, 4)
+        log = _log(x=x, positions="pos", batch="fb")
+        layer = _attention_layer(log, x)
+        mul = log.op("sigmoid_mul", "gated")
+        log.known["gated"] = "gated"
+        with (
+            patch.object(qwen3_5, "_is_cuda", True),
+            patch.object(qwen3_5, "_is_npu", False),
+            patch.object(qwen3_5, "_fp8_tuple_input", return_value=False),
+            patch.object(qwen3_5, "fused_sigmoid_mul", mul),
+            patch("sglang.kernels.ops.elementwise.elementwise.fused_sigmoid_mul", mul),
+        ):
+            if which == "sglang":
+                out = layer.self_attention(
+                    positions="pos", hidden_states=x, forward_batch="fb"
+                )
+            else:
+                st = SimpleNamespace(positions="pos", fb="fb")
+                out = attention.step(layer, x, st)
+        runs.append((log, out))
+    (want_log, want), (got_log, got) = runs
+    assert got_log == want_log and want == got == "out"
+
+
+class _Exit:
+    def __init__(self, log, defer):
+        self.log, self.defer_moe_finalize = log, defer
+
+    def __enter__(self):
+        self.log.append(("ffn_exit.enter",))
+        return self
+
+    def __exit__(self, *exc):
+        self.log.append(("ffn_exit.exit",))
+
+    def finish(self, out):
+        self.log.append(("ffn_exit.finish", self.log.tag(out)))
+        return "layer_out"
+
+
+class _MoeBlock(qwen2_moe.Qwen2MoeSparseMoeBlock):
+    def __init__(self, log):
+        torch.nn.Module.__init__(self)
+        self.__dict__["log"] = log
+
+    def forward(self, x, forward_batch=None, defer_finalize=False):
+        self.log.append(("moe", self.log.tag(x), defer_finalize))
+        return "moe_out"
+
+
+def _decoder_layer(kind, log, defer):
+    layer = kind.__new__(kind)
+    torch.nn.Module.__init__(layer)
+    a_in, m_in = torch.zeros(7, 4), torch.zeros(7, 4)
+    log.known.update(a_in=a_in, m_in=m_in)
+    layer.mlp = _MoeBlock(log)
+    layer.__dict__.update(
+        attn_boundary=SimpleNamespace(
+            prepare=log.op("attn.prepare", a_in), finish=log.op("attn.finish", "h1")
+        ),
+        ffn_boundary=SimpleNamespace(
+            prepare=log.op("ffn.prepare", m_in), exit=lambda fb: _Exit(log, defer)
+        ),
+        linear_attn=lambda x, fb: log.append(("mixer", log.tag(x))) or "part",
+        self_attention=lambda positions, hidden_states, forward_batch: (
+            log.append(("mixer", log.tag(hidden_states))) or "part"
+        ),
+    )
+    return layer
+
+
+@pytest.mark.parametrize(
+    "kind", [qwen3_5.Qwen3_5LinearDecoderLayer, qwen3_5.Qwen3_5AttentionDecoderLayer]
+)
+@pytest.mark.parametrize("defer", [False, True])
+def test_a_layer_runs_what_sglangs_decoder_layer_runs(kind, defer):
+    batch = SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: False))
+    runs = []
+    for which in ("sglang", "plugin"):
+        log = _log(hidden="hidden", batch=batch, positions="pos", h1="h1", part="part")
+        layer = _decoder_layer(kind, log, defer)
+        if which == "sglang":
+            out = layer.forward(
+                positions="pos",
+                hidden_states="hidden",
+                forward_batch=batch,
+                captured_last_layer_outputs=None,
+            )
+        else:
+            st = SimpleNamespace(fb=batch, positions="pos", slots=plan.Slots())
+            built = _verify()
+            built.mixers = {
+                0: lambda layer, x, st: log.append(("mixer", log.tag(x))) or "part"
+            }
+            with patch.object(
+                executor.moe,
+                "step",
+                lambda layer, x, st, defer: (
+                    log.append(("moe", log.tag(x), defer)) or "moe_out"
+                ),
+            ):
+                out = built._layer(0, layer, "hidden", st, None)
+        runs.append((log, out))
+    (want_log, want), (got_log, got) = runs
+    assert got_log == want_log and want == got == "layer_out"
+
+
+def test_the_layer_loop_opens_the_stream_scopes_each_layer_and_closes_it(monkeypatch):
+    log = []
+    layers = [
+        kind.__new__(kind)
+        for kind in (
+            qwen3_5.Qwen3_5LinearDecoderLayer,
+            qwen3_5.Qwen3_5AttentionDecoderLayer,
+        )
+    ]
+    for layer in layers:
+        torch.nn.Module.__init__(layer)
+    model = SimpleNamespace(start_layer=0, end_layer=2, layers=layers)
+    lm = SimpleNamespace(
+        model=model, is_mrope_enabled=True, capture_aux_hidden_states=False
+    )
+    built = executor.Qwen35Verify(lm, {7: plan.Slots()}, {}, (7,))
+    assert built.mixers == {0: gdn.step, 1: attention.step}
+    built.mixers = {i: (lambda i: lambda *a: f"part{i}")(i) for i in range(2)}
+
+    @contextlib.contextmanager
+    def scope(i):
+        log.append(("layer", i))
+        yield
+
+    recorder = SimpleNamespace(with_current_layer=scope)
+    monkeypatch.setattr(
+        "sglang.srt.eplb.expert_distribution.get_global_expert_distribution_recorder",
+        lambda: recorder,
+    )
+    monkeypatch.setattr(executor.embedding, "embed", lambda st: "embeds")
+    monkeypatch.setattr(
+        executor.boundary, "open_stream", lambda st: log.append(("open",))
+    )
+    monkeypatch.setattr(
+        executor.boundary,
+        "close_stream",
+        lambda st, h: log.append(("close", h)) or "final",
+    )
+    monkeypatch.setattr(
+        executor.Qwen35Verify,
+        "_layer",
+        lambda self, i, layer, h, st, capture: (
+            log.append(("run", i, h, capture)) or f"h{i}"
+        ),
+    )
+    monkeypatch.setattr(
+        executor.logits, "logits", lambda st, h, aux: (st.positions, st.slots, h, aux)
+    )
+    batch = SimpleNamespace(mrope_positions="mrope")
+    out = built.forward(Step("target_verify", 7), None, "ids", "pos", batch)
+    assert out == ("mrope", plan.Slots(), "final", None)
+    assert log == [
+        ("open",),
+        ("layer", 0),
+        ("run", 0, "embeds", None),
+        ("layer", 1),
+        ("run", 1, "h0", None),
+        ("close", "h1"),
+    ]
+
+
+# ------------------------------------------------------------------------- slot hop
+
+
+class _Fused:
+    """SGLang's CuTe DSL workspace, or the hop: the same outputs from the same operands
+    (fresh tensors), and a log of the operands."""
+
+    def __init__(self, log, rows=7):
+        self.log, self.rows = log, rows
+
+    def supports(self, m):
+        return m <= self.rows
+
+    def finalize(self, handoff, residual, gamma):
+        return self.moe_finalize_all_reduce_rms_norm(
+            routed_output=handoff.routed_output,
+            expert_weights=handoff.expert_weights,
+            permuted_indices=handoff.permuted_indices,
+            gated_shared_output=handoff.gated_shared_output,
+            residual=residual,
+            gamma=gamma,
+        )
+
+    def moe_finalize_all_reduce_rms_norm(self, *, residual, gamma, **rows):
+        self.log.append(("finalize", *rows.values(), residual, gamma))
+        return residual + gamma, residual * 2
+
+    def all_reduce_residual_rms_norm(self, *, local_contribution, residual, gamma):
+        self.log.append(("all_reduce", local_contribution, residual, gamma))
+        return residual + gamma, residual * 2
+
+
+@pytest.fixture
+def cutedsl_gates(monkeypatch):
+    """SGLang's CuTe DSL eligibility as at TP8 for a verify step: the workspace's rows
+    (``gates["open"] = False`` closes it)."""
+    from sglang.srt.layers.layer_boundary.fusions import cutedsl
+    from sglang.test.boundary_fixtures import parallel_of
+
+    gates = {"open": True}
+    monkeypatch.setattr(
+        cutedsl.CuteDSLFusion,
+        "_eligible",
+        lambda self, plan, fb, m: gates["open"] and self.service.supports(m),
+    )
+    monkeypatch.setattr(
+        cutedsl, "get_parallel", lambda: parallel_of(attn_dp=1, attn_tp=8)
+    )
+    comm = SimpleNamespace(comm=SimpleNamespace(enable_quant_communications=False))
+    monkeypatch.setattr(cutedsl, "get_exec", lambda: comm)
+    monkeypatch.setattr("sglang.srt.runtime_context.get_exec", lambda: comm)
+    return gates
+
+
+def _hop_layer(service, fusions=True):
+    """A Qwen3.5 MoE layer's two stages as SGLang binds them at TP8, with the CuTe DSL
+    fusion on ``service`` unless not ``fusions``."""
+    from sglang.srt.layers.layer_boundary import declare_attn, declare_ffn
+    from sglang.srt.layers.layer_boundary.fusions import cutedsl
+    from sglang.srt.layers.layer_boundary.residual.add_norm import (
+        Fp8Input,
+        NormQuantReadout,
+    )
+    from sglang.srt.layers.layernorm import GemmaRMSNorm
+    from sglang.test.boundary_fixtures import build_stages, parallel_of, planning
+
+    fusion = cutedsl.CuteDSLFusion() if fusions else None
+    if fusions:
+        fusion.install(service, defers_finalize=True, terminal_finalize=True)
+    moe_ffn = dict(sparse=True, next_layer_sparse=True)
+    parallel = parallel_of(attn_dp=1, attn_tp=8)
+    with planning(parallel), patch.object(cutedsl, "get_parallel", lambda: parallel):
+        attn, ffn = build_stages(
+            (
+                declare_attn(read=NormQuantReadout(fp8_input=Fp8Input.TUPLE_AND_BF16)),
+                GemmaRMSNorm(16),
+                {"fusions": fusion},
+            ),
+            (declare_ffn(**moe_ffn), GemmaRMSNorm(16), {"fusions": fusion}),
+            previous=declare_ffn(**moe_ffn),
+        )
+    return SimpleNamespace(attn_boundary=attn, ffn_boundary=ffn, layer_id=3)
+
+
+def _handoff(rows=7, weights=torch.bfloat16):
+    from sglang.srt.layers.layer_boundary.fusions.cutedsl import MoeDeferredFinalize
+
+    return MoeDeferredFinalize(
+        routed_output=torch.randn(rows * 10, 16).bfloat16(),
+        expert_weights=torch.rand(rows, 10).to(weights),
+        permuted_indices=torch.arange(rows * 10, dtype=torch.int32).view(rows, 10),
+        gated_shared_output=torch.randn(rows, 16).bfloat16(),
+        m=rows,
+        finish=lambda: pytest.fail("the handoff was completed unfused"),
+    )
+
+
+def _verify_batch(stream, rows=7):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    return SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        input_ids=torch.zeros(rows),
+        residual_stream=stream,
+    )
+
+
+def _same_calls(a, b):
+    """The same calls on the same tensors (by identity)."""
+    assert len(a) == len(b) == 1
+    assert a[0][0] == b[0][0] and all(x is y for x, y in zip(a[0][1:], b[0][1:]))
+
+
+@pytest.mark.parametrize("point", ["layer input", "MoE input", "final norm"])
+def test_the_hop_slot_runs_where_sglang_runs_its_cutedsl_kernel(cutedsl_gates, point):
+    """At each point, SGLang's stage boundary with the CuTe DSL workspace and the
+    slot's mirror with the hop make the same call on the same tensors and leave the
+    residual stream alike."""
+    from sglang.srt.layers.layer_boundary import PLAIN_ADD
+    from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+    from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+    from sglang.srt.layers.layernorm import GemmaRMSNorm
+
+    logs = {"sglang": [], "plugin": []}
+    service, hop = _Fused(logs["sglang"]), _Fused(logs["plugin"])
+    layer, owed = _hop_layer(service), _handoff()
+    residual, part = torch.randn(7, 16).bfloat16(), torch.randn(7, 16).bfloat16()
+    final = GemmaRMSNorm(16)
+    runs = {}
+    for run in ("sglang", "plugin"):
+        stream = ResidualStream(residual)
+        fb = _verify_batch(stream)
+        st = SimpleNamespace(fb=fb, model=SimpleNamespace(norm=final))
+        if point == "MoE input":
+            handle = layer.attn_boundary.finish(part, fb)
+            x = (
+                layer.ffn_boundary.prepare(handle, fb)
+                if run == "sglang"
+                else boundary_hop.moe_input(hop, layer, handle, st)
+            )
+        else:
+            handle = stream.record(owed, PLAIN_ADD)
+            if point == "layer input":
+                x = (
+                    layer.attn_boundary.prepare(handle, fb)
+                    if run == "sglang"
+                    else boundary_hop.layer_input(hop, layer, handle, st)
+                )
+            else:
+                x = (
+                    residual_batch.final_norm(
+                        handle, fb, final, finalize_norm=service, skip_empty=True
+                    )
+                    if run == "sglang"
+                    else boundary_hop.final_norm(hop, handle, st)
+                )
+        runs[run] = (x, fb.residual_stream, stream.residual, stream.pending)
+    _same_calls(logs["sglang"], logs["plugin"])
+    (x, stream, written, pending), (y, stream2, written2, pending2) = runs.values()
+    assert torch.equal(x, y) and pending is pending2 is None
+    if point == "final norm":
+        assert stream is stream2 is None
+    else:
+        assert torch.equal(written, written2) and written is not residual
+
+
+@pytest.mark.parametrize("why", ["sglang declines", "fp32 weights", "too many rows"])
+def test_the_hop_slot_leaves_to_sglang_a_finalize_it_cannot_stand_in_for(
+    cutedsl_gates, why
+):
+    from sglang.srt.layers.layer_boundary import PLAIN_ADD
+    from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+
+    log = []
+    layer = _hop_layer(_Fused([]))
+    cutedsl_gates["open"] = why != "sglang declines"
+    owed = _handoff(weights=torch.float32 if why == "fp32 weights" else torch.bfloat16)
+    hop = _Fused(log, rows=6 if why == "too many rows" else 7)
+    stream = ResidualStream(torch.zeros(7, 16))
+    handle = stream.record(owed, PLAIN_ADD)
+    st = SimpleNamespace(fb=_verify_batch(stream), model=SimpleNamespace(norm=None))
+    assert boundary_hop.layer_input(hop, layer, handle, st) is None
+    if why != "sglang declines":
+        assert boundary_hop.final_norm(hop, handle, st) is None
+    assert log == [] and stream.pending.owed is owed
+
+
+def test_the_hop_slot_leaves_to_sglang_a_mixer_sum_it_declines(cutedsl_gates):
+    from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+
+    log = []
+    layer = _hop_layer(_Fused([]))
+    cutedsl_gates["open"] = False
+    stream = ResidualStream(torch.zeros(7, 16))
+    st = SimpleNamespace(fb=_verify_batch(stream))
+    handle = layer.attn_boundary.finish(torch.ones(7, 16).bfloat16(), st.fb)
+    assert boundary_hop.moe_input(_Fused(log), layer, handle, st) is None
+    assert log == [] and stream.pending is not None
+
+
+def test_the_hop_slot_mirrors_the_paths_sglang_binds_for_qwen3_5():
+    assert boundary_hop.path_refusals(_hop_layer(SimpleNamespace())) == []
+    assert boundary_hop.path_refusals(_hop_layer(None, fusions=False)) == [
+        "its attention input runs no CuTe DSL fusion",
+        "its ffn input runs no CuTe DSL fusion",
+    ]
+
+
+def test_the_hop_slot_names_what_it_cannot_serve():
+    service = SimpleNamespace(hidden_size=4096, top_k=10)
+    layers = [_hop_layer(SimpleNamespace()), _hop_layer(None, fusions=False)]
+    m = SimpleNamespace(
+        flashinfer_mnnvl_cutedsl_fusion=service,
+        layers=layers,
+        start_layer=0,
+        end_layer=1,
+    )
+    assert boundary_hop.refusals(m, 8) == []
+    assert boundary_hop.refusals(m, 16) == ["TP 16 (the hop serves TP (2, 4, 8))"]
+    service.hidden_size = 5120
+    assert boundary_hop.refusals(m, 8) == [
+        "hidden 5120, top-10 (the hop serves hidden 4096, up to top-16)"
+    ]
+    service.hidden_size, m.end_layer = 4096, 2
+    assert boundary_hop.refusals(m, 8) == [
+        "layer 3: its attention input runs no CuTe DSL fusion (and 1 more)"
+    ]
+    m.flashinfer_mnnvl_cutedsl_fusion = None
+    assert boundary_hop.refusals(m, 8) == [
+        "SGLang runs no FlashInfer MNNVL CuTe DSL fusion"
+    ]
+
+
+@pytest.mark.parametrize("taken", [False, True])
+def test_with_slot_hop_each_point_falls_back_to_sglang_where_the_hop_declines(
+    monkeypatch, taken
+):
+    from sgl_nvidia_mega.qwen3_5 import boundary
+
+    log = []
+    for point in ("layer_input", "moe_input", "final_norm"):
+        monkeypatch.setattr(
+            boundary_hop,
+            point,
+            lambda hop, *a, point=point: (
+                log.append((point, hop)) or (point if taken else None)
+            ),
+        )
+    monkeypatch.setattr(
+        "sglang.srt.layers.layer_boundary.residual.batch.final_norm",
+        lambda *a, **k: "sglang final norm",
+    )
+    layer = SimpleNamespace(
+        attn_boundary=SimpleNamespace(
+            prepare=lambda h, fb, capture_gathered: "sglang layer input",
+            finish=lambda part, fb: "handle",
+        ),
+        ffn_boundary=SimpleNamespace(prepare=lambda h, fb: "sglang MoE input"),
+    )
+    st = SimpleNamespace(
+        fb="fb",
+        slots=plan.Slots(hop=True),
+        bound={"boundary": boundary_hop.Bound(hop="the hop")},
+        model=SimpleNamespace(norm="norm", flashinfer_mnnvl_cutedsl_fusion=None),
+    )
+    got = (
+        boundary.pre(layer, "h", st),
+        boundary.post_attn(layer, "part", st),
+        boundary.close_stream(st, "h"),
+    )
+    if taken:
+        assert got == ("layer_input", "moe_input", "final_norm")
+    else:
+        assert got == ("sglang layer input", "sglang MoE input", "sglang final norm")
+    assert log == [(p, "the hop") for p in ("layer_input", "moe_input", "final_norm")]
+    # an auxiliary capture reads SGLang's own prepare
+    assert boundary.pre(layer, "h", st, capture=[]) == "sglang layer input"
+
+
+# ------------------------------------------------------------------- the parity check
+
+
+@pytest.fixture
+def eager(monkeypatch):
+    """Outside CUDA graph capture (a CPU build of torch has no capture to query), with
+    an attention backend that has no linear-attention states."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        "sglang.srt.model_executor.forward_context.get_attn_backend",
+        lambda: SimpleNamespace(),
+    )
+
+
+def test_the_second_forward_sees_the_conv_windows_the_first_saw(eager, monkeypatch):
+    conv = torch.zeros(2, 3, 4)  # [layers, slots, ...]
+    cache = SimpleNamespace(conv=[conv])
+    linear = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(
+            mamba_pool=SimpleNamespace(mamba_cache=cache)
+        ),
+        forward_metadata=SimpleNamespace(mamba_cache_indices=torch.tensor([1, -1])),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.model_executor.forward_context.get_attn_backend",
+        lambda: SimpleNamespace(linear_attn_backend=linear),
+    )
+
+    def forward():
+        # reads slot 1, then rewrites it in place, as a verify forward's conv update does
+        out = conv[:, 1].sum().reshape(1, 1).clone()
+        conv[:, 1] += 1.0
+        return SimpleNamespace(next_token_logits=out, hidden_states=None)
+
+    got = parity.Parity((7,), "cpu").run(Step("target_verify", 7), forward, forward)
+    assert got.next_token_logits.item() == 0.0  # the restored state, not 8.0
+    assert conv[:, 1].eq(1.0).all() and conv[:, 0].eq(0.0).all()
+
+
+def test_parity_compares_bits_not_values():
+    a = torch.tensor([0.0, 1.0, float("nan")])
+    assert int(parity.differing(a, a.clone())) == 0
+    assert int(parity.differing(a, torch.tensor([-0.0, 1.0, float("nan")]))) == 1
+    assert (
+        int(parity.differing(a, torch.tensor([0.0, 1.0 + 2**-20, float("nan")]))) == 1
+    )
+    assert parity.differing(None, None) == 0
+    with pytest.raises(RuntimeError):
+        parity.differing(a, a[:2])
+    with pytest.raises(RuntimeError):
+        parity.differing(a, None)
+
+
+@pytest.mark.parametrize("mode", ["1", "control"])
+def test_an_eager_parity_step_runs_sglangs_forward_first(
+    eager, monkeypatch, caplog, mode
+):
+    monkeypatch.setattr(parity, "MODE", mode)
+    order = []
+
+    def output(name, value):
+        def run():
+            order.append(name)
+            return SimpleNamespace(
+                next_token_logits=torch.full((7, 3), value), hidden_states=None
+            )
+
+        return run
+
+    checker = parity.Parity((7,), "cpu")
+    with caplog.at_level("INFO"):
+        got = checker.run(
+            Step("target_verify", 7), output("sglang", 1.0), output("plugin", 2.0)
+        )
+    assert order == (["sglang", "plugin"] if mode == "1" else ["sglang", "sglang"])
+    want = 0 if mode == "control" else 21
+    assert (
+        f"rows=7 logits_differ={want} hidden_differ=0 logits_compared=21 "
+        "hidden_compared=0" in caplog.text
+    )
+    assert got.next_token_logits[0, 0] == (1.0 if mode == "control" else 2.0)
+
+
+def test_a_capture_warmup_is_logged_apart_from_the_eager_steps(
+    eager, monkeypatch, caplog
+):
+    monkeypatch.setattr(
+        "sglang.srt.model_executor.runner.get_is_capture_mode", lambda: True
+    )
+
+    def output():
+        return SimpleNamespace(next_token_logits=torch.zeros(7, 3), hidden_states=None)
+
+    with caplog.at_level("INFO"):
+        parity.Parity((7,), "cpu").run(Step("target_verify", 7), output, output)
+    assert "parity capture-warmup target_verify rows=7 logits_differ=0" in caplog.text
+    assert " eager " not in caplog.text
+
+
+@torch.no_grad()
+def test_trace_names_the_first_module_call_that_differs(eager, monkeypatch, caplog):
+    monkeypatch.setattr(parity, "MODE", "trace")
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+    x = torch.ones(7, 4)
+
+    def forward(shift):
+        def run():
+            h = model[0](x) + shift  # an op between two modules
+            return SimpleNamespace(next_token_logits=model[1](h), hidden_states=None)
+
+        return run
+
+    checker = parity.Parity((7,), "cpu", model)
+    with caplog.at_level("INFO"):
+        checker.run(Step("target_verify", 7), forward(0.0), forward(0.0))
+        checker.run(Step("target_verify", 7), forward(0.0), forward(1.0))
+    traces = [r.message for r in caplog.records if "parity trace" in r.message]
+    assert traces == [
+        "NVIDIA megakernel parity trace target_verify rows=7: no diverging call "
+        "among 2 common module calls",
+        "NVIDIA megakernel parity trace target_verify rows=7: 1#0 input: 28 of 28 "
+        "elements differ",
+    ]
+
+
+def test_graph_parity_counts_are_logged_once_each(eager, caplog):
+    checker = parity.Parity((7,), "cpu")
+    checker.counters[7] += torch.tensor([3, 0, 5, 63, 0])
+    with caplog.at_level("INFO"):
+        checker.flush()
+        checker.flush()
+    lines = [r.message for r in caplog.records if "parity graph" in r.message]
+    assert lines == [
+        "NVIDIA megakernel parity graph target_verify rows=7 steps=3 "
+        "logits_differ=0 hidden_differ=5 logits_compared=63 hidden_compared=0"
+    ]
+
+
+def test_the_step_state_carries_the_binding():
+    lm = SimpleNamespace(model="model")
+    st = StepState(
+        lm=lm,
+        forward_batch="fb",
+        positions="pos",
+        input_ids="ids",
+        slots="slots",
+        bound={},
+        binding="EagleBinding",
+        view="EagleForwardView",
+    )
+    assert (st.model, st.binding, st.view) == (
+        "model",
+        "EagleBinding",
+        "EagleForwardView",
+    )

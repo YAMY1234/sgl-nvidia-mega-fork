@@ -23,6 +23,7 @@ SGLANG_READS = {
         "correction_bias_for_dtype",
         "scoring_func",
         "renormalize",
+        "num_shared_topk_slots",
         "use_grouped_topk",
         "custom_routing_function",
         "correction_bias",

@@ -81,10 +81,13 @@ class HopLayout(msgspec.Struct, frozen=True):
     wide_row_tiles: bool
 
 
-def hop_layout(widths, *, hop_b: bool, batch2: bool, hop_b_wide: bool) -> HopLayout:
+def hop_layout(
+    widths, *, hop_b: bool, batch2: bool, hop_b_wide: bool, cap16: bool = False
+) -> HopLayout:
     capacity = hop_a_max_rows(batch2)
     hop_a_rows = tuple(w for w in widths if w <= capacity)
-    hop_b_max = hop_b_max_rows(hop_b_wide, capacity)
+    # slot hop_b_cap16: hop B stays on hop A's widths, so no wide mailbox is built
+    hop_b_max = hop_b_max_rows(hop_b_wide and not cap16, capacity)
     hop_b_rows = tuple(w for w in widths if w <= hop_b_max) if hop_b else ()
     wide = [w for w in hop_b_rows if w > capacity]
     return HopLayout(

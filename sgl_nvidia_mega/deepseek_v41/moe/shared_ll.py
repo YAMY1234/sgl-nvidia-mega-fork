@@ -30,7 +30,6 @@ SGLANG_READS = {
         "gate_up_proj",
         "down_proj",
     ),
-    "kernels/ops/moe/dsv4.py": ("silu_and_mul_clamp",),
     "srt/layers/quantization/fp8.py": ("weight_scale_inv_swizzled",),
 }
 
@@ -100,12 +99,12 @@ class SharedLL:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """The shared expert's output for BF16 rows ``x``, on the current stream."""
-        from sglang.kernels.ops.moe.dsv4 import silu_and_mul_clamp
+        from sgl_nvidia_mega.deepseek_v41 import sglang_ops
 
         rows = x.shape[0]
         assert 0 < rows <= self.max_rows
         x_q, x_s = mxfp8_row_tiles(x)
         gate_up = mxfp8_ll.linear(x_q, x_s, self.weight, self.weight_scale)
         h = gate_up.new_empty((rows, gate_up.shape[1] // 2))
-        silu_and_mul_clamp(gate_up, h, self.limit)
+        sglang_ops.silu_and_mul_clamp(gate_up, h, self.limit)
         return self.down_proj(h)[0]

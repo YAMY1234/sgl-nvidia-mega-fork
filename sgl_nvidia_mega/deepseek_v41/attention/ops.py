@@ -31,10 +31,8 @@ SGLANG_READS = {
         "fused_norm_rope_inplace",
         "fused_q_norm_rope",
         "fused_rope_inplace",
-        "sglang_per_token_group_quant_fp8_dsv4_wo_a",
     ),
     "kernels/ops/attention/dsv4/wo_a.py": ("fused_rope_wo_a_bf16",),
-    "kernels/ops/layernorm/mxfp8_epilogue.py": ("rmsnorm_mxfp8",),
     "kernels/ops/quantization/fp8_kernel.py": ("sglang_per_token_group_quant_fp8",),
     "srt/layers/quantization/fp8_utils.py": (
         "Mxfp8DenseGemmBackend",
@@ -58,7 +56,7 @@ SGLANG_READS = {
 def normalize_q_lora(attn, q):
     """``MQALayer._normalize_q_lora``: the BF16 normed row (the indexer's) and wq_b's
     input, quantized with SGLang's fused norm + MXFP8 epilogue at 1-8 rows."""
-    from sglang.kernels.ops.layernorm.mxfp8_epilogue import rmsnorm_mxfp8
+    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
     from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
     from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
@@ -83,7 +81,7 @@ def normalize_q_lora(attn, q):
             or get_exec().deterministic.enable_deterministic_inference
         )
     ):
-        y, quant, scale = rmsnorm_mxfp8(
+        y, quant, scale = sglang_ops.rmsnorm_mxfp8(
             q, attn.q_norm.weight, attn.q_norm.variance_epsilon
         )
         return y, Mxfp8SwizzledInput(quant, scale)
@@ -170,10 +168,8 @@ def kv_to_cache(attn, x, positions, fb, view, qkv_a):
 def wo_a(attn, o, positions, fb):
     """The CUDA arm of ``MQALayer.forward`` after attention: the inverse RoPE and
     wo_a, as wo_b's input (FlashInfer-swizzled MXFP8 when wo_b takes it)."""
-    from sglang.kernels.ops.attention.dsv4 import (
-        fused_rope_inplace,
-        sglang_per_token_group_quant_fp8_dsv4_wo_a,
-    )
+    from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
+    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
     from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
@@ -212,7 +208,7 @@ def wo_a(attn, o, positions, fb):
         t, g, d = o.shape
         r = attn.o_lora_rank
         if _FP8_WO_A_UE8M0:
-            o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+            o_fp8, o_s = sglang_ops.per_token_group_quant_fp8_wo_a(o)
             recipe = (1, 1, 128)
         else:
             o_fp8, o_s = sglang_per_token_group_quant_fp8(

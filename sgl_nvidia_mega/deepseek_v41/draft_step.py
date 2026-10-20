@@ -37,7 +37,6 @@ SGLANG_READS = {
     ),
     "srt/models/deepseek_v4.py": ("maybe_use_decode_attn_tp", "self_attn", "layer_id"),
     "srt/layers/logits_processor.py": ("LogitsProcessorOutput", "hidden_states"),
-    "kernels/ops/layernorm/mhc.py": ("hc_combine",),
     "srt/eplb/expert_distribution.py": (
         "get_global_expert_distribution_recorder",
         "disable_this_region",
@@ -215,7 +214,7 @@ class DraftDecode(DraftProposal):
 
     def _forward(self, step, input_ids, positions, forward_batch, input_embeds):
         """``DeepseekV4ForCausalLMDSpark.forward`` for a covered draft block."""
-        from sglang.kernels.ops.layernorm.mhc import hc_combine
+        from sgl_nvidia_mega.deepseek_v41 import sglang_ops
         from sglang.srt.eplb.expert_distribution import (
             get_global_expert_distribution_recorder,
         )
@@ -252,7 +251,7 @@ class DraftDecode(DraftProposal):
         streams = residual.flatten(1)
         if not self._tail_bf16:
             streams = streams.float()
-        x = hc_combine(streams, pre, lm.hc_mult, residual.dtype)
+        x = sglang_ops.hc_combine(streams, pre, lm.hc_mult, residual.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
 

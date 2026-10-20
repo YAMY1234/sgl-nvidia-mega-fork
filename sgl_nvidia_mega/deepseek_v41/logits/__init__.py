@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "kernels/ops/layernorm/mhc.py": ("hc_combine",),
     "srt/models/deepseek_v4.py": (
         "norm",
         "hc_mult",
@@ -211,11 +210,11 @@ def _all_ranks_true(group, value: bool) -> bool:
 
 def head(st, residual, pre):
     """(hidden [rows, dim], pre_hc_head [rows, hc * dim]) from the final streams."""
-    from sglang.kernels.ops.layernorm.mhc import hc_combine
+    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
 
     m = st.model
     pre_hc_head = residual.flatten(1)
-    hidden = m.norm(hc_combine(pre_hc_head.float(), pre, m.hc_mult, residual.dtype))
+    hidden = m.norm(sglang_ops.hc_combine(pre_hc_head.float(), pre, m.hc_mult, residual.dtype))
     return hidden, pre_hc_head
 
 

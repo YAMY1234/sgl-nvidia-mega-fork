@@ -70,14 +70,9 @@ SGLANG_READS = {
         "fused_norm_rope_inplace",
         "fused_q_norm_rope",
         "fused_rope_inplace",
-        "sglang_per_token_group_quant_fp8_dsv4_wo_a",
     ),
     "kernels/ops/attention/dsv4/wo_a.py": ("fused_rope_wo_a_bf16",),
-    "kernels/ops/layernorm/mxfp8_epilogue.py": ("rmsnorm_mxfp8",),
     "kernels/ops/quantization/fp8_kernel.py": ("sglang_per_token_group_quant_fp8",),
-    # the unified-KV gate, where SGLang has kept it (kernels/ops/.../env_gate.py, then
-    # srt/layers/attention/dsv4/unified_kv_gate.py)
-    "**/attention/dsv4/**/*_gate.py": ("is_unified_kv_triton",),
     "srt/layers/quantization/fp8_utils.py": (
         "Mxfp8DenseGemmBackend",
         "FLASHINFER_CUTEDSL",
@@ -122,19 +117,9 @@ SGLANG_READS = {
 }
 
 
-def unified_kv_triton() -> bool:
-    """SGLang's unified-KV gate, at the module path of either side of its operator regroup."""
-    try:
-        from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
-    except ImportError:
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
-    return is_unified_kv_triton()
-
-
 def disable_reason(attn) -> str:
     """Why the stock step cannot stand in for ``attn``'s forward, or ""."""
+    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
     from sglang.srt.models.deepseek_v4 import (
         MQALayer,
         _wo_a_fp8_mxscale,
@@ -151,7 +136,7 @@ def disable_reason(attn) -> str:
         return "the ROCm wo_a kernels are loaded"
     if attn.use_npu_arch35_mxfp8_wo_a:
         return f"layer {attn.layer_id}: the NPU wo_a"
-    if unified_kv_triton():
+    if sglang_ops.unified_kv_triton():
         return "the unified KV cache"
     if not hasattr(attn.wo_a, "weight"):
         return f"layer {attn.layer_id}: wo_a has no dense weight"

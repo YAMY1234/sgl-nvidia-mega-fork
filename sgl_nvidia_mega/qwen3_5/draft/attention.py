@@ -18,7 +18,11 @@ decode as the q1 split-KV kernel (``sm103/draft/q1``).
 
 from __future__ import annotations
 
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 # the KV-length graph variants of the draft loop (2.2's graph_variants.Q1_STOCK /
 # Q1_LONG): trtllm-gen below Q1_MIN_LENGTH, SKV2-Q1 from it (2.2's
@@ -304,6 +308,7 @@ class DraftExtendSplitKV:
 
     def __init__(self, split_kv, route):
         self.split_kv, self.route = split_kv, route
+        self._logged = False
 
     @classmethod
     def build(cls, parts):
@@ -327,6 +332,13 @@ class DraftExtendSplitKV:
         return label is None or label == self.route.SPLIT_KV_LONG
 
     def run(self, attn, q8, kv, meta):
+        if not self._logged and torch.cuda.is_current_stream_capturing():
+            self._logged = True
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 MTP draft slot draft_skv2 runs the draft "
+                "extend's %d rows as SKV2",
+                q8.shape[0],
+            )
         return self.split_kv.skv2(attn, q8, kv, meta)
 
 

@@ -123,6 +123,17 @@ def pool_reasons(kv, page_size: int) -> list[str]:
     return reasons
 
 
+def kv_scales(attn, device):
+    """The FP8 KV write's scale tensors TRT-LLM MHA passes: the layer's, else ones."""
+    ones = _ONES.get(device)
+    if ones is None:
+        ones = _ONES[device] = torch.ones(1, dtype=torch.float32, device=device)
+    return (
+        attn.k_scale if attn.k_scale is not None else ones,
+        attn.v_scale if attn.v_scale is not None else ones,
+    )
+
+
 def attend(attn, q, k, v, st):
     """``attn(q, k, v, st.fb)`` for a covered verify step: the attention output
     [rows, heads * head_dim]."""
@@ -131,9 +142,7 @@ def attend(attn, q, k, v, st):
     )
 
     i = st.view.kv.layer_ids.index(attn.layer_id)
-    ones = _ONES.get(q.device)
-    if ones is None:
-        ones = _ONES[q.device] = torch.ones(1, dtype=torch.float32, device=q.device)
+    k_scale, v_scale = kv_scales(attn, q.device)
     q = fused_fp8_qkv_kv_cache(
         q=q,
         k=k,
@@ -141,8 +150,8 @@ def attend(attn, q, k, v, st):
         k_cache=st.view.kv.k[i],
         v_cache=st.view.kv.v[i],
         cache_loc=st.fb.out_cache_loc,
-        k_scale=attn.k_scale if attn.k_scale is not None else ones,
-        v_scale=attn.v_scale if attn.v_scale is not None else ones,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
     return core(attn, q, st)
 

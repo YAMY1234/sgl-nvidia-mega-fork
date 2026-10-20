@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The full-attention kernels of slot skv2, on one SM100-family GPU (GB300), at Qwen3.5's
-TP8 verify shape (7 rows of 4 query heads over one KV head of 256, FP8 pages of 64):
+"""The full-attention kernels of slots skv2 and mka, on one SM100-family GPU (GB300), at
+Qwen3.5's TP8 verify shape (7 rows of 4 query heads over one KV head of 256, FP8 pages of
+64):
 
 - SKV2 against an FP64 reference of the masked attention: at most twice the error of
   SGLang's attention (TRT-LLM MHA's decode kernel) on the same FP8 inputs, at KV lengths
   from one page to past 128K;
-- SKV2 replayed in a CUDA graph on new inputs, bit for bit its eager result.
+- SKV2 replayed in a CUDA graph on new inputs, bit for bit its eager result;
+- the MKA prologue and epilogue twice on the same inputs, and replayed in a CUDA graph on
+  new ones, bit for bit their eager result (FP8 Q, bf16 gate, the written K / V rows and
+  the o_proj output).
 
-Its bits against our 2.2 branch's SKV2 are checked with the branch's tree
+Their bits against our 2.2 branch's kernels are checked with the branch's tree
 (``slot_vs_branch``), not here.
 """
 
@@ -143,3 +147,128 @@ def test_skv2_replays_in_a_cuda_graph_bit_for_bit():
         want = torch.empty_like(out)
         plan.run(q, kv, table, lengths, qk_scale=qk_scale, v_scale=v_scale, out=want)
         assert torch.equal(out.view(torch.int16), want.view(torch.int16)), length
+
+
+HIDDEN, QKV_ROWS, POOL_SLOTS = 4096, (2 * HEADS + 2) * DIM, 1024
+
+
+def _fp8(shape, g, scale=1.0):
+    return (torch.randn(shape, device="cuda", generator=g) * scale).to(
+        torch.float8_e4m3fn
+    )
+
+
+def _mka_operands(g):
+    """The TP8 layer's static operands: packed FP8 qkv (+ gate) and o_proj weights and
+    their static scales, the q / k norm weights, an fp32 M-RoPE cos / sin cache, its axis
+    map and FP8 KV scales."""
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import mka
+
+    def scale(v):
+        return torch.full((1,), v, dtype=torch.float32, device="cuda")
+
+    angles = torch.rand(4096, 32, device="cuda", generator=g) * 6.3
+    return dict(
+        w_qkv=mka.pack_qkv(_fp8((QKV_ROWS, HIDDEN), g), HEADS),
+        w_o=mka.pack_o(_fp8((HIDDEN, HEADS * DIM), g)),
+        qkv_sx=scale(0.02),
+        qkv_sw=scale(0.003),
+        o_sx=scale(0.05),
+        o_sw=scale(0.002),
+        qnw=(torch.randn(DIM, device="cuda", generator=g) * 0.1).to(torch.bfloat16),
+        knw=(torch.randn(DIM, device="cuda", generator=g) * 0.1).to(torch.bfloat16),
+        cos_sin=torch.cat([angles.cos(), angles.sin()], dim=1).contiguous(),
+        axis=torch.randint(0, 3, (32,), device="cuda", generator=g),
+        k_scale=scale(0.8),
+        v_scale=scale(1.3),
+    )
+
+
+class _MkaStep:
+    """One step's buffers, refilled in place: the normed rows, positions, cache slots and
+    the attention output the epilogue reads; the FP8 pool and every output."""
+
+    def __init__(self, m, g):
+        self.x = torch.empty(m, HIDDEN, dtype=torch.bfloat16, device="cuda")
+        self.pos = torch.empty(3, m, dtype=torch.int64, device="cuda")
+        self.loc = torch.empty(m, dtype=torch.int64, device="cuda")
+        self.attn = torch.empty(m, HEADS * DIM, dtype=torch.bfloat16, device="cuda")
+        self.k = _fp8((POOL_SLOTS, 1, DIM), g)
+        self.v = _fp8((POOL_SLOTS, 1, DIM), g)
+        self.q = torch.empty(m, HEADS * DIM, dtype=torch.float8_e4m3fn, device="cuda")
+        self.gate = torch.empty(m, HEADS * DIM, dtype=torch.bfloat16, device="cuda")
+        self.out = torch.empty(m, HIDDEN, dtype=torch.bfloat16, device="cuda")
+        self.fill(g)
+
+    def fill(self, g):
+        m = self.x.shape[0]
+        self.x.copy_(torch.randn(self.x.shape, device="cuda", generator=g) * 3)
+        self.pos.copy_(
+            torch.randint(0, 4096, self.pos.shape, device="cuda", generator=g)
+        )
+        self.loc.copy_(torch.randperm(POOL_SLOTS, device="cuda", generator=g)[:m])
+        self.attn.copy_(torch.randn(self.attn.shape, device="cuda", generator=g))
+
+    def run(self, ops):
+        from sgl_nvidia_mega.qwen3_5.sm103.attention import mka
+
+        mka.prologue(
+            x=self.x,
+            w_packed=ops["w_qkv"],
+            sx=ops["qkv_sx"],
+            sw=ops["qkv_sw"],
+            q_norm_w=ops["qnw"],
+            k_norm_w=ops["knw"],
+            cos_sin=ops["cos_sin"],
+            positions=self.pos,
+            axis_map=ops["axis"],
+            cache_loc=self.loc,
+            k_cache=self.k,
+            v_cache=self.v,
+            k_scale=ops["k_scale"],
+            v_scale=ops["v_scale"],
+            q_out=self.q,
+            gate_out=self.gate,
+            nq=HEADS,
+            eps=1e-6,
+        )
+        mka.epilogue(
+            attn=self.attn,
+            gate=self.gate,
+            w_packed=ops["w_o"],
+            sx=ops["o_sx"],
+            sw=ops["o_sw"],
+            out=self.out,
+            nq=HEADS,
+        )
+
+    def bits(self):
+        torch.cuda.synchronize()
+        rows = (self.k[self.loc], self.v[self.loc])
+        return [
+            t.clone().view(torch.uint8) for t in (self.q, self.gate, *rows, self.out)
+        ]
+
+
+def _same(a, b):
+    return all(torch.equal(x, y) for x, y in zip(a, b))
+
+
+def test_mka_replays_in_a_cuda_graph_bit_for_bit():
+    g = torch.Generator(device="cuda").manual_seed(5)
+    ops = _mka_operands(g)
+    step = _MkaStep(7, g)
+    step.run(ops)
+    first = step.bits()
+    step.run(ops)
+    assert _same(first, step.bits())  # deterministic
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step.run(ops)
+    for _ in range(3):
+        step.fill(g)
+        graph.replay()
+        replayed = step.bits()
+        step.run(ops)
+        assert _same(replayed, step.bits())
+        assert torch.isfinite(step.out.float()).all()

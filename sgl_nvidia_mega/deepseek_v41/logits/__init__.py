@@ -61,11 +61,13 @@ class LowMLmHeadMethod:
     any method outside its unquantized names, ahead of its FP32 and on-policy branches
     (so ``build`` refuses those)."""
 
-    def __init__(self, weight: torch.Tensor):
+    def __init__(self, weight: torch.Tensor, *, pinned: bool = False):
         self.weight = weight
         # the CuTe DSL kernels take operands over DLPack, which refuses grad tensors
         self.weight_t = weight.detach().t()
         self.captured_rows: set[int] = set()
+        # slot lm_head_pinned_tactic: one fixed tactic per row count, no tuning
+        self.pinned = pinned
 
     def low_m(self, x: torch.Tensor, bias) -> bool:
         return (
@@ -80,18 +82,24 @@ class LowMLmHeadMethod:
         if not self.low_m(x, bias):
             # SGLang's BF16 branch (it adds no bias either)
             return torch.matmul(x.to(self.weight.dtype), self.weight.T)
-        from flashinfer import mm_bf16
-
         rows = x.shape[0]
         if _capturing() and rows not in self.captured_rows:
             # a replay runs no Python: the captured row counts are where it serves
             self.captured_rows.add(rows)
             logger.info("NVIDIA megakernel: target_lm_head captured at %d rows", rows)
+        if self.pinned:
+            from sgl_nvidia_mega.deepseek_v41.sampler.pinned import pinned_mm
+
+            return pinned_mm(x, self.weight_t)
+        from flashinfer import mm_bf16
+
         return mm_bf16(x, self.weight_t, pdl=True, backend=LM_HEAD_BACKEND)
 
     def tune(self) -> None:
         """The same calls on every rank, before any graph is captured; the draft's head
         shares the weight, so this and the draft's tuning share FlashInfer's cache."""
+        if self.pinned:
+            return
         from flashinfer.autotuner import autotune
 
         w = self.weight
@@ -105,9 +113,9 @@ class TargetLmHead:
     """What the logits processor gets for the LM head: SGLang's module, with the
     low-M quant method."""
 
-    def __init__(self, lm_head):
+    def __init__(self, lm_head, *, pinned: bool = False):
         self.lm_head, self.weight = lm_head, lm_head.weight
-        self.quant_method = LowMLmHeadMethod(lm_head.weight)
+        self.quant_method = LowMLmHeadMethod(lm_head.weight, pinned=pinned)
 
     def __getattr__(self, name):
         return getattr(self.lm_head, name)
@@ -148,7 +156,7 @@ def build(model, ctx, group):
     if reason:
         logger.warning("NVIDIA megakernel: target LM head not built: %s", reason)
         return None
-    head = TargetLmHead(model.lm_head)
+    head = TargetLmHead(model.lm_head, pinned="lm_head_pinned_tactic" in SLOTS)
     head.quant_method.tune()
     error = check_against_sglang(model, head)
     if not _all_ranks_true(group, not error):

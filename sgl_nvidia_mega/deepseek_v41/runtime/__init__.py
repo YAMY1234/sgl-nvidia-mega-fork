@@ -94,8 +94,15 @@ DRAFT_SLOTS = frozenset(
 # gathered table; hop_b_cap16: hop_b_wide's row tiles at 9-16 rows only, no 48-row
 # mailbox, which measured +16 us on the batch-1 verify graph; target_lm_head: the
 # target's LM head on FlashInfer's low-M kernel at 1-8 rows, not bitwise; hop_b_quad_trigger:
-# hop B's finalize-publish lets the consumer launch right after its own wait, not at its end)
-OPT_IN_SLOTS = ("draft_embed", "hop_b_cap16", "target_lm_head", "hop_b_quad_trigger")
+# hop B's finalize-publish lets the consumer launch right after its own wait, not at its end;
+# lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned)
+OPT_IN_SLOTS = (
+    "draft_embed",
+    "hop_b_cap16",
+    "target_lm_head",
+    "hop_b_quad_trigger",
+    "lm_head_pinned_tactic",
+)
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -166,6 +173,11 @@ def slot_reasons() -> list[str]:
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
+    if "lm_head_pinned_tactic" in SLOTS and not SLOTS & {"draft_lm_head", "target_lm_head"}:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'lm_head_pinned_tactic' needs slot 'draft_lm_head' "
+            "or 'target_lm_head'"
+        )
     return reasons
 
 

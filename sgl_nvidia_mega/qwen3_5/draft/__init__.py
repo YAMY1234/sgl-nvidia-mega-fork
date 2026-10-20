@@ -23,7 +23,13 @@ from __future__ import annotations
 import logging
 from typing import Callable, Optional
 
-from sglang.srt.megakernels.spec import Feature, MegakernelSpec, Requirements
+from sglang.srt.megakernels.spec import (
+    Feature,
+    MegakernelSpec,
+    Numerics,
+    NumericsKind,
+    Requirements,
+)
 
 from sgl_nvidia_mega.qwen3_5 import spec as target
 
@@ -35,6 +41,9 @@ SGLANG_READS = {
         "Feature",
         "SPECULATIVE_DECODING",
         "MegakernelSpec",
+        "Numerics",
+        "NumericsKind",
+        "TOLERANCE",
         "Requirements",
         '"draft_loop"',
         '"draft_extend"',
@@ -54,6 +63,16 @@ SGLANG_READS = {
 }
 
 ARCHITECTURE = "Qwen3_5ForCausalLMMTP"
+
+
+def numerics(slots: frozenset) -> Numerics:
+    """SGLang's draft bit for bit with no draft slot; with one, 2.2's draft kernels,
+    which differ from SGLang's ops only in fp32 summation order (2.2's A6 class:
+    q1 split-KV, the o_proj / fc / MoE GEMVs, the draft head), so a draft token can
+    differ where two logits are within a bf16 rounding."""
+    if not slots & {"draft_moe", "draft_q1", "draft_xchg", "draft_hop"}:
+        return target.NUMERICS
+    return Numerics(NumericsKind.TOLERANCE, {"draft_logits.rel": 2**-7})
 # the one request a draft entry serves: 2.2's draft kernels are single-row
 SERVED_BS = 1
 
@@ -136,15 +155,19 @@ class MtpDraft:
         return extend.step_for
 
 
-def _build(model, hf_config, ctx) -> MtpDraft:
+def _requested() -> frozenset:
+    """The draft's entries and slots in SGLANG_NVIDIA_MEGAKERNEL_SLOTS."""
     from sgl_nvidia_mega.qwen3_5 import runtime
 
-    draft_names = set(runtime.DRAFT_ENTRIES) | set(runtime.DRAFT_SLOTS)
+    return runtime.SLOTS & (set(runtime.DRAFT_ENTRIES) | set(runtime.DRAFT_SLOTS))
+
+
+def _build(model, hf_config, ctx) -> MtpDraft:
     return MtpDraft(
         model,
         binding=ctx.binding,
         deadline_s=ctx.deadline_s,
-        slots=frozenset(runtime.SLOTS & draft_names),
+        slots=frozenset(_requested()),
         context_len=getattr(hf_config, "context_len", None),
     )
 
@@ -159,7 +182,7 @@ SPEC = MegakernelSpec(
         decode_graph_backends=target.REQUIREMENTS.decode_graph_backends,
     ),
     features=frozenset({Feature.SPECULATIVE_DECODING}),
-    numerics=target.NUMERICS,
+    numerics=numerics(_requested()),
     # the draft's forward stays SGLang's: no width is built
     max_rows=0,
     build=_build,

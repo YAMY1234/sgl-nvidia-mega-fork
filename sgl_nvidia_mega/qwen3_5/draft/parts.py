@@ -23,6 +23,11 @@ SGLANG_READS = {
         "lm_head",
         "logits_processor",
     ),
+    "srt/layers/logits_processor.py": ("logit_scale", "vocab_size"),
+    "srt/layers/vocab_parallel_embedding.py": (
+        "shard_indices",
+        "org_vocab_start_index",
+    ),
     "srt/models/qwen3_5.py": (
         "layers",
         "start_layer",
@@ -121,26 +126,43 @@ class Parts:
 
         lm, b = self.lm, self.binding
         embed = self.model.embed_tokens
-        return MkdBoundary(
-            fc_weight=lm.fc.weight,
-            norm_embedding=(
-                lm.pre_fc_norm_embedding.weight,
-                lm.pre_fc_norm_embedding.variance_epsilon,
-            ),
-            norm_hidden=(
-                lm.pre_fc_norm_hidden.weight,
-                lm.pre_fc_norm_hidden.variance_epsilon,
-            ),
-            embed_shard=embed.weight,
-            vocab_start=embed.shard_indices.org_vocab_start_index,
-            lm_head_shard=lm.lm_head.weight,
-            embed=embed,
-            rank=b.tp_rank,
-            world=b.tp_size,
-            device_group=b.tp_device_group,
-            cpu_group=b.tp_cpu_group,
-            num_steps=b.num_steps,
-        )
+        processor = lm.logits_processor
+        # what 2.2's boundary assumed of the draft head and MkdBoundary cannot see
+        refused = [
+            why
+            for bad, why in (
+                (lm.config.tie_word_embeddings, "tied embeddings"),
+                (processor.logit_scale is not None, "logit scaling"),
+                (
+                    getattr(processor, "final_logit_softcapping", None) is not None,
+                    "logit softcapping",
+                ),
+            )
+            if bad
+        ]
+        mkd = None
+        if not refused:
+            mkd = MkdBoundary.maybe_create(
+                vocab_size=processor.vocab_size,
+                fc_weight=lm.fc.weight,
+                norm_embedding=lm.pre_fc_norm_embedding,
+                norm_hidden=lm.pre_fc_norm_hidden,
+                embed_shard=embed.weight,
+                vocab_start=embed.shard_indices.org_vocab_start_index,
+                lm_head_shard=lm.lm_head.weight,
+                embed=embed,
+                rank=b.tp_rank,
+                world=b.tp_size,
+                device_group=b.tp_device_group,
+                cpu_group=b.tp_cpu_group,
+                num_steps=b.num_steps,
+            )
+        if mkd is None:
+            raise RuntimeError(
+                "NVIDIA megakernel: slot draft_xchg cannot run: "
+                + ("; ".join(refused) or "see the MKD draft boundary warning")
+            )
+        return mkd
 
     def note_engaged(self, entry: str, bs: int) -> None:
         """Log once per (entry, bs) captured: the engagement line every rank prints."""

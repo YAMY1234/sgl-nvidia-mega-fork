@@ -116,13 +116,12 @@ class DraftLoop:
             hidden = self._model_step(io, i, mkd.fc())
             if mkd.armed:
                 mkd.hidden_partial(hidden)
-            mkd.exchange(
+            mkd.finish_step(
                 mkd.head(hidden),
-                mkd.topk_index[i],
-                mkd.topk_p[i],
-                io.draft_tokens_out,
                 io.positions,
+                io.draft_tokens_out,
+                i,
                 i + 1,
                 io.mrope_positions,
             )
-            mkd.end()
+        mkd.end()

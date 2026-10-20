@@ -119,12 +119,13 @@ SGLANG_READS = {
 
 def disable_reason(attn) -> str:
     """Why the stock step cannot stand in for ``attn``'s forward, or ""."""
-    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
     from sglang.srt.models.deepseek_v4 import (
         MQALayer,
         _wo_a_fp8_mxscale,
         _wo_a_fp8_mxscale_fused_invrope,
     )
+
+    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
 
     if not isinstance(attn, MQALayer):
         return f"layer {attn.layer_id}: {type(attn).__name__}, not MQALayer"

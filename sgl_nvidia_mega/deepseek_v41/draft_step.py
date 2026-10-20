@@ -214,11 +214,12 @@ class DraftDecode(DraftProposal):
 
     def _forward(self, step, input_ids, positions, forward_batch, input_embeds):
         """``DeepseekV4ForCausalLMDSpark.forward`` for a covered draft block."""
-        from sgl_nvidia_mega.deepseek_v41 import sglang_ops
         from sglang.srt.eplb.expert_distribution import (
             get_global_expert_distribution_recorder,
         )
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+        from sgl_nvidia_mega.deepseek_v41 import sglang_ops
 
         lm = self.lm
         # the draft forward's KV pool and attention metadata, for the ported attention

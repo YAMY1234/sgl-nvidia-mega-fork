@@ -214,7 +214,9 @@ def head(st, residual, pre):
 
     m = st.model
     pre_hc_head = residual.flatten(1)
-    hidden = m.norm(sglang_ops.hc_combine(pre_hc_head.float(), pre, m.hc_mult, residual.dtype))
+    hidden = m.norm(
+        sglang_ops.hc_combine(pre_hc_head.float(), pre, m.hc_mult, residual.dtype)
+    )
     return hidden, pre_hc_head
 
 

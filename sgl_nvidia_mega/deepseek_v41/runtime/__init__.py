@@ -173,7 +173,10 @@ def slot_reasons() -> list[str]:
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
-    if "lm_head_pinned_tactic" in SLOTS and not SLOTS & {"draft_lm_head", "target_lm_head"}:
+    if "lm_head_pinned_tactic" in SLOTS and not SLOTS & {
+        "draft_lm_head",
+        "target_lm_head",
+    }:
         reasons.append(
             f"{SLOTS_ENV}: slot 'lm_head_pinned_tactic' needs slot 'draft_lm_head' "
             "or 'target_lm_head'"

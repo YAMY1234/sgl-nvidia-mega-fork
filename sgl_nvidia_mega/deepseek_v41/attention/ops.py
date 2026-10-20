@@ -56,11 +56,12 @@ SGLANG_READS = {
 def normalize_q_lora(attn, q):
     """``MQALayer._normalize_q_lora``: the BF16 normed row (the indexer's) and wq_b's
     input, quantized with SGLang's fused norm + MXFP8 epilogue at 1-8 rows."""
-    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
     from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
     from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
     from sglang.srt.runtime_context import get_exec
+
+    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
 
     method = attn.wq_b.quant_method
     if (
@@ -169,7 +170,6 @@ def wo_a(attn, o, positions, fb):
     """The CUDA arm of ``MQALayer.forward`` after attention: the inverse RoPE and
     wo_a, as wo_b's input (FlashInfer-swizzled MXFP8 when wo_b takes it)."""
     from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
-    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
     from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
@@ -182,6 +182,8 @@ def wo_a(attn, o, positions, fb):
         _fp8_wo_a_einsum,
     )
     from sglang.srt.runtime_context import get_forward
+
+    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
 
     fuse_mxfp8_quant = attn.use_flashinfer_mxfp8_wo_b and not get_forward().sp_active
     fuse_rope_wo_a = attn.use_fused_wo_a and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS

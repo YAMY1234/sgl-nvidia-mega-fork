@@ -21,7 +21,10 @@ CANDIDATES = {
             "sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0",
             "sglang_per_token_group_quant_fp8_dsv4_wo_a",
         ),
-        ("sglang.kernels.ops.attention.dsv4", "sglang_per_token_group_quant_fp8_dsv4_wo_a"),
+        (
+            "sglang.kernels.ops.attention.dsv4",
+            "sglang_per_token_group_quant_fp8_dsv4_wo_a",
+        ),
     ),
     "hc_combine": (
         ("sglang.kernels.ops.layernorm.mhc", "mhc_combine"),

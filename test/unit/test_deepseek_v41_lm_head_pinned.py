@@ -49,11 +49,19 @@ def fi(monkeypatch):
     def no_autotune(*a, **k):
         raise AssertionError("the pinned heads must not tune")
 
-    monkeypatch.setitem(sys.modules, "flashinfer.gemm", SimpleNamespace(gemm_base=gemm_base))
+    monkeypatch.setitem(
+        sys.modules, "flashinfer.gemm", SimpleNamespace(gemm_base=gemm_base)
+    )
     monkeypatch.setitem(sys.modules, "flashinfer.gemm.gemm_base", gemm_base)
-    monkeypatch.setitem(sys.modules, "flashinfer.autotuner", SimpleNamespace(autotune=no_autotune))
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 3))
-    monkeypatch.setattr(pinned, "PINNED_TACTICS", {(103, N, K, 1): ("Direct", (64, 4, 1))})
+    monkeypatch.setitem(
+        sys.modules, "flashinfer.autotuner", SimpleNamespace(autotune=no_autotune)
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: (10, 3)
+    )
+    monkeypatch.setattr(
+        pinned, "PINNED_TACTICS", {(103, N, K, 1): ("Direct", (64, 4, 1))}
+    )
     pinned._choice.cache_clear()
     yield runners
     pinned._choice.cache_clear()
@@ -64,7 +72,9 @@ def test_pinned_rows_run_their_tactic_and_others_flashinfers_default(fi, caplog)
     w = torch.randn(N, K).to(torch.bfloat16)
     for rows in (1, 6, 1):
         x = torch.randn(rows, K).to(torch.bfloat16)
-        assert torch.equal(pinned.pinned_mm(x, w.t()), (x.float() @ w.t().float()).to(torch.bfloat16))
+        assert torch.equal(
+            pinned.pinned_mm(x, w.t()), (x.float() @ w.t().float()).to(torch.bfloat16)
+        )
     assert direct.calls == [(1, (64, 4, 1))] * 2 and warp.calls == [(6, -1)]
     pinned.PINNED_TACTICS[(103, N, K, 2)] = ("Direct", (128, 2, 2))
     pinned.pinned_mm(torch.randn(2, K).to(torch.bfloat16), w.t())
@@ -88,5 +98,7 @@ def test_the_slot_is_opt_in_and_needs_a_low_m_head(monkeypatch):
     assert "lm_head_pinned_tactic" not in runtime.SHIPPED_SLOTS
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"lm_head_pinned_tactic"}))
     assert any("lm_head_pinned_tactic" in r for r in runtime.slot_reasons())
-    monkeypatch.setattr(runtime, "SLOTS", frozenset({"lm_head_pinned_tactic", "target_lm_head"}))
+    monkeypatch.setattr(
+        runtime, "SLOTS", frozenset({"lm_head_pinned_tactic", "target_lm_head"})
+    )
     assert not any("lm_head_pinned_tactic" in r for r in runtime.slot_reasons())

@@ -111,6 +111,15 @@ NUMERIC_TOLERANCES = {
         "route_shared.gate_up.rel_l2_vs_stock": 1.05,
         "route_shared.gate_up.max_abs_vs_stock": 2.0,
     },
+    # SKV2 against SGLang's TRT-LLM MHA decode (test_skv2_is_within_twice_sglangs_error)
+    "skv2": {"skv2.attention.rel_l2_vs_stock": 2.0},
+    # MKA's own qkv / o_proj GEMMs; the GEMM slots' bounds, no fp64 kernel test yet
+    "mka": {
+        "mka.qkv_proj.rel_l2_vs_stock": 1.05,
+        "mka.qkv_proj.max_abs_vs_stock": 2.0,
+        "mka.o_proj.rel_l2_vs_stock": 1.05,
+        "mka.o_proj.max_abs_vs_stock": 2.0,
+    },
 }
 
 

@@ -99,10 +99,10 @@ def env():
                 quantize_layer_input=True,
                 residual_only=True,
                 early_trigger=early == "poll",
-                hop_b_start_trigger=early in ("start", "quad"),
-                publish_trigger_after_wait=early == "quad",
+                hop_b_start_trigger=early in ("start", "quad", "quad8"),
+                publish_trigger_max_rows={"quad": 48, "quad8": 8}.get(early, 0),
             )
-            for early in ("end", "poll", "start", "quad")
+            for early in ("end", "poll", "start", "quad", "quad8")
         }
         # hop B up to the routed pair's 48 rows, with the row-tile scale variant
         wide = {
@@ -116,11 +116,11 @@ def env():
                 quantize_layer_input=True,
                 residual_only=True,
                 early_trigger=early == "poll",
-                hop_b_start_trigger=early in ("start", "quad"),
+                hop_b_start_trigger=early in ("start", "quad", "quad8"),
                 row_tile_layer_input=True,
-                publish_trigger_after_wait=early == "quad",
+                publish_trigger_max_rows={"quad": 48, "quad8": 8}.get(early, 0),
             )
-            for early in ("end", "poll", "start", "quad")
+            for early in ("end", "poll", "start", "quad", "quad8")
         }
     yield SimpleNamespace(
         rank=rank,
@@ -324,14 +324,24 @@ def test_early_trigger_changes_no_bit(env):
 def test_quad_trigger_changes_no_bit(env, rows):
     """Slot hop_b_quad_trigger: the finalize-publish launches the consumer right after
     its own wait; the consumer still waits for its whole grid, so no output bit moves
-    at batch 1 / 2 / 4 / 8 (6-48 rows, the 16- and the 48-row mailbox)."""
+    at batch 1 / 2 / 4 / 8 (6-48 rows, the 16- and the 48-row mailbox), and the
+    slot's 8-row gate launches that variant at batch 1 only."""
     hops = env.hops if rows <= 16 else env.wide
     inp = _inputs(rows, 300 + rows, env.rank, env.device)
-    for kind in ("norm", "quant", "residual"):
-        base = _run(hops["start"], kind, inp)
-        quad = _run(hops["quad"], kind, inp)
-        for a, b in zip(base, quad):
-            assert _same(a, b), f"quad trigger differs: rows={rows} {kind}"
+    # quad8 (the slot's gate): the trigger variant at up to 8 rows, the end trigger above
+    gated = hops["quad8"]
+    early, calls = gated._finalize_publish_early, []
+    gated._finalize_publish_early = lambda *a: calls.append(rows) or early(*a)
+    try:
+        for kind in ("norm", "quant", "residual"):
+            base = _run(hops["start"], kind, inp)
+            for variant in ("quad", "quad8"):
+                quad = _run(hops[variant], kind, inp)
+                for a, b in zip(base, quad):
+                    assert _same(a, b), f"{variant} differs: rows={rows} {kind}"
+    finally:
+        gated._finalize_publish_early = early
+    assert bool(calls) == (rows <= 8)
     torch.cuda.synchronize()
 
 

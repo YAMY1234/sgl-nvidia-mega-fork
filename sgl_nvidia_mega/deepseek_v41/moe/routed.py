@@ -23,7 +23,6 @@ SGLANG_READS = {
         "correction_bias_for_dtype",
         "scoring_func",
         "renormalize",
-        "num_fused_shared_experts",
         "use_grouped_topk",
         "custom_routing_function",
         "correction_bias",
@@ -171,6 +170,14 @@ class Bound(msgspec.Struct):
     shared_reason: str = ""
 
 
+def shared_topk_slots(config) -> int:
+    """The trailing top-k columns SGLang's router fills with fused shared experts:
+    ``TopKConfig.num_shared_topk_slots``, named ``num_fused_shared_experts`` before
+    SGLang split its two meanings; read by name so both serve."""
+    slots = getattr(config, "num_shared_topk_slots", None)
+    return getattr(config, "num_fused_shared_experts", 0) if slots is None else slots
+
+
 def gate_applies(mlp: torch.nn.Module) -> bool:
     """The DSV4.1 router gate_topk.cu reproduces bit for bit."""
     config = mlp.topk.topk_config
@@ -180,7 +187,7 @@ def gate_applies(mlp: torch.nn.Module) -> bool:
         and config.scoring_func == "sqrtsoftplus"
         and getattr(config, "sqrtsoftplus_log1p", False)
         and config.renormalize
-        and config.num_fused_shared_experts == 0
+        and shared_topk_slots(config) == 0
         and not config.use_grouped_topk
         and config.custom_routing_function is None
         and config.correction_bias is not None

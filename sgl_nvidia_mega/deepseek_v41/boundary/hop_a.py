@@ -99,13 +99,17 @@ def build(
             hop_b_start_trigger=hop_b_start_trigger,
             row_tile_layer_input=lay.row_tiles,
             wide_row_tile_layer_input=lay.wide_row_tiles,
-            publish_trigger_after_wait=hop_b_quad_trigger,
+            # the batch-1 graph only (measured faster there); wider rows keep the end trigger
+            publish_trigger_max_rows=(
+                slot_plan.HOP_A_BATCH1_ROWS if hop_b_quad_trigger else 0
+            ),
         )
         taken = tuple(runner.precompile_publish(wo_b, list(rows)))
         if hop_b and hop_b_quad_trigger:
             logger.info(
                 "NVIDIA megakernel: hop B finalize-publish triggers its consumer "
-                "after its wait"
+                "after its wait at 1-%d rows",
+                slot_plan.HOP_A_BATCH1_ROWS,
             )
     except Exception as e:  # gathered, then raised on every rank
         error = f"{type(e).__name__}: {e}"

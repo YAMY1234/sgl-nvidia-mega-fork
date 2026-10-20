@@ -90,10 +90,10 @@ def env():
                 quantize_layer_input=True,
                 residual_only=True,
                 early_trigger=early == "poll",
-                hop_b_start_trigger=early in ("start", "quad"),
-                publish_trigger_after_wait=early == "quad",
+                hop_b_start_trigger=early in ("start", "quad", "quad8"),
+                publish_trigger_max_rows={"quad": 48, "quad8": 8}.get(early, 0),
             )
-            for early in ("end", "poll", "start", "quad")
+            for early in ("end", "poll", "start", "quad", "quad8")
         }
         # hop B up to the routed pair's 48 rows, with the row-tile scale variant
         wide = {
@@ -107,11 +107,11 @@ def env():
                 quantize_layer_input=True,
                 residual_only=True,
                 early_trigger=early == "poll",
-                hop_b_start_trigger=early in ("start", "quad"),
+                hop_b_start_trigger=early in ("start", "quad", "quad8"),
                 row_tile_layer_input=True,
-                publish_trigger_after_wait=early == "quad",
+                publish_trigger_max_rows={"quad": 48, "quad8": 8}.get(early, 0),
             )
-            for early in ("end", "poll", "start", "quad")
+            for early in ("end", "poll", "start", "quad", "quad8")
         }
     yield SimpleNamespace(
         rank=rank,

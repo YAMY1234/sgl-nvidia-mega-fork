@@ -1075,7 +1075,7 @@ class AllReduceMHC:
         early_trigger: bool = False,
         hop_b_start_trigger: bool = False,
         row_tile_layer_input: bool = False,
-        publish_trigger_after_wait: bool = False,
+        publish_trigger_max_rows: int = 0,
     ) -> None:
         self.hidden_size = hidden = hidden_size
         self.hc_mult = hc = hc_mult
@@ -1114,42 +1114,52 @@ class AllReduceMHC:
                 Int32(capacity),
                 current_cu_stream(),
             )
-            self._finalize_publish = cute.compile(
-                _QuadFinalizePublishDeviceKernel(
-                    hidden=hidden,
-                    top_k=top_k,
-                    tp=tp,
-                    rank=rank,
-                    capacity_m=capacity,
-                    threads=128,
-                    # DSV4.1's router folds the scale into the weights.
-                    routed_scaling_factor=1.0,
-                    include_shared_expert=True,
-                    load_shared_expert_before_pdl=False,
-                    enable_pdl=True,
-                    prefetch_group=top_k,
-                    fp32_weights=True,
-                    # SGLang's order: the routed sum rounds to BF16 before the
-                    # shared-expert add, as its unfused finalize returns it.
-                    round_routed=True,
-                    trigger_after_wait=publish_trigger_after_wait,
-                ),
-                make_fake_dynamic_compact_tensor(
-                    BFloat16, alignment=16, divisibility=hidden
-                ),
-                make_fake_dynamic_compact_tensor(
-                    Float32, alignment=4, divisibility=top_k
-                ),
-                make_fake_dynamic_compact_tensor(
-                    Int32, alignment=4, divisibility=top_k
-                ),
-                make_fake_dynamic_compact_tensor(
-                    BFloat16, alignment=16, divisibility=hidden
-                ),
-                make_fake_compact_tensor(Int32, (2,), assumed_align=4),
-                Int64(0),
-                Int32(capacity),
-                current_cu_stream(),
+
+            def compile_finalize_publish(trigger_after_wait: bool):
+                return cute.compile(
+                    _QuadFinalizePublishDeviceKernel(
+                        hidden=hidden,
+                        top_k=top_k,
+                        tp=tp,
+                        rank=rank,
+                        capacity_m=capacity,
+                        threads=128,
+                        # DSV4.1's router folds the scale into the weights.
+                        routed_scaling_factor=1.0,
+                        include_shared_expert=True,
+                        load_shared_expert_before_pdl=False,
+                        enable_pdl=True,
+                        prefetch_group=top_k,
+                        fp32_weights=True,
+                        # SGLang's order: the routed sum rounds to BF16 before the
+                        # shared-expert add, as its unfused finalize returns it.
+                        round_routed=True,
+                        trigger_after_wait=trigger_after_wait,
+                    ),
+                    make_fake_dynamic_compact_tensor(
+                        BFloat16, alignment=16, divisibility=hidden
+                    ),
+                    make_fake_dynamic_compact_tensor(
+                        Float32, alignment=4, divisibility=top_k
+                    ),
+                    make_fake_dynamic_compact_tensor(
+                        Int32, alignment=4, divisibility=top_k
+                    ),
+                    make_fake_dynamic_compact_tensor(
+                        BFloat16, alignment=16, divisibility=hidden
+                    ),
+                    make_fake_compact_tensor(Int32, (2,), assumed_align=4),
+                    Int64(0),
+                    Int32(capacity),
+                    current_cu_stream(),
+                )
+
+            self._finalize_publish = compile_finalize_publish(False)
+            # slot hop_b_quad_trigger: the trigger-after-wait variant at up to
+            # publish_trigger_max_rows rows only; wider rows keep the end trigger
+            self._publish_trigger_max_rows = publish_trigger_max_rows
+            self._finalize_publish_early = (
+                compile_finalize_publish(True) if publish_trigger_max_rows > 0 else None
             )
             # Stand-ins for the MXFP8 outputs of the unquantized variant,
             # which never touches them.
@@ -1357,7 +1367,12 @@ class AllReduceMHC:
             or expanded_idx_to_permuted_idx.numel() != m * top_k
         ):
             raise ValueError("expanded_idx_to_permuted_idx must be int32 [M, top_k]")
-        self._finalize_publish(
+        finalize_publish = (
+            self._finalize_publish_early
+            if m <= self._publish_trigger_max_rows
+            else self._finalize_publish
+        )
+        finalize_publish(
             to_cute_dynamic(gemm2_permuted.flatten(), 16, divisibility=hidden),
             to_cute_dynamic(expert_weights.flatten(), 4, divisibility=top_k),
             to_cute_dynamic(

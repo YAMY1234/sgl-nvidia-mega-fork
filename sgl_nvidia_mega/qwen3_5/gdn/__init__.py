@@ -11,7 +11,9 @@ causal conv + ReplaySSM verify through the backend (``RadixLinearAttention``), t
 gated RMSNorm and ``out_proj``. ``step`` returns the TP-partial output, whose
 all-reduce the boundary runs. Slot ``gdn_verify`` (``verify.py``) runs the step with
 the backend's chain opened up and its launch choices changed; slot ``gdn_push`` pushes
-``out_proj``'s partial into the decode hop from its GEMM (numeric).
+``out_proj``'s partial into the decode hop from its GEMM (numeric), and slot ``gdn_front``
+(``front.py``) runs the projections and the conv of one request of 7 rows in one launch
+(numeric).
 """
 
 from __future__ import annotations
@@ -62,6 +64,9 @@ class Bound(msgspec.Struct, frozen=True):
     gdn_pdl: bool = False  # and launches its verify dependent on the conv
     # slot gdn_push: layer id -> out_proj's weights packed for the hop's push GEMM
     packed: dict = msgspec.field(default_factory=dict)
+    # slot gdn_front: layer id -> in_proj_qkvz's weights packed for the front
+    front: dict = msgspec.field(default_factory=dict)
+    error: object = None  # the front's sticky error word, int32, zero
     reason: str = ""  # why a requested slot is not built
 
 
@@ -94,7 +99,27 @@ def build(model, ctx) -> Bound:
                 packed[gdn.attn.layer_id] = pack_out_proj(gdn.out_proj.weight.t())
             except ValueError as e:
                 return Bound(reason=f"layer {i}: {e}")
-    return Bound(gdn_verify=True, gdn_pdl="gdn_pdl" in SLOTS, packed=packed)
+    front_packed, error = {}, None
+    if "gdn_front" in SLOTS:
+        import torch
+
+        from sgl_nvidia_mega.qwen3_5.gdn import front
+
+        if ctx.tokens_per_request != front.ROWS:
+            return Bound(reason=f"gdn_front: {ctx.tokens_per_request} rows a request")
+        for i, gdn in gdns:
+            reason = front.unsupported(gdn)
+            if reason:
+                return Bound(reason=f"gdn_front: layer {i}: {reason}")
+        front_packed = front.build(model, gdns)
+        error = torch.zeros(1, dtype=torch.int32, device="cuda")
+    return Bound(
+        gdn_verify=True,
+        gdn_pdl="gdn_pdl" in SLOTS,
+        packed=packed,
+        front=front_packed,
+        error=error,
+    )
 
 
 def step(layer, x, st):
@@ -110,6 +135,10 @@ def step(layer, x, st):
             st.bound["boundary"].hop, layer, st, x.shape[0]
         ):
             opts = msgspec.structs.replace(opts, push=True)
+        if st.slots.gdn_front:
+            from sgl_nvidia_mega.qwen3_5.gdn import front
+
+            return front.step(layer.linear_attn, x, st, opts)
         return verify.step(layer.linear_attn, x, st, opts)
     import triton
     from sglang.kernels.ops.attention.triton_gdn_fused_proj import (

@@ -186,6 +186,15 @@ class Qwen35Verify:
                     "NVIDIA megakernel: slot gdn_verify cannot run: "
                     + "; ".join(reasons)
                 )
+        if any(s.gdn_front for s in self.slots.values()):
+            from sgl_nvidia_mega.qwen3_5.gdn import front
+
+            reasons = front.pool_reasons(view.mamba)
+            if reasons:
+                raise RuntimeError(
+                    "NVIDIA megakernel: slot gdn_front cannot run: "
+                    + "; ".join(reasons)
+                )
         self._pools_checked = True
 
     @torch.no_grad()

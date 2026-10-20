@@ -804,6 +804,356 @@ def test_the_gdn_push_slot_pushes_only_where_the_moe_input_consumes(monkeypatch,
     assert seen == [msgspec.structs.replace(verify.SLOT, push=takes)]
 
 
+def _gdn_front_setup(log):
+    """A Qwen3.5 TP8 GatedDeltaNet (layer 2, the pools' third GDN layer) for slot
+    gdn_front, with the binding of a one-request verify step of 7 rows."""
+    H, K, HV, V, D = 2, 128, 8, 128, 1536
+    k = log.known
+    k.update(
+        x=torch.zeros(7, 4096, dtype=torch.bfloat16),
+        packed2=torch.zeros(16, dtype=torch.uint8),
+        front2=torch.zeros(16, dtype=torch.uint8),
+        error=torch.zeros(1, dtype=torch.int32),
+        in_s=torch.ones(1),
+        in_ws=torch.ones(1),
+        ba_w=torch.zeros(16, 4096, dtype=torch.bfloat16),
+        conv_w=torch.zeros(D, 4, dtype=torch.bfloat16),
+        out_s=torch.ones(1),
+        out_ws=torch.ones(1),
+        norm_w=torch.ones(V),
+        states=torch.tensor([5]),
+        inter=torch.tensor([0]),
+        qsl=torch.tensor([0, 7]),
+        req=torch.tensor([2]),
+        conv=torch.zeros(4, 3, D, 3),
+        window=torch.zeros(4, 3, 7, D, 3),
+        temporal=torch.zeros(4, 3, HV, K, V),
+        ring_d=torch.zeros(4, 3, HV, 16, V),
+        ring_k=torch.zeros(4, 3, H, 16, K),
+        ring_g=torch.zeros(4, 3, HV, 16),
+        write_pos=torch.zeros(3, dtype=torch.int32),
+        cache_base=torch.zeros(3, dtype=torch.int32),
+        is_flush=torch.zeros(3, dtype=torch.int32),
+    )
+    k.update({f"{n}2": k[n][2] for n in ("conv", "window", "temporal")})
+    k.update({f"{n}2": k[n][2] for n in ("ring_d", "ring_k", "ring_g")})
+    attn = SimpleNamespace(
+        layer_id=2,
+        conv_weights=k["conv_w"],
+        q_dim=H * K,
+        k_dim=H * K,
+        v_dim=HV * V,
+        num_k_heads=H,
+        num_v_heads=HV,
+        head_k_dim=K,
+        head_v_dim=V,
+        A_log=torch.zeros(HV),
+        dt_bias=torch.zeros(HV),
+    )
+    gdn = SimpleNamespace(
+        attn=attn,
+        norm=SimpleNamespace(weight=k["norm_w"], eps=1e-6),
+        in_proj_qkvz=SimpleNamespace(input_scale=k["in_s"], weight_scale=k["in_ws"]),
+        in_proj_ba=SimpleNamespace(weight=k["ba_w"]),
+        out_proj=SimpleNamespace(input_scale=k["out_s"], weight_scale=k["out_ws"]),
+    )
+    pools = SimpleNamespace(
+        layer_ids=(0, 1, 2, 4),
+        conv=(k["conv"],),
+        intermediate_conv_window=(k["window"],),
+        temporal=k["temporal"],
+        ring_d=k["ring_d"],
+        ring_k=k["ring_k"],
+        ring_g=k["ring_g"],
+        ring_rawv=None,
+        ring_rawk=None,
+        ring_beta=None,
+        ring_write_pos=k["write_pos"],
+        ring_cache_base=k["cache_base"],
+        ring_is_flush=k["is_flush"],
+    )
+    meta = SimpleNamespace(
+        state_indices=k["states"],
+        intermediate_indices=k["inter"],
+        query_start_loc=k["qsl"],
+        pad_slot_id=-1,
+    )
+    st = SimpleNamespace(
+        fb=SimpleNamespace(req_pool_indices=k["req"]),
+        view=SimpleNamespace(gdn=meta, mamba=pools),
+        bound={
+            "gdn": SimpleNamespace(
+                front={2: k["front2"]}, packed={2: k["packed2"]}, error=k["error"]
+            )
+        },
+    )
+    return gdn, st
+
+
+@pytest.mark.parametrize("push", [False, True])
+def test_the_gdn_front_slot_runs_the_front_the_verify_the_norm_and_out_proj(push):
+    """The branch's fused path in its order: the front (projections, conv, b / a) on
+    the layer's pools at the step's slots, the ReplaySSM verify on its conv rows waiting
+    for it before the gates, the norm into out_proj's FP8 rows, then out_proj (with
+    slot gdn_push, the hop's push GEMM)."""
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5.gdn import front, front_norm, replayssm, verify
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front as kernel
+
+    log = _log()
+    gdn, st = _gdn_front_setup(log)
+    k = log.known
+    hop = SimpleNamespace(out_proj_push=log.op("out_proj_push", "pushed"))
+    st.bound["boundary"] = SimpleNamespace(hop=hop)
+    seen = {}
+
+    def front_launch(*args, **kw):
+        seen["projected"], seen["conv"], seen["ba"] = args[9], args[10], kw["ba_out"]
+        log.op("front")(*args, **kw)
+
+    def spec_decode(q, k_, v, a, b, *args, **kw):
+        seen["core"] = args[2]
+        seen["qkv"] = (q, k_, v)
+        seen["ab"] = (a, b)
+        log.append(("verify", tuple(map(log.tag, args[3:])), kw))
+
+    def norm(x, z, weight, scale, quant, rstd, eps):
+        seen["norm"] = (x, z, quant, rstd)
+        log.append(("norm", log.tag(weight), log.tag(scale), eps))
+
+    opts = msgspec.structs.replace(verify.SLOT_PDL, push=push)
+    with (
+        patch.object(kernel, "front", front_launch),
+        patch.object(replayssm, "verify", spec_decode),
+        patch.object(front_norm, "norm", norm),
+        patch.object(
+            verify,
+            "_out_proj",
+            lambda linear, fp8, dtype: log.append(("out_proj", linear, fp8, dtype))
+            or "partial",
+        ),
+    ):
+        out = front.step(gdn, k["x"], st, opts)
+    assert [e[0] for e in log] == [
+        "front",
+        "verify",
+        "norm",
+        "out_proj_push" if push else "out_proj",
+    ]
+    _, _, args, kw = log[0]
+    assert args == (
+        "x(7, 4096)",
+        "front2(16,)",
+        "in_s(1,)",
+        "in_ws(1,)",
+        "conv_w(1536, 4)",
+        "conv2(3, 1536, 3)",
+        "window2(3, 7, 1536, 3)",
+        "states(1,)",
+        "inter(1,)",
+        "?(7, 2560)",
+        "?(7, 1536)",
+        "error(1,)",
+    )
+    assert dict(kw) == {
+        "ba_weight": "ba_w(16, 4096)",
+        "ba_out": "?(7, 16)",
+        "checkpoint": "temporal2(3, 8, 128, 128)",
+        "history_d": "ring_d2(3, 8, 16, 128)",
+        "history_k": "ring_k2(3, 2, 16, 128)",
+        "history_g": "ring_g2(3, 8, 16)",
+        "ring_indices": "req(1,)",
+        "pad_slot": -1,
+    }
+    # q / k / v are the conv rows' views; a / b the front's b8 / a8 halves
+    q, k_, v = seen["qkv"]
+    conv, ba = seen["conv"], seen["ba"]
+    assert q.data_ptr() == conv.data_ptr() and q.shape == (7, 2, 128)
+    assert v.shape == (7, 8, 128) and v.data_ptr() == conv[:, 512:].data_ptr()
+    a, b = seen["ab"]
+    assert a.data_ptr() == ba[:, 8:].data_ptr() and b.data_ptr() == ba.data_ptr()
+    assert a.shape == b.shape == (7, 8) and a.stride() == (16, 1)
+    tags, options = log[1][1], log[1][2]
+    assert tags[:4] == (
+        "temporal2(3, 8, 128, 128)",
+        "ring_d2(3, 8, 16, 128)",
+        "ring_k2(3, 2, 16, 128)",
+        "ring_g2(3, 8, 16)",
+    )
+    assert tags[4:10] == (None, None, None, "qsl(2,)", "states(1,)", "req(1,)")
+    assert options == dict(
+        max_cache_len=16,
+        max_spec_len=7,
+        scale=128**-0.5,
+        null_block_id=-1,
+        block_v=32,
+        num_warps=2,
+        pdl=True,
+        wait_for_gate_producer=True,
+    )
+    # the norm reads the verify's output and the front's z, into FP8 [56, 128]
+    x_norm, z, quant, rstd = seen["norm"]
+    assert x_norm.data_ptr() == seen["core"].data_ptr() and x_norm.shape == (56, 128)
+    assert z.data_ptr() == seen["projected"][:, 1536:].data_ptr()
+    assert z.shape == (7, 8, 128) and z.stride() == (2560, 128, 1)
+    assert quant.dtype == torch.float8_e4m3fn and quant.shape == (56, 128)
+    assert rstd.shape == (56,) and log[2][1:] == ("norm_w(128,)", "out_s(1,)", 1e-6)
+    if push:
+        assert out == "pushed"
+        assert dict(log[3][3]) == {
+            "input_scale": "out_s(1,)",
+            "packed_w": "packed2(16,)",
+            "weight_scale": "out_ws(1,)",
+            "x_fp8": "?(7, 1024)",
+        }
+    else:
+        assert out == "partial"
+        _, linear, fp8, dtype = log[3]
+        assert linear is gdn.out_proj and dtype == torch.bfloat16
+        assert fp8.data_ptr() == quant.data_ptr() and fp8.shape == (7, 1024)
+
+
+@pytest.mark.parametrize("front_slot", [False, True])
+def test_the_gdn_step_runs_the_front_where_the_plan_gives_it(monkeypatch, front_slot):
+    from sgl_nvidia_mega.qwen3_5 import gdn
+    from sgl_nvidia_mega.qwen3_5.gdn import front, verify
+
+    seen = []
+    monkeypatch.setattr(verify, "step", lambda mod, x, st, opts: seen.append("verify"))
+    monkeypatch.setattr(front, "step", lambda mod, x, st, opts: seen.append(opts))
+    st = SimpleNamespace(
+        slots=plan.Slots(gdn_verify=True, gdn_pdl=True, gdn_front=front_slot)
+    )
+    gdn.step(SimpleNamespace(linear_attn="gdn"), torch.zeros(7, 4), st)
+    assert seen == ([verify.SLOT_PDL] if front_slot else ["verify"])
+
+
+def _front_gdn(**change):
+    """A Qwen3.5 TP8 GatedDeltaNet as SGLang loads the NVFP4 V2 checkpoint (static FP8
+    in_proj_qkvz and out_proj, BF16 in_proj_ba), with ``change`` applied."""
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    def fp8(shape):
+        method = object.__new__(ModelOptFp8LinearMethod)
+        method.use_marlin = method.use_sm120_fp8 = False
+        return SimpleNamespace(
+            quant_method=method,
+            weight=torch.zeros(shape, dtype=torch.float8_e4m3fn),
+            input_scale=torch.ones(1),
+            weight_scale=torch.ones(1),
+        )
+
+    gdn = SimpleNamespace(
+        attn_tp_size=8,
+        head_k_dim=128,
+        head_v_dim=128,
+        conv_kernel_size=4,
+        activation="silu",
+        attn=SimpleNamespace(
+            num_k_heads=2,
+            num_v_heads=8,
+            bias=None,
+            conv_weights=torch.zeros(1536, 4, dtype=torch.bfloat16),
+        ),
+        norm=SimpleNamespace(
+            activation="silu", norm_before_gate=True, bias=None, group_size=None
+        ),
+        in_proj_qkvz=fp8((4096, 2560)),
+        out_proj=fp8((1024, 4096)),
+        in_proj_ba=SimpleNamespace(
+            quant_method=object.__new__(UnquantizedLinearMethod),
+            bias=None,
+            weight=torch.zeros(16, 4096, dtype=torch.bfloat16),
+        ),
+    )
+    for path, value in change.items():
+        obj, *names = path.split("__")
+        target = gdn if obj == "gdn" else getattr(gdn, obj)
+        for name in names[:-1]:
+            target = getattr(target, name)
+        setattr(target, names[-1], value)
+    return gdn
+
+
+@pytest.mark.parametrize(
+    "change, want",
+    [
+        ({}, ""),
+        ({"gdn__attn_tp_size": 4}, "TP 4"),
+        ({"norm__group_size": 2}, "a grouped, biased or gate-first norm"),
+        ({"attn__bias": torch.zeros(1536)}, "a conv bias"),
+        ({"in_proj_qkvz__weight": torch.zeros(4096, 2560)}, "in_proj_qkvz is not"),
+        ({"in_proj_ba__bias": torch.zeros(16)}, "in_proj_ba is not"),
+        ({"out_proj__input_scale": torch.ones(2)}, "out_proj is not"),
+    ],
+)
+def test_the_gdn_front_slot_names_what_a_layer_lacks(change, want):
+    from sgl_nvidia_mega.qwen3_5.gdn import front
+
+    got = front.unsupported(_front_gdn(**change))
+    assert (want in got) if want else got == ""
+
+
+def test_the_gdn_front_slot_names_the_pools_it_cannot_serve():
+    from sgl_nvidia_mega.qwen3_5.gdn import front
+
+    def pools(window):
+        return SimpleNamespace(
+            conv=(torch.zeros(2, 3, 1536, 3, dtype=torch.bfloat16),),
+            intermediate_conv_window=(window,),
+        )
+
+    phys = torch.zeros(2, 3, 1536, 9, dtype=torch.bfloat16)
+    dedup = phys.as_strided((2, 3, 7, 1536, 3), (*phys.stride()[:2], 1, 9, 1))
+    assert front.pool_reasons(pools(dedup)) == []
+    dense = torch.zeros(2, 3, 7, 1536, 3, dtype=torch.bfloat16)
+    assert "deduplicated" in front.pool_reasons(pools(dense))[0]
+
+
+def test_in_proj_qkvz_packs_into_the_fronts_fragments():
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front
+
+    w = torch.arange(2560 * 4096, dtype=torch.int64).remainder(251).to(torch.uint8)
+    packed = front.pack(w.view(2560, 4096).view(torch.float8_e4m3fn))
+    assert packed.dtype == torch.uint8 and packed.numel() == 2560 * 4096
+    # unit 0, rank 0, warp 0, step 0, block 0, lane 0: the first 16 bytes the CTA loads
+    want = w.view(2560, 4096)
+    first = packed[:16].view(4, 4)
+    assert torch.equal(first[0], want[0, 0:4]) and torch.equal(first[1], want[8, 0:4])
+    assert torch.equal(first[2], want[0, 16:20]) and torch.equal(first[3], want[8, 16:20])
+    with pytest.raises(ValueError, match="the GDN front packs"):
+        front.pack(torch.zeros(2560, 4096))
+
+
+def test_the_fronts_launch_arguments_have_the_kernels_layout():
+    import ctypes
+
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front
+
+    # gdn_pdl_front_ba_mkm_detail::Params and gdn_ba::Params on a 64-bit target
+    assert ctypes.sizeof(front.Prefetch) == 32
+    assert ctypes.sizeof(front.BaParams) == 208 and front.BaParams.prefetch.offset == 40
+    assert front.BaParams.pad_slot.offset == 200
+    assert ctypes.sizeof(front.Params) == 376 and front.Params.ba.offset == 168
+    assert front.Params.state_stride.offset == 112 and front.Params.pad_slot.offset == 160
+
+
+def test_the_fronts_l2_prefetch_takes_contiguous_slots_only():
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front
+
+    t = torch.zeros(3, 8, 16, 128, dtype=torch.bfloat16)
+    region = front._prefetch(t, 1)
+    assert (region.slot_stride, region.bytes, region.ring) == (
+        8 * 16 * 128 * 2,
+        8 * 16 * 128 * 2,
+        1,
+    )
+    assert front._prefetch(t.transpose(2, 3), 0) is None
+    assert front._prefetch(torch.zeros(3, 7, dtype=torch.bfloat16), 0) is None
+
+
 @pytest.mark.parametrize(
     "kw, want",
     [

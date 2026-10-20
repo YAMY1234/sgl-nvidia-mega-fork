@@ -1,0 +1,274 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""The Qwen3.5 megakernel's runtime on CPU: the steps it covers, the binding and the
+EAGLE entries at build, the MTP draft spec, the step state and the parity check."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from sglang.srt.megakernels import spec as registry
+from sglang.srt.megakernels.spec import Step
+
+from sgl_nvidia_mega import plugin
+from sgl_nvidia_mega.qwen3_5 import (
+    runtime,
+)
+from sgl_nvidia_mega.qwen3_5.runtime import executor, parity
+from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
+
+
+@pytest.fixture(autouse=True)
+def registered(monkeypatch):
+    monkeypatch.setattr(registry, "_REGISTRY", {})
+    monkeypatch.delenv(plugin.PARITY_SORT_ENV, raising=False)
+    plugin.register()
+
+
+# ---------------------------------------------------------------- the covered steps
+
+
+def _verify(widths=(7,), binding="binding"):
+    """An executor over a model with no layers (plan reads only host state), built
+    with SGLang's EAGLE binding."""
+    lm = SimpleNamespace(model=SimpleNamespace(start_layer=0, end_layer=0, layers=[]))
+    return executor.Qwen35Verify(lm, {}, {}, widths, binding=binding)
+
+
+def _batch(verify=True):
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(is_target_verify=lambda: verify)
+    )
+
+
+def test_only_target_verify_steps_of_built_widths_are_covered():
+    built = _verify()
+    ids = torch.zeros(7, dtype=torch.int64)
+    assert built.plan(ids, _batch()) == Step(mode="target_verify", rows=7)
+    assert built.plan(ids, _batch(), pp_proxy_tensors=None) == Step(
+        mode="target_verify", rows=7
+    )
+    assert built.plan(torch.zeros(14, dtype=torch.int64), _batch()) is None
+    assert built.plan(ids, _batch(verify=False)) is None
+    assert built.plan(ids, _batch(), get_embedding=True) is None
+    assert built.plan(ids, _batch(), pp_proxy_tensors=object()) is None
+    # an argument the executor does not know leaves the step to SGLang
+    assert built.plan(ids, _batch(), input_embeds=None) is None
+
+
+def test_the_build_hands_over_the_binding_and_every_entry_stays_sglangs():
+    from sglang.srt.megakernels.spec import ENTRIES
+
+    from sgl_nvidia_mega.qwen3_5 import draft
+
+    built = _verify()
+    assert built.binding == "binding"
+    # covered from the first step on: the binding comes with the build
+    ids = torch.zeros(7, dtype=torch.int64)
+    assert built.plan(ids, _batch()) == Step(mode="target_verify", rows=7)
+    target, mtp = built, draft.SPEC.build("lm", None, None)
+    assert [n for n in ENTRIES if getattr(target, n, None) is not None] == []
+    assert [n for n in ENTRIES if getattr(mtp, n, None) is not None] == []
+
+
+def test_the_verify_sample_entry_is_offered_only_on_request(monkeypatch):
+    from sglang.srt.megakernels.spec import ENTRIES
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    ctx = SimpleNamespace(
+        widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
+    )
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"verify_sample"}))
+    assert runtime.slot_reasons() == []
+    built = runtime.build(model, ctx)
+    assert [n for n in ENTRIES if getattr(built, n, None) is not None] == [
+        "verify_sample"
+    ]
+    assert built.summary() == "slots none (stock); entries ['verify_sample']"
+    # SGLang calls the factory once and asks it for every batch size
+    steps = built.verify_sample(
+        tokens_per_request=7, max_bs=4, noise_key=1, noise_offset=None
+    )
+    assert [steps(bs) for bs in range(1, 5)] == [None] * 4
+
+
+def test_the_runtime_gives_the_executor_the_build_contexts_binding(monkeypatch):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset())
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    ctx = SimpleNamespace(
+        widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
+    )
+    built = runtime.build(model, ctx)
+    assert built.binding == "EagleBinding" and built.summary() == "slots none (stock)"
+
+
+def test_the_mtp_draft_covers_no_step():
+    from sgl_nvidia_mega.qwen3_5 import draft
+
+    built = draft.SPEC.build("lm", None, None)
+    assert (
+        draft.SPEC.max_rows == 0 and built.widths == () and built.draft_sampler is None
+    )
+    assert built.plan(torch.zeros(7, dtype=torch.int64), _batch()) is None
+    assert (draft.ARCHITECTURE, "sgl_nvidia_mega.qwen3_5.draft:SPEC") in plugin.SPECS
+
+
+# ------------------------------------------------------------------- the parity check
+
+
+@pytest.fixture
+def eager(monkeypatch):
+    """Outside CUDA graph capture (a CPU build of torch has no capture to query), with
+    an attention backend that has no linear-attention states."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        "sglang.srt.model_executor.forward_context.get_attn_backend",
+        lambda: SimpleNamespace(),
+    )
+
+
+def test_the_second_forward_sees_the_conv_windows_the_first_saw(eager, monkeypatch):
+    conv = torch.zeros(2, 3, 4)  # [layers, slots, ...]
+    cache = SimpleNamespace(conv=[conv])
+    linear = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(
+            mamba_pool=SimpleNamespace(mamba_cache=cache)
+        ),
+        forward_metadata=SimpleNamespace(mamba_cache_indices=torch.tensor([1, -1])),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.model_executor.forward_context.get_attn_backend",
+        lambda: SimpleNamespace(linear_attn_backend=linear),
+    )
+
+    def forward():
+        # reads slot 1, then rewrites it in place, as a verify forward's conv update does
+        out = conv[:, 1].sum().reshape(1, 1).clone()
+        conv[:, 1] += 1.0
+        return SimpleNamespace(next_token_logits=out, hidden_states=None)
+
+    got = parity.Parity((7,), "cpu").run(Step("target_verify", 7), forward, forward)
+    assert got.next_token_logits.item() == 0.0  # the restored state, not 8.0
+    assert conv[:, 1].eq(1.0).all() and conv[:, 0].eq(0.0).all()
+
+
+def test_parity_compares_bits_not_values():
+    a = torch.tensor([0.0, 1.0, float("nan")])
+    assert int(parity.differing(a, a.clone())) == 0
+    assert int(parity.differing(a, torch.tensor([-0.0, 1.0, float("nan")]))) == 1
+    assert (
+        int(parity.differing(a, torch.tensor([0.0, 1.0 + 2**-20, float("nan")]))) == 1
+    )
+    assert parity.differing(None, None) == 0
+    with pytest.raises(RuntimeError):
+        parity.differing(a, a[:2])
+    with pytest.raises(RuntimeError):
+        parity.differing(a, None)
+
+
+@pytest.mark.parametrize("mode", ["1", "control"])
+def test_an_eager_parity_step_runs_sglangs_forward_first(
+    eager, monkeypatch, caplog, mode
+):
+    monkeypatch.setattr(parity, "MODE", mode)
+    order = []
+
+    def output(name, value):
+        def run():
+            order.append(name)
+            return SimpleNamespace(
+                next_token_logits=torch.full((7, 3), value), hidden_states=None
+            )
+
+        return run
+
+    checker = parity.Parity((7,), "cpu")
+    with caplog.at_level("INFO"):
+        got = checker.run(
+            Step("target_verify", 7), output("sglang", 1.0), output("plugin", 2.0)
+        )
+    assert order == (["sglang", "plugin"] if mode == "1" else ["sglang", "sglang"])
+    want = 0 if mode == "control" else 21
+    assert (
+        f"rows=7 logits_differ={want} hidden_differ=0 logits_compared=21 "
+        "hidden_compared=0" in caplog.text
+    )
+    assert got.next_token_logits[0, 0] == (1.0 if mode == "control" else 2.0)
+
+
+def test_a_capture_warmup_is_logged_apart_from_the_eager_steps(
+    eager, monkeypatch, caplog
+):
+    monkeypatch.setattr(
+        "sglang.srt.model_executor.runner.get_is_capture_mode", lambda: True
+    )
+
+    def output():
+        return SimpleNamespace(next_token_logits=torch.zeros(7, 3), hidden_states=None)
+
+    with caplog.at_level("INFO"):
+        parity.Parity((7,), "cpu").run(Step("target_verify", 7), output, output)
+    assert "parity capture-warmup target_verify rows=7 logits_differ=0" in caplog.text
+    assert " eager " not in caplog.text
+
+
+@torch.no_grad()
+def test_trace_names_the_first_module_call_that_differs(eager, monkeypatch, caplog):
+    monkeypatch.setattr(parity, "MODE", "trace")
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+    x = torch.ones(7, 4)
+
+    def forward(shift):
+        def run():
+            h = model[0](x) + shift  # an op between two modules
+            return SimpleNamespace(next_token_logits=model[1](h), hidden_states=None)
+
+        return run
+
+    checker = parity.Parity((7,), "cpu", model)
+    with caplog.at_level("INFO"):
+        checker.run(Step("target_verify", 7), forward(0.0), forward(0.0))
+        checker.run(Step("target_verify", 7), forward(0.0), forward(1.0))
+    traces = [r.message for r in caplog.records if "parity trace" in r.message]
+    assert traces == [
+        "NVIDIA megakernel parity trace target_verify rows=7: no diverging call "
+        "among 2 common module calls",
+        "NVIDIA megakernel parity trace target_verify rows=7: 1#0 input: 28 of 28 "
+        "elements differ",
+    ]
+
+
+def test_graph_parity_counts_are_logged_once_each(eager, caplog):
+    checker = parity.Parity((7,), "cpu")
+    checker.counters[7] += torch.tensor([3, 0, 5, 63, 0])
+    with caplog.at_level("INFO"):
+        checker.flush()
+        checker.flush()
+    lines = [r.message for r in caplog.records if "parity graph" in r.message]
+    assert lines == [
+        "NVIDIA megakernel parity graph target_verify rows=7 steps=3 "
+        "logits_differ=0 hidden_differ=5 logits_compared=63 hidden_compared=0"
+    ]
+
+
+def test_the_step_state_carries_the_binding():
+    lm = SimpleNamespace(model="model")
+    st = StepState(
+        lm=lm,
+        forward_batch="fb",
+        positions="pos",
+        input_ids="ids",
+        slots="slots",
+        bound={},
+        binding="EagleBinding",
+        view="EagleForwardView",
+    )
+    assert (st.model, st.binding, st.view) == (
+        "model",
+        "EagleBinding",
+        "EagleForwardView",
+    )

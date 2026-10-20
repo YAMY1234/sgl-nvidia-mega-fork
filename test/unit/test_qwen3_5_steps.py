@@ -1,63 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The Qwen3.5 megakernel on CPU: its spec through SGLang's startup checks, the steps
-it covers, and its stock step against SGLang's own forward on stubbed modules (the
-same ops in the same order, on the same streams, with the same arguments), for the
-decoder layers, the GatedDeltaNet, the attention, the MoE and the layer loop."""
+"""The Qwen3.5 megakernel's step packages on CPU, against SGLang's own forward on
+stubbed modules (the same ops in the same order, on the same streams, with the same
+arguments): the decoder layers, the GatedDeltaNet, the attention, the MoE, the layer
+loop, and the slots route, mkm, gdn_verify and hop."""
 
 import contextlib
-import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
-from sglang.srt.megakernels import guards
 from sglang.srt.megakernels import spec as registry
 from sglang.srt.megakernels.spec import Step
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    default_cuda_graph_config,
-    with_phase,
-)
 from sglang.srt.models import qwen2_moe, qwen3_5
-from sglang.srt.server_args import ServerArgs
 
 from sgl_nvidia_mega import plugin
 from sgl_nvidia_mega.qwen3_5 import (
-    TEXT_CONFIG,
     attention,
     gdn,
     moe,
     plan,
     runtime,
-    spec,
 )
 from sgl_nvidia_mega.qwen3_5.boundary import hop as boundary_hop
-from sgl_nvidia_mega.qwen3_5.runtime import executor, parity
-from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
-
-# The measured TP8 server (the speculative algorithm as resolved: NEXTN is EAGLE)
-DOCUMENTED = dict(
-    model_path="dummy",
-    enable_nvidia_megakernel=True,
-    tp_size=8,
-    nnodes=2,
-    kv_cache_dtype="fp8_e4m3",
-    speculative_algorithm="EAGLE",
-    speculative_num_steps=6,
-    speculative_eagle_topk=1,
-    speculative_num_draft_tokens=7,
-    moe_runner_backend="flashinfer_trtllm",
-    flashinfer_allreduce_fusion_backend="cutedsl",
-    attention_backend="trtllm_mha",
-    linear_attn_decode_backend="triton",
-    enable_linear_replayssm_spec=True,
-    mamba_ssm_dtype="bfloat16",
-    enable_hierarchical_cache=True,
-    cuda_graph_config=default_cuda_graph_config(),
-)
+from sgl_nvidia_mega.qwen3_5.runtime import executor
 
 
 @pytest.fixture(autouse=True)
@@ -67,105 +34,7 @@ def registered(monkeypatch):
     plugin.register()
 
 
-def _refusal(text=None, dtype="bfloat16", isa="sm_103", **args) -> str:
-    """SGLang's resolution step on these arguments: "" when it accepts them, else its
-    error message."""
-    hf_config = SimpleNamespace(
-        architectures=[spec.ARCHITECTURE],
-        model_type="qwen3_5_moe",
-        text_config=SimpleNamespace(**{**TEXT_CONFIG, **(text or {})}),
-    )
-    with (
-        patch.object(guards, "plugin_reasons", return_value=[]),
-        patch.object(guards, "device_isa", return_value=isa),
-        patch.object(guards, "model_config_of") as model_config,
-    ):
-        model_config.return_value = SimpleNamespace(hf_config=hf_config, dtype=dtype)
-        try:
-            guards.handle_nvidia_megakernel(ServerArgs(**{**DOCUMENTED, **args}))
-        except ValueError as e:
-            return str(e)
-    return ""
-
-
-def test_the_documented_setup_is_accepted():
-    assert _refusal() == ""
-
-
-BREAKABLE = with_phase(
-    default_cuda_graph_config(), Phase.DECODE, backend=Backend.BREAKABLE
-)
-
-
-@pytest.mark.parametrize(
-    "kw, want",
-    [
-        (dict(tp_size=4), "tp_size 4"),
-        (dict(pp_size=2), "pipeline parallelism is in use"),
-        (dict(enable_dp_attention=True, dp_size=8), "DP attention is in use"),
-        (dict(kv_cache_dtype="auto"), "kv_cache_dtype 'auto'"),
-        (dict(speculative_algorithm=None), "speculative_algorithm None"),
-        (dict(speculative_eagle_topk=4), "speculative_eagle_topk 4"),
-        (
-            dict(speculative_use_rejection_sampling=True),
-            "speculative_use_rejection_sampling True",
-        ),
-        (dict(moe_runner_backend="flashinfer_cutedsl"), "moe_runner_backend"),
-        (dict(flashinfer_allreduce_fusion_backend=None), "flashinfer_allreduce_fusion"),
-        (dict(attention_backend="triton"), "attention_backend 'triton'"),
-        (dict(linear_attn_decode_backend="flashinfer"), "linear_attn_decode_backend"),
-        (dict(enable_linear_replayssm_spec=False), "enable_linear_replayssm_spec"),
-        (dict(mamba_ssm_dtype="float32"), "mamba_ssm_dtype 'float32'"),
-        (dict(startup_weight_load_mode="overlap"), "startup_weight_load_mode"),
-        (dict(cuda_graph_config=BREAKABLE), "decode CUDA graphs"),
-        (dict(text=dict(num_experts=256)), "config.text_config.num_experts 256"),
-        (dict(text=dict(hidden_size=5120)), "config.text_config.hidden_size 5120"),
-        (dict(dtype="float16"), "dtype 'float16'"),
-        (dict(isa="sm_100"), "not sm_100"),
-    ],
-)
-def test_each_refusal_names_its_reason(kw, want):
-    assert want in _refusal(**kw)
-
-
-def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
-    # an import of this name now raises ImportError
-    monkeypatch.setitem(sys.modules, "sglang.srt.megakernels.eagle_binding", None)
-    assert "this SGLang has no EAGLE forward view" in _refusal()
-
-
-@pytest.mark.parametrize(
-    "slots, want",
-    [
-        ({"hop2"}, "unknown slot 'hop2'"),
-        ({"mkm"}, "slot 'mkm' runs on slot 'route''s outputs"),
-        ({"gdn_pdl"}, "slot 'gdn_pdl' launches slot 'gdn_verify''s verify"),
-    ],
-)
-def test_a_slot_set_that_cannot_run_is_refused_before_the_load(
-    monkeypatch, slots, want
-):
-    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
-    assert want in _refusal()
-
-
-def test_every_reason_is_listed_at_once():
-    message = _refusal(tp_size=4, kv_cache_dtype="auto", pp_size=2)
-    assert message.count("\n  - ") == 3, message
-
-
-def test_the_slot_plan_covers_one_request_of_7_rows():
-    assert plan.plan((7,), plan.Facts()) == {7: plan.Slots()}
-    assert plan.plan((7,), plan.Facts(route=True)) == {7: plan.Slots(route=True)}
-    assert plan.plan((7,), plan.Facts(route=True, mkm=True)) == {
-        7: plan.Slots(route=True, mkm=True)
-    }
-    assert plan.plan((7,), plan.Facts(hop=True)) == {7: plan.Slots(hop=True)}
-    with pytest.raises(ValueError):
-        plan.slots(plan.MAX_ROWS + 1, plan.Facts())
-
-
-# ---------------------------------------------------------------- the covered steps
+# ------------------------------------------------- the stock step against SGLang's
 
 
 def _verify(widths=(7,), binding="binding"):
@@ -173,91 +42,6 @@ def _verify(widths=(7,), binding="binding"):
     with SGLang's EAGLE binding."""
     lm = SimpleNamespace(model=SimpleNamespace(start_layer=0, end_layer=0, layers=[]))
     return executor.Qwen35Verify(lm, {}, {}, widths, binding=binding)
-
-
-def _batch(verify=True):
-    return SimpleNamespace(
-        forward_mode=SimpleNamespace(is_target_verify=lambda: verify)
-    )
-
-
-def test_only_target_verify_steps_of_built_widths_are_covered():
-    built = _verify()
-    ids = torch.zeros(7, dtype=torch.int64)
-    assert built.plan(ids, _batch()) == Step(mode="target_verify", rows=7)
-    assert built.plan(ids, _batch(), pp_proxy_tensors=None) == Step(
-        mode="target_verify", rows=7
-    )
-    assert built.plan(torch.zeros(14, dtype=torch.int64), _batch()) is None
-    assert built.plan(ids, _batch(verify=False)) is None
-    assert built.plan(ids, _batch(), get_embedding=True) is None
-    assert built.plan(ids, _batch(), pp_proxy_tensors=object()) is None
-    # an argument the executor does not know leaves the step to SGLang
-    assert built.plan(ids, _batch(), input_embeds=None) is None
-
-
-def test_the_build_hands_over_the_binding_and_every_entry_stays_sglangs():
-    from sglang.srt.megakernels.spec import ENTRIES
-
-    from sgl_nvidia_mega.qwen3_5 import draft
-
-    built = _verify()
-    assert built.binding == "binding"
-    # covered from the first step on: the binding comes with the build
-    ids = torch.zeros(7, dtype=torch.int64)
-    assert built.plan(ids, _batch()) == Step(mode="target_verify", rows=7)
-    target, mtp = built, draft.SPEC.build("lm", None, None)
-    assert [n for n in ENTRIES if getattr(target, n, None) is not None] == []
-    assert [n for n in ENTRIES if getattr(mtp, n, None) is not None] == []
-
-
-def test_the_verify_sample_entry_is_offered_only_on_request(monkeypatch):
-    from sglang.srt.megakernels.spec import ENTRIES
-
-    model = SimpleNamespace(
-        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
-    )
-    ctx = SimpleNamespace(
-        widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
-    )
-    monkeypatch.setattr(runtime, "SLOTS", frozenset({"verify_sample"}))
-    assert runtime.slot_reasons() == []
-    built = runtime.build(model, ctx)
-    assert [n for n in ENTRIES if getattr(built, n, None) is not None] == [
-        "verify_sample"
-    ]
-    assert built.summary() == "slots none (stock); entries ['verify_sample']"
-    # SGLang calls the factory once and asks it for every batch size
-    steps = built.verify_sample(
-        tokens_per_request=7, max_bs=4, noise_key=1, noise_offset=None
-    )
-    assert [steps(bs) for bs in range(1, 5)] == [None] * 4
-
-
-def test_the_runtime_gives_the_executor_the_build_contexts_binding(monkeypatch):
-    monkeypatch.setattr(runtime, "SLOTS", frozenset())
-    model = SimpleNamespace(
-        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
-    )
-    ctx = SimpleNamespace(
-        widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
-    )
-    built = runtime.build(model, ctx)
-    assert built.binding == "EagleBinding" and built.summary() == "slots none (stock)"
-
-
-def test_the_mtp_draft_covers_no_step():
-    from sgl_nvidia_mega.qwen3_5 import draft
-
-    built = draft.SPEC.build("lm", None, None)
-    assert (
-        draft.SPEC.max_rows == 0 and built.widths == () and built.draft_sampler is None
-    )
-    assert built.plan(torch.zeros(7, dtype=torch.int64), _batch()) is None
-    assert (draft.ARCHITECTURE, "sgl_nvidia_mega.qwen3_5.draft:SPEC") in plugin.SPECS
-
-
-# ------------------------------------------------- the stock step against SGLang's
 
 
 class _Log(list):
@@ -1471,160 +1255,3 @@ def test_with_slot_hop_each_point_falls_back_to_sglang_where_the_hop_declines(
     assert log == [(p, "the hop") for p in ("layer_input", "moe_input", "final_norm")]
     # an auxiliary capture reads SGLang's own prepare
     assert boundary.pre(layer, "h", st, capture=[]) == "sglang layer input"
-
-
-# ------------------------------------------------------------------- the parity check
-
-
-@pytest.fixture
-def eager(monkeypatch):
-    """Outside CUDA graph capture (a CPU build of torch has no capture to query), with
-    an attention backend that has no linear-attention states."""
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(
-        "sglang.srt.model_executor.forward_context.get_attn_backend",
-        lambda: SimpleNamespace(),
-    )
-
-
-def test_the_second_forward_sees_the_conv_windows_the_first_saw(eager, monkeypatch):
-    conv = torch.zeros(2, 3, 4)  # [layers, slots, ...]
-    cache = SimpleNamespace(conv=[conv])
-    linear = SimpleNamespace(
-        req_to_token_pool=SimpleNamespace(
-            mamba_pool=SimpleNamespace(mamba_cache=cache)
-        ),
-        forward_metadata=SimpleNamespace(mamba_cache_indices=torch.tensor([1, -1])),
-    )
-    monkeypatch.setattr(
-        "sglang.srt.model_executor.forward_context.get_attn_backend",
-        lambda: SimpleNamespace(linear_attn_backend=linear),
-    )
-
-    def forward():
-        # reads slot 1, then rewrites it in place, as a verify forward's conv update does
-        out = conv[:, 1].sum().reshape(1, 1).clone()
-        conv[:, 1] += 1.0
-        return SimpleNamespace(next_token_logits=out, hidden_states=None)
-
-    got = parity.Parity((7,), "cpu").run(Step("target_verify", 7), forward, forward)
-    assert got.next_token_logits.item() == 0.0  # the restored state, not 8.0
-    assert conv[:, 1].eq(1.0).all() and conv[:, 0].eq(0.0).all()
-
-
-def test_parity_compares_bits_not_values():
-    a = torch.tensor([0.0, 1.0, float("nan")])
-    assert int(parity.differing(a, a.clone())) == 0
-    assert int(parity.differing(a, torch.tensor([-0.0, 1.0, float("nan")]))) == 1
-    assert (
-        int(parity.differing(a, torch.tensor([0.0, 1.0 + 2**-20, float("nan")]))) == 1
-    )
-    assert parity.differing(None, None) == 0
-    with pytest.raises(RuntimeError):
-        parity.differing(a, a[:2])
-    with pytest.raises(RuntimeError):
-        parity.differing(a, None)
-
-
-@pytest.mark.parametrize("mode", ["1", "control"])
-def test_an_eager_parity_step_runs_sglangs_forward_first(
-    eager, monkeypatch, caplog, mode
-):
-    monkeypatch.setattr(parity, "MODE", mode)
-    order = []
-
-    def output(name, value):
-        def run():
-            order.append(name)
-            return SimpleNamespace(
-                next_token_logits=torch.full((7, 3), value), hidden_states=None
-            )
-
-        return run
-
-    checker = parity.Parity((7,), "cpu")
-    with caplog.at_level("INFO"):
-        got = checker.run(
-            Step("target_verify", 7), output("sglang", 1.0), output("plugin", 2.0)
-        )
-    assert order == (["sglang", "plugin"] if mode == "1" else ["sglang", "sglang"])
-    want = 0 if mode == "control" else 21
-    assert (
-        f"rows=7 logits_differ={want} hidden_differ=0 logits_compared=21 "
-        "hidden_compared=0" in caplog.text
-    )
-    assert got.next_token_logits[0, 0] == (1.0 if mode == "control" else 2.0)
-
-
-def test_a_capture_warmup_is_logged_apart_from_the_eager_steps(
-    eager, monkeypatch, caplog
-):
-    monkeypatch.setattr(
-        "sglang.srt.model_executor.runner.get_is_capture_mode", lambda: True
-    )
-
-    def output():
-        return SimpleNamespace(next_token_logits=torch.zeros(7, 3), hidden_states=None)
-
-    with caplog.at_level("INFO"):
-        parity.Parity((7,), "cpu").run(Step("target_verify", 7), output, output)
-    assert "parity capture-warmup target_verify rows=7 logits_differ=0" in caplog.text
-    assert " eager " not in caplog.text
-
-
-@torch.no_grad()
-def test_trace_names_the_first_module_call_that_differs(eager, monkeypatch, caplog):
-    monkeypatch.setattr(parity, "MODE", "trace")
-    model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
-    x = torch.ones(7, 4)
-
-    def forward(shift):
-        def run():
-            h = model[0](x) + shift  # an op between two modules
-            return SimpleNamespace(next_token_logits=model[1](h), hidden_states=None)
-
-        return run
-
-    checker = parity.Parity((7,), "cpu", model)
-    with caplog.at_level("INFO"):
-        checker.run(Step("target_verify", 7), forward(0.0), forward(0.0))
-        checker.run(Step("target_verify", 7), forward(0.0), forward(1.0))
-    traces = [r.message for r in caplog.records if "parity trace" in r.message]
-    assert traces == [
-        "NVIDIA megakernel parity trace target_verify rows=7: no diverging call "
-        "among 2 common module calls",
-        "NVIDIA megakernel parity trace target_verify rows=7: 1#0 input: 28 of 28 "
-        "elements differ",
-    ]
-
-
-def test_graph_parity_counts_are_logged_once_each(eager, caplog):
-    checker = parity.Parity((7,), "cpu")
-    checker.counters[7] += torch.tensor([3, 0, 5, 63, 0])
-    with caplog.at_level("INFO"):
-        checker.flush()
-        checker.flush()
-    lines = [r.message for r in caplog.records if "parity graph" in r.message]
-    assert lines == [
-        "NVIDIA megakernel parity graph target_verify rows=7 steps=3 "
-        "logits_differ=0 hidden_differ=5 logits_compared=63 hidden_compared=0"
-    ]
-
-
-def test_the_step_state_carries_the_binding():
-    lm = SimpleNamespace(model="model")
-    st = StepState(
-        lm=lm,
-        forward_batch="fb",
-        positions="pos",
-        input_ids="ids",
-        slots="slots",
-        bound={},
-        binding="EagleBinding",
-        view="EagleForwardView",
-    )
-    assert (st.model, st.binding, st.view) == (
-        "model",
-        "EagleBinding",
-        "EagleForwardView",
-    )

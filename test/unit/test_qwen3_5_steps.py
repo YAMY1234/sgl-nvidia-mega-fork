@@ -927,12 +927,15 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows(pu
 
 
 @pytest.mark.parametrize("takes", [False, True])
-def test_the_gdn_push_slot_pushes_only_where_the_moe_input_consumes(monkeypatch, takes):
+def test_the_gdn_push_slot_pushes_only_where_the_moe_input_consumes(
+    monkeypatch, caplog, takes
+):
     import msgspec
 
     from sgl_nvidia_mega.qwen3_5 import gdn
     from sgl_nvidia_mega.qwen3_5.gdn import verify
 
+    monkeypatch.setattr(verify, "_ENGAGED", set())
     seen = []
     monkeypatch.setattr(boundary_hop, "takes_moe_input", lambda hop, *a: takes)
     monkeypatch.setattr(verify, "step", lambda mod, x, st, opts: seen.append(opts))
@@ -941,8 +944,12 @@ def test_the_gdn_push_slot_pushes_only_where_the_moe_input_consumes(monkeypatch,
         slots=plan.Slots(gdn_verify=True, hop=True, gdn_push=True),
         bound={"boundary": boundary_hop.Bound(hop="hop")},
     )
-    gdn.step(layer, torch.zeros(7, 4), st)
+    with caplog.at_level("INFO"):
+        gdn.step(layer, torch.zeros(7, 4), st)
     assert seen == [msgspec.structs.replace(verify.SLOT, push=takes)]
+    # the push is logged once where it is chosen, for slot gdn_verify's and gdn_front's paths
+    logged = "NVIDIA megakernel: Qwen3.5 slot gdn_push runs at 7 rows" in caplog.text
+    assert logged == takes
 
 
 def _gdn_front_setup(log):

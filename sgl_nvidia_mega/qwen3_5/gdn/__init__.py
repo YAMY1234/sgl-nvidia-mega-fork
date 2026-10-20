@@ -135,6 +135,7 @@ def step(layer, x, st):
             st.bound["boundary"].hop, layer, st, x.shape[0]
         ):
             opts = msgspec.structs.replace(opts, push=True)
+            verify.engaged("gdn_push", x.shape[0])
         if st.slots.gdn_front:
             from sgl_nvidia_mega.qwen3_5.gdn import front
 

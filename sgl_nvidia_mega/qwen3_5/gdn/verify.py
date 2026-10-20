@@ -156,6 +156,13 @@ SLOT = Options(views=True, block_n=128, block_v=32, num_warps=2, norm_fp8=True)
 SLOT_PDL = msgspec.structs.replace(SLOT, pdl=True)
 
 
+def engaged(slot: str, rows: int) -> None:
+    """Log once per (slot, rows) that a GDN slot ran, as engagement evidence."""
+    if (slot, rows) not in _ENGAGED:
+        _ENGAGED.add((slot, rows))
+        logger.info("NVIDIA megakernel: Qwen3.5 slot %s runs at %d rows", slot, rows)
+
+
 def unsupported(gdn) -> str:
     """Why the slot cannot serve ``gdn`` (a Qwen3_5GatedDeltaNet) ("" when it can)."""
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
@@ -247,12 +254,6 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
         )
         x = fp8.reshape(-1, nv * gdn.head_v_dim)
         if opts.push:
-            if ("push", x.shape[0]) not in _ENGAGED:
-                _ENGAGED.add(("push", x.shape[0]))
-                logger.info(
-                    "NVIDIA megakernel: Qwen3.5 slot gdn_push runs at %d rows",
-                    x.shape[0],
-                )
             return st.bound["boundary"].hop.out_proj_push(
                 x_fp8=x,
                 packed_w=st.bound["gdn"].packed[gdn.attn.layer_id],

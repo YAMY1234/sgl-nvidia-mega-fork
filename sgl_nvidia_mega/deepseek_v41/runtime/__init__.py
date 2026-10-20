@@ -93,8 +93,9 @@ DRAFT_SLOTS = frozenset(
 # Slots that run only when listed (draft_embed: the draft's tokens from the target's
 # gathered table; hop_b_cap16: hop_b_wide's row tiles at 9-16 rows only, no 48-row
 # mailbox, which measured +16 us on the batch-1 verify graph; target_lm_head: the
-# target's LM head on FlashInfer's low-M kernel at 1-8 rows, not bitwise)
-OPT_IN_SLOTS = ("draft_embed", "hop_b_cap16", "target_lm_head")
+# target's LM head on FlashInfer's low-M kernel at 1-8 rows, not bitwise; hop_b_quad_trigger:
+# hop B's finalize-publish lets the consumer launch right after its own wait, not at its end)
+OPT_IN_SLOTS = ("draft_embed", "hop_b_cap16", "target_lm_head", "hop_b_quad_trigger")
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -144,6 +145,7 @@ def slot_reasons() -> list[str]:
         ("hop_b_wide", "hop_b"),
         ("hop_b_wide", "attn_qkv_a"),
         ("hop_b_cap16", "hop_b_wide"),
+        ("hop_b_quad_trigger", "hop_b"),
         ("draft_lm_head", "markov"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
@@ -321,6 +323,7 @@ def build(model, ctx):
         # hop B on hop A's widths only
         "hop_b_cap16": bound["boundary"].hop_b
         and all(w in hop.rows for w in hop.hop_b_rows),
+        "hop_b_quad_trigger": bound["boundary"].hop_b,
         # step-head work that needs no build: on when requested
         "sched_ahead": "sched_ahead" in SLOTS,
         # swap-AB serves 1-24 rows on low-ratio layers: built when a covered width is

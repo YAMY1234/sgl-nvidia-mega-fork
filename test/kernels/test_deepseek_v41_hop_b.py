@@ -99,9 +99,10 @@ def env():
                 quantize_layer_input=True,
                 residual_only=True,
                 early_trigger=early == "poll",
-                hop_b_start_trigger=early == "start",
+                hop_b_start_trigger=early in ("start", "quad"),
+                publish_trigger_after_wait=early == "quad",
             )
-            for early in ("end", "poll", "start")
+            for early in ("end", "poll", "start", "quad")
         }
         # hop B up to the routed pair's 48 rows, with the row-tile scale variant
         wide = {
@@ -115,10 +116,11 @@ def env():
                 quantize_layer_input=True,
                 residual_only=True,
                 early_trigger=early == "poll",
-                hop_b_start_trigger=early == "start",
+                hop_b_start_trigger=early in ("start", "quad"),
                 row_tile_layer_input=True,
+                publish_trigger_after_wait=early == "quad",
             )
-            for early in ("end", "poll", "start")
+            for early in ("end", "poll", "start", "quad")
         }
     yield SimpleNamespace(
         rank=rank,
@@ -317,6 +319,22 @@ def test_early_trigger_changes_no_bit(env):
     torch.cuda.synchronize()
 
 
+@torch.inference_mode()
+@pytest.mark.parametrize("rows", [6, 12, 24, 48])
+def test_quad_trigger_changes_no_bit(env, rows):
+    """Slot hop_b_quad_trigger: the finalize-publish launches the consumer right after
+    its own wait; the consumer still waits for its whole grid, so no output bit moves
+    at batch 1 / 2 / 4 / 8 (6-48 rows, the 16- and the 48-row mailbox)."""
+    hops = env.hops if rows <= 16 else env.wide
+    inp = _inputs(rows, 300 + rows, env.rank, env.device)
+    for kind in ("norm", "quant", "residual"):
+        base = _run(hops["start"], kind, inp)
+        quad = _run(hops["quad"], kind, inp)
+        for a, b in zip(base, quad):
+            assert _same(a, b), f"quad trigger differs: rows={rows} {kind}"
+    torch.cuda.synchronize()
+
+
 def _interleaved_plan(steps):
     plan = []
     for step in range(steps):
@@ -327,7 +345,7 @@ def _interleaved_plan(steps):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("early", ["end", "poll", "start"])
+@pytest.mark.parametrize("early", ["end", "poll", "start", "quad"])
 def test_hop_a_and_finalize_interleave_on_one_instance(env, early):
     hop = env.hops[early]
     inputs = {
@@ -491,7 +509,7 @@ def test_pdl_dependent_reads_final_outputs(env):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("early", ["end", "poll", "start"])
+@pytest.mark.parametrize("early", ["end", "poll", "start", "quad"])
 def test_row_tile_finalize_relays_the_swizzled_scales(env, early):
     """Hop B past 8 rows for wqkv_a's wide low-latency GEMM: the same streams, row and
     MXFP8 values as the 128x4 variant, each row's scales at its tile's atom, and the
@@ -537,7 +555,7 @@ def test_row_tile_finalize_relays_the_swizzled_scales(env, early):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("early", ["end", "poll", "start"])
+@pytest.mark.parametrize("early", ["end", "poll", "start", "quad"])
 def test_wide_mailbox_changes_no_bit_up_to_8_rows(env, early):
     """The 48-row mailbox serves batch 1 exactly as the 16-row one: hop A and both
     finalize variants at 1-8 rows, bitwise."""

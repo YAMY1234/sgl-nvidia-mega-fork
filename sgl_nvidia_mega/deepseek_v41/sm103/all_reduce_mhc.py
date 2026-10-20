@@ -341,6 +341,7 @@ class _QuadFinalizePublishDeviceKernel:
         prefetch_group: int,
         fp32_weights: bool = False,
         round_routed: bool = False,
+        trigger_after_wait: bool = False,
     ) -> None:
         if hidden <= 0 or hidden % QUAD_BF16:
             raise ValueError("hidden must be a positive multiple of 4")
@@ -360,6 +361,9 @@ class _QuadFinalizePublishDeviceKernel:
         self.prefetch_groups = (top_k + prefetch_group - 1) // prefetch_group
         self.fp32_weights = fp32_weights
         self.round_routed = round_routed
+        # the consumer's prologue overlaps this kernel; its griddepcontrol.wait
+        # still waits for this whole grid, so what it reads is unchanged
+        self.trigger_after_wait = trigger_after_wait
 
     def smem_size_in_bytes(self) -> int:
         return self.top_k * 8
@@ -413,6 +417,8 @@ class _QuadFinalizePublishDeviceKernel:
         if cutlass.const_expr(self.enable_pdl):
             # the routing metadata comes from the kernels this one depends on
             cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(self.trigger_after_wait):
+                cute.arch.griddepcontrol_launch_dependents()
         metadata_index = Int32(tidx)
         while metadata_index < Int32(self.top_k):
             element = Int64(token) * self.top_k + Int64(metadata_index)
@@ -577,7 +583,7 @@ class _QuadFinalizePublishDeviceKernel:
                 stage,
             )
         cute.arch.barrier()
-        if cutlass.const_expr(self.enable_pdl):
+        if cutlass.const_expr(self.enable_pdl and not self.trigger_after_wait):
             cute.arch.griddepcontrol_launch_dependents()
 
 
@@ -1069,6 +1075,7 @@ class AllReduceMHC:
         early_trigger: bool = False,
         hop_b_start_trigger: bool = False,
         row_tile_layer_input: bool = False,
+        publish_trigger_after_wait: bool = False,
     ) -> None:
         self.hidden_size = hidden = hidden_size
         self.hc_mult = hc = hc_mult
@@ -1125,6 +1132,7 @@ class AllReduceMHC:
                     # SGLang's order: the routed sum rounds to BF16 before the
                     # shared-expert add, as its unfused finalize returns it.
                     round_routed=True,
+                    trigger_after_wait=publish_trigger_after_wait,
                 ),
                 make_fake_dynamic_compact_tensor(
                     BFloat16, alignment=16, divisibility=hidden

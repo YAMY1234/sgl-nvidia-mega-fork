@@ -60,6 +60,7 @@ def build(
     batch2: bool = False,
     hop_b_wide: bool = False,
     hop_b_cap16: bool = False,
+    hop_b_quad_trigger: bool = False,
 ) -> tuple[Optional[HopA], str]:
     """(the hop, "") or (None, why not). Collective over the TP group: a failure on
     any rank raises on every rank; an unsupported wo_b leaves the hop off. ``hop_b``
@@ -98,8 +99,14 @@ def build(
             hop_b_start_trigger=hop_b_start_trigger,
             row_tile_layer_input=lay.row_tiles,
             wide_row_tile_layer_input=lay.wide_row_tiles,
+            publish_trigger_after_wait=hop_b_quad_trigger,
         )
         taken = tuple(runner.precompile_publish(wo_b, list(rows)))
+        if hop_b and hop_b_quad_trigger:
+            logger.info(
+                "NVIDIA megakernel: hop B finalize-publish triggers its consumer "
+                "after its wait"
+            )
     except Exception as e:  # gathered, then raised on every rank
         error = f"{type(e).__name__}: {e}"
     gathered = [None] * group.world_size

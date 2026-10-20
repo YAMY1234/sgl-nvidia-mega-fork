@@ -57,6 +57,15 @@ SGLANG_READS = {
         "forward_prepare_cuda_fused",
         "attn_output_gate",
         "o_proj",
+        "qkv_proj",
+        "q_size",
+        "kv_size",
+        "q_norm",
+        "k_norm",
+        "rotary_emb",
+        "num_heads",
+        "num_kv_heads",
+        "head_dim",
     ),
     "srt/layers/radix_attention.py": (
         "tp_q_head_num",
@@ -150,6 +159,8 @@ class Attention:
         self.k_scale = attn.k_scale if attn.k_scale is not None else ones
         self.v_scale = attn.v_scale if attn.v_scale is not None else ones
         self.q1 = None  # sm103.draft.q1 decode (slot draft_q1), set by DraftLoop
+        # slot draft_front: 2.2's F10 front writes the KV and FP8 q in one launch
+        self.front = "draft_front" in parts.slots
 
     def __call__(
         self, x, positions, cache_loc, meta, kv, *, rows_per_request: int, o_proj=None
@@ -160,10 +171,14 @@ class Attention:
         from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
         layer = self.layer
-        q, k, v, gate = layer.forward_prepare_cuda_fused(
-            positions=positions, hidden_states=x
-        )
-        o = self.core(q, k, v, cache_loc, meta, kv, rows_per_request)
+        if self.front:
+            q8, gate = self._front(x, positions, cache_loc, kv)
+            o = self.decode(q8, meta, kv, rows_per_request)
+        else:
+            q, k, v, gate = layer.forward_prepare_cuda_fused(
+                positions=positions, hidden_states=x
+            )
+            o = self.core(q, k, v, cache_loc, meta, kv, rows_per_request)
         if layer.attn_output_gate:
             o = fused_sigmoid_mul(o, gate, inplace=True)
         if o_proj is not None:
@@ -171,25 +186,68 @@ class Attention:
         out, _ = layer.o_proj(o)
         return out
 
-    def core(self, q, k, v, cache_loc, meta, kv, rows_per_request: int):
-        """FP8 q / k / v with the KV write, then the decode: [rows, heads * head_dim]."""
-        import flashinfer
-        from sglang.kernels.ops.kvcache.fused_fp8_qkv_kv_cache import (
-            fused_fp8_qkv_kv_cache,
+    def _front(self, x, positions, cache_loc, kv):
+        """Slot draft_front (2.2's F10): the qkv projection, then one Triton launch for
+        the q / k Gemma RMSNorm, RoPE, gate split, FP8 q, and K / V into the FP8 cache
+        at ``cache_loc``: (q8 [rows, heads * head_dim], gate)."""
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.front import (
+            fused_qk_gemma_rmsnorm_rope_gate,
         )
-        from sglang.srt.environ import envs
 
-        k_cache, v_cache = kv.k[0], kv.v[0]
-        q8 = fused_fp8_qkv_kv_cache(
-            q=q,
-            k=k,
+        layer = self.layer
+        qkv, _ = layer.qkv_proj(x)
+        q_gate_size = layer.q_size * (2 if layer.attn_output_gate else 1)
+        q_gate, k, v = qkv.split([q_gate_size, layer.kv_size, layer.kv_size], dim=-1)
+        q8, _, gate = fused_qk_gemma_rmsnorm_rope_gate(
+            q_gate,
+            k,
+            layer.q_norm.weight.data,
+            layer.k_norm.weight.data,
+            layer.rotary_emb.cos_sin_cache,
+            positions,
+            layer.q_norm.variance_epsilon,
+            layer.num_heads,
+            layer.num_kv_heads,
+            layer.head_dim,
+            layer.rotary_emb.rotary_dim,
+            has_gate=layer.attn_output_gate,
+            mrope_axis_map=(
+                layer.rotary_emb.axis_map if positions.dim() == 2 else None
+            ),
             v=v,
-            k_cache=k_cache,
-            v_cache=v_cache,
+            kv_cache=(kv.k[0], kv.v[0]),
             cache_loc=cache_loc,
             k_scale=self.k_scale,
             v_scale=self.v_scale,
         )
+        rows = x.shape[0]
+        return q8.view(rows, -1), (gate.view(rows, -1) if gate is not None else None)
+
+    def core(self, q, k, v, cache_loc, meta, kv, rows_per_request: int):
+        """FP8 q / k / v with the KV write, then the decode: [rows, heads * head_dim]."""
+        from sglang.kernels.ops.kvcache.fused_fp8_qkv_kv_cache import (
+            fused_fp8_qkv_kv_cache,
+        )
+
+        q8 = fused_fp8_qkv_kv_cache(
+            q=q,
+            k=k,
+            v=v,
+            k_cache=kv.k[0],
+            v_cache=kv.v[0],
+            cache_loc=cache_loc,
+            k_scale=self.k_scale,
+            v_scale=self.v_scale,
+        )
+        return self.decode(q8, meta, kv, rows_per_request)
+
+    def decode(self, q8, meta, kv, rows_per_request: int):
+        """The decode of FP8 q rows over the cache (this step's rows written):
+        [rows, heads * head_dim]."""
+        import flashinfer
+        from sglang.srt.environ import envs
+
+        k_cache, v_cache = kv.k[0], kv.v[0]
         q8 = q8.reshape(-1, self.heads, self.head_dim)
         attn = self.layer.attn
         bmm1_scale = 1.0 * kv.k_scale[0] * attn.scaling

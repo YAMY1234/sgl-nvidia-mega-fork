@@ -1071,8 +1071,9 @@ def test_the_gdn_front_slot_runs_the_front_the_verify_the_norm_and_out_proj(push
         patch.object(
             verify,
             "_out_proj",
-            lambda linear, fp8, dtype: log.append(("out_proj", linear, fp8, dtype))
-            or "partial",
+            lambda linear, fp8, dtype: (
+                log.append(("out_proj", linear, fp8, dtype)) or "partial"
+            ),
         ),
     ):
         out = front.step(gdn, k["x"], st, opts)
@@ -1263,7 +1264,9 @@ def test_in_proj_qkvz_packs_into_the_fronts_fragments():
     want = w.view(2560, 4096)
     first = packed[:16].view(4, 4)
     assert torch.equal(first[0], want[0, 0:4]) and torch.equal(first[1], want[8, 0:4])
-    assert torch.equal(first[2], want[0, 16:20]) and torch.equal(first[3], want[8, 16:20])
+    assert torch.equal(first[2], want[0, 16:20]) and torch.equal(
+        first[3], want[8, 16:20]
+    )
     with pytest.raises(ValueError, match="the GDN front packs"):
         front.pack(torch.zeros(2560, 4096))
 
@@ -1278,7 +1281,9 @@ def test_the_fronts_launch_arguments_have_the_kernels_layout():
     assert ctypes.sizeof(front.BaParams) == 208 and front.BaParams.prefetch.offset == 40
     assert front.BaParams.pad_slot.offset == 200
     assert ctypes.sizeof(front.Params) == 376 and front.Params.ba.offset == 168
-    assert front.Params.state_stride.offset == 112 and front.Params.pad_slot.offset == 160
+    assert (
+        front.Params.state_stride.offset == 112 and front.Params.pad_slot.offset == 160
+    )
 
 
 def test_the_fronts_l2_prefetch_takes_contiguous_slots_only():

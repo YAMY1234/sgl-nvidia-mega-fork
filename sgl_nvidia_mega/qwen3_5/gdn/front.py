@@ -116,12 +116,21 @@ def unsupported(gdn) -> str:
 
     attn, norm, ba = gdn.attn, gdn.norm, gdn.in_proj_ba
     if gdn.attn_tp_size != 8 or (attn.num_k_heads, attn.num_v_heads) != (2, 8):
-        return f"TP {gdn.attn_tp_size} with {attn.num_k_heads} / {attn.num_v_heads} heads"
+        return (
+            f"TP {gdn.attn_tp_size} with {attn.num_k_heads} / {attn.num_v_heads} heads"
+        )
     if (gdn.head_k_dim, gdn.head_v_dim) != (128, 128) or gdn.conv_kernel_size != 4:
         return "head dims or conv width"
-    if gdn.activation not in ("silu", "swish") or norm.activation not in ("silu", "swish"):
+    if gdn.activation not in ("silu", "swish") or norm.activation not in (
+        "silu",
+        "swish",
+    ):
         return "an activation other than SiLU"
-    if not norm.norm_before_gate or norm.bias is not None or norm.group_size is not None:
+    if (
+        not norm.norm_before_gate
+        or norm.bias is not None
+        or norm.group_size is not None
+    ):
         return "a grouped, biased or gate-first norm"
     if attn.bias is not None:
         return "a conv bias"

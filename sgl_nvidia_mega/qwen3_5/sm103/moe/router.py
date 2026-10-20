@@ -25,7 +25,9 @@ HIDDEN, EXPERTS, MAX_TOKENS = 4096, 512, 16
 THREADS, CTAS = 256, 64  # 8 experts a CTA
 _ROW_BYTES = HIDDEN * 2 + 16
 _PART_BYTES = 2 * 16 * 8 * 4
-_SH_ROW_BYTES = HIDDEN + 16  # an e4m3 row of the shared stage, padded like the bf16 ones
+_SH_ROW_BYTES = (
+    HIDDEN + 16
+)  # an e4m3 row of the shared stage, padded like the bf16 ones
 _SH_PART_BYTES = 4 * 16 * 8 * 4  # fp32 [kShSplits 4][16][8]
 SHARED_MAX_M, SHARED_MAX_N = 8, CTAS * 8  # 8 shared rows a CTA
 MODE_QUANT = 1

@@ -20,7 +20,9 @@ import msgspec
 
 MAX_ROWS = 7  # the widest covered step: one request of 7 verify rows (TP8 bs1)
 GDN_FRONT_ROWS = 7  # the rows slot gdn_front's front is built for
-ROUTE_SHARED_ROWS = 8  # the rows slot route_shared's shared stage fits shared memory for
+ROUTE_SHARED_ROWS = (
+    8  # the rows slot route_shared's shared stage fits shared memory for
+)
 
 
 class Slots(msgspec.Struct, frozen=True):
@@ -52,7 +54,9 @@ class Facts(msgspec.Struct, frozen=True):
     hop: bool = False  # the decode hop, built for the widest covered step
     gdn_push: bool = False  # out_proj packed for the push GEMM on every GDN layer
     gdn_front: bool = False  # in_proj_qkvz packed for the front on every GDN layer
-    route_shared: bool = False  # the router front with the shared stage, every MoE layer
+    route_shared: bool = (
+        False  # the router front with the shared stage, every MoE layer
+    )
 
 
 def slots(rows: int, facts: Facts) -> Slots:

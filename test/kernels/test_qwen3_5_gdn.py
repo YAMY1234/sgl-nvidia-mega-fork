@@ -337,7 +337,9 @@ def test_front_holds_its_projections_to_fp64_and_its_conv_is_sglangs(index_dtype
         assert outs["error"].item() == 0
         # the projections against fp64 on the same FP8 / BF16 operands
         xq, _ = static_quant_fp8(o["x"], o["sx"], repeat_scale=False)
-        ref = (xq.double() @ o["w"].double().t()) * (o["sx"].double() * o["sw"].double())
+        ref = (xq.double() @ o["w"].double().t()) * (
+            o["sx"].double() * o["sw"].double()
+        )
         stock = flashinfer_bmm_fp8(xq, o["w"].t(), o["sx"], o["sw"], torch.bfloat16)
         errors["qkvz"].append(_errors(outs["projected"], ref))
         errors["qkvz_stock"].append(_errors(stock, ref))

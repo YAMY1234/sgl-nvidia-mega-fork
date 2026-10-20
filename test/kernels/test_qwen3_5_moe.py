@@ -252,16 +252,24 @@ def test_router_gemm_quant_shared_holds_its_gate_up_to_fp64(m):
         x, w, scale = _router_inputs(m, seed=100 * m + seed)
         x[-1, 32:48] /= 1e4  # keep the shared projection's input in e4m3's range
         sh_w, sh_in, sh_ws = _shared_weights(seed)
-        *routed, gate_up = router.router_gemm_quant_shared(x, w, scale, sh_w, sh_in, sh_ws)
-        for name, a, b in zip(("logits", "x_fp4", "x_sf"), routed, router.router_gemm_quant(x, w, scale)):
+        *routed, gate_up = router.router_gemm_quant_shared(
+            x, w, scale, sh_w, sh_in, sh_ws
+        )
+        for name, a, b in zip(
+            ("logits", "x_fp4", "x_sf"), routed, router.router_gemm_quant(x, w, scale)
+        ):
             assert torch.equal(a, b), name
         xq, _ = static_quant_fp8(x, sh_in, repeat_scale=False)
         ref = (xq.double() @ sh_w.double().t()) * (sh_in.double() * sh_ws.double())
         stock = flashinfer_bmm_fp8(xq, sh_w.t(), sh_in, sh_ws, torch.bfloat16)
         for name, t in (("got", gate_up), ("stock", stock)):
             diff = t.double() - ref
-            errors[name].append(((diff.norm() / ref.norm()).item(), diff.abs().max().item()))
-    got, stock = (torch.tensor(errors[n], dtype=torch.float64) for n in ("got", "stock"))
+            errors[name].append(
+                ((diff.norm() / ref.norm()).item(), diff.abs().max().item())
+            )
+    got, stock = (
+        torch.tensor(errors[n], dtype=torch.float64) for n in ("got", "stock")
+    )
     print(
         f"T0 route_shared m={m}: mean rel-L2 {got[:, 0].mean():.4g} vs stock "
         f"{stock[:, 0].mean():.4g}, max abs {got[:, 1].max():.4g} vs {stock[:, 1].max():.4g}",

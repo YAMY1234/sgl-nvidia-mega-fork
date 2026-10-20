@@ -25,8 +25,14 @@ from sgl_nvidia_mega.common import jit
 
 SOURCE = Path(__file__).parent / "src" / "front.cu"
 ROWS, HIDDEN, QKVZ, CONV, BA = 7, 4096, 2560, 1536, 16
-THREADS, CLUSTER, CTAS = 256, 8, 88  # 10 projection clusters + 1 side-projection cluster
-TIMEOUT = 500_000_000  # clock cycles a CTA waits for its cluster's partials before trapping
+THREADS, CLUSTER, CTAS = (
+    256,
+    8,
+    88,
+)  # 10 projection clusters + 1 side-projection cluster
+TIMEOUT = (
+    500_000_000  # clock cycles a CTA waits for its cluster's partials before trapping
+)
 
 
 class Prefetch(ctypes.Structure):
@@ -89,7 +95,10 @@ class Params(ctypes.Structure):
 def pack(weight_nk: torch.Tensor) -> torch.Tensor:
     """in_proj_qkvz's FP8 weights [2560, 4096] (row-major [N, K]) packed once, as the
     front's tensor-core fragments take them."""
-    if weight_nk.dtype != torch.float8_e4m3fn or tuple(weight_nk.shape) != (QKVZ, HIDDEN):
+    if weight_nk.dtype != torch.float8_e4m3fn or tuple(weight_nk.shape) != (
+        QKVZ,
+        HIDDEN,
+    ):
         raise ValueError(
             f"the GDN front packs FP8 E4M3 [{QKVZ}, {HIDDEN}] weights, not "
             f"{weight_nk.dtype} {tuple(weight_nk.shape)}"
@@ -168,7 +177,9 @@ def front(
         or tuple(x.shape) != (ROWS, HIDDEN)
         or not x.is_contiguous()
     ):
-        raise ValueError(f"the GDN front takes BF16 [7, 4096] rows, not {x.dtype} {tuple(x.shape)}")
+        raise ValueError(
+            f"the GDN front takes BF16 [7, 4096] rows, not {x.dtype} {tuple(x.shape)}"
+        )
     if windows.stride()[1:] != (1, 9, 1) or windows.stride(0) < CONV * 9:
         raise ValueError(f"windows {tuple(windows.stride())} are not deduplicated")
     regions = [

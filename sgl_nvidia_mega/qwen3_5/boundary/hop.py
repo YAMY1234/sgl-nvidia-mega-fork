@@ -310,14 +310,30 @@ def layer_input(hop, layer, hidden, st):
     return norm
 
 
+def takes_moe_input(hop, layer, st, rows: int) -> bool:
+    """Whether ``moe_input`` runs the hop for a mixer output of ``rows`` rows, as far as
+    the batch decides it (the stream's sum and update are checked there): a mixer may
+    push its partial into the hop only then."""
+    from sglang.srt.layers.layer_boundary.construction import BatchVariant
+    from sglang.srt.runtime_context import get_exec
+
+    plan = layer.ffn_boundary.plan
+    return (
+        hop.supports(rows)
+        and plan.variant_for(st.fb) is BatchVariant.ORDINARY
+        and plan.fusions._eligible(plan, st.fb, rows)
+        and not get_exec().comm.enable_quant_communications
+    )
+
+
 def moe_input(hop, layer, hidden, st):
     """``ffn_boundary.prepare`` of the mixer's partial output (``hidden``, as
     ``attn_boundary.finish`` recorded it), with the hop as its kernel; None where that
-    prepare would not run the CuTe DSL kernel."""
+    prepare would not run the CuTe DSL kernel. A partial the mixer already pushed is
+    only consumed."""
     from sglang.srt.layers.layer_boundary.fusions.cutedsl import _fused_norm_gamma
     from sglang.srt.layers.layer_boundary.residual.batch import stream_of
     from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
-    from sglang.srt.runtime_context import get_exec
 
     stream = stream_of(st.fb)
     pending, plan = stream.pending, layer.ffn_boundary.plan
@@ -331,10 +347,8 @@ def moe_input(hop, layer, hidden, st):
     rows = part.shape[0]
     if not (
         residual is not None
-        and hop.supports(rows)
         and part.dtype == torch.bfloat16
-        and plan.fusions._eligible(plan, st.fb, rows)
-        and not get_exec().comm.enable_quant_communications
+        and takes_moe_input(hop, layer, st, rows)
     ):
         return None
     _engage("MoE input", rows)

@@ -17,7 +17,7 @@ from sglang.srt.megakernels.spec import (
     Requirements,
 )
 
-from sgl_nvidia_mega.qwen3_5 import TEXT_CONFIG
+from sgl_nvidia_mega.qwen3_5 import TEXT_CONFIG, runtime
 from sgl_nvidia_mega.qwen3_5.plan import MAX_ROWS
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -31,6 +31,7 @@ SGLANG_READS = {
         "Numerics",
         "NumericsKind",
         "BITWISE",
+        "TOLERANCE",
         "Requirements",
         "decode_graph_backends",
     ),
@@ -92,9 +93,41 @@ REQUIREMENTS = Requirements(
 )
 
 # Against SGLang's forward on the same GPU (test/e2e/test_qwen3_5_stock_parity.py): the
-# stock step and every slot (route, mkm, gdn_verify, gdn_pdl, hop) reproduce it bit
-# for bit
-NUMERICS = Numerics(kind=NumericsKind.BITWISE)
+# stock step and the bitwise slots (route, mkm, gdn_verify, gdn_pdl, hop) reproduce it
+# bit for bit. A numeric slot's outputs are held to fp64 on the same quantized operands
+# (test/kernels), at most these multiples of the error of SGLang's own op.
+NUMERIC_TOLERANCES = {
+    "gdn_push": {
+        "gdn_push.out_proj.rel_l2_vs_stock": 1.05,
+        "gdn_push.out_proj.max_abs_vs_stock": 2.0,
+    },
+    "gdn_front": {
+        "gdn_front.in_proj_qkvz.rel_l2_vs_stock": 1.05,
+        "gdn_front.in_proj_qkvz.max_abs_vs_stock": 2.0,
+        "gdn_front.in_proj_ba.rel_l2_vs_stock": 1.05,
+        "gdn_front.in_proj_ba.max_abs_vs_stock": 2.0,
+    },
+    "route_shared": {
+        "route_shared.gate_up.rel_l2_vs_stock": 1.05,
+        "route_shared.gate_up.max_abs_vs_stock": 2.0,
+    },
+}
+
+
+def numerics(slots) -> Numerics:
+    """The claim for the requested ``slots``: bitwise unless a numeric slot is on."""
+    tolerances = {
+        k: v
+        for slot, held in NUMERIC_TOLERANCES.items()
+        if slot in slots
+        for k, v in held.items()
+    }
+    if not tolerances:
+        return Numerics(kind=NumericsKind.BITWISE)
+    return Numerics(kind=NumericsKind.TOLERANCE, tolerances=tolerances)
+
+
+NUMERICS = numerics(runtime.SLOTS)
 
 
 def text_config_reasons(hf_config) -> list[str]:
@@ -120,8 +153,6 @@ def binding_reasons() -> list[str]:
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    from sgl_nvidia_mega.qwen3_5 import runtime
-
     return text_config_reasons(hf_config) + binding_reasons() + runtime.slot_reasons()
 
 

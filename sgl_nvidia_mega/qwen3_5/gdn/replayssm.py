@@ -11,7 +11,9 @@ rows), SGLang's kernel and launch with one addition: a programmatic dependent la
 The grid starts while the causal conv before it finishes, reads the gates and the
 committed history, and waits for the conv's q / k / v only where it first reads them
 (PTX ``griddepcontrol``). The gates and the history must be ready when it starts:
-they come from launches before the conv.
+they come from launches before the conv. Where the launch before it also writes the
+gates b / a (slot gdn_front's verify front), ``wait_for_gate_producer`` moves the wait
+before the gates' reads, as our TP8 branch's kernel does; the arithmetic is the same.
 """
 
 from __future__ import annotations
@@ -93,6 +95,7 @@ def gdn_replayssm_spec_circular_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    WAIT_FOR_GATE_PRODUCER: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -168,6 +171,8 @@ def gdn_replayssm_spec_circular_kernel(
     # ------------------------------------------------------------------
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
     dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    if USE_GDC and WAIT_FOR_GATE_PRODUCER:
+        tl.extra.cuda.gdc_wait()
     a_s = tl.load(a + (bos + o_s_safe) * stride_a_t + i_hv, mask=mask_s, other=0.0).to(
         tl.float32
     )
@@ -213,7 +218,7 @@ def gdn_replayssm_spec_circular_kernel(
             b_d_scaled = b_d_scaled_fp32.to(d_cache.dtype.element_ty)
 
     # PTX griddepcontrol: consume the convolution's q / k / v only after it completes
-    if USE_GDC:
+    if USE_GDC and not WAIT_FOR_GATE_PRODUCER:
         tl.extra.cuda.gdc_wait()
 
     if USE_QK_L2NORM_IN_KERNEL:
@@ -510,9 +515,11 @@ def verify(
     nk: int = 2,
     bs_min: int = 4,
     pdl: bool = False,
+    wait_for_gate_producer: bool = False,
 ) -> torch.Tensor:
     """``gdn_replayssm_spec_decode(launch_mode="verify", use_qk_l2norm_in_kernel=True)``
-    with an optional dependent launch (``pdl``)."""
+    with an optional dependent launch (``pdl``), whose wait comes before the gates'
+    reads with ``wait_for_gate_producer`` (the launch before it writes b / a)."""
     from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
 
     if is_flush.dtype != torch.int8:
@@ -534,7 +541,15 @@ def verify(
     rawv_buf = rawv_cache if rawv_cache is not None else d_cache
     rawk_buf = rawk_cache if rawk_cache is not None else k_cache
     beta_buf = beta_cache if beta_cache is not None else g_cache
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if pdl else {}
+    pdl_kwargs = (
+        {
+            "USE_GDC": True,
+            "launch_pdl": True,
+            "WAIT_FOR_GATE_PRODUCER": wait_for_gate_producer,
+        }
+        if pdl
+        else {}
+    )
     gdn_replayssm_spec_circular_kernel[(triton.cdiv(V, BV), B, HV)](
         q,
         k,

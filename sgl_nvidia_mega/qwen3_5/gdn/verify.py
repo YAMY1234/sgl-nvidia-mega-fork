@@ -20,6 +20,10 @@ to SGLang's own:
   (``replayssm.py``), and with slot ``gdn_pdl`` launched dependent on the conv;
 - the gated norm writing the static FP8 ``out_proj`` takes (``norm_fp8.py``), which
   ``out_proj``'s FlashInfer BMM then reads without quantizing it again.
+
+Slot ``gdn_push`` (numeric, not bitwise) runs ``out_proj`` on the decode hop's GEMM
+instead, whose epilogue pushes the partial into the hop's mailbox; the MoE input's
+all-reduce then only consumes it.
 """
 
 from __future__ import annotations
@@ -144,11 +148,19 @@ class Options(msgspec.Struct, frozen=True):
     num_warps: int
     norm_fp8: bool  # the gated norm writes out_proj's static FP8 input
     pdl: bool = False  # the verify launches dependent on the conv (slot gdn_pdl)
+    push: bool = False  # out_proj pushes its partial into the hop (slot gdn_push)
 
 
 STOCK = Options(views=False, block_n=256, block_v=64, num_warps=1, norm_fp8=False)
 SLOT = Options(views=True, block_n=128, block_v=32, num_warps=2, norm_fp8=True)
 SLOT_PDL = msgspec.structs.replace(SLOT, pdl=True)
+
+
+def engaged(slot: str, rows: int) -> None:
+    """Log once per (slot, rows) that a GDN slot ran, as engagement evidence."""
+    if (slot, rows) not in _ENGAGED:
+        _ENGAGED.add((slot, rows))
+        logger.info("NVIDIA megakernel: Qwen3.5 slot %s runs at %d rows", slot, rows)
 
 
 def unsupported(gdn) -> str:
@@ -238,8 +250,17 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
             z if opts.views else z.reshape(-1, z.shape[-1]),
             gdn.out_proj.input_scale,
             activation=norm.activation,
+            early_dependents=opts.push,
         )
-        return _out_proj(gdn.out_proj, fp8.reshape(-1, nv * gdn.head_v_dim), core.dtype)
+        x = fp8.reshape(-1, nv * gdn.head_v_dim)
+        if opts.push:
+            return st.bound["boundary"].hop.out_proj_push(
+                x_fp8=x,
+                packed_w=st.bound["gdn"].packed[gdn.attn.layer_id],
+                input_scale=gdn.out_proj.input_scale,
+                weight_scale=gdn.out_proj.weight_scale,
+            )
+        return _out_proj(gdn.out_proj, x, core.dtype)
     z_shape = z.shape
     core = gdn.norm(core, z if opts.views else z.reshape(-1, z.shape[-1]))
     core = core.reshape(z_shape)

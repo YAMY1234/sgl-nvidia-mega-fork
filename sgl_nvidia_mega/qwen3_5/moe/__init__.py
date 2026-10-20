@@ -12,7 +12,10 @@ experts and gated shared expert. At CUDA graph capture it takes the dual-stream 
 alternate stream), otherwise the eager order. With ``defer`` (the boundary takes the
 finalize) it returns SGLang's ``MoeDeferredFinalize`` handoff, otherwise the summed
 rows. Slot ``route`` (``route.py``) runs the deferred routed experts on the router
-front, and slot ``mkm`` (``mkm.py``) runs them in one launch on its outputs.
+front, and slot ``mkm`` (``mkm.py``) runs them in one launch on its outputs. In the
+dual-stream order of up to 8 rows, slot ``route_shared`` computes the shared expert's
+gate/up in the router front's launch; the alternate stream waits for that launch only and
+runs the rest of the shared expert (numeric).
 """
 
 from __future__ import annotations
@@ -72,7 +75,9 @@ def build(model, ctx) -> route.Bound:
 
     if "route" not in SLOTS:
         return route.Bound(reason="stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
-    return route.build(model, max(ctx.widths), fused="mkm" in SLOTS)
+    return route.build(
+        model, max(ctx.widths), fused="mkm" in SLOTS, shared="route_shared" in SLOTS
+    )
 
 
 def step(layer, x: torch.Tensor, st, defer: bool):
@@ -125,6 +130,19 @@ def _dual_stream(mlp, x, use_fused_gate: bool, defer: bool, st):
     shared)."""
     current = torch.cuda.current_stream()
     mlp.alt_stream.wait_stream(current)
+    if defer and st.slots.route_shared:
+        # the router launch also computes the shared gate/up; the alternate stream
+        # waits for that launch only
+        routed, gate_up, ready = route.routed(
+            mlp, x, st.bound["moe"] if st.slots.mkm else None, shared=True
+        )
+        gate_up.record_stream(mlp.alt_stream)
+        with torch.cuda.stream(mlp.alt_stream):
+            mlp.alt_stream.wait_event(ready)
+            shared = route.shared_expert_tail(mlp.shared_expert, gate_up)
+            shared = mlp._gate_shared_output_out_of_place(x, shared)
+        current.wait_stream(mlp.alt_stream)
+        return routed, shared
     if defer:
         # routed FC2 stays on the current stream, the finalize's PDL dependency
         routed = _router_experts(mlp, x, True, st)

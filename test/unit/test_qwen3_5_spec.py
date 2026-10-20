@@ -129,6 +129,15 @@ def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
         ({"hop2"}, "unknown slot 'hop2'"),
         ({"mkm"}, "slot 'mkm' runs on slot 'route''s outputs"),
         ({"gdn_pdl"}, "slot 'gdn_pdl' launches slot 'gdn_verify''s verify"),
+        (
+            {"gdn_verify", "gdn_push"},
+            "slot 'gdn_push' pushes slot 'gdn_verify''s out_proj into slot 'hop'",
+        ),
+        (
+            {"gdn_verify", "gdn_front"},
+            "slot 'gdn_front' runs slot 'gdn_pdl''s dependent verify",
+        ),
+        ({"route_shared"}, "slot 'route_shared' runs in slot 'route''s launch"),
     ],
 )
 def test_a_slot_set_that_cannot_run_is_refused_before_the_load(
@@ -150,5 +159,36 @@ def test_the_slot_plan_covers_one_request_of_7_rows():
         7: plan.Slots(route=True, mkm=True)
     }
     assert plan.plan((7,), plan.Facts(hop=True)) == {7: plan.Slots(hop=True)}
+    # gdn_push pushes gdn_verify's out_proj into the hop: it needs both built
+    both = dict(gdn_verify=True, hop=True)
+    assert plan.plan((7,), plan.Facts(**both, gdn_push=True)) == {
+        7: plan.Slots(**both, gdn_push=True)
+    }
+    assert not plan.slots(7, plan.Facts(gdn_verify=True, gdn_push=True)).gdn_push
+    # gdn_front runs gdn_pdl's verify, for one request of 7 rows only
+    front = dict(gdn_verify=True, gdn_pdl=True, gdn_front=True)
+    assert plan.plan((7,), plan.Facts(**front)) == {7: plan.Slots(**front)}
+    assert not plan.slots(4, plan.Facts(**front)).gdn_front
+    assert not plan.slots(7, plan.Facts(gdn_verify=True, gdn_front=True)).gdn_front
+    # route_shared rides route's launch, up to 8 rows
+    shared = dict(route=True, route_shared=True)
+    assert plan.plan((7,), plan.Facts(**shared)) == {7: plan.Slots(**shared)}
+    assert not plan.slots(7, plan.Facts(route_shared=True)).route_shared
     with pytest.raises(ValueError):
         plan.slots(plan.MAX_ROWS + 1, plan.Facts())
+
+
+def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
+    from sglang.srt.megakernels.spec import NumericsKind
+
+    assert spec.numerics(frozenset({"route", "hop"})).kind is NumericsKind.BITWISE
+    claim = spec.numerics(frozenset({"gdn_verify", "hop", "gdn_push"}))
+    assert claim.kind is NumericsKind.TOLERANCE
+    assert dict(claim.tolerances) == spec.NUMERIC_TOLERANCES["gdn_push"]
+    shared = spec.numerics(frozenset({"route", "route_shared"}))
+    assert dict(shared.tolerances) == spec.NUMERIC_TOLERANCES["route_shared"]
+    both = spec.numerics(frozenset({"gdn_verify", "gdn_pdl", "gdn_front", "gdn_push"}))
+    assert dict(both.tolerances) == {
+        **spec.NUMERIC_TOLERANCES["gdn_push"],
+        **spec.NUMERIC_TOLERANCES["gdn_front"],
+    }

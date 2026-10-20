@@ -20,8 +20,9 @@
 // routing tables equal flashinfer moe_sort's output on every entry the GEMMs
 // read.
 //
-// Built with NVRTC: the kernel is a device function, and the extern "C" entry at the
-// end instantiates only its router GEMM + NVFP4 input quantization (mode kModeQuant).
+// Built with NVRTC: the kernel is a device function, and the extern "C" entries at the
+// end instantiate its router GEMM + NVFP4 input quantization (mode kModeQuant), without and
+// (up to 8 rows) with the shared expert's gate/up projection.
 
 #include <cuda_bf16.h>
 
@@ -1041,3 +1042,12 @@ extern "C" __global__ __launch_bounds__(sglang::qwen_router_front::kThreads, 1) 
     const __grid_constant__ sglang::qwen_router_front::Params p) {
   sglang::qwen_router_front::router_front_kernel<Q35_ROUTER_MAX_M, true, false, false>(p);
 }
+
+#if Q35_ROUTER_MAX_M <= 8
+// The same plus the shared expert's static-FP8 gate/up projection of the rows (sh_* in Params)
+// in the same launch: CTA c computes its 8 rows while warps 0 and 1 run the router GEMV.
+extern "C" __global__ __launch_bounds__(sglang::qwen_router_front::kThreads, 1) void q35_router_gemm_quant_shared(
+    const __grid_constant__ sglang::qwen_router_front::Params p) {
+  sglang::qwen_router_front::router_front_kernel<Q35_ROUTER_MAX_M, true, false, true>(p);
+}
+#endif

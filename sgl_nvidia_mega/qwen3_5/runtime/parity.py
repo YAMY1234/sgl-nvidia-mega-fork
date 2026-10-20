@@ -11,6 +11,11 @@ what the replays added. ``control`` runs SGLang's forward twice instead: the run
 floor of the same comparison. ``trace`` also hooks every module both forwards call and
 logs the first module call whose input or output differs (eager steps only).
 
+Every line also reports how far the two forwards' outputs are apart, which is what a
+numeric slot (not bitwise) is read by: per verify row, whether the two top-1 tokens
+differ and the |difference| of the two log-softmaxes at SGLang's top-1, and the max abs
+difference of the hidden rows.
+
 A verify forward rewrites its requests' conv windows in place (SGLang's commit later
 rolls them back to the accepted token), so the second forward runs on the windows as
 they were before the first: their rows are saved and put back between the two. The
@@ -62,6 +67,10 @@ class Parity:
             w: torch.zeros(5, dtype=torch.int64, device=device) for w in widths
         }
         self.logged = {w: [0] * 5 for w in widths}
+        # rows, top-1 differs, sum and max of |dlp|, hidden max abs; read at each flush
+        self.distance = {
+            w: torch.zeros(5, dtype=torch.float64, device=device) for w in widths
+        }
         self.label = " control" if MODE == "control" else ""
         self.model = model  # whose modules trace mode hooks
 
@@ -88,19 +97,25 @@ class Parity:
         else:
             got = original() if MODE == "control" else megakernel()
         pairs = list(zip(want, (got.next_token_logits, got.hidden_states)))
+        apart = distance(*pairs[0], *pairs[1])
         if torch.cuda.is_current_stream_capturing():
             counts = self.counters[step.rows]
             counts[0:1].add_(1)
             for i, (a, b) in enumerate(pairs, start=1):
                 counts[i : i + 1].add_(differing(a, b))
                 counts[i + 2 : i + 3].add_(0 if a is None else a.numel())
+            if apart is not None:
+                d = self.distance[step.rows]
+                d[0:4:2].add_(apart[0:4:2])
+                d[1:2].add_(apart[1:2])
+                d[3:5].copy_(torch.maximum(d[3:5], apart[3:5]))
             return got
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
         logger.info(
             "NVIDIA megakernel parity%s %s %s rows=%d logits_differ=%d "
             "hidden_differ=%d logits_compared=%d hidden_compared=%d "
-            "logits_max_abs=%s hidden_max_abs=%s valid_rows=%s",
+            "logits_max_abs=%s hidden_max_abs=%s valid_rows=%s%s",
             self.label,
             "capture-warmup" if get_is_capture_mode() else "eager",
             step.mode,
@@ -109,6 +124,7 @@ class Parity:
             *(0 if a is None else a.numel() for a, _ in pairs),
             *(_max_abs(a, b) for a, b in pairs),
             "n/a" if slots is None else int((slots >= 0).sum()),
+            _distance_text(apart),
         )
         return got
 
@@ -123,13 +139,16 @@ class Parity:
                 continue
             added = [n - o for n, o in zip(now, self.logged[rows])]
             self.logged[rows] = now
+            apart = self.distance[rows].clone()
+            self.distance[rows].zero_()
             logger.info(
                 "NVIDIA megakernel parity%s graph target_verify rows=%d steps=%d "
                 "logits_differ=%d hidden_differ=%d logits_compared=%d "
-                "hidden_compared=%d",
+                "hidden_compared=%d%s",
                 self.label,
                 rows,
                 *added,
+                _distance_text(apart),
             )
 
     def _traced(self, fn):
@@ -195,6 +214,45 @@ def _first_tensor(value):
         return next((v.clone() for v in value if isinstance(v, torch.Tensor)), None)
     logits = getattr(value, "next_token_logits", None)
     return logits.clone() if isinstance(logits, torch.Tensor) else None
+
+
+def distance(logits_a, logits_b, hidden_a, hidden_b):
+    """[rows, rows whose top-1 differs, sum and max over rows of |dlp|, hidden max abs]
+    on the device, dlp being the log-softmax difference at a's top-1; None without
+    logits."""
+    if logits_a is None or logits_b is None:
+        return None
+    top = logits_a.argmax(-1, keepdim=True)
+    dlp = (
+        torch.log_softmax(logits_b.float(), -1).gather(-1, top)
+        - torch.log_softmax(logits_a.float(), -1).gather(-1, top)
+    ).abs()
+    hidden = (
+        torch.zeros((), device=logits_a.device)
+        if hidden_a is None
+        else (hidden_a.float() - hidden_b.float()).abs().max()
+    )
+    # no host-to-device copy: this also runs inside graph capture
+    return torch.stack(
+        [
+            torch.full((), float(top.shape[0]), device=logits_a.device),
+            (logits_b.argmax(-1, keepdim=True) != top).sum().float(),
+            dlp.sum(),
+            dlp.max(),
+            hidden,
+        ]
+    ).double()
+
+
+def _distance_text(apart) -> str:
+    if apart is None:
+        return ""
+    rows, top1, total, worst, hidden = apart.tolist()
+    mean = total / rows if rows else 0.0
+    return (
+        f" rows_compared={int(rows)} top1_differ={int(top1)} dlp_mean={mean:.3g} "
+        f"dlp_max={worst:.3g} hidden_dist_max={hidden:.3g}"
+    )
 
 
 def differing(a, b):

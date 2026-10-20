@@ -10,6 +10,11 @@ The logits equal the gate's cuBLAS GEMM bit for bit and the quantized input equa
 trtllm runner's own quantizer, so the step's output is the stock one's. The runner
 takes the quantized input through its pre-quantized (``hidden_states_scale``) path,
 or slot ``mkm`` (``mkm.py``) takes the router front's outputs in its place.
+
+Slot ``route_shared`` (numeric) also computes the shared expert's static-FP8 gate/up
+projection in the router front's launch (our TP8 branch's SGLANG_Q35MF_ROUTE_SHARED), so
+the shared expert on the alternate stream starts at its activation, after that launch
+only; the gate/up sums in another order than the FP8 linear's GEMM.
 """
 
 from __future__ import annotations
@@ -30,6 +35,15 @@ SGLANG_READS = {
         "experts",
         "supports_deferred_finalize",
         "layer_id",
+        # the shared expert after its gate/up projection (slot route_shared)
+        "Qwen2MoeMLP",
+        "shared_expert",
+        "shared_expert_gate",
+        "gate_up_proj",
+        "down_proj",
+        "act_fn",
+        "_enable_silu_fp4_quant_fusion",
+        "_silu_fp4_quant_fused",
     ),
     "srt/models/qwen3_5.py": ("layers", "start_layer", "end_layer", "mlp"),
     "srt/layers/moe/topk.py": ("TopKOutputChecker", "format_is_bypassed"),
@@ -53,7 +67,13 @@ SGLANG_READS = {
         '"w13_input_scale_quant"',
         "quant_config",
         "use_per_token_activation",
+        "ModelOptFp8LinearMethod",
+        "use_marlin",
+        "use_sm120_fp8",
+        '"input_scale"',
+        '"weight_scale"',
     ),
+    "srt/layers/activation.py": ("SiluAndMul",),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
@@ -61,6 +81,7 @@ SGLANG_READS = {
 SGLANG_MIRRORS = {
     "srt/layers/moe/fused_moe_triton/layer.py:FusedMoE.forward_deferred_finalize": "af4b474cbaf33493",
     "srt/layers/moe/fused_moe_triton/layer.py:FusedMoE._dispatch_with_pre_quant": "dcdefc28cf643081",
+    "srt/models/qwen2_moe.py:Qwen2MoeMLP.forward": "6091ffb613568a10",
 }
 
 
@@ -74,12 +95,14 @@ class Bound(msgspec.Struct, frozen=True):
     route: bool = False  # the router front stands in for every layer's gate
     mkm: dict = msgspec.field(default_factory=dict)  # layer id -> its weight TMA maps
     identity: object = None  # [70] int32 0, 1, ...: slot mkm's rows are in expert order
+    shared: bool = False  # slot route_shared: the shared gate/up in the router launch
     reason: str = ""  # why a requested slot is not built
 
 
-def build(model, max_rows: int, fused: bool) -> Bound:
-    """The router front for every MoE layer, compiled for 1..max_rows rows, and with
-    ``fused`` slot mkm's kernel and weight maps; or why a layer cannot take them."""
+def build(model, max_rows: int, fused: bool, shared: bool = False) -> Bound:
+    """The router front for every MoE layer, compiled for 1..max_rows rows, with
+    ``fused`` slot mkm's kernel and weight maps, and with ``shared`` slot route_shared's
+    launch; or why a layer cannot take them."""
     from sgl_nvidia_mega.qwen3_5.moe import mkm
     from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm as mkm_kernel
     from sgl_nvidia_mega.qwen3_5.sm103.moe import router
@@ -90,10 +113,15 @@ def build(model, max_rows: int, fused: bool) -> Bound:
         reason = unsupported(mlp)
         if reason:
             return Bound(reason=f"layer {i}: {reason}")
+    if shared:
+        for i, mlp in zip(range(m.start_layer, m.end_layer), layers):
+            reason = shared_unsupported(mlp)
+            if reason:
+                return Bound(reason=f"route_shared: layer {i}: {reason}")
     device = torch.cuda.current_device()
-    router.build(device, max_rows)
+    router.build(device, max_rows, shared=shared)
     if not fused:
-        return Bound(route=True)
+        return Bound(route=True, shared=shared)
     for i, mlp in zip(range(m.start_layer, m.end_layer), layers):
         reason = mkm.unsupported(mlp)
         if reason:
@@ -110,6 +138,7 @@ def build(model, max_rows: int, fused: bool) -> Bound:
         identity=torch.arange(
             mkm_kernel.MAX_TOKENS * mkm_kernel.TOP_K, dtype=torch.int32, device="cuda"
         ),
+        shared=shared,
     )
 
 
@@ -138,28 +167,97 @@ def unsupported(mlp) -> str:
     return ""
 
 
-def routed(mlp, x: torch.Tensor, fused: Bound | None = None):
+def shared_unsupported(mlp) -> str:
+    """Why the router front cannot compute ``mlp``'s shared gate/up ("" when it can):
+    a static per-tensor FP8 projection of at most 512 rows, then SiLU-and-mul."""
+    from sglang.srt.layers.activation import SiluAndMul
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+    from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
+
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    expert = mlp.shared_expert
+    if not isinstance(expert, Qwen2MoeMLP) or mlp.shared_expert_gate is None:
+        return "no gated Qwen2MoeMLP shared expert"
+    gu = expert.gate_up_proj
+    method = gu.quant_method
+    if (
+        not isinstance(method, ModelOptFp8LinearMethod)
+        or method.use_marlin
+        or method.use_sm120_fp8
+        or gu.bias is not None
+        or gu.weight.dtype != torch.float8_e4m3fn
+        or gu.weight.shape[0] != router.HIDDEN
+        or gu.weight.shape[1] % 8
+        or gu.weight.shape[1] > router.SHARED_MAX_N
+        or not gu.weight.t().is_contiguous()
+        or gu.input_scale.numel() != 1
+        or gu.weight_scale.numel() != 1
+    ):
+        return "the shared gate/up is not a static per-tensor FP8 linear of <= 512 rows"
+    if not isinstance(expert.act_fn, SiluAndMul):
+        return f"shared expert activation {type(expert.act_fn).__name__}"
+    return ""
+
+
+def shared_expert_tail(expert, gate_up: torch.Tensor) -> torch.Tensor:
+    """``Qwen2MoeMLP.forward`` after its gate_up projection."""
+    if expert._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
+        x, _ = expert.down_proj(expert._silu_fp4_quant_fused(gate_up))
+        return x
+    x = expert.act_fn(gate_up)
+    x, _ = expert.down_proj(x)
+    return x
+
+
+def routed(mlp, x: torch.Tensor, fused: Bound | None = None, shared: bool = False):
     """``FusedMoE.forward_deferred_finalize`` of ``mlp``'s routed experts on ``x``
     [rows, hidden], with the router front's logits and quantized input (``fused``: on
-    slot mkm's kernel)."""
+    slot mkm's kernel). With ``shared`` (at most 8 rows) the router launch also computes
+    the shared expert's gate/up: returns (routed, gate_up, the event recorded on the
+    current stream right after that launch)."""
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    experts = mlp.experts
+    for slot in ("route" if fused is None else "mkm",) + (
+        ("route_shared",) if shared else ()
+    ):
+        if (slot, x.shape[0]) not in _ENGAGED:
+            _ENGAGED.add((slot, x.shape[0]))
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 slot %s runs at %d rows", slot, x.shape[0]
+            )
+    if shared:
+        gu = mlp.shared_expert.gate_up_proj
+        logits, x_fp4, x_sf, gate_up = router.router_gemm_quant_shared(
+            x,
+            mlp.gate.weight,
+            experts.w13_input_scale_quant.reshape(1),
+            gu.weight.t(),
+            gu.input_scale.reshape(1),
+            gu.weight_scale.reshape(1),
+        )
+        ready = torch.cuda.Event()
+        ready.record()
+        out = _routed_experts(mlp, x, fused, logits, x_fp4, x_sf)
+        return out, gate_up, ready
+    logits, x_fp4, x_sf = router.router_gemm_quant(
+        x, mlp.gate.weight, experts.w13_input_scale_quant.reshape(1)
+    )
+    return _routed_experts(mlp, x, fused, logits, x_fp4, x_sf)
+
+
+def _routed_experts(mlp, x, fused, logits, x_fp4, x_sf):
+    """The routed experts on the router front's outputs (``fused``: slot mkm's kernel),
+    deferred."""
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         flashinfer_trtllm_deferred_finalize_context,
     )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
     from sgl_nvidia_mega.qwen3_5.moe import mkm
-    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
 
     experts = mlp.experts
-    slot = "route" if fused is None else "mkm"
-    if (slot, x.shape[0]) not in _ENGAGED:
-        _ENGAGED.add((slot, x.shape[0]))
-        logger.info(
-            "NVIDIA megakernel: Qwen3.5 slot %s runs at %d rows", slot, x.shape[0]
-        )
-    logits, x_fp4, x_sf = router.router_gemm_quant(
-        x, mlp.gate.weight, experts.w13_input_scale_quant.reshape(1)
-    )
     if fused is not None:
         maps = fused.mkm[mlp.layer_id]
         return mkm.routed(mlp, maps, fused.identity, logits, x_fp4, x_sf)

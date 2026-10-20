@@ -103,16 +103,18 @@ class Parts:
         return moe
 
     def _build_hop(self):
-        from sgl_nvidia_mega.qwen3_5.boundary import hop as target_hop
         from sgl_nvidia_mega.qwen3_5.draft.hop import DraftHop
 
-        hop = target_hop.active()
+        hop, why = DraftHop.build(
+            tp_size=self.binding.tp_size,
+            deadline_s=self.draft.deadline_s,
+            o_proj_k=int(self.layer.o_proj.weight.shape[1]),
+            early=True,
+            early_head=False,
+        )
         if hop is None:
-            raise RuntimeError(
-                "NVIDIA megakernel: slot draft_hop runs on the target's hop, which "
-                "was not built"
-            )
-        return DraftHop(hop, deadline_s=self.draft.deadline_s)
+            raise RuntimeError(f"NVIDIA megakernel: slot draft_hop cannot run: {why}")
+        return hop
 
     def _build_mkd(self):
         from sgl_nvidia_mega.qwen3_5.draft.xchg import MkdBoundary

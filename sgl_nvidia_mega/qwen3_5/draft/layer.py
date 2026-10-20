@@ -20,6 +20,8 @@ replaces the MoE, slot ``draft_hop`` the two all-reduce points and ``o_proj``.
 
 from __future__ import annotations
 
+from functools import partial
+
 import torch
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -74,17 +76,20 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         meta,
         kv,
         rows_per_request=rows_per_request,
-        o_proj=None if hop is None else hop.o_proj(lay.o_proj),
+        o_proj=None if hop is None else partial(hop.o_proj, weight=lay.o_proj.weight),
     )
+    moe = parts.moe if rows_per_request == 1 else None
     if hop is not None:
         moe_in, residual = hop.ffn_input(
-            attn_out, residual, lay.post_attention_layernorm, early=parts.moe is not None
+            attn_out,
+            residual,
+            lay.post_attention_layernorm,
+            moe_single_launch=moe is not None and moe.single_launch(1),
         )
     else:
         moe_in, residual = lay.post_attention_layernorm(
             tensor_model_parallel_all_reduce(attn_out), residual
         )
-    moe = parts.moe if rows_per_request == 1 else None
     moe_out = moe(moe_in) if moe is not None else lay.mlp(moe_in)
     if hop is not None:
         out, _ = hop.final_norm(moe_out, residual, parts.model.norm)

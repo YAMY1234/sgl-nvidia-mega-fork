@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import torch
 
+# the KV-length graph variant below 2.2's Q1 threshold (graph_variants.Q1_STOCK)
+Q1_STOCK = "q1_stock"
+
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     "srt/models/qwen3_5.py": (
@@ -59,6 +62,9 @@ SGLANG_READS = {
     ),
     "srt/environ.py": ("envs", "SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR"),
     "srt/runtime_context.py": ("get_buffer",),
+    "srt/model_executor/runner_utils/capture_mode.py": (
+        "get_capture_attention_variant",
+    ),
     # ModelConfig._derive_context_length writes the backend's max_context_len into the
     # HF config the draft's build gets
     "srt/configs/model_config.py": ("context_len",),
@@ -160,17 +166,8 @@ class Attention:
         attn = self.layer.attn
         bmm1_scale = 1.0 * kv.k_scale[0] * attn.scaling
         bmm2_scale = kv.v_scale[0]
-        if self.q1 is not None and rows_per_request == 1:
-            out = self.q1(
-                q8,
-                k_cache,
-                v_cache,
-                meta.page_table,
-                meta.cache_seqlens,
-                qk_scale=bmm1_scale,
-                v_scale=bmm2_scale,
-            )
-            return out.view(-1, self.heads * self.head_dim)
+        if self.q1 is not None and rows_per_request == 1 and _q1_label() != Q1_STOCK:
+            return self.q1(q8, kv, meta).view(-1, self.heads * self.head_dim)
         kwargs = {}
         if rows_per_request != 1:
             kwargs["q_len_per_req"] = rows_per_request
@@ -210,9 +207,34 @@ class Attention:
         return k, v
 
 
+def _q1_label():
+    """The KV-length graph variant SGLang is capturing ("q1_stock" / "q1_long"), or
+    None where its draft runner captures one graph per batch size (then Q1 serves
+    every length; 2.2 switched at 16384 by graph variant)."""
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_attention_variant,
+    )
+
+    return get_capture_attention_variant()
+
+
 def build_q1(parts):
-    """Slot draft_q1: the q1 split-KV decode for the draft steps (``sm103/draft/q1``),
-    built before capture, as a callable with ``Attention.core``'s arguments."""
+    """Slot draft_q1: the draft steps' q1 decode as 2.2's SKV2-Q1 (``sm103/draft/q1``),
+    a callable (q8, kv, meta) -> [1, heads, head_dim] bf16; each layout's producer
+    compiles at the graph warmup's first call, outside capture, as in 2.2."""
     from sgl_nvidia_mega.qwen3_5.sm103.draft import q1
 
-    return q1.build_decode(parts)
+    attention, device = parts.attention, parts.device
+    why = q1.enabled_reason(
+        device_index=device.index, max_context_len=attention.max_context_len
+    )
+    if why is not None:
+        raise RuntimeError(f"NVIDIA megakernel: slot draft_q1 cannot run: {why}")
+    q1.build(device.index, heads=attention.heads)
+    decode = q1.Q1Decode()
+    attn = parts.layer.attn
+
+    def run(q8, kv, meta):
+        return decode.step(q8, kv, attn.layer_id, meta, scaling=attn.scaling)
+
+    return run

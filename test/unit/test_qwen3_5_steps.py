@@ -1091,6 +1091,68 @@ def _same_calls(a, b):
     assert a[0][0] == b[0][0] and all(x is y for x, y in zip(a[0][1:], b[0][1:]))
 
 
+def test_out_proj_packs_into_the_push_gemms_fragments():
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop
+
+    w = torch.arange(4096 * 1024, dtype=torch.int64).remainder(251).to(torch.uint8)
+    packed = hop.pack_out_proj(w.view(4096, 1024).view(torch.float8_e4m3fn))
+    assert packed.dtype == torch.uint8 and packed.numel() == 4096 * 1024
+    # CTA 0, warp 0, k-step 0, block 0, lane 0: rows 0 and 8, K bytes 0-3 and 16-19
+    frag = packed[:16].view(4, 4)
+    want = w.view(4096, 1024)
+    assert torch.equal(frag[0], want[0, 0:4]) and torch.equal(frag[1], want[8, 0:4])
+    assert torch.equal(frag[2], want[0, 16:20]) and torch.equal(frag[3], want[8, 16:20])
+    with pytest.raises(ValueError, match="out_proj packing"):
+        hop.pack_out_proj(torch.zeros(4096, 512, dtype=torch.float8_e4m3fn))
+
+
+def _pushing_hop(log):
+    """sm103's Hop without its mailbox: the launches it would issue, logged."""
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop as sm103_hop
+
+    hop = object.__new__(sm103_hop.Hop)
+    hop.max_m, hop._pushed = 8, None
+    hop._args = lambda m, residual, gamma, scale: (SimpleNamespace(m=m), ("out",))
+    hop._launch = lambda name, args, ctas, cluster=None: log.append(name)
+    hop._consume = lambda args: log.append("consume")
+    return hop
+
+
+def test_a_pushed_partials_all_reduce_only_consumes():
+    log = []
+    hop = _pushing_hop(log)
+    pushed, other = torch.zeros(7, 16), torch.zeros(7, 16)
+    hop.mark_pushed(pushed)
+    assert hop.has_pushed(pushed) and not hop.has_pushed(other)
+    for partial in (pushed, other):  # the push consumed, the next one publishes
+        hop.all_reduce_residual_rms_norm(
+            local_contribution=partial, residual="r", gamma="g"
+        )
+    assert log == ["consume", "q35hop_publish", "consume"]
+    assert hop._pushed is None
+
+
+def test_a_push_left_unconsumed_stops_the_next_hop():
+    hop = _pushing_hop([])
+    pushed, other = torch.zeros(7, 16), torch.zeros(7, 16)
+    hop.mark_pushed(pushed)
+    with pytest.raises(RuntimeError, match="never consumed"):
+        hop.mark_pushed(other)
+    with pytest.raises(RuntimeError, match="never consumed"):
+        hop.all_reduce_residual_rms_norm(
+            local_contribution=other, residual="r", gamma="g"
+        )
+    with pytest.raises(RuntimeError, match="never consumed"):
+        hop.moe_finalize_all_reduce_rms_norm(
+            routed_output=None,
+            expert_weights=None,
+            permuted_indices=torch.zeros(7, 10, dtype=torch.int32),
+            gated_shared_output=None,
+            residual="r",
+            gamma="g",
+        )
+
+
 @pytest.mark.parametrize("point", ["layer input", "MoE input", "final norm"])
 def test_the_hop_slot_runs_where_sglang_runs_its_cutedsl_kernel(cutedsl_gates, point):
     """At each point, SGLang's stage boundary with the CuTe DSL workspace and the

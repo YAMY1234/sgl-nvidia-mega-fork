@@ -20,8 +20,18 @@ logger = logging.getLogger(__name__)
 
 # (SM version, N, K, rows) -> (FlashInfer runner class, tactic); rows absent here, or a
 # tactic FlashInfer no longer offers, run FlashInfer's default (its first runner, tactic
-# -1), which is fixed per shape too
-PINNED_TACTICS: dict[tuple[int, int, int, int], tuple[str, tuple[int, ...]]] = {}
+# -1), which is fixed per shape too. GB300 TP4 shard (N 32320, K 5120), CUDA graph
+# replay: the fastest offered tactic per row count, 0.4-1.4 us under the default.
+_DIRECT, _WARP = "CuteDSLDirectBf16Runner", "CuteDSLWarpSplitKBf16Runner"
+PINNED_TACTICS: dict[tuple[int, int, int, int], tuple[str, tuple[int, ...]]] = {
+    (103, 32320, 5120, 1): (_DIRECT, (64, 2, 1)),
+    (103, 32320, 5120, 2): (_WARP, (16, 8, 256, 3, 1)),
+    (103, 32320, 5120, 4): (_WARP, (16, 8, 256, 3, 1)),
+    (103, 32320, 5120, 6): (_WARP, (16, 8, 256, 4, 2)),
+    (103, 32320, 5120, 8): (_WARP, (16, 8, 128, 12, 1)),
+    (103, 32320, 5120, 12): (_WARP, (16, 16, 256, 4, 2)),
+    (103, 32320, 5120, 16): (_WARP, (16, 16, 256, 4, 2)),
+}
 _LOGGED_ROWS: set[int] = set()
 
 

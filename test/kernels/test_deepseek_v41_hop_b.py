@@ -90,9 +90,10 @@ def env():
                 quantize_layer_input=True,
                 residual_only=True,
                 early_trigger=early == "poll",
-                hop_b_start_trigger=early == "start",
+                hop_b_start_trigger=early in ("start", "quad"),
+                publish_trigger_after_wait=early == "quad",
             )
-            for early in ("end", "poll", "start")
+            for early in ("end", "poll", "start", "quad")
         }
         # hop B up to the routed pair's 48 rows, with the row-tile scale variant
         wide = {
@@ -106,10 +107,11 @@ def env():
                 quantize_layer_input=True,
                 residual_only=True,
                 early_trigger=early == "poll",
-                hop_b_start_trigger=early == "start",
+                hop_b_start_trigger=early in ("start", "quad"),
                 row_tile_layer_input=True,
+                publish_trigger_after_wait=early == "quad",
             )
-            for early in ("end", "poll", "start")
+            for early in ("end", "poll", "start", "quad")
         }
     yield SimpleNamespace(
         rank=rank,
@@ -367,7 +369,7 @@ if __name__ == "__main__":
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("early", ["end", "poll", "start"])
+@pytest.mark.parametrize("early", ["end", "poll", "start", "quad"])
 def test_row_tile_finalize_relays_the_swizzled_scales(env, early):
     """Hop B past 8 rows for wqkv_a's wide low-latency GEMM: the same streams, row and
     MXFP8 values as the 128x4 variant, each row's scales at its tile's atom, and the
@@ -413,7 +415,7 @@ def test_row_tile_finalize_relays_the_swizzled_scales(env, early):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("early", ["end", "poll", "start"])
+@pytest.mark.parametrize("early", ["end", "poll", "start", "quad"])
 def test_wide_mailbox_changes_no_bit_up_to_8_rows(env, early):
     """The 48-row mailbox serves batch 1 exactly as the 16-row one: hop A and both
     finalize variants at 1-8 rows, bitwise."""

@@ -126,6 +126,15 @@ def test_hop_layout_keeps_hop_a_widths_on_the_small_mailbox():
     assert (b1.capacity, b1.wide_capacity, b1.row_tiles) == (8, 48, False)
 
 
+def test_hop_b_cap16_builds_no_wide_mailbox_and_keeps_the_12_row_tiles():
+    """Slot hop_b_cap16: hop B only at hop A's widths, so the 48-row mailbox (+16 us on
+    the batch-1 verify graph) is never built; 12 rows keep their row-tile scales."""
+    cap = plan.hop_layout(WIDTHS, hop_b=True, batch2=True, hop_b_wide=True, cap16=True)
+    assert (cap.hop_a_rows, cap.hop_b_rows) == ((6, 12), (6, 12))
+    assert (cap.capacity, cap.wide_capacity, cap.wide_row_tiles) == (16, 0, False)
+    assert cap.row_tiles
+
+
 def test_batch_1_and_2_hops_touch_only_the_small_mailbox():
     """Hop B at hop A's widths runs on hop A's 16-row mailbox; only past it on the
     48-row one (a wider mailbox measured +11.6 us/step at batch 1)."""

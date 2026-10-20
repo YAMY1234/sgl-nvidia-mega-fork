@@ -91,8 +91,9 @@ DRAFT_SLOTS = frozenset(
     }
 )
 # Slots that run only when listed (draft_embed: the draft's tokens from the target's
-# gathered table)
-OPT_IN_SLOTS = ("draft_embed",)
+# gathered table; hop_b_cap16: hop_b_wide's row tiles at 9-16 rows only, no 48-row
+# mailbox, which measured +16 us on the batch-1 verify graph)
+OPT_IN_SLOTS = ("draft_embed", "hop_b_cap16")
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -141,6 +142,7 @@ def slot_reasons() -> list[str]:
         ("hop_b_start_trigger", "hop_b"),
         ("hop_b_wide", "hop_b"),
         ("hop_b_wide", "attn_qkv_a"),
+        ("hop_b_cap16", "hop_b_wide"),
         ("draft_lm_head", "markov"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
@@ -310,10 +312,13 @@ def build(model, ctx):
         ),
         "hop_b_start_trigger": "hop_b_start_trigger" in SLOTS
         and bound["boundary"].hop_b,
-        # hop B past hop A's widths, with a chain that reads its row-tile rows
+        # hop B past 8 rows, with a chain that reads its row-tile rows
         "hop_b_wide": bound["boundary"].hop_b
-        and any(w not in hop.rows for w in hop.hop_b_rows)
+        and any(w > slot_plan.HOP_A_BATCH1_ROWS for w in hop.hop_b_rows)
         and bool(bound["boundary"].row_tile_layers),
+        # hop B on hop A's widths only
+        "hop_b_cap16": bound["boundary"].hop_b
+        and all(w in hop.rows for w in hop.hop_b_rows),
         # step-head work that needs no build: on when requested
         "sched_ahead": "sched_ahead" in SLOTS,
         # swap-AB serves 1-24 rows on low-ratio layers: built when a covered width is

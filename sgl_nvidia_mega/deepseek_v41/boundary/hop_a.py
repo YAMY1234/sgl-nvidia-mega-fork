@@ -59,6 +59,7 @@ def build(
     hop_b_start_trigger: bool = False,
     batch2: bool = False,
     hop_b_wide: bool = False,
+    hop_b_cap16: bool = False,
 ) -> tuple[Optional[HopA], str]:
     """(the hop, "") or (None, why not). Collective over the TP group: a failure on
     any rank raises on every rank; an unsupported wo_b leaves the hop off. ``hop_b``
@@ -72,7 +73,11 @@ def build(
     cfg = model.config
     wo_b = m.layers[m.start_layer].self_attn.wo_b
     lay = slot_plan.hop_layout(
-        ctx.widths, hop_b=hop_b, batch2=batch2, hop_b_wide=hop_b_wide
+        ctx.widths,
+        hop_b=hop_b,
+        batch2=batch2,
+        hop_b_wide=hop_b_wide,
+        cap16=hop_b_cap16,
     )
     rows, hop_b_rows = lay.hop_a_rows, lay.hop_b_rows
     if not rows:

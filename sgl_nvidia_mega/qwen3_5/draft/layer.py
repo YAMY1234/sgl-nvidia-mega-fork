@@ -62,6 +62,12 @@ def fc_input(parts, token_ids, hidden):
     return lm.fc(torch.cat([embeds, hidden], dim=-1))
 
 
+# Slot draft_hop on the draft extend's rows too: their FFN input all-reduce + residual +
+# norm in the hop's MNNVL rounding, which equals what 2.2 runs there (FlashInfer's MNNVL
+# fusion under DRAFT_MNNVL_AR) bit for bit at 1-7 rows
+EXTEND_MNNVL = True
+
+
 def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
     """The decoder layer on the fc output ``x`` [rows, hidden]: the final-norm rows."""
     from sglang.srt.distributed import tensor_model_parallel_all_reduce
@@ -69,6 +75,7 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
     lay = parts.layer
     residual = x
     hop = parts.hop if rows_per_request == 1 else None
+    extend_hop = parts.hop if rows_per_request > 1 and EXTEND_MNNVL else None
     attn_out = parts.attention(
         lay.input_layernorm(x),
         positions,
@@ -85,6 +92,10 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
             residual,
             lay.post_attention_layernorm,
             moe_single_launch=moe is not None and moe.single_launch(1),
+        )
+    elif extend_hop is not None:
+        moe_in, residual = extend_hop.ffn_input(
+            attn_out, residual, lay.post_attention_layernorm, moe_single_launch=False
         )
     else:
         moe_in, residual = lay.post_attention_layernorm(

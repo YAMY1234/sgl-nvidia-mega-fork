@@ -621,12 +621,24 @@ def _gdn_verify_setup(log, *, ring_len=16, temporal_dtype=torch.bfloat16, draft=
     return verify, gdn, st
 
 
-def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows():
+@pytest.mark.parametrize("push", [False, True])
+def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows(push):
+    """With ``push`` (slot gdn_push) the norm releases its dependents early and
+    out_proj runs as the hop's push GEMM on the layer's packed weights."""
+    import msgspec
+
     from sgl_nvidia_mega.qwen3_5.gdn import conv, norm_fp8, replayssm
 
     log = _log()
     verify, gdn, st = _gdn_verify_setup(log)
     k = log.known
+    k["packed2"] = torch.zeros(16, dtype=torch.uint8)
+    hop = SimpleNamespace(out_proj_push=log.op("out_proj_push", torch.zeros(7, 8)))
+    st.bound = {
+        "boundary": SimpleNamespace(hop=hop),
+        "gdn": SimpleNamespace(packed={2: k["packed2"]}),
+    }
+    opts = msgspec.structs.replace(verify.SLOT, push=push)
 
     def views(qkvz, ba, nk, nv, hk, hv):
         log.append(("views", log.tag(qkvz), log.tag(ba), nk, nv, hk, hv))
@@ -715,8 +727,9 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows():
         ),
     ):
         for _ in range(2):  # two layers of one step
-            verify.step(gdn, torch.zeros(7, 8), st)
-    one_layer = ["conv", "verify", "norm_fp8", "symmetric", "bmm_fp8", "views"]
+            verify.step(gdn, torch.zeros(7, 8), st, opts)
+    proj = ["out_proj_push"] if push else ["symmetric", "bmm_fp8"]
+    one_layer = ["conv", "verify", "norm_fp8", *proj, "views"]
     assert [e[0] for e in log] == ["views", *one_layer, *one_layer[:-1]]
     _, shape, state, states, window, inter, kw = log[1]
     assert (shape, states, inter) == ((1, 32, 7), "states(1,)", "inter(1,)")
@@ -747,8 +760,22 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows():
         (28, 4),
         (7, 4, 4),
         "scale(1,)",
-        (("activation", "silu"),),
+        (("activation", "silu"), ("early_dependents", push)),
     )
+    if push:
+        # the push GEMM on the FP8 rows and the layer's packed weights and scales
+        assert log[4] == (
+            "out_proj_push",
+            "main",
+            (),
+            (
+                ("input_scale", "scale(1,)"),
+                ("packed_w", "packed2(16,)"),
+                ("weight_scale", "out_s(1,)"),
+                ("x_fp8", "?(7, 16)"),
+            ),
+        )
+        return
     # out_proj's BMM on the FP8 rows with its static input scale, output in the activation dtype
     assert log[5] == (
         "bmm_fp8",
@@ -756,6 +783,25 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows():
         ("?(7, 16)", "out_w(16, 8)", "scale(1,)", "out_s(1,)", "?"),
         (),
     )
+
+
+@pytest.mark.parametrize("takes", [False, True])
+def test_the_gdn_push_slot_pushes_only_where_the_moe_input_consumes(monkeypatch, takes):
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5 import gdn
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+
+    seen = []
+    monkeypatch.setattr(boundary_hop, "takes_moe_input", lambda hop, *a: takes)
+    monkeypatch.setattr(verify, "step", lambda mod, x, st, opts: seen.append(opts))
+    layer = SimpleNamespace(linear_attn="gdn")
+    st = SimpleNamespace(
+        slots=plan.Slots(gdn_verify=True, hop=True, gdn_push=True),
+        bound={"boundary": boundary_hop.Bound(hop="hop")},
+    )
+    gdn.step(layer, torch.zeros(7, 4), st)
+    assert seen == [msgspec.structs.replace(verify.SLOT, push=takes)]
 
 
 @pytest.mark.parametrize(

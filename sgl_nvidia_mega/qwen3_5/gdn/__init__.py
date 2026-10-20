@@ -10,7 +10,8 @@ ops in its order: the input projections, the fused split of q / k / v / z / b / 
 causal conv + ReplaySSM verify through the backend (``RadixLinearAttention``), the
 gated RMSNorm and ``out_proj``. ``step`` returns the TP-partial output, whose
 all-reduce the boundary runs. Slot ``gdn_verify`` (``verify.py``) runs the step with
-the backend's chain opened up and its launch choices changed.
+the backend's chain opened up and its launch choices changed; slot ``gdn_push`` pushes
+``out_proj``'s partial into the decode hop from its GEMM (numeric).
 """
 
 from __future__ import annotations
@@ -59,6 +60,8 @@ class Bound(msgspec.Struct, frozen=True):
 
     gdn_verify: bool = False  # slot gdn_verify serves every GDN layer
     gdn_pdl: bool = False  # and launches its verify dependent on the conv
+    # slot gdn_push: layer id -> out_proj's weights packed for the hop's push GEMM
+    packed: dict = msgspec.field(default_factory=dict)
     reason: str = ""  # why a requested slot is not built
 
 
@@ -72,22 +75,41 @@ def build(model, ctx) -> Bound:
     if "gdn_verify" not in SLOTS:
         return Bound(reason="stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
     m = model.model
-    for i in range(m.start_layer, m.end_layer):
-        layer = m.layers[i]
-        if isinstance(layer, Qwen3_5LinearDecoderLayer):
-            reason = verify.unsupported(layer.linear_attn)
-            if reason:
-                return Bound(reason=f"layer {i}: {reason}")
-    return Bound(gdn_verify=True, gdn_pdl="gdn_pdl" in SLOTS)
+    gdns = [
+        (i, m.layers[i].linear_attn)
+        for i in range(m.start_layer, m.end_layer)
+        if isinstance(m.layers[i], Qwen3_5LinearDecoderLayer)
+    ]
+    for i, gdn in gdns:
+        reason = verify.unsupported(gdn)
+        if reason:
+            return Bound(reason=f"layer {i}: {reason}")
+    packed = {}
+    if "gdn_push" in SLOTS:
+        from sgl_nvidia_mega.qwen3_5.sm103.hop import pack_out_proj
+
+        for i, gdn in gdns:
+            # the method keeps the weight as the [K, N] transpose of a row-major [N, K]
+            try:
+                packed[gdn.attn.layer_id] = pack_out_proj(gdn.out_proj.weight.t())
+            except ValueError as e:
+                return Bound(reason=f"layer {i}: {e}")
+    return Bound(gdn_verify=True, gdn_pdl="gdn_pdl" in SLOTS, packed=packed)
 
 
 def step(layer, x, st):
     """``layer``'s GatedDeltaNet on the normed input ``x`` [rows, hidden]: the
     TP-partial output [rows, hidden]."""
     if st.slots.gdn_verify:
+        from sgl_nvidia_mega.qwen3_5.boundary import hop
         from sgl_nvidia_mega.qwen3_5.gdn import verify
 
         opts = verify.SLOT_PDL if st.slots.gdn_pdl else verify.SLOT
+        # push only where the MoE input's all-reduce will consume on the hop
+        if st.slots.gdn_push and hop.takes_moe_input(
+            st.bound["boundary"].hop, layer, st, x.shape[0]
+        ):
+            opts = msgspec.structs.replace(opts, push=True)
         return verify.step(layer.linear_attn, x, st, opts)
     import triton
     from sglang.kernels.ops.attention.triton_gdn_fused_proj import (

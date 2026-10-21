@@ -17,6 +17,7 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 OPT_IN_SLOTS: tuple[str, ...] = (
     "route",
     "mkm",
+    "mkm_wide",
     "gdn_verify",
     "gdn_pdl",
     "hop",
@@ -78,6 +79,13 @@ def slot_reasons() -> list[str]:
         )
     if "mkm" in SLOTS and "route" not in SLOTS:
         reasons.append(f"{SLOTS_ENV}: slot 'mkm' runs on slot 'route''s outputs")
+    if "mkm_wide" in SLOTS and "mkm" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'mkm_wide' is slot 'mkm''s 16-token engine")
+    if "mkm_wide" in SLOTS and "multi_request" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'mkm_wide' serves the steps of more than one request "
+            "('multi_request')"
+        )
     if "route_shared" in SLOTS and "route" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'route_shared' runs in slot 'route''s launch"
@@ -167,6 +175,7 @@ def build(model, ctx):
     facts = slot_plan.Facts(
         route=bound["moe"].route,
         mkm=bool(bound["moe"].mkm),
+        mkm_wide=bound["moe"].mkm_wide,
         gdn_verify=bound["gdn"].gdn_verify,
         gdn_pdl=bound["gdn"].gdn_pdl,
         hop=bound["boundary"].hop is not None,
@@ -188,7 +197,14 @@ def build(model, ctx):
     built = msgspec.structs.asdict(facts)
     # every package's build agrees across ranks, so this raises on every rank alike
     target_slots = SLOTS - set(DRAFT_ENTRIES) - set(DRAFT_SLOTS) - set(OPT_IN_COVERAGE)
-    missing = sorted(name for name in target_slots if not built[name])
+    # mkm's 16-token engine has nothing to serve where no covered step is wider than 7 rows
+    vacuous = (
+        {"mkm_wide"}
+        if slot_plan.widest(pctx.widths, slot_plan.MKM_WIDE_MAX_ROWS)
+        <= slot_plan.MKM_MAX_ROWS
+        else set()
+    )
+    missing = sorted(name for name in target_slots - vacuous if not built[name])
     if missing:
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built no width (MoE: "

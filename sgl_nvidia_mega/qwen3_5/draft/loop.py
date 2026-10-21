@@ -45,6 +45,10 @@ class DraftLoop:
     def __init__(self, parts, *, num_steps: int):
         self.parts = parts
         self.num_steps = num_steps
+        if "draft_q1" in parts.slots and parts.attention.q1 is None:
+            from sgl_nvidia_mega.qwen3_5.draft.attention import build_q1
+
+            parts.attention.q1 = build_q1(parts)
 
     def step_for(self, bs: int):
         return self.step if bs == SERVED_BS else None

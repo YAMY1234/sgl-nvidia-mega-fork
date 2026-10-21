@@ -30,7 +30,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
 # The MTP draft's EAGLE entries and kernel groups (qwen3_5/draft), requested in the same
 # variable; the draft spec's build reads them, the target's ignores them
 DRAFT_ENTRIES: tuple[str, ...] = ("draft_loop", "draft_extend")
-DRAFT_SLOTS: tuple[str, ...] = ("draft_moe",)
+DRAFT_SLOTS: tuple[str, ...] = ("draft_moe", "draft_q1")
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 

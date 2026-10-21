@@ -237,8 +237,9 @@ def test_the_draft_slots_name_what_they_need(monkeypatch, slots, want):
 class _DraftParts:
     """Parts with no slot built: the stock model step."""
 
-    def __init__(self, slots=frozenset()):
+    def __init__(self, slots=frozenset(), tp_size=8):
         self.slots, self.mkd, self.engaged = slots, None, []
+        self.binding = SimpleNamespace(tp_size=tp_size)
 
     def note_engaged(self, entry, bs):
         self.engaged.append((entry, bs))
@@ -275,7 +276,7 @@ def test_the_draft_loop_writes_each_steps_token_and_restores_the_positions(
     _stub_model_step(monkeypatch, calls)
     parts = _DraftParts()
     loop = DraftLoop(parts, num_steps=4)
-    assert loop.step_for(SERVED_BS) == loop.step and loop.step_for(2) is None
+    assert loop.step_for(SERVED_BS) == loop.step
     io = SimpleNamespace(
         num_requests=1,
         num_steps=4,
@@ -307,6 +308,75 @@ def test_the_draft_loop_writes_each_steps_token_and_restores_the_positions(
         [100],
         [100],
     ]
+
+
+@pytest.mark.parametrize(
+    "tp_size, slots, served",
+    [
+        (8, {"multi_request"}, (1, 2)),
+        (8, set(), (1,)),
+        (4, {"multi_request"}, (1,)),
+    ],
+)
+def test_the_draft_loop_serves_two_requests_at_tp8_on_request(
+    monkeypatch, tp_size, slots, served
+):
+    from sgl_nvidia_mega.qwen3_5.draft.loop import DraftLoop
+
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
+    loop = DraftLoop(_DraftParts(tp_size=tp_size), num_steps=4)
+    assert tuple(bs for bs in (1, 2, 4) if loop.step_for(bs) == loop.step) == served
+
+
+@pytest.mark.parametrize("split_fc", [False, True])
+def test_a_two_request_draft_loop_runs_each_step_on_dense_rows(monkeypatch, split_fc):
+    from sgl_nvidia_mega.qwen3_5.draft import layer
+    from sgl_nvidia_mega.qwen3_5.draft.loop import DraftLoop
+
+    calls = []
+    _stub_model_step(monkeypatch, calls)
+    stub_layer = layer.layer
+
+    def run_layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request):
+        calls.append(("dense", cache_loc.is_contiguous()))
+        return stub_layer(
+            parts, x, positions, cache_loc, meta, kv, rows_per_request=rows_per_request
+        )
+
+    monkeypatch.setattr(layer, "layer", run_layer)
+    parts = _DraftParts()
+    if split_fc:
+        # slot draft_xchg's row-split fc, never its one-request exchange steps
+        parts.model = SimpleNamespace(embed_tokens=lambda t: t.to(torch.float32))
+        parts.mkd = SimpleNamespace(
+            split_fc=lambda e, h: (calls.append(("split", e.tolist())), h + 1)[1]
+        )
+    loop = DraftLoop(parts, num_steps=4)
+    io = SimpleNamespace(
+        num_requests=2,
+        num_steps=4,
+        topk_index=torch.tensor([[7], [8]]),
+        hidden_states=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        positions=torch.tensor([100, 200]),
+        mrope_positions=None,
+        # request-major: request r's step i writes slot 40 + 10 r + i
+        out_cache_loc=torch.tensor([40, 41, 42, 43, 50, 51, 52, 53]),
+        steps=("m0", "m1", "m2"),
+        kv="kv",
+        draft_tokens_out=torch.full((2, 4), -1, dtype=torch.int64),
+    )
+    loop.step(io)
+    assert parts.engaged == [("draft_loop", 2)]
+    assert [c[1:] for c in calls if c[0] == "layer"] == [
+        ([100, 200], [40, 50], "m0", "kv"),
+        ([101, 201], [41, 51], "m1", "kv"),
+        ([102, 202], [42, 52], "m2", "kv"),
+    ]
+    assert [c[1] for c in calls if c[0] == "dense"] == [True] * 3
+    fc = "split" if split_fc else "fc"
+    assert [c[1] for c in calls if c[0] == fc] == [[7, 8], [20, 40], [210, 410]]
+    assert io.draft_tokens_out.tolist() == [[7, 20, 210, 110], [8, 40, 410, 110]]
+    assert io.positions.tolist() == [100, 200]
 
 
 def test_the_draft_extend_writes_the_selected_rows_outputs(monkeypatch):

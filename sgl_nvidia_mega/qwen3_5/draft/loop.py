@@ -12,7 +12,11 @@ for bs 1 runs inside the capture in place of ``draft_forward``. Draft step i (of
 (column 0 is the round's first token); the step advances the positions in place and
 restores them before it returns, as the binding asks.
 
-Stock: SGLang's model step and top-1 (``layer``).
+Stock: SGLang's model step and top-1 (``layer``). Slot ``draft_xchg`` ends each step
+in the exchange: the next step's fc comes from it, the LM head is the shard GEMV, and
+the token is chosen across the shards in the same launch (``draft/xchg``).
+``begin_draft_round`` then fills the first step's fc when the round's input did not
+come from a served draft extend (2.2's take_fc_buf / fill_fc decision).
 """
 
 from __future__ import annotations
@@ -35,6 +39,8 @@ SGLANG_READS = {
         "steps",
         "kv",
         "draft_tokens_out",
+        "EagleDraftRoundIO",
+        "from_served_extend",
     ),
 }
 
@@ -54,8 +60,16 @@ class DraftLoop:
         return self.step if bs == SERVED_BS else None
 
     def begin_round(self, io) -> None:
-        """On the host before a served draft graph replays: nothing to prepare while
-        every op is SGLang's."""
+        """On the host before a served draft graph replays: the first step's fc when
+        no served draft extend of these requests produced the round's input."""
+        mkd = self.parts.mkd
+        if (
+            mkd is not None
+            and mkd.extend_fc
+            and io.num_requests == SERVED_BS
+            and not io.from_served_extend
+        ):
+            mkd.fill_fc(io.topk_index, io.hidden_states)
 
     @torch.no_grad()
     def step(self, io) -> None:
@@ -65,14 +79,17 @@ class DraftLoop:
         tokens = io.draft_tokens_out
         tokens[:, :1].copy_(io.topk_index)
         positions, mrope = io.positions, io.mrope_positions
-        token, hidden = io.topk_index.view(-1), io.hidden_states
-        for i in range(steps):
-            hidden = self._model_step(io, i, layer.fc_input(parts, token, hidden))
-            token = layer.top1(parts, hidden)
-            tokens[:, i + 1].copy_(token)
-            positions.add_(1)
-            if mrope is not None:
-                mrope.add_(1)
+        if parts.mkd is not None:
+            self._mkd_steps(io, steps)
+        else:
+            token, hidden = io.topk_index.view(-1), io.hidden_states
+            for i in range(steps):
+                hidden = self._model_step(io, i, layer.fc_input(parts, token, hidden))
+                token = layer.top1(parts, hidden)
+                tokens[:, i + 1].copy_(token)
+                positions.add_(1)
+                if mrope is not None:
+                    mrope.add_(1)
         positions.sub_(steps)
         if mrope is not None:
             mrope.sub_(steps)
@@ -88,3 +105,23 @@ class DraftLoop:
             io.kv,
             rows_per_request=1,
         )
+
+    def _mkd_steps(self, io, steps: int) -> None:
+        """The steps with slot draft_xchg, in 2.2's order: fc from the exchange, the
+        layer, the hidden half of the next fc on a side stream, the shard head, the
+        exchange (token, positions and the next fc)."""
+        mkd = self.parts.mkd
+        for i in range(steps):
+            mkd.begin_step(i, io.num_requests)
+            hidden = self._model_step(io, i, mkd.fc())
+            if mkd.armed:
+                mkd.hidden_partial(hidden)
+            mkd.finish_step(
+                mkd.head(hidden),
+                io.positions,
+                io.draft_tokens_out,
+                i,
+                i + 1,
+                io.mrope_positions,
+            )
+        mkd.end()

@@ -14,7 +14,9 @@ model step on the verify's rows (writing their draft KV), and writes the selecte
 row's top-1 (``torch.argmax``'s choice), 1.0 and final-norm hidden state into the
 SGLang-owned outputs.
 
-Stock: SGLang's model step and top-1 (``layer``).
+Stock: SGLang's model step and top-1 (``layer``). Slot ``draft_xchg``: the fc split
+of 2.2 and the exchange's top-1, which also writes the next draft round's first fc
+(2.2's MKD extend fc).
 """
 
 from __future__ import annotations
@@ -57,7 +59,12 @@ class DraftExtend:
     def step(self, io) -> None:
         parts = self.parts
         parts.note_engaged("draft_extend", io.num_requests)
-        x = layer.fc_input(parts, io.input_ids, io.hidden_states)
+        mkd = parts.mkd
+        if mkd is not None:
+            embeds = parts.model.embed_tokens(io.input_ids)
+            x = mkd.split_fc(embeds, io.hidden_states)
+        else:
+            x = layer.fc_input(parts, io.input_ids, io.hidden_states)
         hidden = layer.layer(
             parts,
             x,
@@ -68,6 +75,13 @@ class DraftExtend:
             rows_per_request=io.tokens_per_request,
         )
         selected = hidden.index_select(0, io.select_index)
-        io.topk_index_out.copy_(layer.top1(parts, selected).view(-1, 1))
-        io.topk_p_out.fill_(1.0)
+        if mkd is not None:
+            lm = parts.lm
+            local = lm.logits_processor._compute_lm_head(selected, lm.lm_head, None)
+            topk_p, topk_index = mkd.exchange_extend(local, selected)
+            io.topk_index_out.copy_(topk_index)
+            io.topk_p_out.copy_(topk_p)
+        else:
+            io.topk_index_out.copy_(layer.top1(parts, selected).view(-1, 1))
+            io.topk_p_out.fill_(1.0)
         io.hidden_out.copy_(selected)

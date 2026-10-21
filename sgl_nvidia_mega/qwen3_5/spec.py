@@ -107,6 +107,10 @@ NUMERIC_TOLERANCES = {
         "gdn_front.in_proj_ba.rel_l2_vs_stock": 1.05,
         "gdn_front.in_proj_ba.max_abs_vs_stock": 2.0,
     },
+    "route_shared": {
+        "route_shared.gate_up.rel_l2_vs_stock": 1.05,
+        "route_shared.gate_up.max_abs_vs_stock": 2.0,
+    },
 }
 
 

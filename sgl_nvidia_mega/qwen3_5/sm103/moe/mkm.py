@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The routed experts of up to 7 rows in one launch (``src/mkm_moe.cu``), on the router
-front's outputs: the top-10 of the logits, FC1, SwiGLU, the NVFP4 requantization of the
-intermediate and FC2, reading the trtllm-gen weight layout in place. It writes the
+"""The routed experts of up to 16 rows in one launch, on the router front's outputs: the
+top-10 of the logits, FC1, SwiGLU, the NVFP4 requantization of the intermediate and FC2,
+reading the trtllm-gen weight layout in place. Up to 7 rows ``src/mkm_moe.cu`` runs (a
+2-CTA cluster per selectable expert), up to 16 ``src/mkm_moe_m16.cu`` (a CTA per (token,
+top-k) slot; a slot whose expert an earlier slot holds exits). Both write the
 deferred-finalize rows (row ``t * 10 + k`` is expert ``k`` of token ``t``) and the
 expert weights, as the trtllm runner's deferred finalize takes them.
 """
@@ -18,7 +20,9 @@ import torch
 from sgl_nvidia_mega.common import jit
 
 SOURCE = Path(__file__).parent / "src" / "mkm_moe.cu"
+SOURCE_M16 = Path(__file__).parent / "src" / "mkm_moe_m16.cu"
 HIDDEN, EXPERTS, TOP_K, MAX_TOKENS = 4096, 512, 10, 7
+M16_MAX_TOKENS = 16
 W13_ROWS = 256  # an expert's gate and up rows at TP8 (intermediate 128 per rank)
 W13_BOX_ROWS = 128  # kW13BoxRows: rows of one W13 TMA box
 THREADS = 256
@@ -26,6 +30,8 @@ CTAS = (
     2 * MAX_TOKENS * TOP_K
 )  # a 2-CTA cluster per selectable expert; the unused ones exit
 SMEM_BYTES = 211968  # sizeof(Smem) + 1024, checked when the source compiles
+M16_CTAS = M16_MAX_TOKENS * TOP_K  # a CTA per (token, top-k) slot; the unused ones exit
+M16_SMEM_BYTES = 221184
 
 
 class Params(ctypes.Structure):
@@ -61,9 +67,23 @@ def _kernel(device_index: int) -> jit.Kernel:
     return jit.load(cubin, "q35_mkm_moe", (THREADS, 1, 1), SMEM_BYTES)
 
 
-def build(device_index: int) -> None:
-    """Compile the kernel (no compile inside a step)."""
+@cache
+def _kernel_m16(device_index: int) -> jit.Kernel:
+    major, minor = torch.cuda.get_device_capability(device_index)
+    cubin = jit.compile_source(
+        SOURCE_M16.read_text(),
+        "q35_mkm_moe_m16",
+        f"sm_{major}{minor}a",
+        ("-std=c++17", "-default-device", f"-DQ35_MKM_SMEM_BYTES={M16_SMEM_BYTES}"),
+    )
+    return jit.load(cubin, "q35_mkm_moe_m16", (THREADS, 1, 1), M16_SMEM_BYTES)
+
+
+def build(device_index: int, max_rows: int = MAX_TOKENS) -> None:
+    """Compile the kernels that serve up to ``max_rows`` rows (no compile inside a step)."""
     _kernel(device_index)
+    if max_rows > MAX_TOKENS:
+        _kernel_m16(device_index)
 
 
 def _map(
@@ -125,18 +145,20 @@ def mkm_moe(
     g2_alpha: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(gemm2_out bf16 [M * 10, 4096], expert_weights bf16 [M, 10]) for logits [M, 512]
-    bf16 (M <= 7) and the router front's x_fp4 [M, 2048] / x_sf [M, 256] (uint8, linear
+    bf16 (M <= 16) and the router front's x_fp4 [M, 2048] / x_sf [M, 256] (uint8, linear
     e4m3); w13_sf [512, 256, 256] / w2_sf [512, 4096, 8] e4m3 viewed as uint8; g1_alpha,
     g1_scale_c, g2_alpha [512] fp32."""
     m = logits.shape[0]
-    if not 1 <= m <= MAX_TOKENS:
-        raise ValueError(f"mkm: {m} rows (1-{MAX_TOKENS})")
+    if not 1 <= m <= M16_MAX_TOKENS:
+        raise ValueError(f"mkm: {m} rows (1-{M16_MAX_TOKENS})")
+    wide = m > MAX_TOKENS
     device = logits.device
     gemm2_out = torch.empty((m * TOP_K, HIDDEN), dtype=torch.bfloat16, device=device)
     expert_weights = torch.empty((m, TOP_K), dtype=torch.bfloat16, device=device)
     topk_ids = torch.empty((m, TOP_K), dtype=torch.int32, device=device)
     swizzle = jit.driver().CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
-    x_map = _map(x_fp4, m, HIDDEN // 2, 128, 8, swizzle)
+    # the x rows past m read as zeros: 8 rows a box, 16 for the 16-token engine
+    x_map = _map(x_fp4, m, HIDDEN // 2, 128, 16 if wide else 8, swizzle)
     p = Params(
         logits=logits.data_ptr(),
         expert_weights=expert_weights.data_ptr(),
@@ -150,10 +172,10 @@ def mkm_moe(
         out=gemm2_out.data_ptr(),
         num_tokens=m,
     )
+    kernel, ctas = (
+        (_kernel_m16(device.index), M16_CTAS) if wide else (_kernel(device.index), CTAS)
+    )
     jit.launch(
-        _kernel(device.index),
-        (CTAS, 1, 1),
-        [*maps, x_map, p],
-        torch.cuda.current_stream().cuda_stream,
+        kernel, (ctas, 1, 1), [*maps, x_map, p], torch.cuda.current_stream().cuda_stream
     )
     return gemm2_out, expert_weights

@@ -8,7 +8,7 @@ target verify of 1, 2 or 4 requests (``REQUESTS``: SGLang's decode graphs of bat
 sizes 1, 2 and 4); a width of 2 or 4 requests is covered only where a slot runs there.
 ``route`` (the router GEMM and the routed experts' NVFP4 input in one launch) runs up to
 16 rows, ``mkm`` (on its outputs, the top-10 and both expert GEMMs in one launch) up to
-7. ``gdn_verify`` (the GatedDeltaNet verify chain with its launch choices changed) covers
+7, and with ``mkm_wide`` (its 16-token engine) up to 16. ``gdn_verify`` (the GatedDeltaNet verify chain with its launch choices changed) covers
 every width, and ``hop`` (the boundary's fused all-reduce points on the decode hop) the
 widths where FlashInfer's low-latency kernels, which it equals bit for bit, run.
 ``gdn_push`` (numeric: out_proj as the hop's push GEMM, on gdn_verify's FP8 norm) runs up
@@ -34,6 +34,7 @@ GDN_FRONT_ROWS = 7  # the rows slot gdn_front's front is built for
 # all-reduce the hop equals bit for bit (its finalize runs one-shot up to 23 rows)
 ROUTE_MAX_ROWS = 16
 MKM_MAX_ROWS = 7
+MKM_WIDE_MAX_ROWS = 16
 HOP_MAX_ROWS = 15
 GDN_PUSH_MAX_ROWS = 8
 # the rows slot route_shared's shared stage fits shared memory for
@@ -68,6 +69,7 @@ class Facts(msgspec.Struct, frozen=True):
 
     route: bool = False  # the router front built for every MoE layer
     mkm: bool = False  # the fused routed experts built for every MoE layer
+    mkm_wide: bool = False  # with their 16-token engine
     gdn_verify: bool = False  # the GDN verify slot built for every GDN layer
     gdn_pdl: bool = False  # with its dependent verify launch
     hop: bool = False  # the decode hop, built for the widest step it covers
@@ -89,7 +91,9 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
     mka = facts.mka and rows <= MKA_MAX_ROWS
     return Slots(
         route=route,
-        mkm=route and facts.mkm and rows <= MKM_MAX_ROWS,
+        mkm=route
+        and facts.mkm
+        and rows <= (MKM_WIDE_MAX_ROWS if facts.mkm_wide else MKM_MAX_ROWS),
         gdn_verify=facts.gdn_verify,
         gdn_pdl=facts.gdn_verify and facts.gdn_pdl,
         hop=hop,

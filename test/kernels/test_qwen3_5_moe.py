@@ -7,7 +7,9 @@ replayed from a CUDA graph:
   runner's quantizer (flashinfer.fp4_quantize, linear scale layout), at 1-16 rows;
 - the fused routed experts (slot mkm), against FlashInfer's trtllm-gen NVFP4 MoE as
   SGLang serves Qwen3.5 at TP8 (routing from the logits, RenormalizeNaive, deferred
-  finalize): each token's 10 expert rows and their weights, at 1, 4 and 7 rows;
+  finalize): each token's 10 expert rows and their weights, at 1, 4 and 7 rows (the 2-CTA
+  engine) and 8, 14 and 16 rows (the 16-token engine), also with every token routed to the
+  same experts; graph replay of both;
 - the router front with the shared gate/up stage (slot route_shared, numeric): its
   logits and NVFP4 input bit for bit the plain launch's, and its gate/up rows against
   fp64 on SGLang's static FP8 quantization of the rows, at most 1.05 x the mean relative
@@ -155,16 +157,20 @@ def _stock(layer, logits, x_fp4, x_sf):
         routing_method_type=RoutingMethodType.RenormalizeNaive,
         do_finalize=False,
         activation_type=ActivationType.Swiglu,
-        tune_max_num_tokens=8,
+        tune_max_num_tokens=max(8, m),
         enable_pdl=True,
     )[:3]
     return rows[permuted.reshape(-1).long()[: m * TOP_K]], weights
 
 
-@pytest.mark.parametrize("m", [1, 4, 7])
+@pytest.mark.parametrize("m", [1, 4, 7, 8, 14, 16])
 @pytest.mark.parametrize("seed", [0, 1])
-def test_mkm_is_the_trtllm_routed_experts(layer, m, seed):
+@pytest.mark.parametrize("shared_route", [False, True])
+def test_mkm_is_the_trtllm_routed_experts(layer, m, seed, shared_route):
     logits, x_fp4, x_sf = _inputs(m, seed)
+    if shared_route:
+        # every token routes to the same 10 experts: one slot computes each for all rows
+        logits = logits[:1].expand(m, -1).contiguous()
     rows, weights = _fused(layer, logits, x_fp4, x_sf)
     want_rows, want_weights = _stock(layer, logits, x_fp4, x_sf)
     assert want_weights.dtype == torch.bfloat16
@@ -173,8 +179,9 @@ def test_mkm_is_the_trtllm_routed_experts(layer, m, seed):
     assert not differ.any(), f"rows {differ.nonzero().flatten().tolist()} differ"
 
 
-def test_mkm_replays_from_a_cuda_graph(layer):
-    logits, x_fp4, x_sf = _inputs(7, 2)
+@pytest.mark.parametrize("m", [7, 14])
+def test_mkm_replays_from_a_cuda_graph(layer, m):
+    logits, x_fp4, x_sf = _inputs(m, 2)
     eager = _fused(layer, logits, x_fp4, x_sf)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

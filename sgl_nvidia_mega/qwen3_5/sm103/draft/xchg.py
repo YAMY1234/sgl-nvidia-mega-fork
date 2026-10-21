@@ -16,8 +16,9 @@
   16 tokens (fused norm + slice GEMV, all-gather of the fp32 partials, rank-order sum).
 
 Every launch keeps the 2.2 grid, block, shared memory and PDL setting (the draft head may
-add unused shared memory, ``smem_pad``). ``FcGather`` moves bytes only; the arithmetic of
-the split fc is ``draft_fc_partial`` and ``ordered_partial_sum``, copied unchanged.
+add unused shared memory, ``smem_pad``, and run beside a narrower hidden partial,
+``ctas``). ``FcGather`` moves bytes only; the arithmetic of the split fc is
+``draft_fc_partial`` and ``ordered_partial_sum``, copied unchanged.
 """
 
 from __future__ import annotations
@@ -508,11 +509,13 @@ def mkd_hidden_partial(
     epoch_done: torch.Tensor,
     sync: torch.Tensor,
     world: int,
+    ctas: int = 0,
 ) -> None:
     """Hidden-slice fc partial [1, H] fp32 of ``h`` [1, H] (draft_fc_partial arithmetic
     over ``shard`` [H, W] at hidden-half column ``col``); the last CTA then sets
     ``sync[1]`` to the exchange epoch ``epoch_done[0]`` (``sync[0]`` counts CTAs, zero
-    between calls)."""
+    between calls). ``ctas`` > 0 launches that many CTAs instead of one per SM (same
+    values: each row is one warp's)."""
     device = out.device
     width = 2 * HIDDEN // world
     _check(h, "h", (1, HIDDEN), torch.bfloat16, aligned=True)
@@ -535,9 +538,8 @@ def mkd_hidden_partial(
         col=col,
     )
     kernels = _fc_kernels(device.index, world)
-    _launch(
-        kernels["mkd_hidden_partial"], _sm_count(device.index), p, device, pdl=False
-    )
+    grid = ctas if ctas > 0 else _sm_count(device.index)
+    _launch(kernels["mkd_hidden_partial"], grid, p, device, pdl=False)
 
 
 # ---------------------------------------------------------------- draft lm_head

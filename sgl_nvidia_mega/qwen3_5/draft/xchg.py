@@ -42,6 +42,10 @@ _HEAD_CTAS_PER_SM = 1
 # an SM with 128 KB of shared memory free (its registers already hold the head at one CTA
 # per SM)
 HEAD_SMEM_PAD = 120 * 1024
+# SMs a hidden rank leaves to the side-stream hidden partial: the early-released head
+# would fill every SM, and the partial (which the exchange waits for) would start only as
+# head CTAs retire; the head then runs on the other SMs
+PARTIAL_SMS = 24
 # Draft and draft-extend widths that take the row-split fc (2.2 _FC_SPLIT_MAX_TOKENS)
 FC_SPLIT_MAX_TOKENS = kernels.GATHER_MAX_TOKENS
 # Rows of a draft step the vocabulary exchange serves (2.2 DraftVocabExchange.MAX_ROWS)
@@ -134,6 +138,7 @@ class MkdBoundary:
         extend_fc: bool = True,
         head: bool = True,
         head_smem_pad: int = HEAD_SMEM_PAD,
+        partial_sms: int = PARTIAL_SMS,
     ) -> None:
         import torch.distributed as dist
 
@@ -199,6 +204,7 @@ class MkdBoundary:
         self.side_stream = torch.cuda.Stream(device=dev)
         self.lm_head_weight = lm_head_shard
         self.head_pad = head_smem_pad
+        self.partial_sms = partial_sms
         self._install_head(head, dev)
         # extend_fc: the draft extend's exchange writes fc_buf for the next draft's first
         # step. input_seq counts calls that produce a draft input; fc_buf_key is the
@@ -310,6 +316,7 @@ class MkdBoundary:
 
     def _install_head(self, enabled: bool, dev: torch.device) -> None:
         self.head_part = None
+        self.head_part_cur = None
         self.head_used = False
         if not enabled:
             return
@@ -327,12 +334,21 @@ class MkdBoundary:
         sms = torch.cuda.get_device_properties(dev).multi_processor_count
         self.head_part = torch.zeros(_HEAD_CTAS_PER_SM * sms, dtype=torch.int32, device=dev)
         logger.info(
-            "MKD draft head active: %d x %d shard, %d CTAs, smem pad %d B.",
+            "MKD draft head active: %d x %d shard, %d CTAs, smem pad %d B, hidden ranks "
+            "leave %d SMs to the fc partial.",
             head.shape[0],
             head.shape[1],
             self.head_part.numel(),
             self.head_pad,
+            self.partial_sms,
         )
+
+    def _partial_ctas(self) -> int:
+        """SMs left to the side-stream hidden partial on a hidden rank's step that sends
+        one; 0 keeps one partial CTA per SM, queued behind the head."""
+        if not self.is_hidden_rank or self.last_step or self.head_part is None:
+            return 0
+        return max(0, min(self.partial_sms, self.head_part.numel() - 1))
 
     def head(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """The one-row draft logits [1, N] bf16 on this rank's shard (the exchange then
@@ -341,13 +357,17 @@ class MkdBoundary:
         logits = torch.empty(
             1, self.lm_head_weight.shape[0], dtype=torch.bfloat16, device=x.device
         )
+        # The head's grid is its part count: with SMs left to the hidden partial it runs on
+        # the rest
+        ctas = self.head_part.numel() - self._partial_ctas()
+        self.head_part_cur = self.head_part[:ctas]
         # Alternate the row walk per draft step: the next step re-reads first what is still in L2
         # (T1: -1.9 to -2.4 us per call on the TP8 shard).
         kernels.mkd_draft_head(
             x,
             self.lm_head_weight,
             logits,
-            self.head_part,
+            self.head_part_cur,
             reverse=self.step % 2 == 1,
             smem_pad=self.head_pad,
         )
@@ -390,6 +410,7 @@ class MkdBoundary:
                 self.epoch_done,
                 self.partial_sync,
                 self.world,
+                ctas=self._partial_ctas(),
             )
         self.partial_pending = True
 
@@ -439,7 +460,7 @@ class MkdBoundary:
             token_only=self.last_step,
             partial_flag=partial_flag,
             scan_part=self.scan_part,
-            head_part=self.head_part if self.head_used else None,
+            head_part=self.head_part_cur if self.head_used else None,
         )
         self.head_used = False
         self.pending = not self.last_step

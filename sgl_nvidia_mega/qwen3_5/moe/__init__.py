@@ -71,12 +71,16 @@ SGLANG_MIRRORS = {
 def build(model, ctx) -> route.Bound:
     """Slots ``route`` and ``mkm`` for every MoE layer; the result is
     ``st.bound["moe"]``."""
+    from sgl_nvidia_mega.qwen3_5 import plan
     from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
 
     if "route" not in SLOTS:
         return route.Bound(reason="stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
+    rows = plan.widest(ctx.widths, plan.ROUTE_MAX_ROWS)
+    if not rows:
+        return route.Bound(reason=f"no width of {list(ctx.widths)} within its rows")
     return route.build(
-        model, max(ctx.widths), fused="mkm" in SLOTS, shared="route_shared" in SLOTS
+        model, rows, fused="mkm" in SLOTS, shared="route_shared" in SLOTS
     )
 
 

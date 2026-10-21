@@ -32,6 +32,9 @@ Q1_MIN_LENGTH = 16384
 # A draft step's q1 decode and its merge launch as programmatic dependents, the
 # one-row front releasing them at entry (same arithmetic)
 Q1_PDL = True
+# The one-row front launches as a programmatic dependent of the qkv GEMM, loading its
+# static operands before the wait (same arithmetic)
+QKN_PDL = True
 
 
 class Q1Variants:
@@ -166,6 +169,7 @@ class Attention:
         self.k_scale = attn.k_scale if attn.k_scale is not None else ones
         self.v_scale = attn.v_scale if attn.v_scale is not None else ones
         self.q1 = None  # sm103.draft.q1 decode (slot draft_q1), set by DraftLoop
+        self._noted: set = set()  # engagement lines logged (once each, under capture)
         # slot draft_front: 2.2's attention front writes the KV and FP8 q in one launch
         self.front = "draft_front" in parts.slots
         # slot draft_skv2: the draft extend's split-KV decode (DraftExtendSplitKV)
@@ -229,9 +233,21 @@ class Attention:
             k_scale=self.k_scale,
             v_scale=self.v_scale,
             early_trigger=x.shape[0] == 1 and self.q1 is not None and Q1_PDL,
+            pdl_wait=x.shape[0] == 1 and QKN_PDL,
         )
+        if x.shape[0] == 1 and QKN_PDL and layer.attn_output_gate:
+            self._note(
+                "slot draft_front launches the one-row front as a programmatic "
+                "dependent of the qkv GEMM"
+            )
         rows = x.shape[0]
         return q8.view(rows, -1), (gate.view(rows, -1) if gate is not None else None)
+
+    def _note(self, what: str) -> None:
+        """Log ``what`` once, the first time a graph capture runs it."""
+        if what not in self._noted and torch.cuda.is_current_stream_capturing():
+            self._noted.add(what)
+            logger.info("NVIDIA megakernel: Qwen3.5 MTP draft %s", what)
 
     def core(self, q, k, v, cache_loc, meta, kv, rows_per_request: int):
         """FP8 q / k / v with the KV write, then the decode: [rows, heads * head_dim]."""

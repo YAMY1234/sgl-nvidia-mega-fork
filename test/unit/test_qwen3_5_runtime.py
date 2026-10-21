@@ -102,27 +102,12 @@ def test_the_build_hands_over_the_binding_and_every_entry_stays_sglangs():
     assert [n for n in ENTRIES if getattr(mtp, n, None) is not None] == []
 
 
-def test_the_verify_sample_entry_is_offered_only_on_request(monkeypatch):
-    from sglang.srt.megakernels.spec import ENTRIES
-
-    model = SimpleNamespace(
-        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
-    )
-    ctx = SimpleNamespace(
-        widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
-    )
-    monkeypatch.setattr(runtime, "SLOTS", frozenset({"verify_sample"}))
-    assert runtime.slot_reasons() == []
-    built = runtime.build(model, ctx)
-    assert [n for n in ENTRIES if getattr(built, n, None) is not None] == [
-        "verify_sample"
+def test_verify_sample_is_refused_with_the_switch_that_replaces_it(monkeypatch):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"route", "verify_sample"}))
+    assert [r.split(": ", 1)[1] for r in runtime.slot_reasons()] == [
+        "'verify_sample' is no longer an entry: drop it; an SGLang with post-verify "
+        "graphs turns them on with SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1"
     ]
-    assert built.summary() == "slots none (stock); entries ['verify_sample']"
-    # SGLang calls the factory once and asks it for every batch size
-    steps = built.verify_sample(
-        tokens_per_request=7, max_bs=4, noise_key=1, noise_offset=None
-    )
-    assert [steps(bs) for bs in range(1, 5)] == [None] * 4
 
 
 def test_the_runtime_gives_the_executor_the_build_contexts_binding(monkeypatch):

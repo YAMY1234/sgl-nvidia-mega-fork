@@ -28,10 +28,6 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "mka",
     "mka_push",
 )
-# The EAGLE entries (spec.ENTRIES) offered only when requested in the same variable;
-# verify_sample has no step at any size, so it turns on SGLang's post-verify graphs
-# with SGLang's own sampling
-OPT_IN_ENTRIES: tuple[str, ...] = ("verify_sample",)
 # The MTP draft's EAGLE entries and kernel groups (qwen3_5/draft), requested in the same
 # variable; the draft spec's build reads them, the target's ignores them
 DRAFT_ENTRIES: tuple[str, ...] = ("draft_loop", "draft_extend")
@@ -63,14 +59,19 @@ def slot_reasons() -> list[str]:
     known = (
         *SHIPPED_SLOTS,
         *OPT_IN_SLOTS,
-        *OPT_IN_ENTRIES,
         *DRAFT_ENTRIES,
         *DRAFT_SLOTS,
     )
     reasons = [
         f"{SLOTS_ENV}: unknown slot {name!r} (known: {', '.join(known) or 'none'})"
-        for name in sorted(SLOTS - set(known))
+        for name in sorted(SLOTS - set(known) - {"verify_sample"})
     ]
+    if "verify_sample" in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: 'verify_sample' is no longer an entry: drop it; an SGLang "
+            "with post-verify graphs turns them on with "
+            "SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1"
+        )
     if "mkm" in SLOTS and "route" not in SLOTS:
         reasons.append(f"{SLOTS_ENV}: slot 'mkm' runs on slot 'route''s outputs")
     if "mkm_wide" in SLOTS and "mkm" not in SLOTS:
@@ -185,9 +186,8 @@ def build(model, ctx):
         if w != pctx.tokens_per_request
     )
     built = msgspec.structs.asdict(facts)
-    entries = tuple(name for name in OPT_IN_ENTRIES if name in SLOTS)
     # every package's build agrees across ranks, so this raises on every rank alike
-    target_slots = SLOTS - set(entries) - set(DRAFT_ENTRIES) - set(DRAFT_SLOTS)
+    target_slots = SLOTS - set(DRAFT_ENTRIES) - set(DRAFT_SLOTS)
     # mkm's 16-token engine has nothing to serve where no covered step is wider than 7 rows
     vacuous = (
         {"mkm_wide"}
@@ -209,14 +209,12 @@ def build(model, ctx):
         else None
     )
     on = sorted(name for name, ok in built.items() if ok)
-    offered = f"; entries {list(entries)}" if entries else ""
     return Qwen35Verify(
         model,
         slots,
         bound=bound,
         widths=covered,
         binding=ctx.binding,
-        entries=entries,
-        summary=f"slots {on or 'none (stock)'}{offered}{wider}",
+        summary=f"slots {on or 'none (stock)'}{wider}",
         parity=checker,
     )

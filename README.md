@@ -52,7 +52,7 @@ These slots change the arithmetic (numeric: each sums in another order than SGLa
 | `gdn_front` (with `gdn_verify`, `gdn_pdl`) | 7 (one request) | The GatedDeltaNet `in_proj_qkvz` (static FP8) and `in_proj_ba` (BF16) projections, the conv update and an L2 prefetch of the verify's state in one launch, then the ReplaySSM verify and the gated norm writing `out_proj`'s FP8 input, each launched dependent on the one before |
 | `route_shared` (with `route`) | 1–8 | The shared expert's static-FP8 gate/up in the router front's launch, so the shared expert on the alternate stream waits for that launch only |
 
-`verify_sample` in the same variable offers SGLang's EAGLE entry with no step at any batch size, so SGLang's post-verify graphs run with SGLang's own sampling.
+The sampling and acceptance after the verify, and the GatedDeltaNet extend of prefill, stay SGLang's own code. In an SGLang that has the switches, `SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1` runs the sampling and acceptance in CUDA graphs, and `SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND=1` captures the GatedDeltaNet extend inside the breakable prefill CUDA graphs.
 
 ### Design
 

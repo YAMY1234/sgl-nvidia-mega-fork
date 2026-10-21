@@ -131,6 +131,7 @@ def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
     "slots, want",
     [
         ({"hop2"}, "unknown slot 'hop2'"),
+        ({"verify_sample"}, "'verify_sample' is no longer an entry: drop it"),
         ({"mkm"}, "slot 'mkm' runs on slot 'route''s outputs"),
         ({"gdn_pdl"}, "slot 'gdn_pdl' launches slot 'gdn_verify''s verify"),
         (

@@ -47,7 +47,6 @@ SGLANG_READS = {
         "view",
         "widths",
         "draft_sampler",
-        '"verify_sample"',
         "summary",
         "plan",
         "forward",
@@ -76,13 +75,6 @@ SGLANG_READS = {
     "srt/megakernels/eagle_binding.py": (
         "tokens_per_request",
         "mamba",
-        "noise_key",
-        "noise_offset",
-    ),
-    # how SGLang calls the verify_sample factory
-    "srt/speculative/eagle_megakernel.py": (
-        "bind_verify_sample(max_bs)",
-        "bind_verify_sample(tokens_per_request)",
     ),
 }
 
@@ -110,7 +102,6 @@ class Qwen35Verify:
         bound: dict,
         widths: tuple[int, ...],
         binding=None,
-        entries: tuple[str, ...] = (),
         summary: str = "",
         parity=None,
     ):
@@ -119,8 +110,6 @@ class Qwen35Verify:
         self.lm, self.slots, self.bound = lm, slots, bound
         self.widths = tuple(sorted(widths))
         self.binding = binding  # SGLang's EagleBinding (BuildContext.binding)
-        # the EAGLE entries offered (spec.ENTRIES); None leaves SGLang's own code
-        self.verify_sample = self._verify_sample if "verify_sample" in entries else None
         self._summary = summary
         self.parity = parity  # runtime.parity.Parity under the test-only switch
         # the attention graph variants per SGLang runner ("target_verify"), which it
@@ -142,11 +131,6 @@ class Qwen35Verify:
     def summary(self) -> str:
         """What was built, for SGLang's startup line."""
         return self._summary
-
-    def _verify_sample(self, *, tokens_per_request, max_bs, noise_key, noise_offset):
-        """The verify_sample factory: no step at any batch size, so SGLang's
-        post-verify graphs sample and accept with SGLang's own code."""
-        return lambda bs: None
 
     def plan(
         self,

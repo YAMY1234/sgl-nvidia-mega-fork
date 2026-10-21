@@ -7,6 +7,7 @@ the attention's buffers, and each requested draft slot's build."""
 from __future__ import annotations
 
 import logging
+from typing import Any, Optional
 
 import torch
 
@@ -55,6 +56,7 @@ class Parts:
         self.slots = draft.slots
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.attention = None  # draft.attention.Attention
+        self.moe: Optional[Any] = None  # draft.moe.DraftMoe (slot draft_moe)
         # (entry, bs) pairs whose capture logged the engagement line
         self.engaged: set = set()
 
@@ -71,11 +73,25 @@ class Parts:
         parts = cls(draft, layers[0])
         parts.attention = Attention(parts)
         slots = parts.slots
+        if "draft_moe" in slots:
+            parts.moe = parts._build_moe()
         logger.info(
-            "NVIDIA megakernel: Qwen3.5 MTP draft parts built (slots %s)",
+            "NVIDIA megakernel: Qwen3.5 MTP draft parts built (slots %s; MoE %s)",
             sorted(slots),
+            "single launch" if parts.moe is not None else "SGLang's",
         )
         return parts
+
+    def _build_moe(self):
+        from sgl_nvidia_mega.qwen3_5.draft.moe import DraftMoe
+
+        moe = DraftMoe.build(self.layer.mlp, self.device.index)
+        if moe is None:
+            raise RuntimeError(
+                "NVIDIA megakernel: slot draft_moe cannot run: "
+                f"{getattr(DraftMoe, 'last_reason', 'see the log')}"
+            )
+        return moe
 
     def note_engaged(self, entry: str, bs: int) -> None:
         """Log once per (entry, bs) captured: the engagement line every rank prints."""

@@ -151,6 +151,17 @@ def test_the_draft_entries_are_offered_only_on_request(monkeypatch):
     assert runtime.build(model, target_ctx).summary() == "slots none (stock)"
 
 
+@pytest.mark.parametrize(
+    "slots, want",
+    [
+        ({"draft_moe"}, "slot 'draft_moe' runs inside entry 'draft_loop'"),
+    ],
+)
+def test_the_draft_slots_name_what_they_need(monkeypatch, slots, want):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
+    assert [r.split(": ", 1)[1] for r in runtime.slot_reasons()] == [want]
+
+
 class _DraftParts:
     """Parts with no slot built: the stock model step."""
 

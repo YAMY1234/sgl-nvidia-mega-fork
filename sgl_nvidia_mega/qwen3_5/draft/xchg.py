@@ -527,12 +527,23 @@ class MkdBoundary:
         return self.exchange_extend(local_logits, hidden_states)
 
     def exchange_extend(
-        self, local_logits: torch.Tensor, hidden_states: Optional[torch.Tensor]
+        self,
+        local_logits: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        topk_index: Optional[torch.Tensor] = None,
+        topk_p: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Draft-extend token (torch.argmax NaN rule) through the same one-launch exchange;
-        with extend_fc it also writes the next draft's first fc into fc_buf."""
-        topk_index = torch.empty((1, 1), dtype=torch.int64, device=local_logits.device)
-        topk_p = torch.empty((1, 1), dtype=torch.float32, device=local_logits.device)
+        with extend_fc it also writes the next draft's first fc into fc_buf. The token and
+        its 1.0 land in ``topk_index`` / ``topk_p`` ([1, 1]) when given."""
+        if topk_index is None:
+            topk_index = torch.empty(
+                (1, 1), dtype=torch.int64, device=local_logits.device
+            )
+        if topk_p is None:
+            topk_p = torch.empty(
+                (1, 1), dtype=torch.float32, device=local_logits.device
+            )
         payload = (
             self.extend_fc and hidden_states is not None and hidden_states.shape[0] == 1
         )

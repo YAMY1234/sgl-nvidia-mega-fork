@@ -6,8 +6,9 @@ replayed from a CUDA graph:
   GEMM SGLang runs (ReplicatedLinear, bf16), and its NVFP4 input against the trtllm
   runner's quantizer (flashinfer.fp4_quantize, linear scale layout), at 1-16 rows;
 - the fused routed experts (slot mkm), against FlashInfer's trtllm-gen NVFP4 MoE as
-  SGLang serves Qwen3.5 at TP8 (routing from the logits, RenormalizeNaive, deferred
-  finalize): each token's 10 expert rows and their weights, at 1, 4 and 7 rows;
+  SGLang serves Qwen3.5 at TP8 and TP4 (intermediate 128 / 256 a rank; routing from the
+  logits, RenormalizeNaive, deferred finalize): each token's 10 expert rows and their
+  weights, at 1, 4 and 7 rows;
 - the router front with the shared gate/up stage (slot route_shared, numeric): its
   logits and NVFP4 input bit for bit the plain launch's, and its gate/up rows against
   fp64 on SGLang's static FP8 quantization of the rows, at most 1.05 x the mean relative
@@ -19,7 +20,6 @@ import torch
 from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm, router
 
 E, H, TOP_K = mkm.EXPERTS, mkm.HIDDEN, mkm.TOP_K
-I = mkm.W13_ROWS // 2  # intermediate per rank
 X_SCALE = 448.0 * 6.0 / 12.0  # the static input scale of the routed experts
 H_SCALE = 30.0 / (448.0 * 6.0)  # the static FC2 input scale
 
@@ -59,13 +59,15 @@ def _experts(g, rows, cols, std):
     return packed, sf, scale
 
 
-@pytest.fixture(scope="module")
-def layer():
-    """One TP8 Qwen3.5 MoE layer on the trtllm-gen weight layout, as SGLang loads it."""
+@pytest.fixture(scope="module", params=mkm.INTERMEDIATES, ids=lambda i: f"I{i}")
+def layer(request):
+    """One TP8 (intermediate 128 a rank) or TP4 (256) Qwen3.5 MoE layer on the trtllm-gen
+    weight layout, as SGLang loads it."""
     from sglang.srt.layers.quantization.utils import (
         prepare_static_weights_for_trtllm_fp4_moe,
     )
 
+    I = request.param  # intermediate per rank
     g = torch.Generator(device="cuda").manual_seed(11)
     w13, sf13, s13 = _experts(g, 2 * I, H, 0.02)
     w2, sf2, s2 = _experts(g, H, I, 0.02)
@@ -82,6 +84,7 @@ def layer():
         "g1c": (g1 / H_SCALE).float(),
         "g2": (H_SCALE / s2).float(),
         "maps": mkm.weight_maps(w13, w2),
+        "I": I,
     }
 
 
@@ -148,7 +151,7 @@ def _stock(layer, logits, x_fp4, x_sf):
         top_k=TOP_K,
         n_group=None,
         topk_group=None,
-        intermediate_size=I,
+        intermediate_size=layer["I"],
         local_expert_offset=0,
         local_num_experts=E,
         routed_scaling_factor=None,

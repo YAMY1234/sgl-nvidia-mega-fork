@@ -126,7 +126,7 @@ def build(model, max_rows: int, fused: bool, shared: bool = False) -> Bound:
         reason = mkm.unsupported(mlp)
         if reason:
             return Bound(route=True, reason=f"mkm: layer {i}: {reason}")
-    mkm_kernel.build(device)
+    mkm_kernel.build(device, layers[0].experts.w2_weight.shape[-1] * 2)
     return Bound(
         route=True,
         mkm={

@@ -14,7 +14,8 @@
 - ``top1``: the LM head on this rank's vocabulary shard, the all-gather of the logits
   and their arg-max (``torch.argmax``'s choice, as SGLang's top-1).
 
-Stock: the ops SGLang's draft runs for these rows, in its order.
+Stock: the ops SGLang's draft runs for these rows, in its order. Slot ``draft_moe``
+replaces the MoE.
 """
 
 from __future__ import annotations
@@ -76,7 +77,8 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
     moe_in, residual = lay.post_attention_layernorm(
         tensor_model_parallel_all_reduce(attn_out), residual
     )
-    moe_out = lay.mlp(moe_in)
+    moe = parts.moe if rows_per_request == 1 else None
+    moe_out = moe(moe_in) if moe is not None else lay.mlp(moe_in)
     out, _ = parts.model.norm(tensor_model_parallel_all_reduce(moe_out), residual)
     return out
 

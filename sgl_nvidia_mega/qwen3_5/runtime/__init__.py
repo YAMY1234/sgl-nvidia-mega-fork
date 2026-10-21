@@ -135,13 +135,14 @@ def build(model, ctx):
     from sgl_nvidia_mega.qwen3_5.runtime import parity
     from sgl_nvidia_mega.qwen3_5.runtime.executor import Qwen35Verify
 
-    if not ctx.widths:
+    widths = slot_plan.candidates(ctx.widths, ctx.tokens_per_request)
+    if not widths:
         raise RuntimeError(
             f"NVIDIA megakernel: {ctx.tokens_per_request} rows a request leave no "
             "covered width"
         )
     pctx = PackageContext(
-        widths=ctx.widths,
+        widths=widths,
         tokens_per_request=ctx.tokens_per_request,
         deadline_s=ctx.deadline_s,
     )
@@ -164,7 +165,14 @@ def build(model, ctx):
         mka=bound["attention"].mka,
         mka_push=bound["attention"].mka_push,
     )
-    slots = slot_plan.plan(pctx.widths, facts)
+    covered = slot_plan.covered(pctx.widths, facts, pctx.tokens_per_request)
+    slots = slot_plan.plan(covered, facts, pctx.tokens_per_request)
+    # the slots of every width wider than one request, for the startup line
+    wider = "".join(
+        f"; {w} rows: {[n for n, ok in msgspec.structs.asdict(s).items() if ok]}"
+        for w, s in slots.items()
+        if w != pctx.tokens_per_request
+    )
     built = msgspec.structs.asdict(facts)
     entries = tuple(name for name in OPT_IN_ENTRIES if name in SLOTS)
     # every package's build agrees across ranks, so this raises on every rank alike
@@ -178,7 +186,7 @@ def build(model, ctx):
             f"attention: {bound['attention'].reason or 'built'})"
         )
     checker = (
-        parity.Parity(pctx.widths, torch.cuda.current_device(), model)
+        parity.Parity(covered, torch.cuda.current_device(), model)
         if parity.ENABLED
         else None
     )
@@ -188,9 +196,9 @@ def build(model, ctx):
         model,
         slots,
         bound=bound,
-        widths=pctx.widths,
+        widths=covered,
         binding=ctx.binding,
         entries=entries,
-        summary=f"slots {on or 'none (stock)'}{offered}",
+        summary=f"slots {on or 'none (stock)'}{offered}{wider}",
         parity=checker,
     )

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The kernels slot gdn_verify launches its own way, on one SM100-family GPU (GB300),
-against SGLang's, bit for bit, at Qwen3.5's TP8 GatedDeltaNet shapes:
+against SGLang's, bit for bit, at Qwen3.5's TP8 GatedDeltaNet shapes, for steps of 1, 2
+and 4 requests:
 
 - the causal conv update with the 128-channel tile and the token-major output, against
   ``causal_conv1d_update`` (output, conv states and intermediate windows), on the
@@ -55,15 +56,22 @@ def _projection(bs, views, g):
     return qkvz[:, :D] if views else qkvz[:, :D].contiguous()
 
 
+# a covered step's requests (slot gdn_verify covers B1, B2 and B4) and their slots
+REQUESTS = (1, 2, 4)
+STATE_SLOTS = (4, 7, 0, 8)
+RING_SLOTS = (3, 5, 0, 8)
+REPLAY_SLOTS = (1, 2, 4, 6)
+
+
+@pytest.mark.parametrize("bs", REQUESTS)
 @pytest.mark.parametrize("views", [False, True])
 @pytest.mark.parametrize("block_n", [256, 128])
-def test_conv_update_is_sglangs(views, block_n):
+def test_conv_update_is_sglangs(views, block_n, bs):
     from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
 
     from sgl_nvidia_mega.qwen3_5.gdn.conv import conv_update
 
-    g = torch.Generator(device="cuda").manual_seed(block_n + views)
-    bs = 2
+    g = torch.Generator(device="cuda").manual_seed(block_n + views + 10 * bs)
     rows = _projection(bs, views, g)
     weight = torch.randn(D, WIDTH, device="cuda", generator=g).to(torch.bfloat16)
     bias = torch.randn(D, device="cuda", generator=g).to(torch.bfloat16)
@@ -73,8 +81,8 @@ def test_conv_update_is_sglangs(views, block_n):
     window = torch.zeros(
         SLOTS, DRAFT, D, WIDTH - 1, dtype=torch.bfloat16, device="cuda"
     )
-    slots = torch.tensor([4, 7], dtype=torch.int32, device="cuda")
-    inter = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    slots = torch.tensor(STATE_SLOTS[:bs], dtype=torch.int32, device="cuda")
+    inter = torch.arange(bs, dtype=torch.int32, device="cuda")
     x = rows.view(bs, DRAFT, D).transpose(1, 2)
     want_state, want_window = state.clone(), window.clone()
     want = causal_conv1d_update(
@@ -105,15 +113,16 @@ def test_conv_update_is_sglangs(views, block_n):
     assert got.transpose(1, 2).is_contiguous()
 
 
+@pytest.mark.parametrize("bs", REQUESTS)
 @pytest.mark.parametrize("views", [False, True])
-def test_norm_fp8_is_sglangs_norm_then_static_quant(views):
+def test_norm_fp8_is_sglangs_norm_then_static_quant(views, bs):
     from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm
     from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 
     from sgl_nvidia_mega.qwen3_5.gdn.norm_fp8 import rms_norm_gated_fp8
 
-    g = torch.Generator(device="cuda").manual_seed(int(views))
-    tokens = 2 * DRAFT
+    g = torch.Generator(device="cuda").manual_seed(int(views) + 10 * bs)
+    tokens = bs * DRAFT
     core = torch.randn(tokens * HV, V, device="cuda", generator=g).to(torch.bfloat16)
     qkvz = torch.randn(tokens, D + HV * V, device="cuda", generator=g).to(
         torch.bfloat16
@@ -137,8 +146,9 @@ def test_norm_fp8_is_sglangs_norm_then_static_quant(views):
     )
 
 
+@pytest.mark.parametrize("bs", REQUESTS)
 @pytest.mark.parametrize("pdl, gate", [(False, False), (True, False), (True, True)])
-def test_replayssm_verify_is_sglangs(pdl, gate):
+def test_replayssm_verify_is_sglangs(pdl, gate, bs):
     """The slot's verify launch (32-wide value tiles on 2 warps, and with or without the
     dependent launch, waiting before the gates with ``gate``) against
     gdn_replayssm_spec_decode's verify launch: the output and this step's ring entries."""
@@ -148,8 +158,10 @@ def test_replayssm_verify_is_sglangs(pdl, gate):
 
     from sgl_nvidia_mega.qwen3_5.gdn import replayssm
 
-    g = torch.Generator(device="cuda").manual_seed(3 + int(pdl) + 2 * int(gate))
-    bs, ring_len, slots = 2, 16, 9
+    g = torch.Generator(device="cuda").manual_seed(
+        3 + int(pdl) + 2 * int(gate) + 10 * bs
+    )
+    ring_len, slots = 16, 9
     tokens = bs * DRAFT
 
     def rand(*shape, dtype=torch.bfloat16):
@@ -176,8 +188,8 @@ def test_replayssm_verify_is_sglangs(pdl, gate):
     cache_base = cache_base.to(torch.int32)
     is_flush = torch.zeros(slots, dtype=torch.int8, device="cuda")
     qsl = torch.arange(0, tokens + 1, DRAFT, dtype=torch.int32, device="cuda")
-    states = torch.tensor([3, 5], dtype=torch.int32, device="cuda")
-    replay = torch.tensor([1, 2], dtype=torch.int32, device="cuda")
+    states = torch.tensor(RING_SLOTS[:bs], dtype=torch.int32, device="cuda")
+    replay = torch.tensor(REPLAY_SLOTS[:bs], dtype=torch.int32, device="cuda")
     want_ring, got_ring = [t.clone() for t in ring], [t.clone() for t in ring]
     want, got = (q.new_empty(tokens, HV, V) for _ in range(2))
     gdn_replayssm_spec_decode(

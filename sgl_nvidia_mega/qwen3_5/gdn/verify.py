@@ -126,7 +126,12 @@ SGLANG_READS = {
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": "12a835fc4f78af33",
+    # Without and with the early return of the GDN extend in breakable prefill graphs,
+    # which target verify never takes; the first goes once all supported SGLangs have it
+    "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": (
+        "ab7b048fafb07d0e",
+        "12a835fc4f78af33",
+    ),
     "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend._replayssm_target_verify": "28b89fa4b48b47ad",
     "srt/layers/linear.py:RowParallelLinear.forward": "b291a3c452e428a5",
     "srt/layers/quantization/fp8_utils.py:apply_fp8_linear_bmm_flashinfer": "c66562e1de0008db",

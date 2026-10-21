@@ -9,7 +9,8 @@ path (``plugin.TEST_HOOKS``). Every module that imports from
 ``sglang`` lists what it reads in ``SGLANG_READS``. A refactor that renames one fails here, naming the file to
 repair, instead of failing at a GPU server's startup. A module whose stock step mirrors
 the body of an SGLang function lists it in ``SGLANG_MIRRORS`` with the digest of its
-code (its tokens without comments or docstring), so a changed branch fails here too.
+code (its tokens without comments or docstring; a tuple of digests where the supported
+SGLangs differ), so a changed branch fails here too.
 The checks are static (AST and tokens): no module of this package is imported. Run it
 against each SGLang this package supports, and nightly against SGLang main.
 """
@@ -274,7 +275,8 @@ def test_the_mirrored_sglang_code_is_unchanged(path, key, digest):
     assert len(files) == 1, f"{_id(path)}: {pattern} matches {len(files)} files"
     got = mirror_digest(files[0], qualname)
     assert got is not None, f"{_id(path)}: SGLang no longer defines {key}"
-    assert got == digest, (
+    assert got in ((digest,) if isinstance(digest, str) else digest), (
         f"SGLang changed {key}, whose body {_id(path)} mirrors: re-read it, update "
-        f"the mirror, then pin {got!r} in its SGLANG_MIRRORS"
+        f"the mirror, then pin {got!r} in its SGLANG_MIRRORS (a tuple where the "
+        "supported SGLangs differ)"
     )

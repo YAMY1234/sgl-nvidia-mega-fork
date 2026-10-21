@@ -11,8 +11,11 @@ what the replays added. ``control`` runs SGLang's forward twice instead: the run
 floor of the same comparison. ``trace`` also hooks every module both forwards call and
 logs the first module call whose input or output differs (eager steps only).
 
-Every line also reports how far the two forwards' outputs are apart, which is what a
-numeric slot (not bitwise) is read by: per verify row, whether the two top-1 tokens
+Graph lines also count the differing elements of the requests' own rows apart
+(valid_*): a captured step of more requests replays for fewer, and SGLang's ops leave a
+padded request's rows unwritten (its mamba slot is the pad slot), so both forwards read
+whatever those rows held. Every line also reports how far the two forwards' outputs are
+apart, which is what a numeric slot (not bitwise) is read by: per verify row, whether the two top-1 tokens
 differ and the |difference| of the two log-softmaxes at SGLang's top-1, and the max abs
 difference of the hidden rows.
 
@@ -59,14 +62,15 @@ _BITS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
 
 class Parity:
     """One rank's comparison counters per width: covered steps, the elements of the
-    logits and of the hidden rows whose bits differ, and the elements compared (zero
-    when a forward returned no such output, e.g. SGLang's autotune dummy run)."""
+    logits and of the hidden rows whose bits differ, the elements compared (zero when a
+    forward returned no such output, e.g. SGLang's autotune dummy run), and the
+    differing elements of the logits and hidden rows of requests with a mamba slot."""
 
     def __init__(self, widths: tuple[int, ...], device, model=None):
         self.counters = {
-            w: torch.zeros(5, dtype=torch.int64, device=device) for w in widths
+            w: torch.zeros(7, dtype=torch.int64, device=device) for w in widths
         }
-        self.logged = {w: [0] * 5 for w in widths}
+        self.logged = {w: [0] * 7 for w in widths}
         # rows, top-1 differs, sum and max of |dlp|, hidden max abs; read at each flush
         self.distance = {
             w: torch.zeros(5, dtype=torch.float64, device=device) for w in widths
@@ -101,9 +105,15 @@ class Parity:
         if torch.cuda.is_current_stream_capturing():
             counts = self.counters[step.rows]
             counts[0:1].add_(1)
+            valid = (
+                None
+                if slots is None or step.rows % slots.numel()
+                else valid_rows(slots, step.rows)
+            )
             for i, (a, b) in enumerate(pairs, start=1):
                 counts[i : i + 1].add_(differing(a, b))
                 counts[i + 2 : i + 3].add_(0 if a is None else a.numel())
+                counts[i + 4 : i + 5].add_(differing(a, b, valid))
             if apart is not None:
                 d = self.distance[step.rows]
                 d[0:4:2].add_(apart[0:4:2])
@@ -144,7 +154,7 @@ class Parity:
             logger.info(
                 "NVIDIA megakernel parity%s graph target_verify rows=%d steps=%d "
                 "logits_differ=%d hidden_differ=%d logits_compared=%d "
-                "hidden_compared=%d%s",
+                "hidden_compared=%d valid_logits_differ=%d valid_hidden_differ=%d%s",
                 self.label,
                 rows,
                 *added,
@@ -255,8 +265,15 @@ def _distance_text(apart) -> str:
     )
 
 
-def differing(a, b):
-    """The number of elements of a and b whose bits differ (a device scalar)."""
+def valid_rows(slots: torch.Tensor, rows: int) -> torch.Tensor:
+    """[rows] bool: the rows of requests with a mamba slot (not the pad slot), for a step
+    of ``slots.numel()`` requests of equal rows."""
+    return (slots >= 0).repeat_interleave(rows // slots.numel())
+
+
+def differing(a, b, valid=None):
+    """The number of elements of a and b whose bits differ (a device scalar); with
+    ``valid`` ([rows] bool), only in those rows."""
     if a is None or b is None:
         if a is None and b is None:
             return 0
@@ -266,7 +283,10 @@ def differing(a, b):
             f"parity: {a.dtype}{tuple(a.shape)} against {b.dtype}{tuple(b.shape)}"
         )
     bits = _BITS[a.element_size()]
-    return (a.contiguous().view(bits) != b.contiguous().view(bits)).sum()
+    differ = a.contiguous().view(bits) != b.contiguous().view(bits)
+    if valid is not None:
+        differ = differ & valid.view(-1, *([1] * (differ.dim() - 1)))
+    return differ.sum()
 
 
 def _clone(t):

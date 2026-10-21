@@ -15,10 +15,12 @@
   and their arg-max (``torch.argmax``'s choice, as SGLang's top-1).
 
 Stock: the ops SGLang's draft runs for these rows, in its order. Slot ``draft_moe``
-replaces the MoE.
+replaces the MoE, slot ``draft_hop`` the two all-reduce points and ``o_proj``.
 """
 
 from __future__ import annotations
+
+from functools import partial
 
 import torch
 
@@ -60,12 +62,20 @@ def fc_input(parts, token_ids, hidden):
     return lm.fc(torch.cat([embeds, hidden], dim=-1))
 
 
+# Slot draft_hop on the draft extend's rows too: their FFN input all-reduce + residual +
+# norm in the hop's MNNVL rounding, which equals what 2.2 runs there (FlashInfer's MNNVL
+# fusion under DRAFT_MNNVL_AR) bit for bit at 1-7 rows
+EXTEND_MNNVL = True
+
+
 def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
     """The decoder layer on the fc output ``x`` [rows, hidden]: the final-norm rows."""
     from sglang.srt.distributed import tensor_model_parallel_all_reduce
 
     lay = parts.layer
     residual = x
+    hop = parts.hop if rows_per_request == 1 else None
+    extend_hop = parts.hop if rows_per_request > 1 and EXTEND_MNNVL else None
     attn_out = parts.attention(
         lay.input_layernorm(x),
         positions,
@@ -73,12 +83,28 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         meta,
         kv,
         rows_per_request=rows_per_request,
-    )
-    moe_in, residual = lay.post_attention_layernorm(
-        tensor_model_parallel_all_reduce(attn_out), residual
+        o_proj=None if hop is None else partial(hop.o_proj, weight=lay.o_proj.weight),
     )
     moe = parts.moe if rows_per_request == 1 else None
+    if hop is not None:
+        moe_in, residual = hop.ffn_input(
+            attn_out,
+            residual,
+            lay.post_attention_layernorm,
+            moe_single_launch=moe is not None and moe.single_launch(1),
+        )
+    elif extend_hop is not None:
+        moe_in, residual = extend_hop.ffn_input(
+            attn_out, residual, lay.post_attention_layernorm, moe_single_launch=False
+        )
+    else:
+        moe_in, residual = lay.post_attention_layernorm(
+            tensor_model_parallel_all_reduce(attn_out), residual
+        )
     moe_out = moe(moe_in) if moe is not None else lay.mlp(moe_in)
+    if hop is not None:
+        out, _ = hop.final_norm(moe_out, residual, parts.model.norm)
+        return out
     out, _ = parts.model.norm(tensor_model_parallel_all_reduce(moe_out), residual)
     return out
 

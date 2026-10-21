@@ -151,9 +151,12 @@ class Attention:
         self.v_scale = attn.v_scale if attn.v_scale is not None else ones
         self.q1 = None  # sm103.draft.q1 decode (slot draft_q1), set by DraftLoop
 
-    def __call__(self, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
+    def __call__(
+        self, x, positions, cache_loc, meta, kv, *, rows_per_request: int, o_proj=None
+    ):
         """The TP-partial attention output [rows, hidden] of the normed input ``x``
-        [rows, hidden]; writes this step's KV rows at ``cache_loc``."""
+        [rows, hidden]; writes this step's KV rows at ``cache_loc``. ``o_proj`` (the
+        draft hop's GEMV) stands in for SGLang's when given."""
         from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
         layer = self.layer
@@ -163,6 +166,8 @@ class Attention:
         o = self.core(q, k, v, cache_loc, meta, kv, rows_per_request)
         if layer.attn_output_gate:
             o = fused_sigmoid_mul(o, gate, inplace=True)
+        if o_proj is not None:
+            return o_proj(o)
         out, _ = layer.o_proj(o)
         return out
 

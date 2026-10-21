@@ -62,6 +62,7 @@ class Parts:
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.attention = None  # draft.attention.Attention
         self.moe: Optional[Any] = None  # draft.moe.DraftMoe (slot draft_moe)
+        self.hop: Optional[Any] = None  # draft.hop.DraftHop (slot draft_hop)
         self.mkd: Optional[Any] = None  # draft.xchg.MkdBoundary (slot draft_xchg)
         # (entry, bs) pairs whose capture logged the engagement line
         self.engaged: set = set()
@@ -81,13 +82,16 @@ class Parts:
         slots = parts.slots
         if "draft_moe" in slots:
             parts.moe = parts._build_moe()
+        if "draft_hop" in slots:
+            parts.hop = parts._build_hop()
         if "draft_xchg" in slots:
             parts.mkd = parts._build_mkd()
         logger.info(
-            "NVIDIA megakernel: Qwen3.5 MTP draft parts built (slots %s; MoE %s, "
-            "exchange %s)",
+            "NVIDIA megakernel: Qwen3.5 MTP draft parts built (slots %s; MoE %s, hop "
+            "%s, exchange %s)",
             sorted(slots),
             "single launch" if parts.moe is not None else "SGLang's",
+            "draft hop" if parts.hop is not None else "SGLang's",
             "MKD" if parts.mkd is not None else "SGLang's",
         )
         return parts
@@ -102,6 +106,20 @@ class Parts:
                 f"{getattr(DraftMoe, 'last_reason', 'see the log')}"
             )
         return moe
+
+    def _build_hop(self):
+        from sgl_nvidia_mega.qwen3_5.draft.hop import DraftHop
+
+        hop, why = DraftHop.build(
+            tp_size=self.binding.tp_size,
+            deadline_s=self.draft.deadline_s,
+            o_proj_k=int(self.layer.o_proj.weight.shape[1]),
+            early=True,
+            early_head=False,
+        )
+        if hop is None:
+            raise RuntimeError(f"NVIDIA megakernel: slot draft_hop cannot run: {why}")
+        return hop
 
     def _build_mkd(self):
         from sgl_nvidia_mega.qwen3_5.draft.xchg import MkdBoundary

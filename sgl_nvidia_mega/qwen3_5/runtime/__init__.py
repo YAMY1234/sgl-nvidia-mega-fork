@@ -27,9 +27,10 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "mka",
     "mka_push",
 )
-# The MTP draft's EAGLE entries (qwen3_5/draft), requested in the same variable; the
-# draft spec's build reads them, the target's ignores them
+# The MTP draft's EAGLE entries and kernel groups (qwen3_5/draft), requested in the same
+# variable; the draft spec's build reads them, the target's ignores them
 DRAFT_ENTRIES: tuple[str, ...] = ("draft_loop", "draft_extend")
+DRAFT_SLOTS: tuple[str, ...] = ("draft_moe",)
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -47,7 +48,12 @@ SLOTS = _requested_slots()
 
 def slot_reasons() -> list[str]:
     """Why the requested slots cannot be served ([] when they can)."""
-    known = (*SHIPPED_SLOTS, *OPT_IN_SLOTS, *DRAFT_ENTRIES)
+    known = (
+        *SHIPPED_SLOTS,
+        *OPT_IN_SLOTS,
+        *DRAFT_ENTRIES,
+        *DRAFT_SLOTS,
+    )
     reasons = [
         f"{SLOTS_ENV}: unknown slot {name!r} (known: {', '.join(known) or 'none'})"
         for name in sorted(SLOTS - set(known) - {"verify_sample"})
@@ -77,6 +83,9 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_pdl' launches slot 'gdn_verify''s verify"
         )
+    for name in sorted(SLOTS & set(DRAFT_SLOTS)):
+        if "draft_loop" not in SLOTS:
+            reasons.append(f"{SLOTS_ENV}: slot {name!r} runs inside entry 'draft_loop'")
     if "mka_push" in SLOTS and not {"mka", "hop"} <= SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'mka_push' pushes slot 'mka''s epilogue into slot "
@@ -146,7 +155,7 @@ def build(model, ctx):
     slots = slot_plan.plan(pctx.widths, facts)
     built = msgspec.structs.asdict(facts)
     # every package's build agrees across ranks, so this raises on every rank alike
-    target_slots = SLOTS - set(DRAFT_ENTRIES)
+    target_slots = SLOTS - set(DRAFT_ENTRIES) - set(DRAFT_SLOTS)
     missing = sorted(name for name in target_slots if not built[name])
     if missing:
         raise RuntimeError(

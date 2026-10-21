@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""The MTP draft's SM103 (GB300) kernels: the single-launch draft MoE (``moe``)."""

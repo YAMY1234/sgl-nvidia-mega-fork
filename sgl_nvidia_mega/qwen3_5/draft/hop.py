@@ -13,7 +13,8 @@ target's decode hop, and the draft o_proj GEMV that pushes into the first one.
   rounding of SGLang's one-shot push all-reduce and FlashInfer's CuTe DSL
   FusedAddRMSNorm (multiplier 1 + the raw weight, in fp32);
 - ``o_proj``: the attention output's one-row o_proj (fp32 accumulation), pushed into
-  ``ffn_input``'s hop, which then only consumes.
+  ``ffn_input``'s hop, which then only consumes; with the output gate it stages
+  ``attn * sigmoid(gate)`` itself, in place of SGLang's gate kernel.
 
 The draft shares the target's hop (``boundary.hop.active()``): one mailbox and one
 stage order for every hop of the process, as SGLang runs the draft after the target's
@@ -109,15 +110,21 @@ class DraftHop:
             raise RuntimeError("draft hop: a pushed partial was never consumed")
         return False
 
-    def o_proj(self, attn_output: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    def o_proj(
+        self,
+        attn_output: torch.Tensor,
+        weight: torch.Tensor,
+        gate: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """The one-row o_proj partial [1, N] bf16 (``weight`` [N, K] bf16), pushed into
-        the FFN input's hop when that hop takes the row."""
+        the FFN input's hop when that hop takes the row; with ``gate`` [1, K] its input
+        is ``attn_output`` * sigmoid(``gate``)."""
         out = torch.empty(
             1, weight.shape[0], dtype=torch.bfloat16, device=weight.device
         )
         if self.attn_push_target(int(attn_output.shape[0])) is None:
-            return kernels.draft_gemv(attn_output, weight, out)
-        kernels.draft_gemv(attn_output, weight, out, hop_site=self.hop.site)
+            return kernels.draft_gemv(attn_output, weight, out, gate=gate)
+        kernels.draft_gemv(attn_output, weight, out, hop_site=self.hop.site, gate=gate)
         self.mark_pushed(out)
         return out
 

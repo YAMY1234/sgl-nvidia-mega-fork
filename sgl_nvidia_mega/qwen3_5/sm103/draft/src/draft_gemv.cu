@@ -5,12 +5,14 @@
 // One-row draft GEMV y[n] = bf16(sum_k W[n, k] * x[k]): bf16 operands, fp32 accumulation, output rounded
 // to bf16 as the served GEMM writes it (only the fp32 summation order differs). One warp per row with the
 // whole row in flight, the row loaded before the PDL wait (weights are static). With a hop site, every CTA
-// owns one 8-row fragment of the output and pushes it into the decode hop (sm103/hop) before storing it.
+// owns one 8-row fragment of the output and pushes it into the decode hop (sm103/hop) before storing it. With a
+// gate, the input is x * sigmoid(gate) rounded to bf16, as SGLang's attention output gate kernel writes it.
 // The q35hop namespace below is hop.cu's, copied verbatim (the push must follow its mailbox protocol;
 // test/kernels/test_qwen3_5_draft_hop.py compares the text).
 //
 // Built with NVRTC per reduction length Q35_DRAFT_GEMV_K: C-linkage entries q35_draft_gemv (4 rows a
-// CTA) and q35_draft_gemv_push (8 rows a CTA, pushing).
+// CTA) and q35_draft_gemv_push (8 rows a CTA, pushing), and their gated twins q35_draft_gemv_gate and
+// q35_draft_gemv_push_gate.
 
 #include <cuda_bf16.h>
 
@@ -360,6 +362,7 @@ namespace q35draft_gemv {
 
 struct Params {
   const __nv_bfloat16* x;               // [K], written by the previous grid
+  const __nv_bfloat16* gate;            // kGate: [K], applied to x as it is staged
   const __nv_bfloat16* __restrict__ w;  // [N, K]
   __nv_bfloat16* y;                     // [N]
   int32_t n;
@@ -374,13 +377,36 @@ __device__ __forceinline__ float warp_reduce_sum(float value) {
   return value;
 }
 
+// Eight bf16(x * sigmoid(g)) in the instruction sequence Triton emits for _fused_sigmoid_mul_kernel (fp32,
+// exp(-g) as ex2.approx of -g * log2(e), 1 / (1 + e) by div.full, product rounded to nearest-even bf16).
+__device__ __forceinline__ uint4 gate_mul8(const uint4 xv, const uint4 gv) {
+  const __nv_bfloat16* x = reinterpret_cast<const __nv_bfloat16*>(&xv);
+  const __nv_bfloat16* g = reinterpret_cast<const __nv_bfloat16*>(&gv);
+  uint4 out;
+  __nv_bfloat16* o = reinterpret_cast<__nv_bfloat16*>(&out);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    float t;
+    asm("mul.rn.f32 %0, %1, 0fBFB8AA3B;\n\t"
+        "ex2.approx.f32 %0, %0;\n\t"
+        "add.rn.f32 %0, %0, 0f3F800000;\n\t"
+        "div.full.f32 %0, 0f3F800000, %0;\n\t"
+        "mul.rn.f32 %0, %2, %0;"
+        : "=&f"(t)
+        : "f"(__bfloat162float(g[e])), "f"(__bfloat162float(x[e])));
+    o[e] = __float2bfloat16_rn(t);
+  }
+  return out;
+}
+
 /**
  * \brief kRows warps per CTA; warp w of CTA c takes rows kRows * c + w, then a grid stride further on, the
  * next row loaded while the current one is reduced (as the draft head does).
  * \tparam kK    reduction length (a multiple of 256)
  * \tparam kRows warps per CTA; 8 when pushing, with one row per warp so a CTA owns one hop fragment
+ * \tparam kGate stage x * sigmoid(gate) instead of x
  */
-template <int kK, int kRows, bool kUsePDL, bool kPush>
+template <int kK, int kRows, bool kUsePDL, bool kPush, bool kGate>
 __device__ __forceinline__ void mkd_gemv_kernel(const Params& p) {
   static_assert(kK % 256 == 0, "K must tile 32 lanes x 8 bf16");
   static_assert(!kPush || kRows == 8, "a pushing CTA owns exactly one 8-row fragment");
@@ -400,7 +426,9 @@ __device__ __forceinline__ void mkd_gemv_kernel(const Params& p) {
   }
   if (kUsePDL) q35hop::pdl_wait();
   for (int i = static_cast<int>(threadIdx.x); i < kK / 8; i += kRows * 32) {
-    reinterpret_cast<uint4*>(s_x)[i] = reinterpret_cast<const uint4*>(p.x)[i];
+    uint4 xv = reinterpret_cast<const uint4*>(p.x)[i];
+    if constexpr (kGate) xv = gate_mul8(xv, reinterpret_cast<const uint4*>(p.gate)[i]);
+    reinterpret_cast<uint4*>(s_x)[i] = xv;
   }
   if constexpr (kPush) {
     if (threadIdx.x == 0) s_stage = q35hop::stage_peek(p.hop);
@@ -442,9 +470,17 @@ __device__ __forceinline__ void mkd_gemv_kernel(const Params& p) {
 using q35draft_gemv::Params;
 
 extern "C" __global__ void __launch_bounds__(4 * 32) q35_draft_gemv(const Params __grid_constant__ p) {
-  q35draft_gemv::mkd_gemv_kernel<Q35_DRAFT_GEMV_K, 4, true, false>(p);
+  q35draft_gemv::mkd_gemv_kernel<Q35_DRAFT_GEMV_K, 4, true, false, false>(p);
 }
 
 extern "C" __global__ void __launch_bounds__(8 * 32) q35_draft_gemv_push(const Params __grid_constant__ p) {
-  q35draft_gemv::mkd_gemv_kernel<Q35_DRAFT_GEMV_K, 8, true, true>(p);
+  q35draft_gemv::mkd_gemv_kernel<Q35_DRAFT_GEMV_K, 8, true, true, false>(p);
+}
+
+extern "C" __global__ void __launch_bounds__(4 * 32) q35_draft_gemv_gate(const Params __grid_constant__ p) {
+  q35draft_gemv::mkd_gemv_kernel<Q35_DRAFT_GEMV_K, 4, true, false, true>(p);
+}
+
+extern "C" __global__ void __launch_bounds__(8 * 32) q35_draft_gemv_push_gate(const Params __grid_constant__ p) {
+  q35draft_gemv::mkd_gemv_kernel<Q35_DRAFT_GEMV_K, 8, true, true, true>(p);
 }

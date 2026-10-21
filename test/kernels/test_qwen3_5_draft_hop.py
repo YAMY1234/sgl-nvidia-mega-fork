@@ -12,6 +12,8 @@ SM100-family GPUs (GB300) with NVLink multicast, on the decode hop's mailbox:
   decode hop's own, so the three mailbox stages cycle;
 - the draft o_proj GEMV equals an fp32 emulation of its summation order, bit for bit, and
   its pushed output followed by a consume-only all-reduce equals publish + consume;
+- with the attention output gate, the GEMV (plain and pushing) equals SGLang's gate
+  kernel followed by the plain GEMV, bit for bit;
 - a draft step's hops replayed from a CUDA graph with fresh inputs equal the eager run.
 
 Run with ``python test/kernels/test_qwen3_5_draft_hop.py --num-gpu 4``.
@@ -241,6 +243,33 @@ def test_draft_gemv_and_push(rank, draft):
             assert not draft.has_pushed(pushed)
             _same((pushed,), (plain,))
             _same(got, want)
+        torch.cuda.synchronize()
+
+
+@gpu
+def test_draft_gemv_folds_the_output_gate(rank, draft):
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import hop as kernels
+
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    with torch.inference_mode():
+        for seed in range(4):
+            x = _operands(1, device, rank, seed=500 + seed)
+            norm = _Norm(x["weight"])
+            g = torch.Generator(device=device).manual_seed(600 + seed)
+            gate = (
+                8.0 * torch.randn(1, O_PROJ_K, device=device, generator=g)
+            ).bfloat16()
+            gate[0, :4] = torch.tensor([-0.0, 0.0, 100.0, -100.0])
+            want = torch.empty(1, HIDDEN, dtype=torch.bfloat16, device=device)
+            kernels.draft_gemv(fused_sigmoid_mul(x["attn"], gate), x["o_proj"], want)
+            got = torch.empty_like(want)
+            kernels.draft_gemv(x["attn"], x["o_proj"], got, gate=gate)
+            _same((got,), (want,))
+            pushed = draft.o_proj(x["attn"], x["o_proj"], gate=gate)
+            draft.ffn_input(pushed, x["residual"], norm, moe_single_launch=False)
+            _same((pushed,), (want,))
         torch.cuda.synchronize()
 
 

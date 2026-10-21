@@ -292,7 +292,13 @@ class Attention:
         attn = self.layer.attn
         bmm1_scale = 1.0 * kv.k_scale[0] * attn.scaling
         bmm2_scale = kv.v_scale[0]
-        if self.q1 is not None and rows_per_request == 1 and _q1_label() != Q1_STOCK:
+        # q1 decodes one request
+        if (
+            self.q1 is not None
+            and rows_per_request == 1
+            and q8.shape[0] == 1
+            and _q1_label() != Q1_STOCK
+        ):
             return self.q1(q8, kv, meta).view(-1, self.heads * self.head_dim)
         if self.skv2 is not None and rows_per_request > 1 and self.skv2.long():
             return self.skv2.run(attn, q8, kv, meta)

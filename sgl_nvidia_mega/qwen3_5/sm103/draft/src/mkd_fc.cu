@@ -316,8 +316,8 @@ extern "C" __global__ void __launch_bounds__(256) mkd_fc_memo(const MkdFcMemoPar
   sglang::mkd_fc_memo_kernel<4096, MKD_WORLD, 8>(p);
 }
 
-// One CTA per SM (the launch is SM-count CTAs). With 2.2's __launch_bounds__(256) ptxas holds NVRTC's
-// build to 32 registers and splits each row's four weight loads into two batches (+24%).
+// One CTA per SM (SM-count CTAs, or the SMs the draft head leaves it). With 2.2's __launch_bounds__(256)
+// ptxas holds NVRTC's build to 32 registers and splits each row's four weight loads into two batches (+24%).
 extern "C" __global__ void __launch_bounds__(256, 1) mkd_hidden_partial(const MkdHiddenPartialParams __grid_constant__ p) {
   sglang::mkd_hidden_partial_kernel<4096, MKD_WORLD>(p);
 }

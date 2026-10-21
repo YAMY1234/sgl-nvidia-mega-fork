@@ -1687,6 +1687,244 @@ def test_the_executor_offers_the_verify_split_kv_variants_with_slot_skv2():
     assert slot.graph_variants == {"target_verify": route.VERIFY}
 
 
+# -------------------------------------------------------------------- slot mka
+
+
+def _fp8_linear(log, name):
+    """A static per-tensor FP8 ModelOpt linear (its method matched by name, as the branch does)."""
+    method = type("ModelOptFp8LinearMethod", (), {"use_marlin": False})()
+    linear = SimpleNamespace(
+        quant_method=method,
+        weight=torch.zeros(8, 4, dtype=torch.float8_e4m3fn),
+        input_scale=torch.ones(1),
+        weight_scale=torch.ones(1),
+    )
+    log.known.update(
+        {f"{name}_sx": linear.input_scale, f"{name}_sw": linear.weight_scale}
+    )
+    return linear
+
+
+def _mka_layer(log, attn, **kw):
+    """A Qwen3.5 TP8 full-attention layer as slot mka reads it."""
+    from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
+
+    rope = MRotaryEmbedding.__new__(MRotaryEmbedding)
+    torch.nn.Module.__init__(rope)
+    rope.__dict__.update(
+        rotary_dim=64,
+        cos_sin_cache=torch.zeros(16, 64),
+        axis_map=torch.zeros(32, dtype=torch.int64),
+    )
+    layer = SimpleNamespace(
+        attn=attn,
+        attn_output_gate=True,
+        num_heads=4,
+        num_kv_heads=1,
+        head_dim=256,
+        hidden_size=4096,
+        rotary_emb=rope,
+        qkv_proj=_fp8_linear(log, "qkv"),
+        o_proj=_fp8_linear(log, "o"),
+        q_norm=SimpleNamespace(weight=torch.zeros(256), variance_epsilon=1e-6),
+        k_norm=SimpleNamespace(weight=torch.zeros(256)),
+    )
+    layer.__dict__.update(kw)
+    log.known.update(
+        cos_sin=rope.cos_sin_cache,
+        axis=rope.axis_map,
+        qnw=layer.q_norm.weight,
+        knw=layer.k_norm.weight,
+    )
+    return layer
+
+
+@pytest.mark.parametrize("skv2", [False, True])
+def test_the_mka_slot_runs_the_prologue_the_attention_and_the_epilogue(skv2):
+    from sgl_nvidia_mega.qwen3_5.attention import mka, split_kv
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import mka as kernels
+
+    log = _log()
+    attn, st = _skv2_setup(log, k_scale=torch.full((1,), 0.75))
+    log.known["k_scale"] = attn.k_scale
+    layer = _mka_layer(log, attn)
+    x = torch.zeros(7, 4096, dtype=torch.bfloat16)
+    positions = torch.zeros(3, 7, dtype=torch.int64)
+    st.positions, st.slots = positions, plan.Slots(skv2=skv2, mka=True)
+    log.known.update(x=x, positions=positions, w_qkv="w_qkv", w_o="w_o")
+    mka.WEIGHTS[7] = ("w_qkv", "w_o")
+    attn._fn = lambda *a, **k: log.op("attention")(*a, **k) or torch.zeros(7, 4, 256)
+
+    def prologue(**kw):
+        log.known.update(q=kw["q_out"], gate=kw["gate_out"])
+        log.append(("prologue", tuple(sorted((k, log.tag(v)) for k, v in kw.items()))))
+        log.known["eps"] = kw["eps"]
+
+    def epilogue(**kw):
+        log.append(("epilogue", tuple(sorted((k, log.tag(v)) for k, v in kw.items()))))
+
+    def core(attn_, q, st_):
+        log.append(("skv2_core", log.tag(q)))
+        return torch.zeros(7, 1024, dtype=torch.bfloat16)
+
+    @contextlib.contextmanager
+    def symmetric(group, disabled=False):
+        log.append(("symmetric", group, disabled))
+        yield
+
+    with (
+        patch.object(kernels, "prologue", prologue),
+        patch.object(kernels, "epilogue", epilogue),
+        patch.object(split_kv, "core", core),
+        patch(
+            "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
+            symmetric,
+        ),
+        patch("sglang.srt.layers.dp_attention.is_allocation_symmetric", lambda: True),
+        patch(
+            "sglang.srt.runtime_context.get_parallel",
+            lambda: SimpleNamespace(tp_group="tp"),
+        ),
+    ):
+        out = attention.step(layer, x, st)
+    del mka.WEIGHTS[7]
+    assert [e[0] for e in log] == [
+        "prologue",
+        "skv2_core" if skv2 else "attention",
+        "symmetric",
+        "epilogue",
+    ]
+    assert dict(log[0][1]) == {
+        "x": "x(7, 4096)",
+        "w_packed": "w_qkv",
+        "sx": "qkv_sx(1,)",
+        "sw": "qkv_sw(1,)",
+        "q_norm_w": "qnw(256,)",
+        "k_norm_w": "knw(256,)",
+        "cos_sin": "cos_sin(16, 64)",
+        "positions": "positions(3, 7)",
+        "axis_map": "axis(32,)",
+        # this layer's pool rows of the forward's view, at the step's slots
+        "cache_loc": "loc(7,)",
+        "k_cache": "k7(192, 1, 256)",
+        "v_cache": "v7(192, 1, 256)",
+        "k_scale": "k_scale(1,)",
+        "v_scale": "v_scale(1,)",
+        "q_out": "q(7, 1024)",
+        "gate_out": "gate(7, 1024)",
+        "nq": 4,
+        "eps": "?",
+    }
+    assert log.known["eps"] == 1e-6  # the q norm's epsilon
+    if skv2:
+        assert log[1] == ("skv2_core", "q(7, 1024)")
+    else:
+        # SGLang's attention on the rows the prologue wrote: no K / V to write
+        assert log[1][2:] == (("q(7, 1024)", None, None, "fb"), ())
+    assert log[2] == ("symmetric", "tp", False)
+    kw = dict(log[3][1])
+    assert (kw["gate"], kw["w_packed"], kw["sx"], kw["sw"]) == (
+        "gate(7, 1024)",
+        "w_o",
+        "o_sx(1,)",
+        "o_sw(1,)",
+    )
+    assert kw["attn"] == "?(7, 1024)" and kw["nq"] == 4 and kw["site"] is None
+    assert out.shape == (7, 4096) and out.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize(
+    "kw, want",
+    [
+        (dict(), ""),
+        (dict(attn_output_gate=False), "no attention output gate"),
+        (dict(num_heads=2), "2 query / 1 KV heads a rank"),
+        (dict(num_kv_heads=2), "4 query / 2 KV heads a rank"),
+        (dict(head_dim=128), "head_dim 128, hidden 4096"),
+        (dict(rotary_emb=SimpleNamespace(rotary_dim=64)), "no M-RoPE axis map"),
+        (dict(rotary_dim=128), "rotary_dim 128 with a torch.float32 cos/sin cache"),
+        (dict(cos_sin_dtype=torch.bfloat16), "rotary_dim 64 with a torch.bfloat16"),
+        (dict(qkv_marlin=True), "not a static per-tensor FP8 linear"),
+        (dict(o_scales=2), "not a static per-tensor FP8 linear"),
+    ],
+)
+def test_the_mka_slot_names_what_a_layer_lacks(kw, want):
+    from sgl_nvidia_mega.qwen3_5.attention import mka
+
+    log = _log()
+    special = {
+        k: kw.pop(k)
+        for k in list(kw)
+        if k in ("rotary_dim", "cos_sin_dtype", "qkv_marlin", "o_scales")
+    }
+    layer = _mka_layer(log, None, **kw)
+    if "rotary_dim" in special:
+        layer.rotary_emb.rotary_dim = special["rotary_dim"]
+    if "cos_sin_dtype" in special:
+        layer.rotary_emb.cos_sin_cache = torch.zeros(
+            16, 64, dtype=special["cos_sin_dtype"]
+        )
+    if "qkv_marlin" in special:
+        layer.qkv_proj.quant_method.use_marlin = True
+    if "o_scales" in special:
+        layer.o_proj.weight_scale = torch.ones(special["o_scales"])
+    got = mka.unsupported(layer)
+    assert (want in got) if want else got == ""
+
+
+def test_the_mka_slot_is_built_with_its_weights_packed_for_every_attention_layer(
+    monkeypatch,
+):
+    from sgl_nvidia_mega.qwen3_5.attention import mka
+
+    def layer(kind):
+        made = kind.__new__(kind)
+        torch.nn.Module.__init__(made)
+        return made
+
+    layers = [
+        layer(qwen3_5.Qwen3_5LinearDecoderLayer),
+        layer(qwen3_5.Qwen3_5AttentionDecoderLayer),
+        layer(qwen3_5.Qwen3_5AttentionDecoderLayer),
+    ]
+    model = SimpleNamespace(
+        is_mrope_enabled=True,
+        model=SimpleNamespace(start_layer=0, end_layer=3, layers=layers),
+    )
+    packed, why = [], {}
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"mka"}))
+    monkeypatch.setattr(mka, "unsupported", lambda l: why.get(id(l), ""))
+    monkeypatch.setattr(mka, "pack", packed.append)
+    ctx = SimpleNamespace(tokens_per_request=7)
+    assert attention.build(model, ctx) == attention.Bound(mka=True)
+    assert packed == layers[1:]
+    # a layer the slot cannot serve leaves the slot unbuilt, packs nothing more
+    why[id(layers[2])] = "no attention output gate"
+    assert attention.build(model, ctx) == attention.Bound(
+        reason="layer 2: no attention output gate"
+    )
+    assert len(packed) == 2
+    model.is_mrope_enabled = False
+    assert attention.build(model, ctx).reason == (
+        "layer 1: no M-RoPE positions (MKA reads them)"
+    )
+
+
+def test_the_mka_slot_names_the_pools_it_cannot_write():
+    from sgl_nvidia_mega.qwen3_5.attention import mka
+
+    def kv(*bufs):
+        return SimpleNamespace(k=bufs, v=bufs)
+
+    assert (
+        mka.pool_reasons(kv(torch.zeros(64, 1, 256, dtype=torch.float8_e4m3fn))) == []
+    )
+    assert mka.pool_reasons(kv(torch.zeros(64, 2, 256, dtype=torch.float8_e4m3fn))) == [
+        "a torch.float8_e4m3fn KV pool buffer of strides (512, 256, 1)"
+    ]
+    assert "torch.float32" in mka.pool_reasons(kv(torch.zeros(64, 1, 256)))[0]
+
+
 class _Exit:
     def __init__(self, log, defer):
         self.log, self.defer_moe_finalize = log, defer

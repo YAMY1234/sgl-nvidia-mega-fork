@@ -203,11 +203,14 @@ class Qwen35Verify:
                     "NVIDIA megakernel: slot gdn_front cannot run: "
                     + "; ".join(reasons)
                 )
-        if any(s.skv2 for s in self.slots.values()):
-            reasons = attention.pool_reasons(view, self.binding)
+        skv2 = any(s.skv2 for s in self.slots.values())
+        mka = any(s.mka for s in self.slots.values())
+        if skv2 or mka:
+            reasons = attention.pool_reasons(view, self.binding, skv2=skv2, mka=mka)
             if reasons:
                 raise RuntimeError(
-                    "NVIDIA megakernel: slot skv2 cannot run: " + "; ".join(reasons)
+                    "NVIDIA megakernel: the attention slots cannot run: "
+                    + "; ".join(reasons)
                 )
         self._pools_checked = True
 

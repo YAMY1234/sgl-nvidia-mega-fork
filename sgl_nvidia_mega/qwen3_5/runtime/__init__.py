@@ -24,6 +24,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "gdn_front",
     "route_shared",
     "skv2",
+    "mka",
 )
 # The EAGLE entries (spec.ENTRIES) offered only when requested in the same variable;
 # verify_sample has no step at any size, so it turns on SGLang's post-verify graphs
@@ -128,6 +129,7 @@ def build(model, ctx):
         gdn_front=bool(bound["gdn"].front),
         route_shared=bound["moe"].shared,
         skv2=bound["attention"].skv2,
+        mka=bound["attention"].mka,
     )
     slots = slot_plan.plan(pctx.widths, facts)
     built = msgspec.structs.asdict(facts)

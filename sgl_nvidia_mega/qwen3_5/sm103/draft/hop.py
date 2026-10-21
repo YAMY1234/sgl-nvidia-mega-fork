@@ -13,7 +13,8 @@
 then FlashInfer's CuTe DSL FusedAddRMSNorm (multiplier ``weight_bias + gamma``).
 ``draft_gemv`` (``src/draft_gemv.cu``) is the one-row bf16 GEMV with fp32 accumulation;
 with ``hop_site`` it also pushes its output into the hop, whose all-reduce then only
-consumes.
+consumes; with ``gate`` it takes ``x * sigmoid(gate)`` as its input, in the arithmetic of
+SGLang's attention output gate kernel.
 
 Kernels compile in ``build`` (never under CUDA-graph capture); the consume's wait
 deadline is compiled in, as the decode hop's.
@@ -51,6 +52,7 @@ class GemvParams(ctypes.Structure):
 
     _fields_ = [
         ("x", ctypes.c_void_p),
+        ("gate", ctypes.c_void_p),
         ("w", ctypes.c_void_p),
         ("y", ctypes.c_void_p),
         ("n", ctypes.c_int),
@@ -83,8 +85,11 @@ def _consume_kernels(device_index: int, deadline_ns: int) -> dict[str, jit.Kerne
 
 
 @cache
-def _gemv_kernels(device_index: int, k: int) -> tuple[jit.Kernel, jit.Kernel, int]:
-    """(plain, pushing, the plain kernel's grid cap: resident CTAs on the device)."""
+def _gemv_kernels(
+    device_index: int, k: int, gate: bool = False
+) -> tuple[jit.Kernel, jit.Kernel, int]:
+    """(plain, pushing, the plain kernel's grid cap: resident CTAs on the device), the
+    gated twins with ``gate``."""
     if k % 256:
         raise ValueError(f"draft GEMV: K {k} is not a multiple of 256")
     major, minor = torch.cuda.get_device_capability(device_index)
@@ -94,8 +99,11 @@ def _gemv_kernels(device_index: int, k: int) -> tuple[jit.Kernel, jit.Kernel, in
         f"sm_{major}{minor}a",
         ("-std=c++17", "-default-device", f"-DQ35_DRAFT_GEMV_K={k}"),
     )
-    plain = jit.load(cubin, "q35_draft_gemv", (GEMV_ROWS * 32, 1, 1), 0)
-    push = jit.load(cubin, "q35_draft_gemv_push", (GEMV_PUSH_ROWS * 32, 1, 1), 0)
+    suffix = "_gate" if gate else ""
+    plain = jit.load(cubin, f"q35_draft_gemv{suffix}", (GEMV_ROWS * 32, 1, 1), 0)
+    push = jit.load(
+        cubin, f"q35_draft_gemv_push{suffix}", (GEMV_PUSH_ROWS * 32, 1, 1), 0
+    )
     cu = jit.driver()
     (per_sm,) = jit.check(
         cu.cuOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -116,7 +124,8 @@ def build(device_index: int, deadline_ns: int, gemv_ks: tuple[int, ...] = ()) ->
     for each reduction length in ``gemv_ks``."""
     _CONSUME[device_index] = _consume_kernels(device_index, int(deadline_ns))
     for k in gemv_ks:
-        _gemv_kernels(device_index, int(k))
+        for gate in (False, True):
+            _gemv_kernels(device_index, int(k), gate)
 
 
 def draft_all_reduce_rms_norm(
@@ -202,11 +211,13 @@ def draft_gemv(
     out: torch.Tensor,
     hop_site: Optional[decode_hop.Site] = None,
     hop_token: int = 0,
+    gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``out`` [1, N] bf16 = ``x`` [1, K] @ ``weight`` [N, K]^T with fp32 accumulation,
     one warp per row. ``hop_site``: the decode hop's ``Site``; the output (N = 4096) is
     then also pushed into that hop as row ``hop_token``, and its all-reduce only
-    consumes."""
+    consumes. ``gate`` [1, K] bf16: the input is then ``x`` * sigmoid(``gate``),
+    rounded to bf16."""
     k, n = int(x.shape[-1]), int(weight.shape[0])
     if (
         x.dtype != torch.bfloat16
@@ -223,9 +234,17 @@ def draft_gemv(
             f"draft GEMV: x {x.dtype} {tuple(x.shape)}, weight {weight.dtype} "
             f"{tuple(weight.shape)}, out {out.dtype} {tuple(out.shape)}"
         )
-    plain, push, resident = _gemv_kernels(x.device.index, k)
+    if gate is not None and (
+        gate.dtype != torch.bfloat16
+        or tuple(gate.shape) != (1, k)
+        or not gate.is_contiguous()
+        or gate.data_ptr() % 16
+    ):
+        raise ValueError(f"draft GEMV: gate {gate.dtype} {tuple(gate.shape)}")
+    plain, push, resident = _gemv_kernels(x.device.index, k, gate is not None)
     params = GemvParams(
         x=x.data_ptr(),
+        gate=gate.data_ptr() if gate is not None else x.data_ptr(),
         w=weight.data_ptr(),
         y=out.data_ptr(),
         n=n,

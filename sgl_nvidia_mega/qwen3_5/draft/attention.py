@@ -35,6 +35,10 @@ Q1_PDL = True
 # The one-row front launches as a programmatic dependent of the qkv GEMM, loading its
 # static operands before the wait (same arithmetic)
 QKN_PDL = True
+# 1: slot draft_hop's one-row o_proj stages attn * sigmoid(gate) itself, in the gate
+# kernel's arithmetic, in place of that kernel; 2: also, under Q1_PDL, the q1 merge
+# releases that o_proj at entry
+GATE_FOLD = 2
 
 
 class Q1Variants:
@@ -193,6 +197,16 @@ class Attention:
             )
             o = self.core(q, k, v, cache_loc, meta, kv, rows_per_request)
         if layer.attn_output_gate:
+            if (
+                o_proj is not None
+                and GATE_FOLD
+                and gate.shape == o.shape
+                and gate.is_contiguous()
+            ):
+                self._note(
+                    "slot draft_hop's one-row o_proj applies the attention output gate"
+                )
+                return o_proj(o, gate=gate)
             o = fused_sigmoid_mul(o, gate, inplace=True)
         if o_proj is not None:
             return o_proj(o)
@@ -385,8 +399,9 @@ def build_q1(parts):
     )
     if why is not None:
         raise RuntimeError(f"NVIDIA megakernel: slot draft_q1 cannot run: {why}")
-    q1.build(device.index, heads=attention.heads, pdl=Q1_PDL)
-    decode = q1.Q1Decode(pdl=Q1_PDL)
+    release = GATE_FOLD == 2
+    q1.build(device.index, heads=attention.heads, pdl=Q1_PDL, release=release)
+    decode = q1.Q1Decode(pdl=Q1_PDL, release=release)
     if Q1_PDL:
         logger.info(
             "NVIDIA megakernel: Qwen3.5 MTP draft slot draft_q1 launches the q1 decode "

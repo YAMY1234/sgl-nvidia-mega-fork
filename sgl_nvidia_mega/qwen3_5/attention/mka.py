@@ -10,7 +10,10 @@ The prologue takes the normed rows and writes the FP8 query rows, the bf16 gate 
 step's FP8 K / V rows into the forward view's pool; the attention reads them (slot
 ``skv2``'s core when it runs, else SGLang's attention with no K / V to write); the
 epilogue gates, quantizes and runs ``o_proj`` into the TP-partial output, in SGLang's
-symmetric pool as ``RowParallelLinear``'s output. The weights are packed at build.
+symmetric pool as ``RowParallelLinear``'s output. The weights are packed at build. With
+slot ``mka_push`` the epilogue also pushes its rows into the decode hop's mailbox where
+the MoE input's all-reduce will run the hop for them, and that all-reduce only consumes
+(the branch's MKA_PUSH).
 """
 
 from __future__ import annotations
@@ -174,7 +177,7 @@ def step(layer, x, st):
         get_parallel().tp_group, disabled=not is_allocation_symmetric()
     ):
         out = torch.empty((m, layer.hidden_size), dtype=torch.bfloat16, device=x.device)
-    # slot mka_push hands the hop's site here and marks the rows pushed
+    hop = _push_hop(layer, st, m) if st.slots.mka_push else None
     kernels.epilogue(
         attn=o,
         gate=gate,
@@ -183,6 +186,22 @@ def step(layer, x, st):
         sw=layer.o_proj.weight_scale,
         out=out,
         nq=layer.num_heads,
-        site=None,
+        site=None if hop is None else hop.site,
     )
+    if hop is not None:
+        hop.mark_pushed(out)
     return out
+
+
+def _push_hop(layer, st, m: int):
+    """Slot mka_push: the hop the epilogue pushes its rows into, where the MoE input's
+    all-reduce runs the hop for them (it then only consumes); else None."""
+    from sgl_nvidia_mega.qwen3_5.boundary import hop as boundary_hop
+
+    hop = st.bound["boundary"].hop
+    if not boundary_hop.takes_moe_input(hop, layer, st, m):
+        return None
+    if ("push", m) not in _ENGAGED:
+        _ENGAGED.add(("push", m))
+        logger.info("NVIDIA megakernel: Qwen3.5 slot mka_push runs at %d rows", m)
+    return hop

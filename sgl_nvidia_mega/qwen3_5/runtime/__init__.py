@@ -25,6 +25,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "route_shared",
     "skv2",
     "mka",
+    "mka_push",
 )
 # The EAGLE entries (spec.ENTRIES) offered only when requested in the same variable;
 # verify_sample has no step at any size, so it turns on SGLang's post-verify graphs
@@ -70,6 +71,11 @@ def slot_reasons() -> list[str]:
     if "gdn_pdl" in SLOTS and "gdn_verify" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_pdl' launches slot 'gdn_verify''s verify"
+        )
+    if "mka_push" in SLOTS and not {"mka", "hop"} <= SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'mka_push' pushes slot 'mka''s epilogue into slot "
+            "'hop''s mailbox"
         )
     return reasons
 
@@ -130,6 +136,7 @@ def build(model, ctx):
         route_shared=bound["moe"].shared,
         skv2=bound["attention"].skv2,
         mka=bound["attention"].mka,
+        mka_push=bound["attention"].mka_push,
     )
     slots = slot_plan.plan(pctx.widths, facts)
     built = msgspec.structs.asdict(facts)

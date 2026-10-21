@@ -36,6 +36,12 @@ SGLANG_READS = {
 
 # Draft steps carry one row; the verify and extend widths keep their own kernels.
 MAX_M = 1
+# Whether the attention output's o_proj runs as the one-row GEMV that pushes into the FFN
+# input's hop, per TP size, as SGLang branch nvidia/qwen35-agentx-gb300 runs them: TP8 does
+# (SGLANG_Q35MF_MKD_GEMV); TP4 runs SGLang's o_proj and the hop publishes its output (that
+# branch's TP4 setup also pushes the single-launch MoE into the final norm's hop,
+# SGLANG_Q35MF_MKD_HOP_PUSH, which changes no bits and is not ported).
+GEMV_O_PROJ = {8: True, 4: False}
 
 
 class DraftHop:
@@ -45,9 +51,16 @@ class DraftHop:
     head (both read only static data before their PDL wait)."""
 
     def __init__(
-        self, hop, *, early: bool = True, early_head: bool = False, delay_ns: int = 0
+        self,
+        hop,
+        *,
+        early: bool = True,
+        early_head: bool = False,
+        delay_ns: int = 0,
+        gemv: bool = True,
     ):
         self.hop = hop  # the target's sm103.hop.Hop
+        self.gemv = gemv  # the o_proj GEMV built: o_proj() pushes into ffn_input's hop
         self.early = early
         self.early_head = early and early_head
         self.delay_ns = delay_ns  # diagnostic: hold the consume's output stores
@@ -82,7 +95,10 @@ class DraftHop:
             int(deadline_s * 1e9),
             gemv_ks=() if o_proj_k is None else (o_proj_k,),
         )
-        return cls(hop, early=early, early_head=early_head), ""
+        return (
+            cls(hop, early=early, early_head=early_head, gemv=o_proj_k is not None),
+            "",
+        )
 
     def supports(self, m: int) -> bool:
         return 1 <= m <= MAX_M and self.hop.supports(m)

@@ -3,26 +3,27 @@
 """Slot draft_front's attention front (sm103/draft/front.py, 2.2's ATTN_FRONT) against SGLang's
 two launches it replaces, on one GPU: the fused q / k Gemma RMSNorm + RoPE + gate split,
 then the fused FP8 q / k / v + paged KV write. The FP8 q, the gate and the K / V cache
-rows must be the same bytes, at the draft's widths (1 and 7 rows), in eager and in a
-CUDA graph replayed with new positions and slots."""
+rows must be the same bytes, at the draft's widths (1 and 7 rows) and query heads a rank
+(4 at TP8, 8 at TP4), in eager and in a CUDA graph replayed with new positions and
+slots."""
 
 import pytest
 import torch
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
-HEADS, KV_HEADS, HEAD_DIM, ROTARY = 4, 1, 256, 64  # the TP8 draft layer's shapes
+KV_HEADS, HEAD_DIM, ROTARY = 1, 256, 64  # the draft layer's shapes at TP8 and TP4
 SLOTS = 4096
 
 
-def _inputs(rows, seed):
+def _inputs(rows, seed, heads):
     g = torch.Generator(device="cuda").manual_seed(seed)
     dev = "cuda"
 
     def randn(*shape, scale=1.0):
         return (torch.randn(*shape, generator=g, device=dev) * scale).to(torch.bfloat16)
 
-    q_gate = randn(rows, HEADS * 2 * HEAD_DIM, scale=2.0)
+    q_gate = randn(rows, heads * 2 * HEAD_DIM, scale=2.0)
     k = randn(rows, KV_HEADS * HEAD_DIM, scale=2.0)
     v = randn(rows, KV_HEADS * HEAD_DIM, scale=3.0)
     q_gate[0, :8] = -0.0
@@ -55,9 +56,9 @@ def _stock(inputs, kv):
     )
 
     q_gate, k, v, q_w, k_w, cos_sin, positions, cache_loc, k_scale, v_scale = inputs
-    rows = q_gate.shape[0]
+    rows, heads = q_gate.shape[0], q_gate.shape[1] // (2 * HEAD_DIM)
     q, k_out, gate = fused_qk_gemma_rmsnorm_rope_gate(
-        q_gate, k, q_w, k_w, cos_sin, positions, 1e-6, HEADS, KV_HEADS, HEAD_DIM, ROTARY
+        q_gate, k, q_w, k_w, cos_sin, positions, 1e-6, heads, KV_HEADS, HEAD_DIM, ROTARY
     )
     q8 = fused_fp8_qkv_kv_cache(
         q=q.view(rows, -1),
@@ -78,7 +79,7 @@ def _plugin(inputs, kv):
     )
 
     q_gate, k, v, q_w, k_w, cos_sin, positions, cache_loc, k_scale, v_scale = inputs
-    rows = q_gate.shape[0]
+    rows, heads = q_gate.shape[0], q_gate.shape[1] // (2 * HEAD_DIM)
     q8, k_none, gate = fused_qk_gemma_rmsnorm_rope_gate(
         q_gate,
         k,
@@ -87,7 +88,7 @@ def _plugin(inputs, kv):
         cos_sin,
         positions,
         1e-6,
-        HEADS,
+        heads,
         KV_HEADS,
         HEAD_DIM,
         ROTARY,
@@ -106,10 +107,11 @@ def _same(a, b):
 
 
 @cuda
+@pytest.mark.parametrize("heads", [4, 8])
 @pytest.mark.parametrize("rows", [1, 7])
 @pytest.mark.parametrize("seed", [0, 1, 2])
-def test_the_front_writes_what_sglangs_two_launches_write(rows, seed):
-    inputs = _inputs(rows, seed)
+def test_the_front_writes_what_sglangs_two_launches_write(rows, seed, heads):
+    inputs = _inputs(rows, seed, heads)
     kv_s, kv_p = _caches(), _caches()
     q_s, gate_s = _stock(inputs, kv_s)
     q_p, gate_p = _plugin(inputs, kv_p)
@@ -119,9 +121,10 @@ def test_the_front_writes_what_sglangs_two_launches_write(rows, seed):
 
 
 @cuda
-def test_the_front_replays_in_a_graph_with_new_positions_and_slots():
+@pytest.mark.parametrize("heads", [4, 8])
+def test_the_front_replays_in_a_graph_with_new_positions_and_slots(heads):
     rows = 1
-    inputs = _inputs(rows, 5)
+    inputs = _inputs(rows, 5, heads)
     kv_s, kv_p = _caches(), _caches()
     static = [t.clone() for t in inputs]
     _plugin(static, kv_p)  # compile outside capture
@@ -130,7 +133,7 @@ def test_the_front_replays_in_a_graph_with_new_positions_and_slots():
     with torch.cuda.graph(graph):
         q_p, gate_p = _plugin(static, kv_p)
     for seed in (11, 12, 13):
-        fresh = _inputs(rows, seed)
+        fresh = _inputs(rows, seed, heads)
         for dst, src in zip(static, fresh):
             dst.copy_(src)
         graph.replay()

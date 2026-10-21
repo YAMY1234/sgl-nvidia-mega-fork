@@ -81,6 +81,10 @@ def test_the_documented_setup_is_accepted():
     assert _refusal() == ""
 
 
+def test_tp4_on_one_tray_is_accepted():
+    assert _refusal(tp_size=4, nnodes=1) == ""
+
+
 BREAKABLE = with_phase(
     default_cuda_graph_config(), Phase.DECODE, backend=Backend.BREAKABLE
 )
@@ -89,7 +93,7 @@ BREAKABLE = with_phase(
 @pytest.mark.parametrize(
     "kw, want",
     [
-        (dict(tp_size=4), "tp_size 4"),
+        (dict(tp_size=2, nnodes=1), "tp_size 2"),
         (dict(pp_size=2), "pipeline parallelism is in use"),
         (dict(enable_dp_attention=True, dp_size=8), "DP attention is in use"),
         (dict(kv_cache_dtype="auto"), "kv_cache_dtype 'auto'"),
@@ -148,7 +152,7 @@ def test_a_slot_set_that_cannot_run_is_refused_before_the_load(
 
 
 def test_every_reason_is_listed_at_once():
-    message = _refusal(tp_size=4, kv_cache_dtype="auto", pp_size=2)
+    message = _refusal(tp_size=2, nnodes=1, kv_cache_dtype="auto", pp_size=2)
     assert message.count("\n  - ") == 3, message
 
 

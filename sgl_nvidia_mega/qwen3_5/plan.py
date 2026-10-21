@@ -27,9 +27,11 @@ import msgspec
 
 MAX_ROWS = 28  # the widest covered step: four requests of 7 verify rows (TP8 bs4)
 REQUESTS = (1, 2, 4)  # the requests of a covered step (SGLang's decode graph sizes)
-# the TP sizes whose steps of more than one request are covered (checked at TP8); at the
-# others a covered step is one request
+# the TP sizes whose steps of more than one request are covered when requested (checked at
+# TP8); at the others a covered step is one request
 MULTI_REQUEST_TP = (8,)
+# the name that requests them in the slot list
+MULTI_REQUEST = "multi_request"
 GDN_FRONT_ROWS = 7  # the rows slot gdn_front's front is built for
 # Each slot's widest step: its launcher's bound (sm103/moe/router.py MAX_TOKENS,
 # sm103/moe/mkm.py MAX_TOKENS, sm103/hop OPROJ_MAX_M, sm103/attention/mka.py), and for
@@ -122,12 +124,18 @@ def plan(
     return {w: slots(w, facts, tokens_per_request) for w in widths}
 
 
+def multi_request(tp_size: int, requested: frozenset) -> bool:
+    """Whether steps of more than one request are covered: ``MULTI_REQUEST`` requested
+    at a TP size in ``MULTI_REQUEST_TP``."""
+    return MULTI_REQUEST in requested and tp_size in MULTI_REQUEST_TP
+
+
 def candidates(
-    offered: tuple[int, ...], tokens_per_request: int, tp_size: int = 8
+    offered: tuple[int, ...], tokens_per_request: int, multi: bool = True
 ) -> tuple[int, ...]:
-    """The widths SGLang offers (``BuildContext.widths``) of ``REQUESTS`` requests (one
-    request at a TP size outside ``MULTI_REQUEST_TP``)."""
-    requests = REQUESTS if tp_size in MULTI_REQUEST_TP else (1,)
+    """The widths SGLang offers (``BuildContext.widths``) of ``REQUESTS`` requests, or of
+    one request without ``multi``."""
+    requests = REQUESTS if multi else (1,)
     return tuple(
         w
         for w in offered

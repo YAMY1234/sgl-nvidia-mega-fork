@@ -144,6 +144,10 @@ def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
         ),
         ({"route_shared"}, "slot 'route_shared' runs in slot 'route''s launch"),
         ({"route", "mkm_wide"}, "slot 'mkm_wide' is slot 'mkm''s 16-token engine"),
+        (
+            {"route", "mkm", "mkm_wide"},
+            "slot 'mkm_wide' serves the steps of more than one request ('multi_request')",
+        ),
     ],
 )
 def test_a_slot_set_that_cannot_run_is_refused_before_the_load(
@@ -201,8 +205,12 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     # SGLang offers every multiple of 7 up to MAX_ROWS; three requests are not covered
     offered = tuple(range(7, plan.MAX_ROWS + 1, 7))
     assert plan.candidates(offered, 7) == (7, 14, 28)
-    # more than one request only at TP8; TP4 keeps the one-request step it is checked at
-    assert plan.candidates(offered, 7, tp_size=4) == (7,)
+    assert plan.candidates(offered, 7, multi=False) == (7,)
+    # more than one request only when requested, and only at TP8; TP4 keeps the
+    # one-request step it is checked at
+    assert plan.multi_request(8, frozenset({"multi_request"}))
+    assert not plan.multi_request(8, frozenset())
+    assert not plan.multi_request(4, frozenset({"multi_request"}))
     assert plan.covered((7, 14, 28), every, 7) == (7, 14, 28)
     # one request is always covered, more only where a slot runs
     assert plan.covered((7, 14, 28), plan.Facts(), 7) == (7,)

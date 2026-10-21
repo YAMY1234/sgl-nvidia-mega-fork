@@ -74,14 +74,13 @@ class DraftExtend:
             io.kv,
             rows_per_request=io.tokens_per_request,
         )
-        selected = hidden.index_select(0, io.select_index)
+        # the selected rows and the exchange's token go straight into SGLang's outputs: no
+        # copies at the end of the graph
+        selected = torch.index_select(hidden, 0, io.select_index, out=io.hidden_out)
         if mkd is not None:
             lm = parts.lm
             local = lm.logits_processor._compute_lm_head(selected, lm.lm_head, None)
-            topk_p, topk_index = mkd.exchange_extend(local, selected)
-            io.topk_index_out.copy_(topk_index)
-            io.topk_p_out.copy_(topk_p)
+            mkd.exchange_extend(local, selected, io.topk_index_out, io.topk_p_out)
         else:
             io.topk_index_out.copy_(layer.top1(parts, selected).view(-1, 1))
             io.topk_p_out.fill_(1.0)
-        io.hidden_out.copy_(selected)

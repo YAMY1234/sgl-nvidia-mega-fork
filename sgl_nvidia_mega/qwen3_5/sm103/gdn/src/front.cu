@@ -8,8 +8,9 @@
 // and history ring. Ported from gdn_pdl_front_ba_mkm.cuh of SGLang branch nvidia/qwen35-agentx-gb300
 // (SGLANG_Q35MF_MKG_FUSED + MKG_BA_TC + MKM_GDN_FRONT); the device code is unchanged.
 //
-// Built with NVRTC: front_kernel is a device function, and the extern "C" entry at the end
-// instantiates its BF16-input form with the fused conv and the inline side projection.
+// Built with NVRTC: front_kernel is a device function, and the extern "C" entries at the end
+// instantiate its BF16-input form with the fused conv and the inline side projection, with the
+// projection weights in registers (q35_gdn_front) or by bulk copy into shared memory (q35_gdn_front_tma).
 
 #include <cuda_bf16.h>
 
@@ -207,6 +208,21 @@ __device__ __forceinline__ void mbar_expect_tx(uint64_t* bar, uint32_t bytes) {
   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(bar)), "r"(bytes)
                : "memory");
 }
+// Bulk copy of `bytes` from global memory into this CTA's shared memory, completing on `bar` (TMA engine).
+__device__ __forceinline__ void bulk_g2s(void* dst, const void* src, uint32_t bytes, uint64_t* bar) {
+  asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+               ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar))
+               : "memory");
+}
+__device__ __forceinline__ void mbar_wait_parity0(uint64_t* bar) {
+  unsigned ready = 0;
+  do {
+    asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], 0; selp.u32 %0, 1, 0, p; }"
+                 : "=r"(ready)
+                 : "r"(smem_u32(bar))
+                 : "memory");
+  } while (!ready);
+}
 __device__ __forceinline__ float div_full(float a, float b) {
   float r;
   asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
@@ -289,13 +305,20 @@ struct Params {
   gdn_ba::Params ba;
 };
 
+// Weight bytes per projection CTA: [8 warps][16 steps][2 blocks][32 lanes] x 16 B, contiguous in the packed layout.
+constexpr uint32_t kWeightBytes = 8 * 16 * 2 * 32 * 16;
+
 // Each cluster reduces its split-K partials in fixed rank order.
-template <bool Quantized, bool FuseConv = false, bool InlineBa = false>
+// Tma: the CTA's weights arrive by one bulk copy into shared memory issued before the PDL wait (instead of 32
+// register loads per thread), then each thread reads the same A fragments; same MMAs, same bits.
+template <bool Quantized, bool FuseConv = false, bool InlineBa = false, bool Tma = false>
 __device__ __forceinline__ void front_kernel(const Params& p) {
   if (threadIdx.x == 0) pdl_trigger();
   __shared__ __align__(16) float inbox[kCluster][256];
   __shared__ __align__(16) uint2 fragments[16][32];
   __shared__ __align__(8) uint64_t barrier;
+  __shared__ __align__(8) uint64_t weight_barrier;
+  extern __shared__ __align__(128) uint4 weight_smem[];  // kWeightBytes when Tma
   __shared__ float conv_stage[32][8];  // per channel: state taps 0..2, weights 3..6
   __shared__ int64_t conv_meta[3];     // valid, state slot, replay slot
   const int rank = cluster_rank(), unit = blockIdx.x / kCluster;
@@ -310,9 +333,23 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
       return;
     }
   }
-  if (tid == 0) { mbar_init(&barrier, 1); mbar_init_fence(); }
+  if (tid == 0) {
+    mbar_init(&barrier, 1);
+    if constexpr (Tma) mbar_init(&weight_barrier, 1);
+    mbar_init_fence();
+  }
   __syncthreads();
   cluster_arrive();
+  const uint4* block_weights = p.weight + (size_t)(unit * kCluster + rank) * (8 * 16 * 2 * 32);
+  if constexpr (Tma) {
+    if (tid == 0) {
+      mbar_expect_tx(&weight_barrier, kWeightBytes);
+#pragma unroll
+      for (int chunk = 0; chunk < 4; ++chunk)
+        bulk_g2s(weight_smem + chunk * (kWeightBytes / 64), block_weights + chunk * (kWeightBytes / 64),
+                 kWeightBytes / 4, &weight_barrier);
+    }
+  }
   // Convolution owners: warp 0 reads the weights, indices and rolling state off the projection path.
   const bool conv_reader = FuseConv && unit < 6 && warp == 0;
   const int conv_channel = unit * 256 + rank * 32 + (tid >> 2) + 8 * (tid & 3);
@@ -323,12 +360,14 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
     for (int tap = 0; tap < 4; ++tap) conv_tap[tap] = p.conv_weight[conv_channel * 4 + tap];
   }
   uint4 weights[16][2];
-  const uint4* wp = p.weight + (size_t)(unit * kCluster + rank) * (8 * 16 * 2 * 32) + warp * 1024 + lane;
+  if constexpr (!Tma) {
+    const uint4* wp = block_weights + warp * 1024 + lane;
 #pragma unroll
-  for (int step = 0; step < 16; ++step)
+    for (int step = 0; step < 16; ++step)
 #pragma unroll
-    for (int block = 0; block < 2; ++block)
-      weights[step][block] = ldg_nc_v4(wp + (step * 2 + block) * 32);
+      for (int block = 0; block < 2; ++block)
+        weights[step][block] = ldg_nc_v4(wp + (step * 2 + block) * 32);
+  }
   const float sx = __ldg(p.sx), alpha = __fmul_rn(sx, __ldg(p.sw));
   pdl_wait();
   // Issued now, tested before the first push: no store precedes the check.
@@ -360,6 +399,15 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
     fragments[step][lane] = value;
   }
   __syncthreads();
+  if constexpr (Tma) {
+    mbar_wait_parity0(&weight_barrier);
+    const uint4* ws = weight_smem + warp * 1024 + lane;
+#pragma unroll
+    for (int step = 0; step < 16; ++step)
+#pragma unroll
+      for (int block = 0; block < 2; ++block)
+        weights[step][block] = ws[(step * 2 + block) * 32];
+  }
   float chains[2][4][4] = {};
 #pragma unroll
   for (int step = 0; step < 16; ++step) {
@@ -484,4 +532,10 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
 extern "C" __global__ __launch_bounds__(sglang::gdn_pdl_front_ba_mkm_detail::kThreads, 1) void q35_gdn_front(
     const __grid_constant__ sglang::gdn_pdl_front_ba_mkm_detail::Params p) {
   sglang::gdn_pdl_front_ba_mkm_detail::front_kernel<false, true, true>(p);
+}
+
+// The same with each projection CTA's weights bulk-copied into kWeightBytes of dynamic shared memory.
+extern "C" __global__ __launch_bounds__(sglang::gdn_pdl_front_ba_mkm_detail::kThreads, 1) void q35_gdn_front_tma(
+    const __grid_constant__ sglang::gdn_pdl_front_ba_mkm_detail::Params p) {
+  sglang::gdn_pdl_front_ba_mkm_detail::front_kernel<false, true, true, true>(p);
 }

@@ -402,6 +402,18 @@ def test_parity_compares_bits_not_values():
         parity.differing(a, None)
 
 
+def test_parity_counts_the_requests_own_rows_apart():
+    # two requests of 2 rows; the second is a padded one (the pad slot)
+    valid = parity.valid_rows(torch.tensor([3, -1]), 4)
+    assert valid.tolist() == [True, True, False, False]
+    a = torch.zeros(4, 3)
+    b = a.clone()
+    b[3] = 1.0  # a padded row
+    assert int(parity.differing(a, b)) == 3 and int(parity.differing(a, b, valid)) == 0
+    b[0, 1] = 1.0  # a request's row
+    assert int(parity.differing(a, b, valid)) == 1
+
+
 @pytest.mark.parametrize("mode", ["1", "control"])
 def test_an_eager_parity_step_runs_sglangs_forward_first(
     eager, monkeypatch, caplog, mode
@@ -476,7 +488,7 @@ def test_trace_names_the_first_module_call_that_differs(eager, monkeypatch, capl
 
 def test_graph_parity_counts_are_logged_once_each(eager, caplog):
     checker = parity.Parity((7,), "cpu")
-    checker.counters[7] += torch.tensor([3, 0, 5, 63, 0])
+    checker.counters[7] += torch.tensor([3, 0, 5, 63, 0, 0, 2])
     checker.distance[7] += torch.tensor(
         [21.0, 2.0, 0.42, 0.25, 0.5], dtype=torch.float64
     )
@@ -487,6 +499,7 @@ def test_graph_parity_counts_are_logged_once_each(eager, caplog):
     assert lines == [
         "NVIDIA megakernel parity graph target_verify rows=7 steps=3 "
         "logits_differ=0 hidden_differ=5 logits_compared=63 hidden_compared=0 "
+        "valid_logits_differ=0 valid_hidden_differ=2 "
         "rows_compared=21 top1_differ=2 dlp_mean=0.02 dlp_max=0.25 hidden_dist_max=0.5"
     ]
     # the distance restarts with every flush

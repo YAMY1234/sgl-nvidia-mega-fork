@@ -44,6 +44,12 @@ Qwen3.5 (`qwen3_5/runtime`) runs the same way: per layer the stage boundary (`bo
 | `gdn_pdl` (with `gdn_verify`) | 7 | Its ReplaySSM verify launched as a programmatic dependent of the conv |
 | `hop` | 7 | The layer boundary's fused all-reduce + residual add + RMSNorm points on an NVLink multicast hop |
 
+These slots change the arithmetic (numeric: each sums in another order than SGLang's op, within the tolerances `spec.py` declares):
+
+| Slot | Rows | Kernel |
+| --- | --- | --- |
+| `gdn_push` (with `gdn_verify`, `hop`) | 7 | The GatedDeltaNet `out_proj` as the hop's GEMM, whose epilogue pushes the partial into the hop's mailbox |
+
 The sampling and acceptance after the verify, and the GatedDeltaNet extend of prefill, stay SGLang's own code. In an SGLang that has the switches, `SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1` runs the sampling and acceptance in CUDA graphs, and `SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND=1` captures the GatedDeltaNet extend inside the breakable prefill CUDA graphs.
 
 ### Design

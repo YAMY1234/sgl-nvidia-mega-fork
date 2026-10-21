@@ -6,8 +6,9 @@ A slot runs only where it is requested (``SGLANG_NVIDIA_MEGAKERNEL_SLOTS``), bui
 inside its row bounds; every other op is SGLang's own. ``route`` (the router
 GEMM and the routed experts' NVFP4 input in one launch) and ``mkm`` (on its outputs, the
 top-10 and both expert GEMMs in one launch, up to 7 rows) cover every width, as do
-``gdn_verify`` (the GatedDeltaNet verify chain with its launch choices changed) and
-``hop`` (the boundary's fused all-reduce points on the decode hop).
+``gdn_verify`` (the GatedDeltaNet verify chain with its launch choices changed),
+``hop`` (the boundary's fused all-reduce points on the decode hop) and ``gdn_push``
+(numeric: out_proj as the hop's push GEMM, on gdn_verify's FP8 norm).
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ class Slots(msgspec.Struct, frozen=True):
     gdn_verify: bool = False  # the GDN verify chain's launch choices (gdn/verify.py)
     gdn_pdl: bool = False  # its ReplaySSM verify launched dependent on the conv
     hop: bool = False  # the boundary's fused all-reduce points (boundary/hop.py)
+    # out_proj pushes its partial into the hop from its GEMM (gdn/verify.py; numeric)
+    gdn_push: bool = False
 
 
 class Facts(msgspec.Struct, frozen=True):
@@ -38,6 +41,7 @@ class Facts(msgspec.Struct, frozen=True):
     gdn_verify: bool = False  # the GDN verify slot built for every GDN layer
     gdn_pdl: bool = False  # with its dependent verify launch
     hop: bool = False  # the decode hop, built for the widest covered step
+    gdn_push: bool = False  # out_proj packed for the push GEMM on every GDN layer
 
 
 def slots(rows: int, facts: Facts) -> Slots:
@@ -49,6 +53,7 @@ def slots(rows: int, facts: Facts) -> Slots:
         gdn_verify=facts.gdn_verify,
         gdn_pdl=facts.gdn_verify and facts.gdn_pdl,
         hop=facts.hop,
+        gdn_push=facts.gdn_verify and facts.hop and facts.gdn_push,
     )
 
 

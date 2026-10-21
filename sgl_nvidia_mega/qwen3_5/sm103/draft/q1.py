@@ -228,10 +228,13 @@ class Q1Decode:
     """One rank's SKV2-Q1 plans by input layout (the backend's ``_q1_plans``): a
     plan owns the CTA partials and the producer compiled for that layout, so the
     first call of a layout must not be under graph capture (graph warmup runs it
-    eagerly, as in the branch)."""
+    eagerly, as in the branch). ``pdl``: the producer and the merge launch as
+    programmatic dependents, the producer loading the leading K / V tiles this step
+    does not write before its wait (same arithmetic)."""
 
-    def __init__(self):
+    def __init__(self, pdl: bool = True):
         self._plans = {}
+        self.pdl = pdl
 
     @staticmethod
     def key(query, kv_cache, block_tables, seq_lens) -> tuple:
@@ -250,7 +253,7 @@ class Q1Decode:
         key = self.key(query, kv_cache, block_tables, seq_lens)
         plan = self._plans.get(key)
         if plan is None:
-            plan = Q1SplitPlan(query, kv_cache, block_tables, seq_lens)
+            plan = Q1SplitPlan(query, kv_cache, block_tables, seq_lens, pdl=self.pdl)
             self._plans[key] = plan
         return plan
 
@@ -334,9 +337,10 @@ class Q1Decode:
 
 
 @cache
-def build(device_index: int, heads: int = 4) -> None:
+def build(device_index: int, heads: int = 4, pdl: bool = True) -> None:
     """Import CuTe DSL and Triton and compile the fp32 merge for ``heads`` rows and
-    this GPU's SM count; each layout's producer compiles at its plan's first use."""
+    this GPU's SM count (as a programmatic dependent with ``pdl``); each layout's
+    producer compiles at its plan's first use."""
     import triton
 
     from sgl_nvidia_mega.qwen3_5.sm103.draft.q1_kernel import _q1_merge
@@ -361,6 +365,8 @@ def build(device_index: int, heads: int = 4) -> None:
             nsplit,
             triton.next_power_of_2(nsplit),
             MERGE_BLOCK_D,
+            USE_GDC=pdl,
             num_warps=MERGE_WARPS,
+            **({"launch_pdl": True} if pdl else {}),
         )
     torch.cuda.synchronize(device)

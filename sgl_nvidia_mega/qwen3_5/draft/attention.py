@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 # SGLANG_Q35MF_MKA_Q1_MIN_LENGTH default, which its TP8 serving configuration keeps)
 Q1_STOCK, Q1_LONG = "q1_stock", "q1_long"
 Q1_MIN_LENGTH = 16384
+# A draft step's q1 decode and its merge launch as programmatic dependents, the
+# one-row front releasing them at entry (same arithmetic)
+Q1_PDL = True
 
 
 class Q1Variants:
@@ -225,6 +228,7 @@ class Attention:
             cache_loc=cache_loc,
             k_scale=self.k_scale,
             v_scale=self.v_scale,
+            early_trigger=x.shape[0] == 1 and self.q1 is not None and Q1_PDL,
         )
         rows = x.shape[0]
         return q8.view(rows, -1), (gate.view(rows, -1) if gate is not None else None)
@@ -365,8 +369,13 @@ def build_q1(parts):
     )
     if why is not None:
         raise RuntimeError(f"NVIDIA megakernel: slot draft_q1 cannot run: {why}")
-    q1.build(device.index, heads=attention.heads)
-    decode = q1.Q1Decode()
+    q1.build(device.index, heads=attention.heads, pdl=Q1_PDL)
+    decode = q1.Q1Decode(pdl=Q1_PDL)
+    if Q1_PDL:
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 MTP draft slot draft_q1 launches the q1 decode "
+            "and its merge as programmatic dependents"
+        )
     attn = parts.layer.attn
 
     def run(q8, kv, meta):

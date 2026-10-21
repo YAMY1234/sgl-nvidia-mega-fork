@@ -95,15 +95,20 @@ class Bound(msgspec.Struct, frozen=True):
 
     route: bool = False  # the router front stands in for every layer's gate
     mkm: dict = msgspec.field(default_factory=dict)  # layer id -> its weight TMA maps
-    identity: object = None  # [70] int32 0, 1, ...: slot mkm's rows are in expert order
+    mkm_wide: bool = False  # slot mkm_wide: mkm's 16-token engine built
+    # [160] int32 0, 1, ...: slot mkm's rows are in expert order
+    identity: object = None
     shared: bool = False  # slot route_shared: the shared gate/up in the router launch
     reason: str = ""  # why a requested slot is not built
 
 
-def build(model, max_rows: int, fused: bool, shared: bool = False) -> Bound:
+def build(
+    model, max_rows: int, fused: bool, shared: bool = False, wide: bool = False
+) -> Bound:
     """The router front for every MoE layer, compiled for 1..max_rows rows, with
-    ``fused`` slot mkm's kernel and weight maps, and with ``shared`` slot route_shared's
-    launch; or why a layer cannot take them."""
+    ``fused`` slot mkm's kernel and weight maps (with ``wide`` its 16-token engine too,
+    for the rows past 7 up to max_rows), and with ``shared`` slot route_shared's launch;
+    or why a layer cannot take them."""
     from sgl_nvidia_mega.qwen3_5.moe import mkm
     from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm as mkm_kernel
     from sgl_nvidia_mega.qwen3_5.sm103.moe import router
@@ -127,7 +132,14 @@ def build(model, max_rows: int, fused: bool, shared: bool = False) -> Bound:
         reason = mkm.unsupported(mlp)
         if reason:
             return Bound(route=True, reason=f"mkm: layer {i}: {reason}")
-    mkm_kernel.build(device, layers[0].experts.w2_weight.shape[-1] * 2)
+    intermediate = layers[0].experts.w2_weight.shape[-1] * 2
+    # the 16-token engine serves the rows past 7 where this rank's intermediate has one
+    wide = (
+        wide
+        and max_rows > mkm_kernel.MAX_TOKENS
+        and intermediate in mkm_kernel.WIDE_ENGINES
+    )
+    mkm_kernel.build(device, intermediate, max_rows if wide else mkm_kernel.MAX_TOKENS)
     return Bound(
         route=True,
         mkm={
@@ -136,8 +148,11 @@ def build(model, max_rows: int, fused: bool, shared: bool = False) -> Bound:
             )
             for mlp in layers
         },
+        mkm_wide=wide,
         identity=torch.arange(
-            mkm_kernel.MAX_TOKENS * mkm_kernel.TOP_K, dtype=torch.int32, device="cuda"
+            mkm_kernel.M16_MAX_TOKENS * mkm_kernel.TOP_K,
+            dtype=torch.int32,
+            device="cuda",
         ),
         shared=shared,
     )

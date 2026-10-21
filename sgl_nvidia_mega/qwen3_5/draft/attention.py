@@ -1,0 +1,196 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from SGLang (Apache-2.0, SGLang Team):
+# python/sglang/srt/models/qwen3_5.py (Qwen3_5AttentionDecoderLayer.self_attention) and
+# python/sglang/srt/layers/attention/trtllm_mha_backend.py (TRTLLMHAAttnBackend
+# forward_decode / forward_extend on the fused FP8 KV path, _run_fixed_q_len_decode).
+"""The MTP draft layer's gated full attention inside a draft entry, which gets the
+step's attention metadata and the draft's KV pool from SGLang's binding
+(``AttnStepMetadata``, ``KvPoolBuffers``) instead of a forward batch.
+
+Stock: SGLang's ops in the order the TRT-LLM MHA backend runs them on an FP8 KV cache:
+the qkv projection with the fused q / k Gemma RMSNorm + RoPE + gate split, the fused
+FP8 quantization of q / k / v with the paged KV write, trtllm-gen's decode with
+``q_len_per_req`` rows a request (1 for a draft step, the verify width for the draft
+extend), the sigmoid output gate and ``o_proj``.
+"""
+
+from __future__ import annotations
+
+import torch
+
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/models/qwen3_5.py": (
+        "forward_prepare_cuda_fused",
+        "attn_output_gate",
+        "o_proj",
+    ),
+    "srt/layers/radix_attention.py": (
+        "tp_q_head_num",
+        "tp_k_head_num",
+        "tp_v_head_num",
+        "head_dim",
+        "scaling",
+        "sliding_window_size",
+        "k_scale",
+        "v_scale",
+    ),
+    "kernels/ops/kvcache/fused_fp8_qkv_kv_cache.py": ("fused_fp8_qkv_kv_cache",),
+    "kernels/ops/elementwise/elementwise.py": (
+        "fused_sigmoid_mul",
+        "fused_sigmoid_mul(inplace)",
+    ),
+    "kernels/ops/attention/utils.py": ("canonicalize_stride",),
+    "srt/mem_cache/layout/paged_view.py": ("paged_kv_view",),
+    # TRTLLMHAAttnBackend: its shared workspace, its counters and max_context_len, and
+    # _run_fixed_q_len_decode's trtllm-gen call
+    "srt/layers/attention/trtllm_mha_backend.py": (
+        "DEFAULT_WORKSPACE_SIZE_MB",
+        '"trtllm_mha_zero_workspace"',
+        "max_context_len",
+        "_multi_ctas_kv_counter_buffer",
+        "_run_fixed_q_len_decode",
+        "flashinfer",
+    ),
+    "srt/layers/attention/trtllm_mla_backend.py": (
+        "make_persistent_multi_ctas_kv_counter_buffer",
+    ),
+    "srt/environ.py": ("envs", "SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR"),
+    "srt/runtime_context.py": ("get_buffer",),
+    # ModelConfig._derive_context_length writes the backend's max_context_len into the
+    # HF config the draft's build gets
+    "srt/configs/model_config.py": ("context_len",),
+}
+
+# The SGLang functions whose body this module mirrors, by the digest of their code
+# (test/unit/test_contract.py recomputes them on the installed SGLang)
+SGLANG_MIRRORS = {
+    "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer.self_attention": "db0f4d98e0fb1abf",
+}
+
+
+def _context_len(draft) -> int:
+    """The max_seq_len SGLang's TRT-LLM MHA backend gives trtllm-gen: the draft's
+    ModelConfig.context_len, which it writes into the HF config the build gets."""
+    if draft.context_len is None:
+        raise RuntimeError(
+            "NVIDIA megakernel: the draft's HF config has no context_len"
+        )
+    return int(draft.context_len)
+
+
+class Attention:
+    """The draft layer's attention buffers: trtllm-gen's zeroed workspace (SGLang's
+    shared one) and multi-CTA counters, and the FP8 KV scales."""
+
+    def __init__(self, parts):
+        from sglang.srt.layers.attention.trtllm_mha_backend import (
+            DEFAULT_WORKSPACE_SIZE_MB,
+        )
+        from sglang.srt.layers.attention.trtllm_mla_backend import (
+            make_persistent_multi_ctas_kv_counter_buffer,
+        )
+        from sglang.srt.runtime_context import get_buffer
+
+        layer, device = parts.layer, parts.device
+        attn = layer.attn
+        self.layer = layer
+        self.heads = attn.tp_q_head_num
+        self.head_dim = attn.head_dim
+        self.page_size = parts.binding.page_size
+        self.max_context_len = _context_len(parts.draft)
+        self.workspace = get_buffer(
+            "trtllm_mha_zero_workspace",
+            lambda: torch.zeros(
+                DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024,
+                dtype=torch.uint8,
+                device=device,
+            ),
+        )
+        # the draft's rows a call at most: the verify width of the draft extend
+        width = int(parts.binding.tokens_per_request)
+        self.counters = make_persistent_multi_ctas_kv_counter_buffer(
+            device,
+            num_q_heads=parts.lm.config.num_attention_heads,
+            max_batch_size=width,
+        )
+        ones = torch.ones(1, dtype=torch.float32, device=device)
+        self.k_scale = attn.k_scale if attn.k_scale is not None else ones
+        self.v_scale = attn.v_scale if attn.v_scale is not None else ones
+
+    def __call__(self, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
+        """The TP-partial attention output [rows, hidden] of the normed input ``x``
+        [rows, hidden]; writes this step's KV rows at ``cache_loc``."""
+        from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+        layer = self.layer
+        q, k, v, gate = layer.forward_prepare_cuda_fused(
+            positions=positions, hidden_states=x
+        )
+        o = self.core(q, k, v, cache_loc, meta, kv, rows_per_request)
+        if layer.attn_output_gate:
+            o = fused_sigmoid_mul(o, gate, inplace=True)
+        out, _ = layer.o_proj(o)
+        return out
+
+    def core(self, q, k, v, cache_loc, meta, kv, rows_per_request: int):
+        """FP8 q / k / v with the KV write, then the decode: [rows, heads * head_dim]."""
+        import flashinfer
+        from sglang.kernels.ops.kvcache.fused_fp8_qkv_kv_cache import (
+            fused_fp8_qkv_kv_cache,
+        )
+        from sglang.srt.environ import envs
+
+        k_cache, v_cache = kv.k[0], kv.v[0]
+        q8 = fused_fp8_qkv_kv_cache(
+            q=q,
+            k=k,
+            v=v,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_loc=cache_loc,
+            k_scale=self.k_scale,
+            v_scale=self.v_scale,
+        )
+        q8 = q8.reshape(-1, self.heads, self.head_dim)
+        attn = self.layer.attn
+        bmm1_scale = 1.0 * kv.k_scale[0] * attn.scaling
+        bmm2_scale = kv.v_scale[0]
+        kwargs = {}
+        if rows_per_request != 1:
+            kwargs["q_len_per_req"] = rows_per_request
+        o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=q8,
+            kv_cache=self._paged(k_cache, v_cache),
+            workspace_buffer=self.workspace,
+            block_tables=meta.page_table,
+            seq_lens=meta.cache_seqlens,
+            max_seq_len=self.max_context_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            window_left=attn.sliding_window_size,
+            sinks=None,
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            out=None,
+            out_dtype=torch.bfloat16,
+            kv_cache_sf=None,
+            multi_ctas_kv_counter_buffer=self.counters,
+            **kwargs,
+        )
+        return o.view(-1, self.heads * self.head_dim)
+
+    def _paged(self, k_cache, v_cache):
+        """The pool buffers as trtllm-gen's HND pages, as the backend views them."""
+        from sglang.kernels.ops.attention.utils import canonicalize_stride
+        from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
+
+        attn = self.layer.attn
+        k = paged_kv_view(k_cache, self.page_size, attn.tp_k_head_num, self.head_dim)
+        v = paged_kv_view(v_cache, self.page_size, attn.tp_v_head_num, self.head_dim)
+        k, v = k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
+        if attn.tp_k_head_num == 1:
+            k = canonicalize_stride(k)
+        if attn.tp_v_head_num == 1:
+            v = canonicalize_stride(v)
+        return k, v

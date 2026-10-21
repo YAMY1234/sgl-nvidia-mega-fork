@@ -279,7 +279,7 @@ def _front_operands(seed, *, pad=False, index_dtype=torch.int32):
     )
 
 
-def _run_front(o, packed, outs):
+def _run_front(o, packed, outs, **kw):
     from sgl_nvidia_mega.qwen3_5.sm103.gdn import front
 
     front.front(
@@ -302,6 +302,7 @@ def _run_front(o, packed, outs):
         history_k=o["ring_k"],
         history_g=o["ring_g"],
         ring_indices=o["req"],
+        **kw,
     )
 
 
@@ -386,6 +387,30 @@ def test_front_leaves_a_padded_requests_state_alone():
     torch.cuda.synchronize()
     assert outs["error"].item() == 0
     assert torch.equal(o["state"], state0) and torch.equal(o["phys"], phys0)
+
+
+@pytest.mark.parametrize("pad", [False, True])
+def test_front_takes_its_weights_by_bulk_copy_with_the_same_bytes(pad):
+    """The default launch bulk-copies each projection CTA's weights into shared memory;
+    every output and pool equals the launch that loads them into registers."""
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front
+
+    for seed in range(3):
+        o = _front_operands(20 + seed, pad=pad)
+        packed = front.pack(o["w"])
+        start = {n: o[n].clone() for n in ("state", "phys")}
+        got = []
+        for tma in (False, True):
+            for n, t in start.items():
+                o[n].copy_(t)
+            outs = _front_outputs()
+            for t in outs.values():  # a padded request leaves the conv rows unwritten
+                t.zero_()
+            _run_front(o, packed, outs, tma=tma)
+            torch.cuda.synchronize()
+            got.append({**outs, "state": o["state"].clone(), "phys": o["phys"].clone()})
+        for n, t in got[0].items():
+            assert torch.equal(t, got[1][n]), n
 
 
 def test_front_replays_from_a_cuda_graph():

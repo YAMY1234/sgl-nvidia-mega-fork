@@ -23,6 +23,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "gdn_push",
     "gdn_front",
     "route_shared",
+    "skv2",
 )
 # The EAGLE entries (spec.ENTRIES) offered only when requested in the same variable;
 # verify_sample has no step at any size, so it turns on SGLang's post-verify graphs
@@ -96,7 +97,7 @@ def build(model, ctx):
     SGLang's BuildContext."""
     import torch
 
-    from sgl_nvidia_mega.qwen3_5 import boundary, gdn, moe
+    from sgl_nvidia_mega.qwen3_5 import attention, boundary, gdn, moe
     from sgl_nvidia_mega.qwen3_5 import plan as slot_plan
     from sgl_nvidia_mega.qwen3_5.runtime import parity
     from sgl_nvidia_mega.qwen3_5.runtime.executor import Qwen35Verify
@@ -115,6 +116,7 @@ def build(model, ctx):
         "moe": moe.build(model, pctx),
         "gdn": gdn.build(model, pctx),
         "boundary": boundary.build(model, pctx),
+        "attention": attention.build(model, pctx),
     }
     facts = slot_plan.Facts(
         route=bound["moe"].route,
@@ -125,6 +127,7 @@ def build(model, ctx):
         gdn_push=bool(bound["gdn"].packed),
         gdn_front=bool(bound["gdn"].front),
         route_shared=bound["moe"].shared,
+        skv2=bound["attention"].skv2,
     )
     slots = slot_plan.plan(pctx.widths, facts)
     built = msgspec.structs.asdict(facts)
@@ -135,7 +138,8 @@ def build(model, ctx):
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built no width (MoE: "
             f"{bound['moe'].reason or 'built'}; GDN: {bound['gdn'].reason or 'built'}; "
-            f"boundary: {bound['boundary'].reason or 'built'})"
+            f"boundary: {bound['boundary'].reason or 'built'}; "
+            f"attention: {bound['attention'].reason or 'built'})"
         )
     checker = (
         parity.Parity(pctx.widths, torch.cuda.current_device(), model)

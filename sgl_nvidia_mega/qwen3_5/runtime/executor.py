@@ -32,6 +32,7 @@ import torch
 from sglang.srt.megakernels.spec import Step
 
 from sgl_nvidia_mega.qwen3_5 import attention, boundary, gdn, logits, moe
+from sgl_nvidia_mega.qwen3_5.attention import route as _attention_route  # noqa: F401
 from sgl_nvidia_mega.qwen3_5.gdn import verify as _gdn_verify  # noqa: F401
 from sgl_nvidia_mega.qwen3_5.runtime import embedding
 from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
@@ -122,6 +123,13 @@ class Qwen35Verify:
         self.verify_sample = self._verify_sample if "verify_sample" in entries else None
         self._summary = summary
         self.parity = parity  # runtime.parity.Parity under the test-only switch
+        # the attention graph variants per SGLang runner ("target_verify"), which it
+        # captures once it takes a megakernel's (attention/route.py)
+        self.graph_variants = (
+            {"target_verify": attention.route.VERIFY}
+            if any(s.skv2 for s in slots.values())
+            else {}
+        )
         self._pools_checked = False
         m = lm.model
         self.mixers = {
@@ -194,6 +202,12 @@ class Qwen35Verify:
                 raise RuntimeError(
                     "NVIDIA megakernel: slot gdn_front cannot run: "
                     + "; ".join(reasons)
+                )
+        if any(s.skv2 for s in self.slots.values()):
+            reasons = attention.pool_reasons(view, self.binding)
+            if reasons:
+                raise RuntimeError(
+                    "NVIDIA megakernel: slot skv2 cannot run: " + "; ".join(reasons)
                 )
         self._pools_checked = True
 

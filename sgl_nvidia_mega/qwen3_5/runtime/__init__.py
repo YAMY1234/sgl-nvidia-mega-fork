@@ -21,6 +21,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "gdn_pdl",
     "hop",
     "gdn_push",
+    "gdn_front",
 )
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
@@ -56,6 +57,10 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_push' pushes slot 'gdn_verify''s out_proj into "
             "slot 'hop'"
+        )
+    if "gdn_front" in SLOTS and not {"gdn_verify", "gdn_pdl"} <= SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'gdn_front' runs slot 'gdn_pdl''s dependent verify"
         )
     if "gdn_pdl" in SLOTS and "gdn_verify" not in SLOTS:
         reasons.append(
@@ -115,6 +120,7 @@ def build(model, ctx):
         gdn_pdl=bound["gdn"].gdn_pdl,
         hop=bound["boundary"].hop is not None,
         gdn_push=bool(bound["gdn"].packed),
+        gdn_front=bool(bound["gdn"].front),
     )
     slots = slot_plan.plan(pctx.widths, facts)
     built = msgspec.structs.asdict(facts)

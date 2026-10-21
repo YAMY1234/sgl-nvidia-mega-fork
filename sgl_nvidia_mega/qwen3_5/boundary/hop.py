@@ -128,6 +128,8 @@ SGLANG_MIRRORS = {
 
 # the (point, rows) the slot has run at (each logged once, as engagement evidence)
 _ENGAGED: set = set()
+# the target's hop once built (active())
+_ACTIVE: Optional[object] = None
 
 
 class Bound(msgspec.Struct, frozen=True):
@@ -162,7 +164,15 @@ def build(model, ctx) -> Bound:
         device=torch.device("cuda", torch.cuda.current_device()),
         deadline_s=ctx.deadline_s,
     )
+    global _ACTIVE
+    _ACTIVE = hop
     return Bound(hop=hop)
+
+
+def active() -> Optional[object]:
+    """The target's built hop (sm103.hop.Hop), or None: the MTP draft's hops share its
+    mailbox and stage order (built before the draft, which loads after the target)."""
+    return _ACTIVE
 
 
 def refusals(m, world: int) -> list[str]:

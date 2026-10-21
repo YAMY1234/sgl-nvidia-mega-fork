@@ -12,12 +12,44 @@ Stock: SGLang's ops in the order the TRT-LLM MHA backend runs them on an FP8 KV 
 the qkv projection with the fused q / k Gemma RMSNorm + RoPE + gate split, the fused
 FP8 quantization of q / k / v with the paged KV write, trtllm-gen's decode with
 ``q_len_per_req`` rows a request (1 for a draft step, the verify width for the draft
-extend), the sigmoid output gate and ``o_proj``.
+extend), the sigmoid output gate and ``o_proj``. Slot ``draft_q1`` runs a draft step's
+decode as the q1 split-KV kernel (``sm103/draft/q1``).
 """
 
 from __future__ import annotations
 
 import torch
+
+# the KV-length graph variants of the draft loop (2.2's graph_variants.Q1_STOCK /
+# Q1_LONG): trtllm-gen below Q1_MIN_LENGTH, SKV2-Q1 from it (2.2's
+# SGLANG_Q35MF_MKA_Q1_MIN_LENGTH default; the TP8 production run leaves it unset)
+Q1_STOCK, Q1_LONG = "q1_stock", "q1_long"
+Q1_MIN_LENGTH = 16384
+
+
+class Q1Variants:
+    """The draft loop's graph variants (SGLang's AttentionGraphVariants), as 2.2's
+    Q1GraphVariants: SKV2-Q1 from a host-only KV length lower bound."""
+
+    # stock first, as 2.2 captures them (variants share a graph memory pool)
+    capture_labels = (Q1_STOCK, Q1_LONG)
+
+    def __init__(self, min_length: int = Q1_MIN_LENGTH):
+        self.min_length = min_length
+
+    def select(self, forward_batch) -> str:
+        if forward_batch.batch_size != 1:
+            return Q1_STOCK
+        length = getattr(forward_batch, "attention_kv_len_lower_bound", None)
+        if length is None:
+            lengths = forward_batch.seq_lens_cpu
+            if (
+                lengths is not None
+                and lengths.device.type == "cpu"
+                and lengths.numel() == 1
+            ):
+                length = int(lengths[0])
+        return Q1_LONG if length is not None and length >= self.min_length else Q1_STOCK
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -58,6 +90,9 @@ SGLANG_READS = {
     ),
     "srt/environ.py": ("envs", "SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR"),
     "srt/runtime_context.py": ("get_buffer",),
+    "srt/model_executor/runner_utils/capture_mode.py": (
+        "get_capture_attention_variant",
+    ),
     # ModelConfig._derive_context_length writes the backend's max_context_len into the
     # HF config the draft's build gets
     "srt/configs/model_config.py": ("context_len",),
@@ -114,6 +149,7 @@ class Attention:
         ones = torch.ones(1, dtype=torch.float32, device=device)
         self.k_scale = attn.k_scale if attn.k_scale is not None else ones
         self.v_scale = attn.v_scale if attn.v_scale is not None else ones
+        self.q1 = None  # sm103.draft.q1 decode (slot draft_q1), set by DraftLoop
 
     def __call__(self, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         """The TP-partial attention output [rows, hidden] of the normed input ``x``
@@ -153,6 +189,8 @@ class Attention:
         attn = self.layer.attn
         bmm1_scale = 1.0 * kv.k_scale[0] * attn.scaling
         bmm2_scale = kv.v_scale[0]
+        if self.q1 is not None and rows_per_request == 1 and _q1_label() != Q1_STOCK:
+            return self.q1(q8, kv, meta).view(-1, self.heads * self.head_dim)
         kwargs = {}
         if rows_per_request != 1:
             kwargs["q_len_per_req"] = rows_per_request
@@ -190,3 +228,36 @@ class Attention:
         if attn.tp_v_head_num == 1:
             v = canonicalize_stride(v)
         return k, v
+
+
+def _q1_label():
+    """The KV-length graph variant SGLang is capturing ("q1_stock" / "q1_long"), or
+    None where its draft runner captures one graph per batch size (then Q1 serves
+    every length; 2.2 switched at 16384 by graph variant)."""
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_attention_variant,
+    )
+
+    return get_capture_attention_variant()
+
+
+def build_q1(parts):
+    """Slot draft_q1: the draft steps' q1 decode as 2.2's SKV2-Q1 (``sm103/draft/q1``),
+    a callable (q8, kv, meta) -> [1, heads, head_dim] bf16; each layout's producer
+    compiles at the graph warmup's first call, outside capture, as in 2.2."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import q1
+
+    attention, device = parts.attention, parts.device
+    why = q1.enabled_reason(
+        device_index=device.index, max_context_len=attention.max_context_len
+    )
+    if why is not None:
+        raise RuntimeError(f"NVIDIA megakernel: slot draft_q1 cannot run: {why}")
+    q1.build(device.index, heads=attention.heads)
+    decode = q1.Q1Decode()
+    attn = parts.layer.attn
+
+    def run(q8, kv, meta):
+        return decode.step(q8, kv, attn.layer_id, meta, scaling=attn.scaling)
+
+    return run

@@ -13,7 +13,7 @@ entries for one request (bs 1), which run inside SGLang's draft graphs:
   (``extend``).
 
 Inside them every op is SGLang's own unless a draft slot replaces it: ``draft_moe``
-(the single-launch MoE).
+(the single-launch MoE) and ``draft_q1`` (the q1 split-KV decode).
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ def numerics(slots: frozenset) -> Numerics:
     which differ from SGLang's ops only in fp32 summation order (2.2's A6 class:
     q1 split-KV, the o_proj / fc / MoE GEMVs, the draft head), so a draft token can
     differ where two logits are within a bf16 rounding."""
-    if not slots & {"draft_moe"}:
+    if not slots & {"draft_moe", "draft_q1"}:
         return target.NUMERICS
     return Numerics(NumericsKind.TOLERANCE, {"draft_logits.rel": 2**-7})
 # the one request a draft entry serves: 2.2's draft kernels are single-row
@@ -109,6 +109,13 @@ class MtpDraft:
         self.draft_extend: Optional[Callable] = (
             self._draft_extend if "draft_extend" in slots else None
         )
+        # the KV-length graph variants by runner kind, for an SGLang that captures them
+        # (2.2 routes the draft steps' q1 decode by KV length)
+        self.graph_variants = None
+        if "draft_loop" in slots and "draft_q1" in slots:
+            from sgl_nvidia_mega.qwen3_5.draft.attention import Q1Variants
+
+            self.graph_variants = {"draft_loop": Q1Variants()}
 
     def summary(self) -> str:
         entries = [

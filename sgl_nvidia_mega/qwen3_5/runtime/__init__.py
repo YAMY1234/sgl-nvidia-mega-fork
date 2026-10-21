@@ -27,6 +27,10 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "mka",
     "mka_push",
 )
+# Steps of more than one request (TP8's decode graphs of batch sizes 2 and 4), covered only
+# when requested in the same variable: covering them costs the one-request step about
+# 0.3% at TP8
+OPT_IN_COVERAGE: tuple[str, ...] = ("multi_request",)
 # The MTP draft's EAGLE entries and kernel groups (qwen3_5/draft), requested in the same
 # variable; the draft spec's build reads them, the target's ignores them
 DRAFT_ENTRIES: tuple[str, ...] = ("draft_loop", "draft_extend")
@@ -58,6 +62,7 @@ def slot_reasons() -> list[str]:
     known = (
         *SHIPPED_SLOTS,
         *OPT_IN_SLOTS,
+        *OPT_IN_COVERAGE,
         *DRAFT_ENTRIES,
         *DRAFT_SLOTS,
     )
@@ -115,6 +120,7 @@ SGLANG_READS = {
         "deadline_s",
         "binding",
     ),
+    "srt/runtime_context.py": ("get_parallel", '"tp_size"'),
 }
 
 
@@ -136,13 +142,19 @@ def build(model, ctx):
     from sgl_nvidia_mega.qwen3_5.runtime import parity
     from sgl_nvidia_mega.qwen3_5.runtime.executor import Qwen35Verify
 
-    if not ctx.widths:
+    multi = slot_plan.MULTI_REQUEST in SLOTS
+    if multi:
+        from sglang.srt.runtime_context import get_parallel
+
+        multi = slot_plan.multi_request(get_parallel().tp_size, SLOTS)
+    widths = slot_plan.candidates(ctx.widths, ctx.tokens_per_request, multi)
+    if not widths:
         raise RuntimeError(
             f"NVIDIA megakernel: {ctx.tokens_per_request} rows a request leave no "
             "covered width"
         )
     pctx = PackageContext(
-        widths=ctx.widths,
+        widths=widths,
         tokens_per_request=ctx.tokens_per_request,
         deadline_s=ctx.deadline_s,
     )
@@ -165,10 +177,17 @@ def build(model, ctx):
         mka=bound["attention"].mka,
         mka_push=bound["attention"].mka_push,
     )
-    slots = slot_plan.plan(pctx.widths, facts)
+    covered = slot_plan.covered(pctx.widths, facts, pctx.tokens_per_request)
+    slots = slot_plan.plan(covered, facts, pctx.tokens_per_request)
+    # the slots of every width wider than one request, for the startup line
+    wider = "".join(
+        f"; {w} rows: {[n for n, ok in msgspec.structs.asdict(s).items() if ok]}"
+        for w, s in slots.items()
+        if w != pctx.tokens_per_request
+    )
     built = msgspec.structs.asdict(facts)
     # every package's build agrees across ranks, so this raises on every rank alike
-    target_slots = SLOTS - set(DRAFT_ENTRIES) - set(DRAFT_SLOTS)
+    target_slots = SLOTS - set(DRAFT_ENTRIES) - set(DRAFT_SLOTS) - set(OPT_IN_COVERAGE)
     missing = sorted(name for name in target_slots if not built[name])
     if missing:
         raise RuntimeError(
@@ -178,7 +197,7 @@ def build(model, ctx):
             f"attention: {bound['attention'].reason or 'built'})"
         )
     checker = (
-        parity.Parity(pctx.widths, torch.cuda.current_device(), model)
+        parity.Parity(covered, torch.cuda.current_device(), model)
         if parity.ENABLED
         else None
     )
@@ -187,8 +206,8 @@ def build(model, ctx):
         model,
         slots,
         bound=bound,
-        widths=pctx.widths,
+        widths=covered,
         binding=ctx.binding,
-        summary=f"slots {on or 'none (stock)'}",
+        summary=f"slots {on or 'none (stock)'}{wider}",
         parity=checker,
     )

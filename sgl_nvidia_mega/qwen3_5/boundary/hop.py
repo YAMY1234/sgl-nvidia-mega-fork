@@ -145,11 +145,15 @@ def build(model, ctx) -> Bound:
     from sglang.srt.megakernels.runtime import megakernel_agree
     from sglang.srt.runtime_context import get_parallel
 
-    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5 import plan, runtime
     from sgl_nvidia_mega.qwen3_5.sm103.hop import Hop
 
     if "hop" not in runtime.SLOTS:
         return Bound(reason="slot off")
+    # the widest step the hop covers: its mailbox's rows
+    rows = plan.widest(ctx.widths, plan.HOP_MAX_ROWS)
+    if not rows:
+        return Bound(reason=f"no width of {list(ctx.widths)} within its rows")
     m = model.model
     group = get_parallel().tp_group
     reasons = refusals(m, group.world_size)
@@ -158,7 +162,7 @@ def build(model, ctx) -> Bound:
     if reasons:
         return Bound(reason="; ".join(reasons))
     hop = Hop(
-        max_m=max(ctx.widths),
+        max_m=rows,
         eps=m.flashinfer_mnnvl_cutedsl_fusion.rms_epsilon,
         group=group.device_group,
         device=torch.device("cuda", torch.cuda.current_device()),

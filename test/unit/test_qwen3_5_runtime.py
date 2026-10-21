@@ -56,6 +56,37 @@ def test_only_target_verify_steps_of_built_widths_are_covered():
     assert built.plan(ids, _batch(), input_embeds=None) is None
 
 
+def test_the_covered_widths_are_the_ones_the_build_returns():
+    built = _verify(widths=(7, 14, 28))
+    for rows in (7, 14, 28):
+        ids = torch.zeros(rows, dtype=torch.int64)
+        assert built.plan(ids, _batch()) == Step(mode="target_verify", rows=rows)
+    assert built.plan(torch.zeros(21, dtype=torch.int64), _batch()) is None
+
+
+@pytest.mark.parametrize("tp_size, want", [(8, (7,)), (4, (7,))])
+def test_the_build_covers_more_requests_only_where_a_slot_runs(
+    monkeypatch, tp_size, want
+):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset())
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=tp_size),
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    # what SGLang offers for the spec's MAX_ROWS with 7 rows a request
+    ctx = SimpleNamespace(
+        widths=(7, 14, 21, 28),
+        tokens_per_request=7,
+        deadline_s=60.0,
+        binding="EagleBinding",
+    )
+    built = runtime.build(model, ctx)
+    assert built.widths == want and built.summary() == "slots none (stock)"
+
+
 def test_the_build_hands_over_the_binding_and_every_entry_stays_sglangs():
     from sglang.srt.megakernels.spec import ENTRIES
 
@@ -363,6 +394,18 @@ def test_parity_compares_bits_not_values():
         parity.differing(a, None)
 
 
+def test_parity_counts_the_requests_own_rows_apart():
+    # two requests of 2 rows; the second is a padded one (the pad slot)
+    valid = parity.valid_rows(torch.tensor([3, -1]), 4)
+    assert valid.tolist() == [True, True, False, False]
+    a = torch.zeros(4, 3)
+    b = a.clone()
+    b[3] = 1.0  # a padded row
+    assert int(parity.differing(a, b)) == 3 and int(parity.differing(a, b, valid)) == 0
+    b[0, 1] = 1.0  # a request's row
+    assert int(parity.differing(a, b, valid)) == 1
+
+
 @pytest.mark.parametrize("mode", ["1", "control"])
 def test_an_eager_parity_step_runs_sglangs_forward_first(
     eager, monkeypatch, caplog, mode
@@ -437,7 +480,7 @@ def test_trace_names_the_first_module_call_that_differs(eager, monkeypatch, capl
 
 def test_graph_parity_counts_are_logged_once_each(eager, caplog):
     checker = parity.Parity((7,), "cpu")
-    checker.counters[7] += torch.tensor([3, 0, 5, 63, 0])
+    checker.counters[7] += torch.tensor([3, 0, 5, 63, 0, 0, 2])
     checker.distance[7] += torch.tensor(
         [21.0, 2.0, 0.42, 0.25, 0.5], dtype=torch.float64
     )
@@ -448,6 +491,7 @@ def test_graph_parity_counts_are_logged_once_each(eager, caplog):
     assert lines == [
         "NVIDIA megakernel parity graph target_verify rows=7 steps=3 "
         "logits_differ=0 hidden_differ=5 logits_compared=63 hidden_compared=0 "
+        "valid_logits_differ=0 valid_hidden_differ=2 "
         "rows_compared=21 top1_differ=2 dlp_mean=0.02 dlp_max=0.25 hidden_dist_max=0.5"
     ]
     # the distance restarts with every flush

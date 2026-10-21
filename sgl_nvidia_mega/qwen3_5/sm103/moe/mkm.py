@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The routed experts of up to 7 rows in one launch (``src/mkm_moe.cu``), on the router
-front's outputs: the top-10 of the logits, FC1, SwiGLU, the NVFP4 requantization of the
-intermediate and FC2, reading the trtllm-gen weight layout in place. It writes the
-deferred-finalize rows (row ``t * 10 + k`` is expert ``k`` of token ``t``) and the
-expert weights, as the trtllm runner's deferred finalize takes them.
+"""The routed experts of up to 7 rows in one launch, on the router front's outputs: the
+top-10 of the logits, FC1, SwiGLU, the NVFP4 requantization of the intermediate and FC2,
+reading the trtllm-gen weight layout in place. It writes the deferred-finalize rows (row
+``t * 10 + k`` is expert ``k`` of token ``t``) and the expert weights, as the trtllm
+runner's deferred finalize takes them. One engine per intermediate size a rank holds:
+128 at TP8 (``src/mkm_moe.cu``), 256 at TP4 (``src/mkm_moe_tp4.cu``).
 """
 
 from __future__ import annotations
@@ -12,12 +13,12 @@ from __future__ import annotations
 import ctypes
 from functools import cache
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 
 from sgl_nvidia_mega.common import jit
 
-SOURCE = Path(__file__).parent / "src" / "mkm_moe.cu"
 HIDDEN, EXPERTS, TOP_K, MAX_TOKENS = 4096, 512, 10, 7
 W13_ROWS = 256  # an expert's gate and up rows at TP8 (intermediate 128 per rank)
 W13_BOX_ROWS = 128  # kW13BoxRows: rows of one W13 TMA box
@@ -25,7 +26,24 @@ THREADS = 256
 CTAS = (
     2 * MAX_TOKENS * TOP_K
 )  # a 2-CTA cluster per selectable expert; the unused ones exit
-SMEM_BYTES = 211968  # sizeof(Smem) + 1024, checked when the source compiles
+
+
+class Engine(NamedTuple):
+    source: str  # under src/
+    kernel: str
+    smem_bytes: int  # sizeof(Smem) + 1024, checked when the source compiles
+    w2_swizzle: str  # the W2 TMA map's swizzle: its box is a row of I / 2 bytes
+
+
+# per intermediate size a rank holds (TP8, TP4)
+ENGINES = {
+    128: Engine("mkm_moe.cu", "q35_mkm_moe", 211968, "CU_TENSOR_MAP_SWIZZLE_64B"),
+    256: Engine(
+        "mkm_moe_tp4.cu", "q35_mkm_moe_tp4", 216064, "CU_TENSOR_MAP_SWIZZLE_128B"
+    ),
+}
+INTERMEDIATES = tuple(ENGINES)
+SMEM_BYTES = ENGINES[128].smem_bytes
 
 
 class Params(ctypes.Structure):
@@ -50,20 +68,25 @@ class Params(ctypes.Structure):
 
 
 @cache
-def _kernel(device_index: int) -> jit.Kernel:
+def _kernel(device_index: int, intermediate: int = 128) -> jit.Kernel:
+    engine = ENGINES[intermediate]
     major, minor = torch.cuda.get_device_capability(device_index)
     cubin = jit.compile_source(
-        SOURCE.read_text(),
-        "q35_mkm_moe",
+        (Path(__file__).parent / "src" / engine.source).read_text(),
+        engine.kernel,
         f"sm_{major}{minor}a",
-        ("-std=c++17", "-default-device", f"-DQ35_MKM_SMEM_BYTES={SMEM_BYTES}"),
+        (
+            "-std=c++17",
+            "-default-device",
+            f"-DQ35_MKM_SMEM_BYTES={engine.smem_bytes}",
+        ),
     )
-    return jit.load(cubin, "q35_mkm_moe", (THREADS, 1, 1), SMEM_BYTES)
+    return jit.load(cubin, engine.kernel, (THREADS, 1, 1), engine.smem_bytes)
 
 
-def build(device_index: int) -> None:
-    """Compile the kernel (no compile inside a step)."""
-    _kernel(device_index)
+def build(device_index: int, intermediate: int = 128) -> None:
+    """Compile the engine for ``intermediate`` per rank (no compile inside a step)."""
+    _kernel(device_index, intermediate)
 
 
 def _map(
@@ -97,19 +120,28 @@ def _map(
 
 
 def weight_maps(w13: torch.Tensor, w2: torch.Tensor) -> tuple:
-    """The TMA maps of a layer's W13 [512, 256, 2048] and W2 [512, 4096, 64] (uint8, the
-    trtllm-gen layout); they stay valid as long as the weights."""
+    """The TMA maps of a layer's W13 [512, 2 I, 2048] and W2 [512, 4096, I / 2] (uint8,
+    the trtllm-gen layout; I = 128 or 256 per rank); they stay valid as long as the
+    weights."""
+    i = w2.shape[2] * 2
     swizzle = jit.driver().CUtensorMapSwizzle
     return (
         _map(
             w13,
-            EXPERTS * W13_ROWS,
+            EXPERTS * 2 * i,
             HIDDEN // 2,
             128,
             W13_BOX_ROWS,
             swizzle.CU_TENSOR_MAP_SWIZZLE_128B,
         ),
-        _map(w2, EXPERTS * HIDDEN, 64, 64, 256, swizzle.CU_TENSOR_MAP_SWIZZLE_64B),
+        _map(
+            w2,
+            EXPERTS * HIDDEN,
+            i // 2,
+            i // 2,
+            256,
+            getattr(swizzle, ENGINES[i].w2_swizzle),
+        ),
     )
 
 
@@ -126,11 +158,12 @@ def mkm_moe(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(gemm2_out bf16 [M * 10, 4096], expert_weights bf16 [M, 10]) for logits [M, 512]
     bf16 (M <= 7) and the router front's x_fp4 [M, 2048] / x_sf [M, 256] (uint8, linear
-    e4m3); w13_sf [512, 256, 256] / w2_sf [512, 4096, 8] e4m3 viewed as uint8; g1_alpha,
-    g1_scale_c, g2_alpha [512] fp32."""
+    e4m3); w13_sf [512, 2 I, 256] / w2_sf [512, 4096, I / 16] e4m3 viewed as uint8 (the
+    engine follows I); g1_alpha, g1_scale_c, g2_alpha [512] fp32."""
     m = logits.shape[0]
     if not 1 <= m <= MAX_TOKENS:
         raise ValueError(f"mkm: {m} rows (1-{MAX_TOKENS})")
+    intermediate = w2_sf.shape[2] * 16
     device = logits.device
     gemm2_out = torch.empty((m * TOP_K, HIDDEN), dtype=torch.bfloat16, device=device)
     expert_weights = torch.empty((m, TOP_K), dtype=torch.bfloat16, device=device)
@@ -151,7 +184,7 @@ def mkm_moe(
         num_tokens=m,
     )
     jit.launch(
-        _kernel(device.index),
+        _kernel(device.index, intermediate),
         (CTAS, 1, 1),
         [*maps, x_map, p],
         torch.cuda.current_stream().cuda_stream,

@@ -43,8 +43,8 @@ def _protocol(path: Path) -> str:
 
 def test_protocol_copies():
     """The draft kernels' copy of the decode hop's Site, Ctrl and mailbox protocol is
-    hop.cu's, verbatim."""
-    want = _protocol(SM103 / "hop" / "src" / "hop.cu")
+    q35_hop.cuh's, verbatim."""
+    want = _protocol(SM103 / "hop" / "src" / "q35_hop.cuh")
     for name in ("draft_hop.cu", "draft_gemv.cu"):
         assert _protocol(SM103 / "draft" / "src" / name) == want, name
     # the draft consume's Args extends hop.cu's field by field

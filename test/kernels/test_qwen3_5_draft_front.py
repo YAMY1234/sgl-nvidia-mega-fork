@@ -125,6 +125,7 @@ def test_the_front_replays_in_a_graph_with_new_positions_and_slots():
     kv_s, kv_p = _caches(), _caches()
     static = [t.clone() for t in inputs]
     _plugin(static, kv_p)  # compile outside capture
+    _stock(static, kv_s)  # the same warm-up row in the stock caches
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         q_p, gate_p = _plugin(static, kv_p)

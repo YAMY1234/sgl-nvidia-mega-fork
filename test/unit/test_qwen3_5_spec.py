@@ -143,6 +143,11 @@ def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
             "slot 'gdn_front' runs slot 'gdn_pdl''s dependent verify",
         ),
         ({"route_shared"}, "slot 'route_shared' runs in slot 'route''s launch"),
+        ({"route", "mkm_wide"}, "slot 'mkm_wide' is slot 'mkm''s 16-token engine"),
+        (
+            {"route", "mkm", "mkm_wide"},
+            "slot 'mkm_wide' serves the steps of more than one request ('multi_request')",
+        ),
     ],
 )
 def test_a_slot_set_that_cannot_run_is_refused_before_the_load(
@@ -188,7 +193,10 @@ def _on(slots):
 
 
 def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
-    every = plan.Facts(**dict.fromkeys(plan.Facts.__struct_fields__, True))
+    # every slot built except mkm's 16-token engine (mkm_wide, below)
+    every = plan.Facts(
+        **{**dict.fromkeys(plan.Facts.__struct_fields__, True), "mkm_wide": False}
+    )
     assert _on(plan.slots(7, every)) == sorted(plan.Slots.__struct_fields__)
     # two requests: the 16-row router front, the GDN chain and the hop's one-shot rows
     assert _on(plan.slots(14, every)) == ["gdn_pdl", "gdn_verify", "hop", "route"]
@@ -210,6 +218,11 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     attention = plan.Facts(skv2=True, mka=True, mka_push=True, hop=True)
     assert plan.covered((7, 14, 28), attention, 7) == (7, 14)
     assert _on(plan.slots(14, attention)) == ["hop"]
+    # mkm_wide: mkm's 16-token engine at two requests, not past the router front's rows
+    wide = plan.Facts(route=True, mkm=True, mkm_wide=True)
+    assert _on(plan.slots(14, wide)) == ["mkm", "route"]
+    assert _on(plan.slots(28, wide)) == []
+    assert _on(plan.slots(14, plan.Facts(route=True, mkm=True))) == ["route"]
     # the router front and the hop's mailbox are built for the widest width they serve
     assert plan.widest((7, 14, 28), plan.ROUTE_MAX_ROWS) == 14
     assert plan.widest((7, 14, 28), plan.HOP_MAX_ROWS) == 14
@@ -224,6 +237,7 @@ def test_the_slot_plans_row_bounds_are_the_kernels():
     assert plan.ROUTE_MAX_ROWS == router.MAX_TOKENS
     assert plan.ROUTE_SHARED_ROWS == router.SHARED_MAX_M
     assert plan.MKM_MAX_ROWS == mkm.MAX_TOKENS
+    assert plan.MKM_WIDE_MAX_ROWS == mkm.M16_MAX_TOKENS
     assert plan.GDN_PUSH_MAX_ROWS == hop.OPROJ_MAX_M
     assert plan.MKA_MAX_ROWS == mka.MAX_ROWS
 

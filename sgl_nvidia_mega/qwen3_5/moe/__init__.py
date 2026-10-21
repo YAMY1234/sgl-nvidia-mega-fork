@@ -80,7 +80,11 @@ def build(model, ctx) -> route.Bound:
     if not rows:
         return route.Bound(reason=f"no width of {list(ctx.widths)} within its rows")
     return route.build(
-        model, rows, fused="mkm" in SLOTS, shared="route_shared" in SLOTS
+        model,
+        rows,
+        fused="mkm" in SLOTS,
+        shared="route_shared" in SLOTS,
+        wide="mkm_wide" in SLOTS,
     )
 
 

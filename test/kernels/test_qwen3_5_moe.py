@@ -7,7 +7,11 @@ replayed from a CUDA graph:
   runner's quantizer (flashinfer.fp4_quantize, linear scale layout), at 1-16 rows;
 - the fused routed experts (slot mkm), against FlashInfer's trtllm-gen NVFP4 MoE as
   SGLang serves Qwen3.5 at TP8 (routing from the logits, RenormalizeNaive, deferred
-  finalize): each token's 10 expert rows and their weights, at 1, 4 and 7 rows."""
+  finalize): each token's 10 expert rows and their weights, at 1, 4 and 7 rows;
+- the router front with the shared gate/up stage (slot route_shared, numeric): its
+  logits and NVFP4 input bit for bit the plain launch's, and its gate/up rows against
+  fp64 on SGLang's static FP8 quantization of the rows, at most 1.05 x the mean relative
+  L2 and 2 x the max abs error of FlashInfer's FP8 BMM, at 1-8 rows; graph replay."""
 
 import pytest
 import torch
@@ -221,6 +225,68 @@ def test_router_gemm_quant_replays_from_a_cuda_graph():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = router.router_gemm_quant(x, w, scale)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(eager, captured))
+
+
+def _shared_weights(seed: int, n: int = 256):
+    """The shared expert's static-FP8 gate/up at TP8 (2 x 128 rows a rank): [N, 4096]
+    e4m3 row-major, and its input and weight scales."""
+    g = torch.Generator(device="cuda").manual_seed(1000 + seed)
+    w = torch.randn(n, router.HIDDEN, device="cuda", generator=g) * 0.05
+    return (
+        w.clamp(-440, 440).to(torch.float8_e4m3fn),
+        torch.tensor([0.01], device="cuda"),
+        torch.tensor([0.002], device="cuda"),
+    )
+
+
+@pytest.mark.parametrize("m", list(range(1, router.SHARED_MAX_M + 1)))
+def test_router_gemm_quant_shared_holds_its_gate_up_to_fp64(m):
+    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+    from sglang.srt.layers.quantization.fp8_utils import flashinfer_bmm_fp8
+
+    errors = {"got": [], "stock": []}
+    for seed in range(3):
+        x, w, scale = _router_inputs(m, seed=100 * m + seed)
+        x[-1, 32:48] /= 1e4  # keep the shared projection's input in e4m3's range
+        sh_w, sh_in, sh_ws = _shared_weights(seed)
+        *routed, gate_up = router.router_gemm_quant_shared(
+            x, w, scale, sh_w, sh_in, sh_ws
+        )
+        for name, a, b in zip(
+            ("logits", "x_fp4", "x_sf"), routed, router.router_gemm_quant(x, w, scale)
+        ):
+            assert torch.equal(a, b), name
+        xq, _ = static_quant_fp8(x, sh_in, repeat_scale=False)
+        ref = (xq.double() @ sh_w.double().t()) * (sh_in.double() * sh_ws.double())
+        stock = flashinfer_bmm_fp8(xq, sh_w.t(), sh_in, sh_ws, torch.bfloat16)
+        for name, t in (("got", gate_up), ("stock", stock)):
+            diff = t.double() - ref
+            errors[name].append(
+                ((diff.norm() / ref.norm()).item(), diff.abs().max().item())
+            )
+    got, stock = (
+        torch.tensor(errors[n], dtype=torch.float64) for n in ("got", "stock")
+    )
+    print(
+        f"T0 route_shared m={m}: mean rel-L2 {got[:, 0].mean():.4g} vs stock "
+        f"{stock[:, 0].mean():.4g}, max abs {got[:, 1].max():.4g} vs {stock[:, 1].max():.4g}",
+        flush=True,
+    )
+    assert got[:, 0].mean() <= 1.05 * stock[:, 0].mean()
+    assert got[:, 1].max() <= 2 * stock[:, 1].max()
+
+
+def test_router_gemm_quant_shared_replays_from_a_cuda_graph():
+    x, w, scale = _router_inputs(7, seed=0)
+    sh_w, sh_in, sh_ws = _shared_weights(0)
+    router.build(x.device.index, 7, shared=True)
+    eager = router.router_gemm_quant_shared(x, w, scale, sh_w, sh_in, sh_ws)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = router.router_gemm_quant_shared(x, w, scale, sh_w, sh_in, sh_ws)
     graph.replay()
     torch.cuda.synchronize()
     assert all(torch.equal(a, b) for a, b in zip(eager, captured))

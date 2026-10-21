@@ -10,7 +10,9 @@ order than SGLang's GEMMs (numeric), the conv equals SGLang's on the projected r
 
 It launches as a programmatic dependent and releases its own dependents at entry: the
 next launch must wait (``griddepcontrol.wait``) before it reads any output, b / a
-included.
+included. By default (``tma``) each projection CTA's packed weights arrive by one bulk
+copy into shared memory issued before that wait, instead of register loads; same MMAs,
+same bits.
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ THREADS, CLUSTER, CTAS = (
 TIMEOUT = (
     500_000_000  # clock cycles a CTA waits for its cluster's partials before trapping
 )
+# one projection CTA's packed weights (kWeightBytes)
+WEIGHT_BYTES = 8 * 16 * 2 * 32 * 16
 
 
 class Prefetch(ctypes.Structure):
@@ -109,7 +113,7 @@ def pack(weight_nk: torch.Tensor) -> torch.Tensor:
 
 
 @cache
-def _kernel(device_index: int) -> jit.Kernel:
+def _kernel(device_index: int, tma: bool = True) -> jit.Kernel:
     major, minor = torch.cuda.get_device_capability(device_index)
     cubin = jit.compile_source(
         SOURCE.read_text(),
@@ -117,12 +121,14 @@ def _kernel(device_index: int) -> jit.Kernel:
         f"sm_{major}{minor}a",
         ("-std=c++17", "-default-device"),
     )
+    if tma:
+        return jit.load(cubin, "q35_gdn_front_tma", (THREADS, 1, 1), WEIGHT_BYTES)
     return jit.load(cubin, "q35_gdn_front", (THREADS, 1, 1), 0)
 
 
 def build(device_index: int) -> None:
     """Compile the front (no compile inside a step)."""
-    _kernel(device_index)
+    _kernel(device_index, True)
 
 
 def _prefetch(t: torch.Tensor, ring: int):
@@ -162,6 +168,7 @@ def front(
     history_g: torch.Tensor,
     ring_indices: torch.Tensor,
     pad_slot: int = -1,
+    tma: bool = True,
 ) -> None:
     """The front of the BF16 rows ``x`` [7, 4096] (contiguous) into the caller's
     buffers: ``projected`` [7, 2560] BF16 (q / k / v / z), ``conv_out`` [7, 1536] BF16,
@@ -171,7 +178,8 @@ def front(
     of ``pad_slot`` skips the conv writes). ``error`` is an int32 word, zero before
     capture, that a timed-out wait sets before trapping. The ReplaySSM verify's
     ``checkpoint`` (by state index) and ``history_*`` rings (by ``ring_indices[0]``) are
-    prefetched into L2: a hint, nothing is written."""
+    prefetched into L2: a hint, nothing is written. ``tma`` False takes the weights by
+    register loads instead of the bulk copy (same values)."""
     if (
         x.dtype != torch.bfloat16
         or tuple(x.shape) != (ROWS, HIDDEN)
@@ -230,7 +238,7 @@ def front(
     p.state_stride[:] = list(conv_state.stride())
     p.window_stride[:] = [windows.stride(0), 9]
     jit.launch(
-        _kernel(x.device.index),
+        _kernel(x.device.index, tma),
         (CTAS, 1, 1),
         [p],
         torch.cuda.current_stream(x.device).cuda_stream,

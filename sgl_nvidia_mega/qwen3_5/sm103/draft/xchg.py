@@ -15,9 +15,9 @@
 - ``draft_fc_partial`` + ``FcGather`` + ``ordered_partial_sum``: the row-split fc of up to
   16 tokens (fused norm + slice GEMV, all-gather of the fp32 partials, rank-order sum).
 
-Every launch keeps the 2.2 grid, block, shared memory and PDL setting. ``FcGather`` moves
-bytes only; the arithmetic of the split fc is ``draft_fc_partial`` and
-``ordered_partial_sum``, copied unchanged.
+Every launch keeps the 2.2 grid, block, shared memory and PDL setting (the draft head may
+add unused shared memory, ``smem_pad``). ``FcGather`` moves bytes only; the arithmetic of
+the split fc is ``draft_fc_partial`` and ``ordered_partial_sum``, copied unchanged.
 """
 
 from __future__ import annotations
@@ -199,9 +199,9 @@ def _fc_kernels(device_index: int, world: int) -> dict[str, jit.Kernel]:
 
 
 @cache
-def _head_kernel(device_index: int) -> jit.Kernel:
+def _head_kernel(device_index: int, smem_pad: int = 0) -> jit.Kernel:
     cubin = _compile(device_index, "mkd_head", ())
-    return jit.load(cubin, "mkd_head", (HEAD_WARPS * 32, 1, 1), 0)
+    return jit.load(cubin, "mkd_head", (HEAD_WARPS * 32, 1, 1), smem_pad)
 
 
 @cache
@@ -549,11 +549,13 @@ def mkd_draft_head(
     logits: torch.Tensor,
     part: torch.Tensor,
     reverse: bool = False,
+    smem_pad: int = 0,
 ) -> None:
     """Draft lm_head of one token, ``logits`` [1, N] bf16 = ``x`` [1, 4096] @ ``weight``
     [N, 4096]^T with fp32 accumulation, and per CTA (``part.numel()`` CTAs) the packed
     maximum of its rows for mkd_xchg. ``reverse`` walks the rows from the end (same
-    values)."""
+    values). ``smem_pad`` bytes of unused dynamic shared memory per CTA (same values;
+    above half an SM it allows one CTA per SM)."""
     device = logits.device
     n = int(weight.shape[0])
     _check(x, "x", (1, HIDDEN), torch.bfloat16, aligned=True)
@@ -570,7 +572,7 @@ def mkd_draft_head(
         n=n,
         reverse=int(bool(reverse)),
     )
-    _launch(_head_kernel(device.index), part.numel(), p, device, pdl=True)
+    _launch(_head_kernel(device.index, smem_pad), part.numel(), p, device, pdl=True)
 
 
 # ---------------------------------------------------------------- the row-split fc

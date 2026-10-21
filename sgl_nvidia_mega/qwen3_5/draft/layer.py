@@ -103,7 +103,12 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         )
     moe_out = moe(moe_in) if moe is not None else lay.mlp(moe_in)
     if hop is not None:
-        out, _ = hop.final_norm(moe_out, residual, parts.model.norm)
+        out, _ = hop.final_norm(
+            moe_out,
+            residual,
+            parts.model.norm,
+            head_follows=parts.mkd is not None and parts.mkd.head_follows(),
+        )
         return out
     out, _ = parts.model.norm(tensor_model_parallel_all_reduce(moe_out), residual)
     return out

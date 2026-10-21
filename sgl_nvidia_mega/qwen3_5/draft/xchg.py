@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 _MEMO_BLOCK = 4096
 # CTAs of mkd_draft_head per SM (T1, TP8 shard: 1 -> 39.3 us, 2 -> 40.5 us, 3 -> 41.6 us)
 _HEAD_CTAS_PER_SM = 1
+# Unused dynamic shared memory per head CTA: an early-released head CTA then starts only on
+# an SM with 128 KB of shared memory free (its registers already hold the head at one CTA
+# per SM)
+HEAD_SMEM_PAD = 120 * 1024
 # Draft and draft-extend widths that take the row-split fc (2.2 _FC_SPLIT_MAX_TOKENS)
 FC_SPLIT_MAX_TOKENS = kernels.GATHER_MAX_TOKENS
 # Rows of a draft step the vocabulary exchange serves (2.2 DraftVocabExchange.MAX_ROWS)
@@ -129,6 +133,7 @@ class MkdBoundary:
         memo: bool = True,
         extend_fc: bool = True,
         head: bool = True,
+        head_smem_pad: int = HEAD_SMEM_PAD,
     ) -> None:
         import torch.distributed as dist
 
@@ -193,6 +198,7 @@ class MkdBoundary:
         self.ext_partials = torch.empty_like(self.out_partials)
         self.side_stream = torch.cuda.Stream(device=dev)
         self.lm_head_weight = lm_head_shard
+        self.head_pad = head_smem_pad
         self._install_head(head, dev)
         # extend_fc: the draft extend's exchange writes fc_buf for the next draft's first
         # step. input_seq counts calls that produce a draft input; fc_buf_key is the
@@ -321,10 +327,11 @@ class MkdBoundary:
         sms = torch.cuda.get_device_properties(dev).multi_processor_count
         self.head_part = torch.zeros(_HEAD_CTAS_PER_SM * sms, dtype=torch.int32, device=dev)
         logger.info(
-            "MKD draft head active: %d x %d shard, %d CTAs.",
+            "MKD draft head active: %d x %d shard, %d CTAs, smem pad %d B.",
             head.shape[0],
             head.shape[1],
             self.head_part.numel(),
+            self.head_pad,
         )
 
     def head(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -337,10 +344,20 @@ class MkdBoundary:
         # Alternate the row walk per draft step: the next step re-reads first what is still in L2
         # (T1: -1.9 to -2.4 us per call on the TP8 shard).
         kernels.mkd_draft_head(
-            x, self.lm_head_weight, logits, self.head_part, reverse=self.step % 2 == 1
+            x,
+            self.lm_head_weight,
+            logits,
+            self.head_part,
+            reverse=self.step % 2 == 1,
+            smem_pad=self.head_pad,
         )
         self.head_used = True
         return logits
+
+    def head_follows(self) -> bool:
+        """Whether the draft head is the next launch after this step's final norm (an
+        armed step with the head installed)."""
+        return self.armed and self.head_part is not None
 
     # ---------------------------------------------------------------- per step
 

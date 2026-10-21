@@ -621,12 +621,24 @@ def _gdn_verify_setup(log, *, ring_len=16, temporal_dtype=torch.bfloat16, draft=
     return verify, gdn, st
 
 
-def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows():
+@pytest.mark.parametrize("push", [False, True])
+def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows(push):
+    """With ``push`` (slot gdn_push) the norm releases its dependents early and
+    out_proj runs as the hop's push GEMM on the layer's packed weights."""
+    import msgspec
+
     from sgl_nvidia_mega.qwen3_5.gdn import conv, norm_fp8, replayssm
 
     log = _log()
     verify, gdn, st = _gdn_verify_setup(log)
     k = log.known
+    k["packed2"] = torch.zeros(16, dtype=torch.uint8)
+    hop = SimpleNamespace(out_proj_push=log.op("out_proj_push", torch.zeros(7, 8)))
+    st.bound = {
+        "boundary": SimpleNamespace(hop=hop),
+        "gdn": SimpleNamespace(packed={2: k["packed2"]}),
+    }
+    opts = msgspec.structs.replace(verify.SLOT, push=push)
 
     def views(qkvz, ba, nk, nv, hk, hv):
         log.append(("views", log.tag(qkvz), log.tag(ba), nk, nv, hk, hv))
@@ -715,8 +727,9 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows():
         ),
     ):
         for _ in range(2):  # two layers of one step
-            verify.step(gdn, torch.zeros(7, 8), st)
-    one_layer = ["conv", "verify", "norm_fp8", "symmetric", "bmm_fp8", "views"]
+            verify.step(gdn, torch.zeros(7, 8), st, opts)
+    proj = ["out_proj_push"] if push else ["symmetric", "bmm_fp8"]
+    one_layer = ["conv", "verify", "norm_fp8", *proj, "views"]
     assert [e[0] for e in log] == ["views", *one_layer, *one_layer[:-1]]
     _, shape, state, states, window, inter, kw = log[1]
     assert (shape, states, inter) == ((1, 32, 7), "states(1,)", "inter(1,)")
@@ -747,8 +760,22 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows():
         (28, 4),
         (7, 4, 4),
         "scale(1,)",
-        (("activation", "silu"),),
+        (("activation", "silu"), ("early_dependents", push)),
     )
+    if push:
+        # the push GEMM on the FP8 rows and the layer's packed weights and scales
+        assert log[4] == (
+            "out_proj_push",
+            "main",
+            (),
+            (
+                ("input_scale", "scale(1,)"),
+                ("packed_w", "packed2(16,)"),
+                ("weight_scale", "out_s(1,)"),
+                ("x_fp8", "?(7, 16)"),
+            ),
+        )
+        return
     # out_proj's BMM on the FP8 rows with its static input scale, output in the activation dtype
     assert log[5] == (
         "bmm_fp8",
@@ -756,6 +783,32 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows():
         ("?(7, 16)", "out_w(16, 8)", "scale(1,)", "out_s(1,)", "?"),
         (),
     )
+
+
+@pytest.mark.parametrize("takes", [False, True])
+def test_the_gdn_push_slot_pushes_only_where_the_moe_input_consumes(
+    monkeypatch, caplog, takes
+):
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5 import gdn
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+
+    monkeypatch.setattr(verify, "_ENGAGED", set())
+    seen = []
+    monkeypatch.setattr(boundary_hop, "takes_moe_input", lambda hop, *a: takes)
+    monkeypatch.setattr(verify, "step", lambda mod, x, st, opts: seen.append(opts))
+    layer = SimpleNamespace(linear_attn="gdn")
+    st = SimpleNamespace(
+        slots=plan.Slots(gdn_verify=True, hop=True, gdn_push=True),
+        bound={"boundary": boundary_hop.Bound(hop="hop")},
+    )
+    with caplog.at_level("INFO"):
+        gdn.step(layer, torch.zeros(7, 4), st)
+    assert seen == [msgspec.structs.replace(verify.SLOT, push=takes)]
+    # the push is logged once, where it is chosen
+    logged = "NVIDIA megakernel: Qwen3.5 slot gdn_push runs at 7 rows" in caplog.text
+    assert logged == takes
 
 
 @pytest.mark.parametrize(
@@ -1089,6 +1142,68 @@ def _same_calls(a, b):
     """The same calls on the same tensors (by identity)."""
     assert len(a) == len(b) == 1
     assert a[0][0] == b[0][0] and all(x is y for x, y in zip(a[0][1:], b[0][1:]))
+
+
+def test_out_proj_packs_into_the_push_gemms_fragments():
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop
+
+    w = torch.arange(4096 * 1024, dtype=torch.int64).remainder(251).to(torch.uint8)
+    packed = hop.pack_out_proj(w.view(4096, 1024).view(torch.float8_e4m3fn))
+    assert packed.dtype == torch.uint8 and packed.numel() == 4096 * 1024
+    # CTA 0, warp 0, k-step 0, block 0, lane 0: rows 0 and 8, K bytes 0-3 and 16-19
+    frag = packed[:16].view(4, 4)
+    want = w.view(4096, 1024)
+    assert torch.equal(frag[0], want[0, 0:4]) and torch.equal(frag[1], want[8, 0:4])
+    assert torch.equal(frag[2], want[0, 16:20]) and torch.equal(frag[3], want[8, 16:20])
+    with pytest.raises(ValueError, match="out_proj packing"):
+        hop.pack_out_proj(torch.zeros(4096, 512, dtype=torch.float8_e4m3fn))
+
+
+def _pushing_hop(log):
+    """sm103's Hop without its mailbox: the launches it would issue, logged."""
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop as sm103_hop
+
+    hop = object.__new__(sm103_hop.Hop)
+    hop.max_m, hop._pushed = 8, None
+    hop._args = lambda m, residual, gamma, scale: (SimpleNamespace(m=m), ("out",))
+    hop._launch = lambda name, args, ctas, cluster=None: log.append(name)
+    hop._consume = lambda args: log.append("consume")
+    return hop
+
+
+def test_a_pushed_partials_all_reduce_only_consumes():
+    log = []
+    hop = _pushing_hop(log)
+    pushed, other = torch.zeros(7, 16), torch.zeros(7, 16)
+    hop.mark_pushed(pushed)
+    assert hop.has_pushed(pushed) and not hop.has_pushed(other)
+    for partial in (pushed, other):  # the push consumed, the next one publishes
+        hop.all_reduce_residual_rms_norm(
+            local_contribution=partial, residual="r", gamma="g"
+        )
+    assert log == ["consume", "q35hop_publish", "consume"]
+    assert hop._pushed is None
+
+
+def test_a_push_left_unconsumed_stops_the_next_hop():
+    hop = _pushing_hop([])
+    pushed, other = torch.zeros(7, 16), torch.zeros(7, 16)
+    hop.mark_pushed(pushed)
+    with pytest.raises(RuntimeError, match="never consumed"):
+        hop.mark_pushed(other)
+    with pytest.raises(RuntimeError, match="never consumed"):
+        hop.all_reduce_residual_rms_norm(
+            local_contribution=other, residual="r", gamma="g"
+        )
+    with pytest.raises(RuntimeError, match="never consumed"):
+        hop.moe_finalize_all_reduce_rms_norm(
+            routed_output=None,
+            expert_weights=None,
+            permuted_indices=torch.zeros(7, 10, dtype=torch.int32),
+            gated_shared_output=None,
+            residual="r",
+            gamma="g",
+        )
 
 
 @pytest.mark.parametrize("point", ["layer input", "MoE input", "final norm"])

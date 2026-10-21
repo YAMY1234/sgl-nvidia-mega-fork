@@ -14,7 +14,14 @@ import msgspec
 # The kernel slots that run by default, and the ones that run only when requested
 # (until step-level timing and accuracy runs move them to the default list)
 SHIPPED_SLOTS: tuple[str, ...] = ()
-OPT_IN_SLOTS: tuple[str, ...] = ("route", "mkm", "gdn_verify", "gdn_pdl", "hop")
+OPT_IN_SLOTS: tuple[str, ...] = (
+    "route",
+    "mkm",
+    "gdn_verify",
+    "gdn_pdl",
+    "hop",
+    "gdn_push",
+)
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -45,6 +52,11 @@ def slot_reasons() -> list[str]:
         )
     if "mkm" in SLOTS and "route" not in SLOTS:
         reasons.append(f"{SLOTS_ENV}: slot 'mkm' runs on slot 'route''s outputs")
+    if "gdn_push" in SLOTS and not {"gdn_verify", "hop"} <= SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'gdn_push' pushes slot 'gdn_verify''s out_proj into "
+            "slot 'hop'"
+        )
     if "gdn_pdl" in SLOTS and "gdn_verify" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_pdl' launches slot 'gdn_verify''s verify"
@@ -102,6 +114,7 @@ def build(model, ctx):
         gdn_verify=bound["gdn"].gdn_verify,
         gdn_pdl=bound["gdn"].gdn_pdl,
         hop=bound["boundary"].hop is not None,
+        gdn_push=bool(bound["gdn"].packed),
     )
     slots = slot_plan.plan(pctx.widths, facts)
     built = msgspec.structs.asdict(facts)

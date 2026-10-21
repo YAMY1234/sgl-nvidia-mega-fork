@@ -55,9 +55,13 @@ def _layer_norm_fwd_1pass_kernel(
     ACTIVATION: tl.constexpr,
     OUT_DTYPE: tl.constexpr,  # the activation dtype each output is rounded to first
     USE_GDC: tl.constexpr = False,
+    EARLY_DEPENDENTS: tl.constexpr = False,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
+        # the next launch loads only static data until its own wait
+        if EARLY_DEPENDENTS:
+            tl.extra.cuda.gdc_launch_dependents()
 
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
     group = tl.program_id(1)
@@ -113,7 +117,7 @@ def _layer_norm_fwd_1pass_kernel(
     y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(Q.dtype.element_ty)
     tl.store(Q + rows[:, None] * stride_q_row + col_offsets, y_q, mask=mask)
 
-    if USE_GDC:
+    if USE_GDC and not EARLY_DEPENDENTS:
         tl.extra.cuda.gdc_launch_dependents()
 
 
@@ -126,9 +130,11 @@ def rms_norm_gated_fp8(
     *,
     norm_before_gate: bool = True,
     activation: str = "swish",
+    early_dependents: bool = False,
 ) -> torch.Tensor:
     """e4m3 of RMSNorm(x) * act(z) [M, N] (rounded to x's dtype first) over the static
-    input ``scale`` [1] of the linear it feeds; z [M, N] or [tokens, heads, N]."""
+    input ``scale`` [1] of the linear it feeds; z [M, N] or [tokens, heads, N]. With
+    ``early_dependents`` the next launch may start (and load its weights) at once."""
     from sglang.kernels.jit.utils import is_arch_support_pdl
     from sglang.kernels.ops.attention.fla.layernorm_gated import calc_rows_per_block
 
@@ -139,7 +145,11 @@ def rms_norm_gated_fp8(
     block_n = min(65536 // x.element_size(), triton.next_power_of_2(N))
     num_warps = min(max(block_n // 256, 1), 8)
     rows_per_block = calc_rows_per_block(M, x.device)
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = (
+        {"USE_GDC": True, "launch_pdl": True, "EARLY_DEPENDENTS": early_dependents}
+        if is_arch_support_pdl()
+        else {}
+    )
     out_dtype = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}[x.dtype]
     _layer_norm_fwd_1pass_kernel[(triton.cdiv(M, rows_per_block), 1)](
         x,

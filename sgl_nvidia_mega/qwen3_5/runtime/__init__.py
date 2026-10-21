@@ -24,6 +24,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "gdn_front",
     "route_shared",
     "skv2",
+    "mka",
 )
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
@@ -130,6 +131,7 @@ def build(model, ctx):
         gdn_front=bool(bound["gdn"].front),
         route_shared=bound["moe"].shared,
         skv2=bound["attention"].skv2,
+        mka=bound["attention"].mka,
     )
     slots = slot_plan.plan(pctx.widths, facts)
     built = msgspec.structs.asdict(facts)

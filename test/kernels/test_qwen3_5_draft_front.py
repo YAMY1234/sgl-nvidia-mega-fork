@@ -3,7 +3,7 @@
 """Slot draft_front's attention front (sm103/draft/front.py, 2.2's ATTN_FRONT) against SGLang's
 two launches it replaces, on one GPU: the fused q / k Gemma RMSNorm + RoPE + gate split,
 then the fused FP8 q / k / v + paged KV write. The FP8 q, the gate and the K / V cache
-rows must be the same bytes, at the draft's widths (1 and 7 rows) and query heads a rank
+rows must be the same bytes, at the draft's widths (1, 2 and 7 rows) and query heads a rank
 (4 at TP8, 8 at TP4), in eager and in a CUDA graph replayed with new positions and
 slots."""
 
@@ -108,7 +108,7 @@ def _same(a, b):
 
 @cuda
 @pytest.mark.parametrize("heads", [4, 8])
-@pytest.mark.parametrize("rows", [1, 7])
+@pytest.mark.parametrize("rows", [1, 2, 7])
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_the_front_writes_what_sglangs_two_launches_write(rows, seed, heads):
     inputs = _inputs(rows, seed, heads)

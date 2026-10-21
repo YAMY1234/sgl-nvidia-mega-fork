@@ -8,7 +8,7 @@ SM100-family GPUs (GB300) with NVLink multicast, on the decode hop's mailbox:
 - mnnvl: its residual output equals bf16(bf16(sum) + residual) bit for bit, and its norm
   stays within one bf16 ulp of an fp32 reference (its bits against FlashInfer's legacy
   MNNVL kernel are checked with SGLang branch nvidia/qwen35-agentx-gb300, not here);
-- rows 1 and 7, both entry releases, a late rank in turn, hops interleaved with the
+- rows 1, 2 and 7, both entry releases, a late rank in turn, hops interleaved with the
   decode hop's own, so the three mailbox stages cycle;
 - the draft o_proj GEMV equals an fp32 emulation of its summation order, bit for bit, and
   its pushed output followed by a consume-only all-reduce equals publish + consume;
@@ -171,7 +171,7 @@ def test_draft_hop_rounding(rank, draft):
     hop = draft.hop
     calls = [
         (m, add_norm, early)
-        for m in (1, 7)
+        for m in (1, 2, 7)
         for add_norm in (False, True)
         for early in (False, True)
     ]

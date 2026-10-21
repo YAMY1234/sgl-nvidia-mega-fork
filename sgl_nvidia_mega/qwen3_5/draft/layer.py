@@ -75,6 +75,9 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
     lay = parts.layer
     residual = x
     hop = parts.hop if rows_per_request == 1 else None
+    # a draft step of one request pushes its o_proj into the hop and releases the next
+    # launch early; of two requests it takes only the hop's all-reduce points
+    push = hop if x.shape[0] == 1 else None
     extend_hop = parts.hop if rows_per_request > 1 and EXTEND_MNNVL else None
     attn_out = parts.attention(
         lay.input_layernorm(x),
@@ -84,8 +87,8 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         kv,
         rows_per_request=rows_per_request,
         o_proj=(
-            partial(hop.o_proj, weight=lay.o_proj.weight)
-            if hop is not None and hop.gemv
+            partial(push.o_proj, weight=lay.o_proj.weight)
+            if push is not None and push.gemv
             else None
         ),
     )
@@ -95,7 +98,9 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
             attn_out,
             residual,
             lay.post_attention_layernorm,
-            moe_single_launch=moe is not None and moe.single_launch(1),
+            moe_single_launch=push is not None
+            and moe is not None
+            and moe.single_launch(1),
         )
     elif extend_hop is not None:
         moe_in, residual = extend_hop.ffn_input(
@@ -111,7 +116,9 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
             moe_out,
             residual,
             parts.model.norm,
-            head_follows=parts.mkd is not None and parts.mkd.head_follows(),
+            head_follows=push is not None
+            and parts.mkd is not None
+            and parts.mkd.head_follows(),
         )
         return out
     out, _ = parts.model.norm(tensor_model_parallel_all_reduce(moe_out), residual)

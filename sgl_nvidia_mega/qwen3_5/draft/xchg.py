@@ -224,7 +224,7 @@ class MkdBoundary:
         )
 
     @classmethod
-    def maybe_create(cls, *, vocab_size: int, **kwargs) -> Optional["MkdBoundary"]:
+    def maybe_create(cls, *, vocab_size: int, **kwargs) -> Optional[MkdBoundary]:
         """The boundary, or None (logged) when ``unsupported_reason`` refuses it; every
         rank decides alike."""
         fc_weight = kwargs["fc_weight"]

@@ -68,7 +68,7 @@ class Parts:
         self.engaged: set = set()
 
     @classmethod
-    def build(cls, draft) -> "Parts":
+    def build(cls, draft) -> Parts:
         from sgl_nvidia_mega.qwen3_5.draft.attention import Attention
 
         m = draft.lm.model

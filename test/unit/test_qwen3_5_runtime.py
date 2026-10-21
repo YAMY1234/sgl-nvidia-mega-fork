@@ -137,6 +137,34 @@ def test_the_draft_entries_are_offered_only_on_request(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "batch_size, lower_bound, seq_lens, want",
+    [
+        (1, 16384, None, "q1_long"),
+        (1, 16383, None, "q1_stock"),
+        (1, None, [20000], "q1_long"),
+        (1, None, [100], "q1_stock"),
+        (1, None, None, "q1_stock"),
+        (2, 50000, None, "q1_stock"),
+    ],
+)
+def test_the_draft_loop_routes_q1_by_kv_length_as_2_2(
+    monkeypatch, batch_size, lower_bound, seq_lens, want
+):
+    from sgl_nvidia_mega.qwen3_5 import draft
+
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"draft_loop", "draft_q1"}))
+    built = draft.SPEC.build("lm", SimpleNamespace(context_len=4096), _draft_ctx())
+    variants = built.graph_variants["draft_loop"]
+    assert variants.capture_labels == ("q1_stock", "q1_long")
+    batch = SimpleNamespace(
+        batch_size=batch_size,
+        attention_kv_len_lower_bound=lower_bound,
+        seq_lens_cpu=None if seq_lens is None else torch.tensor(seq_lens),
+    )
+    assert variants.select(batch) == want
+
+
+@pytest.mark.parametrize(
     "slots, want",
     [
         ({"draft_moe"}, "slot 'draft_moe' runs inside entry 'draft_loop'"),

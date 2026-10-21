@@ -101,6 +101,12 @@ NUMERIC_TOLERANCES = {
         "gdn_push.out_proj.rel_l2_vs_stock": 1.05,
         "gdn_push.out_proj.max_abs_vs_stock": 2.0,
     },
+    "gdn_front": {
+        "gdn_front.in_proj_qkvz.rel_l2_vs_stock": 1.05,
+        "gdn_front.in_proj_qkvz.max_abs_vs_stock": 2.0,
+        "gdn_front.in_proj_ba.rel_l2_vs_stock": 1.05,
+        "gdn_front.in_proj_ba.max_abs_vs_stock": 2.0,
+    },
 }
 
 

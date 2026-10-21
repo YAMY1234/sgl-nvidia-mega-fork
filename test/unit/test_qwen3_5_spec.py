@@ -134,6 +134,10 @@ def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
             {"gdn_verify", "gdn_push"},
             "slot 'gdn_push' pushes slot 'gdn_verify''s out_proj into slot 'hop'",
         ),
+        (
+            {"gdn_verify", "gdn_front"},
+            "slot 'gdn_front' runs slot 'gdn_pdl''s dependent verify",
+        ),
     ],
 )
 def test_a_slot_set_that_cannot_run_is_refused_before_the_load(
@@ -161,6 +165,11 @@ def test_the_slot_plan_covers_one_request_of_7_rows():
         7: plan.Slots(**both, gdn_push=True)
     }
     assert not plan.slots(7, plan.Facts(gdn_verify=True, gdn_push=True)).gdn_push
+    # gdn_front runs gdn_pdl's verify, for one request of 7 rows only
+    front = dict(gdn_verify=True, gdn_pdl=True, gdn_front=True)
+    assert plan.plan((7,), plan.Facts(**front)) == {7: plan.Slots(**front)}
+    assert not plan.slots(4, plan.Facts(**front)).gdn_front
+    assert not plan.slots(7, plan.Facts(gdn_verify=True, gdn_front=True)).gdn_front
     with pytest.raises(ValueError):
         plan.slots(plan.MAX_ROWS + 1, plan.Facts())
 
@@ -172,3 +181,8 @@ def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
     claim = spec.numerics(frozenset({"gdn_verify", "hop", "gdn_push"}))
     assert claim.kind is NumericsKind.TOLERANCE
     assert dict(claim.tolerances) == spec.NUMERIC_TOLERANCES["gdn_push"]
+    both = spec.numerics(frozenset({"gdn_verify", "gdn_pdl", "gdn_front", "gdn_push"}))
+    assert dict(both.tolerances) == {
+        **spec.NUMERIC_TOLERANCES["gdn_push"],
+        **spec.NUMERIC_TOLERANCES["gdn_front"],
+    }

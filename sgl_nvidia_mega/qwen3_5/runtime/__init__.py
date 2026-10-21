@@ -28,6 +28,10 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "mka",
     "mka_push",
 )
+# Steps of more than one request (TP8's decode graphs of batch sizes 2 and 4), covered only
+# when requested in the same variable: covering them costs the one-request step about
+# 0.3% at TP8
+OPT_IN_COVERAGE: tuple[str, ...] = ("multi_request",)
 # The EAGLE entries (spec.ENTRIES) offered only when requested in the same variable;
 # verify_sample has no step at any size, so it turns on SGLang's post-verify graphs
 # with SGLang's own sampling
@@ -63,6 +67,7 @@ def slot_reasons() -> list[str]:
     known = (
         *SHIPPED_SLOTS,
         *OPT_IN_SLOTS,
+        *OPT_IN_COVERAGE,
         *OPT_IN_ENTRIES,
         *DRAFT_ENTRIES,
         *DRAFT_SLOTS,
@@ -75,6 +80,11 @@ def slot_reasons() -> list[str]:
         reasons.append(f"{SLOTS_ENV}: slot 'mkm' runs on slot 'route''s outputs")
     if "mkm_wide" in SLOTS and "mkm" not in SLOTS:
         reasons.append(f"{SLOTS_ENV}: slot 'mkm_wide' is slot 'mkm''s 16-token engine")
+    if "mkm_wide" in SLOTS and "multi_request" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'mkm_wide' serves the steps of more than one request "
+            "('multi_request')"
+        )
     if "route_shared" in SLOTS and "route" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'route_shared' runs in slot 'route''s launch"
@@ -139,13 +149,12 @@ def build(model, ctx):
     from sgl_nvidia_mega.qwen3_5.runtime import parity
     from sgl_nvidia_mega.qwen3_5.runtime.executor import Qwen35Verify
 
-    widths = slot_plan.candidates(ctx.widths, ctx.tokens_per_request)
-    if len(widths) > 1:
+    multi = slot_plan.MULTI_REQUEST in SLOTS
+    if multi:
         from sglang.srt.runtime_context import get_parallel
 
-        widths = slot_plan.candidates(
-            ctx.widths, ctx.tokens_per_request, get_parallel().tp_size
-        )
+        multi = slot_plan.multi_request(get_parallel().tp_size, SLOTS)
+    widths = slot_plan.candidates(ctx.widths, ctx.tokens_per_request, multi)
     if not widths:
         raise RuntimeError(
             f"NVIDIA megakernel: {ctx.tokens_per_request} rows a request leave no "
@@ -187,7 +196,13 @@ def build(model, ctx):
     built = msgspec.structs.asdict(facts)
     entries = tuple(name for name in OPT_IN_ENTRIES if name in SLOTS)
     # every package's build agrees across ranks, so this raises on every rank alike
-    target_slots = SLOTS - set(entries) - set(DRAFT_ENTRIES) - set(DRAFT_SLOTS)
+    target_slots = (
+        SLOTS
+        - set(entries)
+        - set(DRAFT_ENTRIES)
+        - set(DRAFT_SLOTS)
+        - set(OPT_IN_COVERAGE)
+    )
     # mkm's 16-token engine has nothing to serve where no covered step is wider than 7 rows
     vacuous = (
         {"mkm_wide"}

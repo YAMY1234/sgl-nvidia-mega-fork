@@ -194,7 +194,7 @@ class _DraftParts:
     """Parts with no slot built: the stock model step."""
 
     def __init__(self, slots=frozenset()):
-        self.slots, self.engaged = slots, []
+        self.slots, self.mkd, self.engaged = slots, None, []
 
     def note_engaged(self, entry, bs):
         self.engaged.append((entry, bs))

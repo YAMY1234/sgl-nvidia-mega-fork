@@ -115,10 +115,16 @@ class Parts:
             deadline_s=self.draft.deadline_s,
             o_proj_k=int(self.layer.o_proj.weight.shape[1]),
             early=True,
-            early_head=False,
+            early_head=True,
         )
         if hop is None:
             raise RuntimeError(f"NVIDIA megakernel: slot draft_hop cannot run: {why}")
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 MTP draft hop releases at entry: the "
+            "single-launch MoE %s, the draft head %s",
+            hop.early,
+            hop.early_head,
+        )
         return hop
 
     def _build_mkd(self):

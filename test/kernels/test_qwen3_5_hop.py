@@ -10,6 +10,11 @@ verify server builds it (hidden 4096, top-10, no early shared-expert load), bit 
   rank in turn; the static FP8 output equals SGLang's static quantization of the norm;
 - the same operations replayed from a CUDA graph with fresh inputs.
 
+And the GatedDeltaNet out_proj push (slot gdn_push, numeric): its partial against an
+fp64 reference on the same FP8 operands, at most 1.05 x the mean relative L2 and 2 x the
+max abs error of FlashInfer's BMM (SGLang's op), and its all-reduce, which only consumes,
+bit for bit the fusion's on the same partial.
+
 Run with ``python test/kernels/test_qwen3_5_hop.py --num-gpu 4``.
 """
 
@@ -174,6 +179,66 @@ def test_hop_replays_from_a_cuda_graph(rank, pair):
             for op, x, got in zip(ops, static, outputs):
                 _same(got, _run(fusion, op, x))
         torch.cuda.synchronize()
+
+
+def _fp8(rows, cols, device, gen, *, outliers=False, scale=1.0):
+    x = torch.randn(rows, cols, device=device, generator=gen) * scale
+    if outliers:
+        x[:, :: cols // 8] *= 32  # a few large channels, inside e4m3's range
+    return x.clamp(-440, 440).to(torch.float8_e4m3fn)
+
+
+def _errors(got, ref):
+    diff = got.double() - ref
+    return (diff.norm() / ref.norm()).item(), diff.abs().max().item()
+
+
+def test_out_proj_push_holds_to_fp64_and_its_all_reduce_only_consumes(rank, pair):
+    from sglang.srt.layers.quantization.fp8_utils import flashinfer_bmm_fp8
+
+    from sgl_nvidia_mega.qwen3_5.sm103.hop import pack_out_proj
+
+    fusion, hop = pair
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    k = 1024  # out_proj's input per rank at TP8
+    errors = {"push": [], "stock": []}
+    with torch.inference_mode():
+        for seed in range(3):
+            gen = torch.Generator(device=device).manual_seed(1000 * seed + rank)
+            w = _fp8(HIDDEN, k, device, gen, scale=0.5)
+            packed = pack_out_proj(w)
+            sw = torch.tensor([0.01], device=device)
+            sx = torch.tensor([0.02], device=device)
+            for m in (1, 2, 7):
+                for outliers in (False, True):
+                    x = _fp8(m, k, device, gen, outliers=outliers)
+                    partial = hop.out_proj_push(
+                        x_fp8=x, packed_w=packed, input_scale=sx, weight_scale=sw
+                    )
+                    x2 = _operands(m, device, rank, seed=seed)
+                    got = hop.all_reduce_residual_rms_norm(
+                        local_contribution=partial,
+                        residual=x2["residual"],
+                        gamma=x2["gamma"],
+                    )
+                    _same(got, _run(fusion, "all_reduce", dict(x2, partial=partial)))
+                    ref = (x.double() @ w.double().t()) * (sx.double() * sw.double())
+                    stock = flashinfer_bmm_fp8(x, w.t(), sx, sw, torch.bfloat16)
+                    errors["push"].append(_errors(partial, ref))
+                    errors["stock"].append(_errors(stock, ref))
+        torch.cuda.synchronize()
+    push, stock = (
+        torch.tensor(errors[n], dtype=torch.float64) for n in ("push", "stock")
+    )
+    print(
+        f"T0 gdn_push out_proj rank {rank}: {len(push)} cases, mean rel-L2 "
+        f"{push[:, 0].mean():.4g} vs stock {stock[:, 0].mean():.4g}, max abs "
+        f"{push[:, 1].max():.4g} vs stock {stock[:, 1].max():.4g}",
+        flush=True,
+    )
+    # the numeric-slot protocol's T0 rule
+    assert push[:, 0].mean() <= 1.05 * stock[:, 0].mean()
+    assert push[:, 1].max() <= 2 * stock[:, 1].max()
 
 
 if __name__ == "__main__":

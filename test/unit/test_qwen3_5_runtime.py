@@ -64,8 +64,15 @@ def test_the_covered_widths_are_the_ones_the_build_returns():
     assert built.plan(torch.zeros(21, dtype=torch.int64), _batch()) is None
 
 
-def test_the_build_covers_more_requests_only_where_a_slot_runs(monkeypatch):
+@pytest.mark.parametrize("tp_size, want", [(8, (7,)), (4, (7,))])
+def test_the_build_covers_more_requests_only_where_a_slot_runs(
+    monkeypatch, tp_size, want
+):
     monkeypatch.setattr(runtime, "SLOTS", frozenset())
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=tp_size),
+    )
     model = SimpleNamespace(
         model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
     )
@@ -77,7 +84,7 @@ def test_the_build_covers_more_requests_only_where_a_slot_runs(monkeypatch):
         binding="EagleBinding",
     )
     built = runtime.build(model, ctx)
-    assert built.widths == (7,) and built.summary() == "slots none (stock)"
+    assert built.widths == want and built.summary() == "slots none (stock)"
 
 
 def test_the_build_hands_over_the_binding_and_every_entry_stays_sglangs():

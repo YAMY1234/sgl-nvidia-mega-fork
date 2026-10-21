@@ -200,6 +200,8 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     # SGLang offers every multiple of 7 up to MAX_ROWS; three requests are not covered
     offered = tuple(range(7, plan.MAX_ROWS + 1, 7))
     assert plan.candidates(offered, 7) == (7, 14, 28)
+    # more than one request only at TP8; TP4 keeps the one-request step it is checked at
+    assert plan.candidates(offered, 7, tp_size=4) == (7,)
     assert plan.covered((7, 14, 28), every, 7) == (7, 14, 28)
     # one request is always covered, more only where a slot runs
     assert plan.covered((7, 14, 28), plan.Facts(), 7) == (7,)

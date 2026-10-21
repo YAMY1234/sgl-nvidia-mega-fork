@@ -117,6 +117,7 @@ SGLANG_READS = {
         "deadline_s",
         "binding",
     ),
+    "srt/runtime_context.py": ("get_parallel", '"tp_size"'),
 }
 
 
@@ -139,6 +140,12 @@ def build(model, ctx):
     from sgl_nvidia_mega.qwen3_5.runtime.executor import Qwen35Verify
 
     widths = slot_plan.candidates(ctx.widths, ctx.tokens_per_request)
+    if len(widths) > 1:
+        from sglang.srt.runtime_context import get_parallel
+
+        widths = slot_plan.candidates(
+            ctx.widths, ctx.tokens_per_request, get_parallel().tp_size
+        )
     if not widths:
         raise RuntimeError(
             f"NVIDIA megakernel: {ctx.tokens_per_request} rows a request leave no "
@@ -181,7 +188,14 @@ def build(model, ctx):
     entries = tuple(name for name in OPT_IN_ENTRIES if name in SLOTS)
     # every package's build agrees across ranks, so this raises on every rank alike
     target_slots = SLOTS - set(entries) - set(DRAFT_ENTRIES) - set(DRAFT_SLOTS)
-    missing = sorted(name for name in target_slots if not built[name])
+    # mkm's 16-token engine has nothing to serve where no covered step is wider than 7 rows
+    vacuous = (
+        {"mkm_wide"}
+        if slot_plan.widest(pctx.widths, slot_plan.MKM_WIDE_MAX_ROWS)
+        <= slot_plan.MKM_MAX_ROWS
+        else set()
+    )
+    missing = sorted(name for name in target_slots - vacuous if not built[name])
     if missing:
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built no width (MoE: "

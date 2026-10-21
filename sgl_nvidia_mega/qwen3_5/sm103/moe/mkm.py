@@ -38,7 +38,9 @@ class Engine(NamedTuple):
 # per intermediate size a rank holds (TP8, TP4)
 ENGINES = {
     128: Engine("mkm_moe.cu", "q35_mkm_moe", 211968, "CU_TENSOR_MAP_SWIZZLE_64B"),
-    256: Engine("mkm_moe_tp4.cu", "q35_mkm_moe_tp4", 216064, "CU_TENSOR_MAP_SWIZZLE_128B"),
+    256: Engine(
+        "mkm_moe_tp4.cu", "q35_mkm_moe_tp4", 216064, "CU_TENSOR_MAP_SWIZZLE_128B"
+    ),
 }
 INTERMEDIATES = tuple(ENGINES)
 SMEM_BYTES = ENGINES[128].smem_bytes

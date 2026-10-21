@@ -73,14 +73,16 @@ def shared_topk_slots(config) -> int:
 
 def unsupported(mlp) -> str:
     """Why the fused experts cannot stand in for ``mlp``'s routed experts ("" when
-    they can): the TP8 shapes on the trtllm-gen weight layout, no expert parallelism,
-    softmax top-10 renormalized, plain SwiGLU."""
+    they can): the TP8 or TP4 shapes on the trtllm-gen weight layout, no expert
+    parallelism, softmax top-10 renormalized, plain SwiGLU."""
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
     from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm
 
     experts, cfg = mlp.experts, mlp.topk.topk_config
-    e, h, i = mkm.EXPERTS, mkm.HIDDEN, mkm.W13_ROWS // 2
+    e, h, i = mkm.EXPERTS, mkm.HIDDEN, experts.w2_weight.shape[-1] * 2
+    if i not in mkm.INTERMEDIATES:
+        return f"intermediate {i} per rank (engines: {list(mkm.INTERMEDIATES)})"
     for name, t, dtype, shape in (
         ("w13_weight", experts.w13_weight, torch.uint8, (e, 2 * i, h // 2)),
         ("w2_weight", experts.w2_weight, torch.uint8, (e, h, i // 2)),

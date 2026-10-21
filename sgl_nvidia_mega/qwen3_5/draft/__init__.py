@@ -68,9 +68,9 @@ ARCHITECTURE = "Qwen3_5ForCausalLMMTP"
 
 def numerics(slots: frozenset) -> Numerics:
     """SGLang's draft bit for bit with no draft slot; with one, 2.2's draft kernels,
-    which differ from SGLang's ops only in fp32 summation order (2.2's A6 class:
-    q1 split-KV, the o_proj / fc / MoE GEMVs, the draft head), so a draft token can
-    differ where two logits are within a bf16 rounding."""
+    which differ from SGLang's ops only in fp32 summation order (q1 split-KV, the
+    o_proj / fc / MoE GEMVs, the draft head), so a draft token can differ where two
+    logits are within a bf16 rounding."""
     if not slots & {
         "draft_moe",
         "draft_q1",

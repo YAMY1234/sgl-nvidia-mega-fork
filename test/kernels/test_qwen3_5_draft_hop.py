@@ -7,7 +7,7 @@ SM100-family GPUs (GB300) with NVLink multicast, on the decode hop's mailbox:
   SGLang's ``gemma_fused_add_rmsnorm`` (the stock draft's add-norm), bit for bit;
 - mnnvl: its residual output equals bf16(bf16(sum) + residual) bit for bit, and its norm
   stays within one bf16 ulp of an fp32 reference (its bits against FlashInfer's legacy
-  MNNVL kernel are checked against our 2.2 branch, results/qmk-fd/tools/vs_branch_hop.py);
+  MNNVL kernel are checked with SGLang branch nvidia/qwen35-agentx-gb300, not here);
 - rows 1 and 7, both entry releases, a late rank in turn, hops interleaved with the
   decode hop's own, so the three mailbox stages cycle;
 - the draft o_proj GEMV equals an fp32 emulation of its summation order, bit for bit, and

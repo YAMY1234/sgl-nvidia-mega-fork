@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adapted from SGLang (Apache-2.0): python/sglang/srt/layers/moe/single_token_draft_moe.py
-# (SingleTokenDraftMoe: its eligibility checks and single-launch forward).
+# (SingleTokenDraftMoe: its eligibility checks and single-launch forward), on branch
+# nvidia/qwen35-agentx-gb300.
 """The MTP draft layer's MoE as one launch per token (``sm103/draft/moe.py``): router
 GEMV + softmax top-k, the routed experts and the gated shared expert, from the bf16
 weights SGLang loaded for the draft's ``Qwen2MoeSparseMoeBlock``.
 
 ``DraftMoe(x)`` returns this rank's unreduced output (routed and gated shared summed),
 whose TP sum the draft boundary completes. Against SGLang's stock draft MoE only the
-fp32 dot-product order differs (A6).
+fp32 dot-product order differs.
 """
 
 from __future__ import annotations

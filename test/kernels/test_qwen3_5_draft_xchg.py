@@ -13,7 +13,8 @@ SM100-family GPUs (GB300) with NVLink multicast, against torch on the same input
 - a whole draft round (five steps, the extend exchange with extend fc) replays from a CUDA
   graph with fresh inputs, equal to its eager run.
 
-The bitwise comparison with our 2.2 branch's kernels is results/qmk-fd/tools/vs_branch_xchg.py.
+The bitwise comparison with the kernels of SGLang branch nvidia/qwen35-agentx-gb300 needs that
+branch installed as ``sglang`` and is not part of this test.
 Run with ``python test/kernels/test_qwen3_5_draft_xchg.py --num-gpu 4``.
 """
 

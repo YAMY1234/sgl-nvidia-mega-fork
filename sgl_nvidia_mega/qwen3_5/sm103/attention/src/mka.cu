@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// Copied from our TP8 2.2 branch (sglang-q35mf a19fb4ce63):
+// Copied from SGLang branch nvidia/qwen35-agentx-gb300:
 // python/sglang/kernels/ops/attention/mka_fused.cu, device code unchanged. Built with NVRTC: the
 // kernels are device bodies under C-linkage entries (below), and the push reads the plugin's hop.
 //

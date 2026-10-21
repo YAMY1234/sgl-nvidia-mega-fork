@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# Adapted from our TP8 2.2 branch (sglang-q35mf a19fb4ce63):
+# Adapted from SGLang branch nvidia/qwen35-agentx-gb300:
 # python/sglang/srt/layers/attention/graph_variants.py (SplitKVGraphVariants,
 # _split_kv_min_length, use_split_kv_attention).
 """Which verify steps take split-KV attention: one request whose KV holds at least
 ``min_length`` tokens, by a host-side lower bound of its length, so a captured graph is
 picked without reading the device.
 
-``VERIFY`` (8192 tokens, as our 2.2 production run sets
-``SGLANG_Q35MF_MKA_SKV2_VERIFY_MIN_LENGTH``) routes the target verify and ``EXTEND``
-(32768, the branch's ``SPLIT_KV_MIN_LENGTH``) the draft extend. A built megakernel offers
-its variants per SGLang runner (``graph_variants``: "target_verify", "draft_loop",
-"draft_extend"); a runner captures each of ``capture_labels`` in order and replays the
-one ``select`` picks. A step reads the label being captured; where SGLang captures none
-(no runner takes the variants yet), every covered step takes split-KV attention.
+``VERIFY`` (8192 tokens, as the TP8 serving configuration on SGLang branch
+nvidia/qwen35-agentx-gb300 sets ``SGLANG_Q35MF_MKA_SKV2_VERIFY_MIN_LENGTH``) routes the
+target verify and ``EXTEND`` (32768, that branch's ``SPLIT_KV_MIN_LENGTH``) the draft
+extend. A built megakernel offers its variants per SGLang runner (``graph_variants``:
+"target_verify", "draft_loop", "draft_extend"); a runner captures each of
+``capture_labels`` in order and replays the one ``select`` picks. A step reads the label
+being captured; where SGLang captures none (no runner takes the variants yet), every
+covered step takes split-KV attention.
 """
 
 from __future__ import annotations

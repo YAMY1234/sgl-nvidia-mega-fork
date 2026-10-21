@@ -6,8 +6,9 @@ trtllm MoE runner, which routes from the logits itself (``src/router_front.cu``)
 The logits equal SGLang's cuBLAS router GEMM bit for bit, and the quantization equals
 the runner's own NVFP4 input quantizer (16-element blocks, e4m3 scales, linear layout).
 ``router_gemm_quant_shared`` also computes the shared expert's static-FP8 gate/up
-projection of up to 8 rows in the same launch (our TP8 branch's SGLANG_Q35MF_ROUTE_SHARED);
-it sums in another order than the FP8 linear's GEMM (numeric).
+projection of up to 8 rows in the same launch (SGLANG_Q35MF_ROUTE_SHARED on SGLang branch
+nvidia/qwen35-agentx-gb300); it sums in another order than the FP8 linear's GEMM
+(numeric).
 """
 
 from __future__ import annotations

@@ -13,8 +13,8 @@ against SGLang's, bit for bit, at Qwen3.5's TP8 GatedDeltaNet shapes:
   before the gates, slot gdn_front's), against ``gdn_replayssm_spec_decode``'s (output and
   ring entries).
 
-And slot gdn_front's kernels (numeric: our TP8 branch's, which tools hold to it bit for
-bit on the same inputs):
+And slot gdn_front's kernels (numeric: those of SGLang branch nvidia/qwen35-agentx-gb300,
+checked bit for bit against that branch on the same inputs, not here):
 
 - the verify front: its in_proj_qkvz and in_proj_ba rows against fp64 on the same
   operands, at most 1.05 x the mean relative L2 and 2 x the max abs error of SGLang's ops

@@ -15,8 +15,8 @@ Qwen3.5's TP8 verify shape (7 rows of 4 query heads over one KV head of 256, FP8
   write bit for bit SGLang's fused q / k norm + RoPE + gate split, and with it replayed
   in a CUDA graph bit for bit.
 
-Their bits against our 2.2 branch's kernels are checked with the branch's tree
-(``slot_vs_branch``), not here.
+Their bits against the kernels of SGLang branch nvidia/qwen35-agentx-gb300 are checked
+with that branch installed as ``sglang``, not here.
 """
 
 import math

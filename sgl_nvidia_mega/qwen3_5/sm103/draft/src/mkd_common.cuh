@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Adapted from SGLang (Apache-2.0): python/sglang/kernels/jit/include/sgl_kernel/{utils,type,vec,
-// warp,mbarrier}.cuh (our 2.2 tree a19fb4ce63), the subset the MKD draft-boundary kernels use.
+// warp,mbarrier}.cuh (branch nvidia/qwen35-agentx-gb300), the subset the MKD draft-boundary
+// kernels use.
 //
 // NVRTC prelude of the MTP draft step-boundary kernels (mkd_xchg.cu, mkd_fc.cu, mkd_head.cu,
 // draft_fc.cu): the same definitions as SGLang's JIT headers for sm_103 (PDL on, 32-lane warps),

@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Adapted from SGLang (Apache-2.0): python/sglang/kernels/jit/csrc/speculative/draft_moe_fused.cuh,
 // the draft_moe helpers of draft_moe_gemv.cuh, and the device helpers of
-// python/sglang/kernels/jit/include/sgl_kernel/{utils,vec,type,warp,mbarrier}.cuh it uses.
+// python/sglang/kernels/jit/include/sgl_kernel/{utils,vec,type,warp,mbarrier}.cuh it uses
+// (branch nvidia/qwen35-agentx-gb300).
 //
 // Single-launch M = 1 bf16 draft MoE: router logits, softmax top-k, routed and
 // shared up pass, act, down pass and output in one grid of one CTA per SM.

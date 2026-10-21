@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Adapted from SGLang (Apache-2.0): python/sglang/kernels/jit/csrc/distributed/q35_hop_kernels.cu
-// (consume_draft_kernel and its helpers) on include/sgl_kernel/distributed/q35_hop.cuh.
+// (consume_draft_kernel and its helpers) on include/sgl_kernel/distributed/q35_hop.cuh
+// (branch nvidia/qwen35-agentx-gb300).
 // The draft hop: the consume of a one-row MTP draft step's all-reduce + residual + RMSNorm on the
 // decode hop's mailbox (sm103/hop/src/hop.cu, whose producer q35hop_publish pushes the partials). The
 // draft keeps the rounding of the kernels these replace; only the transport differs:

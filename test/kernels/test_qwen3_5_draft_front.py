@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Slot draft_front's attention front (sm103/draft/front.py, 2.2's F10) against SGLang's
+"""Slot draft_front's attention front (sm103/draft/front.py, 2.2's ATTN_FRONT) against SGLang's
 two launches it replaces, on one GPU: the fused q / k Gemma RMSNorm + RoPE + gate split,
 then the fused FP8 q / k / v + paged KV write. The FP8 q, the gate and the K / V cache
 rows must be the same bytes, at the draft's widths (1 and 7 rows), in eager and in a

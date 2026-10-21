@@ -5,8 +5,8 @@
 // tensor-core split-K reduced in fixed cluster-rank order), the causal conv update of its q / k / v
 // channels (output, rolling state, deduplicated intermediate windows), the BF16 in_proj_ba side
 // projection on tensor cores (cluster 10), and an L2 prefetch of the ReplaySSM verify's checkpoint
-// and history ring. Ported from our TP8 branch's gdn_pdl_front_ba_mkm.cuh (SGLANG_Q35MF_MKG_FUSED +
-// MKG_BA_TC + MKM_GDN_FRONT); the device code is unchanged.
+// and history ring. Ported from gdn_pdl_front_ba_mkm.cuh of SGLang branch nvidia/qwen35-agentx-gb300
+// (SGLANG_Q35MF_MKG_FUSED + MKG_BA_TC + MKM_GDN_FRONT); the device code is unchanged.
 //
 // Built with NVRTC: front_kernel is a device function, and the extern "C" entry at the end
 // instantiates its BF16-input form with the fused conv and the inline side projection.

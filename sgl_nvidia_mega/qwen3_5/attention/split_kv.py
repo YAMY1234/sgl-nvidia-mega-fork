@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adapted from SGLang (Apache-2.0, SGLang Team):
 # python/sglang/srt/layers/attention/trtllm_mha_backend.py (TRTLLMHAAttnBackend.forward_extend,
-# _fused_fp8_qkv_kv_cache, _get_bmm_scales, _reshape_paged_kv_cache), and from our TP8
-# 2.2 branch (sglang-q35mf a19fb4ce63): the same file's _run_fixed_q_len_decode and
-# _run_skv2 (use_split_kv with use_skv2).
+# _fused_fp8_qkv_kv_cache, _get_bmm_scales, _reshape_paged_kv_cache), and from SGLang branch
+# nvidia/qwen35-agentx-gb300: the same file's _run_fixed_q_len_decode and _run_skv2
+# (use_split_kv with use_skv2).
 """Slot ``skv2``: the full attention of a covered target-verify step with its core
-through SKV2 (``sm103/attention/skv2.py``), our 2.2 branch's split-KV attention: a CuTe
-DSL producer over 148 page splits and the Triton merge, bit for bit the branch's.
+through SKV2 (``sm103/attention/skv2.py``), the split-KV attention of SGLang branch
+nvidia/qwen35-agentx-gb300: a CuTe DSL producer over 148 page splits and the Triton
+merge, bit for bit the branch's.
 
 ``attend`` stands in for ``layer.attn(q, k, v, forward_batch)``: as TRT-LLM MHA's
 ``forward_extend`` does for a target verify on an FP8 KV cache, it writes the step's

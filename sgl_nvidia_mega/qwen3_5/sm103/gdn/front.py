@@ -4,9 +4,9 @@
 (``src/front.cu``): the static-FP8 ``in_proj_qkvz`` projection of the BF16 rows, the
 causal conv update of its q / k / v channels (output, rolling state, deduplicated
 intermediate windows), the BF16 ``in_proj_ba`` side projection and an L2 prefetch of the
-ReplaySSM verify's checkpoint and history ring. Our TP8 branch's ``gdn_pdl_front_ba_mkm``
-(the kernel and its launch); the projections sum in another order than SGLang's GEMMs
-(numeric), the conv equals SGLang's on the projected rows.
+ReplaySSM verify's checkpoint and history ring. ``gdn_pdl_front_ba_mkm`` of SGLang branch
+nvidia/qwen35-agentx-gb300 (the kernel and its launch); the projections sum in another
+order than SGLang's GEMMs (numeric), the conv equals SGLang's on the projected rows.
 
 It launches as a programmatic dependent and releases its own dependents at entry: the
 next launch must wait (``griddepcontrol.wait``) before it reads any output, b / a

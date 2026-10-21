@@ -12,9 +12,10 @@ takes the quantized input through its pre-quantized (``hidden_states_scale``) pa
 or slot ``mkm`` (``mkm.py``) takes the router front's outputs in its place.
 
 Slot ``route_shared`` (numeric) also computes the shared expert's static-FP8 gate/up
-projection in the router front's launch (our TP8 branch's SGLANG_Q35MF_ROUTE_SHARED), so
-the shared expert on the alternate stream starts at its activation, after that launch
-only; the gate/up sums in another order than the FP8 linear's GEMM.
+projection in the router front's launch (SGLANG_Q35MF_ROUTE_SHARED on SGLang branch
+nvidia/qwen35-agentx-gb300), so the shared expert on the alternate stream starts at its
+activation, after that launch only; the gate/up sums in another order than the FP8
+linear's GEMM.
 """
 
 from __future__ import annotations

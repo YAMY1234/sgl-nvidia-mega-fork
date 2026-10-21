@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// Adapted from SGLang (Apache-2.0): python/sglang/kernels/jit/csrc/speculative/mkd_draft_gemv.cuh.
+// Adapted from SGLang (Apache-2.0): python/sglang/kernels/jit/csrc/speculative/mkd_draft_gemv.cuh
+// (branch nvidia/qwen35-agentx-gb300).
 // One-row draft GEMV y[n] = bf16(sum_k W[n, k] * x[k]): bf16 operands, fp32 accumulation, output rounded
 // to bf16 as the served GEMM writes it (only the fp32 summation order differs). One warp per row with the
 // whole row in flight, the row loaded before the PDL wait (weights are static). With a hop site, every CTA

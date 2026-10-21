@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adapted from SGLang (Apache-2.0): python/sglang/srt/layers/layer_boundary/fusions/q35_draft_hop.py
 # (DraftHopFusion) and python/sglang/srt/models/qwen3_5.py
-# (Qwen3_5AttentionDecoderLayer._draft_o_proj).
+# (Qwen3_5AttentionDecoderLayer._draft_o_proj), on branch nvidia/qwen35-agentx-gb300.
 """The one-row MTP draft step's two all-reduce + residual + norm points as hops on the
 target's decode hop, and the draft o_proj GEMV that pushes into the first one.
 

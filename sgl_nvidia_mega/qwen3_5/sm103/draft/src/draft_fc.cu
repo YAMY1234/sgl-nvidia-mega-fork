@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Adapted from SGLang (Apache-2.0): python/sglang/kernels/jit/csrc/speculative/draft_fc_partial.cuh
-// (our 2.2 tree a19fb4ce63), device code unchanged; fc_gather is new (see below).
+// (branch nvidia/qwen35-agentx-gb300), device code unchanged; fc_gather is new (see below).
 //
 // Row-parallel MTP fc for draft-width batches: per token, the Gemma RMSNorm of
 // one input half (fp32 statistics, bf16 output as the stock norm stores it),

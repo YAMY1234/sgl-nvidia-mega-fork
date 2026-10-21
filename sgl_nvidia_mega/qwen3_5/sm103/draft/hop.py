@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adapted from SGLang (Apache-2.0): python/sglang/srt/layers/q35_hop.py
-# (Q35Hop.draft_all_reduce_rms_norm) and python/sglang/kernels/ops/speculative/mkd_draft_gemv.py.
+# (Q35Hop.draft_all_reduce_rms_norm) and python/sglang/kernels/ops/speculative/mkd_draft_gemv.py,
+# on branch nvidia/qwen35-agentx-gb300.
 """The MTP draft's hops on the decode hop's mailbox (``sm103/hop``), and its o_proj GEMV.
 
 ``draft_all_reduce_rms_norm`` pushes this rank's partial with the decode hop's

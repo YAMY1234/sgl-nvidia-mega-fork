@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Adapted from SGLang (Apache-2.0): python/sglang/kernels/jit/csrc/speculative/mkd_draft_head.cuh
-// (our 2.2 tree a19fb4ce63), device code unchanged.
+// (branch nvidia/qwen35-agentx-gb300), device code unchanged.
 //
 // Draft lm_head of one token on this rank's vocabulary shard, with the shard argmax folded in:
 // logits[n] = bf16(sum_k W[n, k] * x[k]) with fp32 accumulation (bf16 inputs and weights, logits

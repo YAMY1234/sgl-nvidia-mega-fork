@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # the KV-length graph variants of the draft loop (2.2's graph_variants.Q1_STOCK /
 # Q1_LONG): trtllm-gen below Q1_MIN_LENGTH, SKV2-Q1 from it (2.2's
-# SGLANG_Q35MF_MKA_Q1_MIN_LENGTH default; the TP8 production run leaves it unset)
+# SGLANG_Q35MF_MKA_Q1_MIN_LENGTH default, which its TP8 serving configuration keeps)
 Q1_STOCK, Q1_LONG = "q1_stock", "q1_long"
 Q1_MIN_LENGTH = 16384
 
@@ -163,7 +163,7 @@ class Attention:
         self.k_scale = attn.k_scale if attn.k_scale is not None else ones
         self.v_scale = attn.v_scale if attn.v_scale is not None else ones
         self.q1 = None  # sm103.draft.q1 decode (slot draft_q1), set by DraftLoop
-        # slot draft_front: 2.2's F10 front writes the KV and FP8 q in one launch
+        # slot draft_front: 2.2's attention front writes the KV and FP8 q in one launch
         self.front = "draft_front" in parts.slots
         # slot draft_skv2: the draft extend's split-KV decode (DraftExtendSplitKV)
         self.skv2 = DraftExtendSplitKV.build(parts) if "draft_skv2" in parts.slots else None
@@ -193,7 +193,7 @@ class Attention:
         return out
 
     def _front(self, x, positions, cache_loc, kv):
-        """Slot draft_front (2.2's F10): the qkv projection, then one Triton launch for
+        """Slot draft_front (2.2's ATTN_FRONT): the qkv projection, then one Triton launch for
         the q / k Gemma RMSNorm, RoPE, gate split, FP8 q, and K / V into the FP8 cache
         at ``cache_loc``: (q8 [rows, heads * head_dim], gate)."""
         from sgl_nvidia_mega.qwen3_5.sm103.draft.front import (

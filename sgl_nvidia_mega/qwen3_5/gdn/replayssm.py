@@ -13,7 +13,8 @@ committed history, and waits for the conv's q / k / v only where it first reads 
 (PTX ``griddepcontrol``). The gates and the history must be ready when it starts:
 they come from launches before the conv. Where the launch before it also writes the
 gates b / a (slot gdn_front's verify front), ``wait_for_gate_producer`` moves the wait
-before the gates' reads, as our TP8 branch's kernel does; the arithmetic is the same.
+before the gates' reads, as the kernel on SGLang branch nvidia/qwen35-agentx-gb300 does;
+the arithmetic is the same.
 """
 
 from __future__ import annotations

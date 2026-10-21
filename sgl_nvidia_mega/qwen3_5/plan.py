@@ -12,9 +12,9 @@ top-10 and both expert GEMMs in one launch, up to 7 rows) cover every width, as 
 (numeric: the GDN projections and conv in one launch, then gdn_pdl's verify) covers one
 request of 7 rows, ``route_shared`` (numeric: the shared expert's gate/up in route's
 launch) up to 8 rows. ``skv2`` runs the
-full attention's core through our 2.2 branch's split-KV attention, ``mka`` the fused
-attention prologue and epilogue around it, and ``mka_push`` (with ``hop``) has the
-epilogue push its rows into the hop.
+full attention's core through the split-KV attention of SGLang branch
+nvidia/qwen35-agentx-gb300, ``mka`` the fused attention prologue and epilogue around it,
+and ``mka_push`` (with ``hop``) has the epilogue push its rows into the hop.
 """
 
 from __future__ import annotations

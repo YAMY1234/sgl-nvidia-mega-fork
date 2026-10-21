@@ -25,8 +25,11 @@
 # CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# Derived from NVIDIA/cutlass v4.8.0 examples/python/CuTeDSL/cute_ext/blackwell/attention/
+# (gqa_decode_simple.py, gqa_decode_opt.py; BSD-3-Clause): warp-specialized split-KV decode structure,
+# rewritten for paged FP8 KV.
 
-# Copied from our TP8 2.2 branch (sglang-q35mf a19fb4ce63, BSD-3-Clause as above):
+# Copied from SGLang branch nvidia/qwen35-agentx-gb300 (BSD-3-Clause as above):
 # python/sglang/kernels/ops/attention/skv2_split_kv.py (the producer and its plan) and
 # python/sglang/kernels/ops/attention/split_kv_verify.py (_merge_tile, _merge_attention),
 # unchanged, so a slot run is bit for bit the branch's.
@@ -43,7 +46,7 @@
 
 Same splits (page-based, 148), 128-token blocks, running-max sequence, single e4m3 rounding of P x 256 and bf16
 partials x (V_SCALE / 256) as sglang split_kv_verify, so the stock merge kernel reduces the partials unchanged.
-Only fp32 association differs: per-lane denominators and O = O * alpha + O_block (A6).
+Only fp32 association differs: per-lane denominators and O = O * alpha + O_block.
 """
 
 import cuda.bindings.driver as cuda

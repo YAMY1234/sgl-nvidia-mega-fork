@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adapted from SGLang (Apache-2.0): python/sglang/kernels/ops/speculative/draft_moe_gemv.py
-# (draft_moe_fused_scratch, draft_moe_fused).
+# (draft_moe_fused_scratch, draft_moe_fused), on branch nvidia/qwen35-agentx-gb300.
 """The single-launch M = 1 bf16 draft MoE (``src/draft_moe.cu``): router GEMV,
 softmax top-k with renormalized weights, the routed and gated shared expert, one grid
 of one CTA per SM whose CTAs hand over through tagged words in global scratch.

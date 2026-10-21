@@ -8,8 +8,8 @@
   points (only the fp32 summation order differs);
 - repeated calls and CUDA-graph replays give the same bytes;
 - DraftMoe runs a two-token batch as two single launches.
-Bitwise equality with the SGLang kernel it is ported from is checked on the cluster
-(results/qmk-fd/tools/vs_branch_moe.py)."""
+Bitwise equality with the SGLang kernel it is ported from (on SGLang branch
+nvidia/qwen35-agentx-gb300) is checked with that branch installed as ``sglang``, not here."""
 
 from types import SimpleNamespace
 

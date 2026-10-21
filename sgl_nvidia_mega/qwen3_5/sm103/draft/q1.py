@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# Adapted from SGLang's python/sglang/srt/layers/attention/trtllm_mha_backend.py (our
-# branch, a19fb4ce63): the SKV2-Q1 arm of TRTLLMHAAttnBackend._run_fixed_q_len_decode,
+# Adapted from SGLang's python/sglang/srt/layers/attention/trtllm_mha_backend.py (branch
+# nvidia/qwen35-agentx-gb300): the SKV2-Q1 arm of TRTLLMHAAttnBackend._run_fixed_q_len_decode,
 # _run_q1 and the _q1_enabled check, with _get_bmm_scales, _reshape_paged_kv_cache
 # and SGLang's paged_kv_view (srt/mem_cache/layout/paged_view.py).
 """The MTP draft's q1 decode attention on SKV2-Q1 (``q1_kernel``): FP8 paged KV,
 trtllm-gen's KV split (one CTA per SM, contiguous 256-token steps) and its rounding
 points, the CTAs merged in fp32 by a small Triton kernel. Only the fp32 association
-differs from trtllm-gen (class A6); our branch serves it at KV >= 16384.
+differs from trtllm-gen; SGLang branch nvidia/qwen35-agentx-gb300 serves it at KV >= 16384.
 
 The draft step has no forward batch or attention backend. ``Q1Decode.step`` takes the
 step's ``AttnStepMetadata`` and the draft's ``KvPoolBuffers``
@@ -40,8 +40,8 @@ SGLANG_READS = {
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
-# (test/unit/test_contract.py recomputes them on the installed SGLang); our branch
-# a19fb4ce63 has the same digests
+# (test/unit/test_contract.py recomputes them on the installed SGLang); SGLang branch
+# nvidia/qwen35-agentx-gb300 has the same digests
 SGLANG_MIRRORS = {
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._get_bmm_scales": "90a1387e8f561611",
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._reshape_paged_kv_cache": "53ae20937769b99a",
@@ -53,15 +53,15 @@ PAGE_SIZE = 64
 HEAD_DIM = 256
 KV_HEADS = 1  # the draft's KV heads on a rank: 2 KV heads over TP8, replicated
 QUERY_HEADS = (4, 8)
-# the KV length from which our branch serves the draft's q1 decode with SKV2-Q1
-# (SGLANG_Q35MF_MKA_Q1_MIN_LENGTH, unset in the TP8 production run)
+# the KV length from which the branch serves the draft's q1 decode with SKV2-Q1
+# (SGLANG_Q35MF_MKA_Q1_MIN_LENGTH, unset in its TP8 serving configuration)
 MIN_LENGTH = 16384
 # the merge's head-dim block and warps (Q1SplitPlan.run)
 MERGE_BLOCK_D, MERGE_WARPS = 32, 4
 
 
 def enabled_reason(*, device_index: int, max_context_len: int) -> Optional[str]:
-    """None where our branch's backend enables SKV2-Q1 (``_q1_enabled``), else why
+    """None where the branch's backend enables SKV2-Q1 (``_q1_enabled``), else why
     not: an SM10x GPU, and a context of at least one 256-token step per SM, the
     lengths at which trtllm-gen splits the KV one CTA per SM."""
     major, _ = torch.cuda.get_device_capability(device_index)
@@ -161,7 +161,7 @@ def unsupported_reason(
     mask: Optional[torch.Tensor] = None,
     kv_cache_sf=None,
 ) -> Optional[str]:
-    """None when the SKV2-Q1 arm of our branch's ``_run_fixed_q_len_decode`` takes
+    """None when the SKV2-Q1 arm of the branch's ``_run_fixed_q_len_decode`` takes
     the call, else the first condition it fails (the branch then runs trtllm-gen).
     The branch also requires trtllm-gen rather than XQA, which SM10x always is."""
     checks = (
@@ -228,7 +228,7 @@ class Q1Decode:
     """One rank's SKV2-Q1 plans by input layout (the backend's ``_q1_plans``): a
     plan owns the CTA partials and the producer compiled for that layout, so the
     first call of a layout must not be under graph capture (graph warmup runs it
-    eagerly, as in our branch)."""
+    eagerly, as in the branch)."""
 
     def __init__(self):
         self._plans = {}

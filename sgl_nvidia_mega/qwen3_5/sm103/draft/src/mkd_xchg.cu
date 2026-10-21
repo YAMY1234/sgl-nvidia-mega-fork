@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Adapted from SGLang (Apache-2.0): python/sglang/kernels/jit/csrc/speculative/mkd_draft_xchg.cuh
-// (our 2.2 tree a19fb4ce63), device code unchanged.
+// (branch nvidia/qwen35-agentx-gb300), device code unchanged.
 //
 // Greedy MTP draft step boundary in one launch: shard argmax of the hot-vocab logits, a
 // multicast push of each rank's candidate (its embedding row, or its fc memo row) plus the

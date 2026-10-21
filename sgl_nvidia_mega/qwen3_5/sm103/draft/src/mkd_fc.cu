@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Adapted from SGLang (Apache-2.0): python/sglang/kernels/jit/csrc/speculative/mkd_draft_fc.cuh
-// (our 2.2 tree a19fb4ce63), device code unchanged.
+// (branch nvidia/qwen35-agentx-gb300), device code unchanged.
 //
 // MTP draft fc for one token from an exchanged input, bitwise equal to the row-split fc
 // (draft_fc_partial on each rank's input-column slice, fp32 partials summed in rank order,

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
-# Adapted from SGLang's python/sglang/kernels/ops/attention/skv2_q1.py (our branch,
-# a19fb4ce63), which is distributed under this notice:
+# Adapted from SGLang's python/sglang/kernels/ops/attention/skv2_q1.py (branch
+# nvidia/qwen35-agentx-gb300), which is distributed under this notice:
 #
 # Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
@@ -31,6 +31,9 @@
 # CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# Derived from NVIDIA/cutlass v4.8.0 examples/python/CuTeDSL/cute_ext/blackwell/attention/
+# (gqa_decode_simple.py, gqa_decode_opt.py; BSD-3-Clause): warp-specialized split-KV decode structure,
+# rewritten for paged FP8 KV.
 #
 # Modified by NVIDIA: paged FP8 verify with explicit local reduction.
 #
@@ -49,7 +52,7 @@
 Same KV split as trtllm-gen's multi-CTA generation kernel: one CTA per SM, ceil(steps / CTAs) contiguous 256-token
 steps per CTA. Each CTA keeps two softmax streams (the two 128-token halves of every step) with a running max of the
 raw scores; P x 448 = ex2(fma(s, c, -fma(m, c, -log2 448))) is rounded once to e4m3, the CTA writes bf16(O / 448)
-with fp32 maxima and denominators, and a small kernel merges the CTAs in fp32. Only fp32 association differs (A6).
+with fp32 maxima and denominators, and a small kernel merges the CTAs in fp32. Only fp32 association differs.
 """
 
 import math

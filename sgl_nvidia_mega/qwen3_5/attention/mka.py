@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# Adapted from our TP8 2.2 branch (sglang-q35mf a19fb4ce63):
+# Adapted from SGLang branch nvidia/qwen35-agentx-gb300:
 # python/sglang/srt/models/qwen3_5.py (Qwen3_5AttentionDecoderLayer._mka_static_eligible,
 # _mka_eligible and _mka_self_attention).
-"""Slot ``mka``: the full attention of a covered target-verify step through our 2.2
-branch's fused prologue and epilogue (``sm103/attention/mka.py``) around the attention.
+"""Slot ``mka``: the full attention of a covered target-verify step through the fused
+prologue and epilogue of SGLang branch nvidia/qwen35-agentx-gb300
+(``sm103/attention/mka.py``) around the attention.
 
 The prologue takes the normed rows and writes the FP8 query rows, the bf16 gate and this
 step's FP8 K / V rows into the forward view's pool; the attention reads them (slot

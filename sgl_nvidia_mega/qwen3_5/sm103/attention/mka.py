@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# Adapted from our TP8 2.2 branch (sglang-q35mf a19fb4ce63):
+# Adapted from SGLang branch nvidia/qwen35-agentx-gb300:
 # python/sglang/kernels/ops/attention/mka_fused.py and mka_fused.cu (its host side).
 """MKA (``src/mka.cu``): the fused full-attention prologue and epilogue of one request's
-verify rows (at most 8) at hidden 4096 and head_dim 256, our 2.2 branch's kernels built
-with NVRTC.
+verify rows (at most 8) at hidden 4096 and head_dim 256, the kernels of SGLang branch
+nvidia/qwen35-agentx-gb300 built with NVRTC.
 
 ``prologue``: the normed hidden rows' static FP8 quantization, the qkv (+ gate) GEMM, the
 q / k Gemma RMSNorm, the partial NeoX M-RoPE, the FP8 query rows, the FP8 K / V rows

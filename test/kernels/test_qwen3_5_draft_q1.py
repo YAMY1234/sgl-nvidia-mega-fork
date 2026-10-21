@@ -5,13 +5,13 @@ GPU (GB300): FP8 paged KV of one KV head, 4 query heads (TP8) and 8 (TP4), 64-to
 pages, at KV lengths from 1 to 150K:
 - against a float64 attention over the same FP8 values, no farther than trtllm-gen
   (FlashInfer's decode as SGLang serves the draft) is, and close to trtllm-gen
-  itself (only the fp32 association differs, class A6);
+  itself (only the fp32 association differs);
 - the same bits eager and replayed from a CUDA graph whose KV length changes on the
   device between replays;
 - the cache view and BMM scales formed from a draft step's KvPoolBuffers and
   AttnStepMetadata are SGLang's own (paged_kv_view, canonicalize_stride).
-Our branch's own kernel against this copy, bit for bit, is
-results/qmk-fd/tools/vs_branch_q1.py (it needs the branch mounted as sglang)."""
+The kernel of SGLang branch nvidia/qwen35-agentx-gb300 against this copy, bit for bit, is
+checked with that branch installed as ``sglang``, not here."""
 
 from types import SimpleNamespace
 

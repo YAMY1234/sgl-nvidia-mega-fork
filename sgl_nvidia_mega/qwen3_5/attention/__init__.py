@@ -10,8 +10,9 @@ ops in its order: the qkv projection with the fused q / k Gemma RMSNorm + RoPE +
 split, the attention through the backend (which writes this step's KV rows), the
 sigmoid output gate and ``o_proj``. ``step`` returns the TP-partial output, whose
 all-reduce the boundary runs. Slot ``skv2`` (``split_kv.py``) runs the attention's core
-through our 2.2 branch's split-KV attention, and slot ``mka`` (``mka.py``) the rest of
-the layer through the branch's fused prologue and epilogue.
+through the split-KV attention of SGLang branch nvidia/qwen35-agentx-gb300, and slot
+``mka`` (``mka.py``) the rest of the layer through that branch's fused prologue and
+epilogue.
 """
 
 from __future__ import annotations

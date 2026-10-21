@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adapted from SGLang (Apache-2.0): python/sglang/srt/speculative/mkd_draft_boundary.py
 # (MkdDraftBoundary), draft_vocab_exchange.py (the one-launch boundary's path) and
-# python/sglang/srt/models/qwen3_5_mtp.py (the row-split fc) of our 2.2 tree a19fb4ce63.
+# python/sglang/srt/models/qwen3_5_mtp.py (the row-split fc), on branch
+# nvidia/qwen35-agentx-gb300.
 """The greedy one-row MTP draft step boundary (MKD) in two launches instead of seven.
 
 A draft step's lm_head runs on this rank's vocabulary shard (``head``, which also leaves

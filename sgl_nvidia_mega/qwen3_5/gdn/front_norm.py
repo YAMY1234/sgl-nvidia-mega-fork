@@ -3,13 +3,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # This file has been modified from its original version (a static FP8 store, preallocated
 # outputs, and a dependent launch released at entry).
-# Adapted from our TP8 branch's python/sglang/kernels/ops/attention/gdn_pdl_norm.py, itself
-# adapted from SGLang's kernels/ops/attention/fla/layernorm_gated.py and flash-linear-attention
-# (MIT, Tri Dao).
+# Adapted from python/sglang/kernels/ops/attention/gdn_pdl_norm.py of SGLang branch
+# nvidia/qwen35-agentx-gb300, itself adapted from SGLang's
+# kernels/ops/attention/fla/layernorm_gated.py and flash-linear-attention (MIT, Tri Dao).
 """The gated RMSNorm after slot gdn_front's verify, writing out_proj's static FP8 input
-into the caller's buffers: our TP8 branch's ``gdn_pdl_norm`` (the kernel and its launch).
-It releases its programmatic dependents at entry and waits before it reads, and rounds
-through BF16 before the static FP8 conversion, as the unfused norm and quantization do.
+into the caller's buffers: ``gdn_pdl_norm`` of SGLang branch nvidia/qwen35-agentx-gb300
+(the kernel and its launch). It releases its programmatic dependents at entry and waits
+before it reads, and rounds through BF16 before the static FP8 conversion, as the
+unfused norm and quantization do.
 """
 
 from __future__ import annotations

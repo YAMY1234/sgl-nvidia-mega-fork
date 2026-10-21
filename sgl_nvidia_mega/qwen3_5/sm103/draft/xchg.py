@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adapted from SGLang (Apache-2.0): python/sglang/kernels/ops/speculative/{mkd_draft_xchg,
 # mkd_draft_fc, mkd_draft_head, draft_fc_partial, ordered_partial_sum,
-# draft_vocab_argmax}.py (our 2.2 tree a19fb4ce63).
+# draft_vocab_argmax}.py (branch nvidia/qwen35-agentx-gb300).
 """The MTP draft step boundary's kernels (``src/mkd_xchg.cu``, ``src/mkd_fc.cu``,
 ``src/mkd_head.cu``, ``src/draft_fc.cu``) with the launch signatures of the 2.2 ops:
 

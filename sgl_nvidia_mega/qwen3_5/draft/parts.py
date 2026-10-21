@@ -108,12 +108,17 @@ class Parts:
         return moe
 
     def _build_hop(self):
-        from sgl_nvidia_mega.qwen3_5.draft.hop import DraftHop
+        from sgl_nvidia_mega.qwen3_5.draft.hop import GEMV_O_PROJ, DraftHop
 
+        tp = self.binding.tp_size
         hop, why = DraftHop.build(
-            tp_size=self.binding.tp_size,
+            tp_size=tp,
             deadline_s=self.draft.deadline_s,
-            o_proj_k=int(self.layer.o_proj.weight.shape[1]),
+            o_proj_k=(
+                int(self.layer.o_proj.weight.shape[1])
+                if GEMV_O_PROJ.get(tp, False)
+                else None
+            ),
             early=True,
             early_head=False,
         )

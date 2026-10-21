@@ -83,7 +83,11 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         meta,
         kv,
         rows_per_request=rows_per_request,
-        o_proj=None if hop is None else partial(hop.o_proj, weight=lay.o_proj.weight),
+        o_proj=(
+            partial(hop.o_proj, weight=lay.o_proj.weight)
+            if hop is not None and hop.gemv
+            else None
+        ),
     )
     moe = parts.moe if rows_per_request == 1 else None
     if hop is not None:

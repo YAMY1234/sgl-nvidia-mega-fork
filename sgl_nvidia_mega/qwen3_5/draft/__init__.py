@@ -14,8 +14,8 @@ entries for one request (bs 1), which run inside SGLang's draft graphs:
 
 Inside them every op is SGLang's own unless a draft slot replaces it: ``draft_moe``
 (the single-launch MoE), ``draft_q1`` (the q1 split-KV decode), ``draft_xchg`` (the
-step boundary's fc split, exchange and head) and ``draft_hop`` (the draft hops and the
-o_proj GEMV).
+step boundary's fc split, exchange and head), ``draft_hop`` (the draft hops and the
+o_proj GEMV) and ``draft_front`` (the attention front writing the FP8 KV itself).
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def numerics(slots: frozenset) -> Numerics:
     which differ from SGLang's ops only in fp32 summation order (2.2's A6 class:
     q1 split-KV, the o_proj / fc / MoE GEMVs, the draft head), so a draft token can
     differ where two logits are within a bf16 rounding."""
-    if not slots & {"draft_moe", "draft_q1", "draft_xchg", "draft_hop"}:
+    if not slots & {"draft_moe", "draft_q1", "draft_xchg", "draft_hop", "draft_front"}:
         return target.NUMERICS
     return Numerics(NumericsKind.TOLERANCE, {"draft_logits.rel": 2**-7})
 # the one request a draft entry serves: 2.2's draft kernels are single-row

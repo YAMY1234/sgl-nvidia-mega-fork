@@ -10,7 +10,10 @@ Qwen3.5's TP8 verify shape (7 rows of 4 query heads over one KV head of 256, FP8
 - SKV2 replayed in a CUDA graph on new inputs, bit for bit its eager result;
 - the MKA prologue and epilogue twice on the same inputs, and replayed in a CUDA graph on
   new ones, bit for bit their eager result (FP8 Q, bf16 gate, the written K / V rows and
-  the o_proj output).
+  the o_proj output);
+- the ATTN_FRONT op (slot draft_front's kernel, sm103/draft/front.py) without its cache
+  write bit for bit SGLang's fused q / k norm + RoPE + gate split, and with it replayed
+  in a CUDA graph bit for bit.
 
 Their bits against our 2.2 branch's kernels are checked with the branch's tree
 (``slot_vs_branch``), not here.
@@ -272,3 +275,89 @@ def test_mka_replays_in_a_cuda_graph_bit_for_bit():
         step.run(ops)
         assert _same(replayed, step.bits())
         assert torch.isfinite(step.out.float()).all()
+
+
+def _bits(a, b):
+    """Whether two tensors (of any dtype, FP8 too) hold the same bytes."""
+    if a is None or b is None:
+        return a is b
+    return a.shape == b.shape and torch.equal(
+        a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
+    )
+
+
+def _front_operands(rows, g, mrope=True, slots=64 * 16):
+    q_gate = (torch.randn(rows, HEADS * 2 * DIM, device="cuda", generator=g) * 3).to(
+        torch.bfloat16
+    )
+    k, v = (
+        (torch.randn(rows, DIM, device="cuda", generator=g) * 3).to(torch.bfloat16)
+        for _ in range(2)
+    )
+    norms = [
+        (torch.randn(DIM, device="cuda", generator=g) * 0.1).to(torch.bfloat16)
+        for _ in range(2)
+    ]
+    angles = torch.rand(4096, 32, device="cuda", generator=g) * 6.3
+    cos_sin = torch.cat([angles.cos(), angles.sin()], dim=1).contiguous()
+    if mrope:
+        pos = torch.randint(0, 4096, (3, rows), device="cuda", generator=g)
+        axis = torch.randint(0, 3, (32,), device="cuda", generator=g)
+    else:
+        pos, axis = torch.randint(0, 4096, (rows,), device="cuda", generator=g), None
+    pools = tuple(
+        torch.randn(slots, 1, DIM, device="cuda", generator=g).to(torch.float8_e4m3fn)
+        for _ in range(2)
+    )
+    loc = torch.randperm(slots, device="cuda", generator=g)[:rows]
+    args = (q_gate, k, *norms, cos_sin, pos, 1e-6, HEADS, 1, DIM, 64)
+    return args, axis, v, pools, loc
+
+
+@pytest.mark.parametrize("rows", [1, 7])
+@pytest.mark.parametrize("mrope", [False, True])
+def test_front_without_the_cache_write_is_sglangs(rows, mrope):
+    from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+        fused_qk_gemma_rmsnorm_rope_gate as sglang_op,
+    )
+
+    from sgl_nvidia_mega.qwen3_5.sm103.draft.front import (
+        fused_qk_gemma_rmsnorm_rope_gate,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(rows + 10 * mrope)
+    args, axis, *_ = _front_operands(rows, g, mrope)
+    want = sglang_op(*args, has_gate=True, mrope_axis_map=axis)
+    got = fused_qk_gemma_rmsnorm_rope_gate(*args, has_gate=True, mrope_axis_map=axis)
+    assert all(_bits(a, b) for a, b in zip(want, got))
+
+
+def test_front_with_the_cache_write_replays_in_a_cuda_graph_bit_for_bit():
+    from sgl_nvidia_mega.qwen3_5.sm103.draft.front import (
+        fused_qk_gemma_rmsnorm_rope_gate,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(5)
+    args, axis, v, pools, loc = _front_operands(7, g)
+    scales = [torch.full((1,), s, device="cuda") for s in (0.8, 1.3)]
+    kw = dict(has_gate=True, mrope_axis_map=axis, v=v, kv_cache=pools, cache_loc=loc)
+
+    def run():
+        return fused_qk_gemma_rmsnorm_rope_gate(
+            *args, **kw, k_scale=scales[0], v_scale=scales[1]
+        )
+
+    q8, _, gate = run()
+    eager = [q8.clone(), gate.clone(), *(p.clone() for p in pools)]
+    for p in pools:
+        p.zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        q8, _, gate = run()
+    graph.replay()
+    torch.cuda.synchronize()
+    rows = loc.long()
+    for a, b in zip(eager[:2], (q8, gate)):
+        assert _bits(a, b)
+    for a, b in zip(eager[2:], pools):
+        assert _bits(a[rows], b[rows])

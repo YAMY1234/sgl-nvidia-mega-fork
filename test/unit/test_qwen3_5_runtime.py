@@ -164,11 +164,38 @@ def test_the_draft_loop_routes_q1_by_kv_length_as_2_2(
     assert variants.select(batch) == want
 
 
+def test_the_draft_extend_takes_the_split_kv_variants_with_slot_draft_skv2(
+    monkeypatch,
+):
+    from sgl_nvidia_mega.qwen3_5 import draft
+    from sgl_nvidia_mega.qwen3_5.attention import route
+
+    # inside entry draft_extend only: the draft loop is not needed
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"draft_extend", "draft_skv2"}))
+    assert runtime.slot_reasons() == []
+    built = draft.SPEC.build("lm", SimpleNamespace(context_len=4096), _draft_ctx())
+    assert built.graph_variants == {"draft_extend": route.EXTEND}
+    assert route.EXTEND.min_length == 32768
+    # with draft_q1 the draft offers each runner its own variants
+    monkeypatch.setattr(
+        runtime,
+        "SLOTS",
+        frozenset({"draft_loop", "draft_q1", "draft_extend", "draft_skv2"}),
+    )
+    built = draft.SPEC.build("lm", SimpleNamespace(context_len=4096), _draft_ctx())
+    assert sorted(built.graph_variants) == ["draft_extend", "draft_loop"]
+    assert built.graph_variants["draft_extend"] is route.EXTEND
+
+
 @pytest.mark.parametrize(
     "slots, want",
     [
         ({"draft_moe"}, "slot 'draft_moe' runs inside entry 'draft_loop'"),
         ({"draft_loop", "draft_hop"}, "slot 'draft_hop' runs on slot 'hop''s mailbox"),
+        (
+            {"draft_loop", "draft_skv2"},
+            "slot 'draft_skv2' runs inside entry 'draft_extend'",
+        ),
     ],
 )
 def test_the_draft_slots_name_what_they_need(monkeypatch, slots, want):

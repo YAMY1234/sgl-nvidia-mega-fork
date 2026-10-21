@@ -18,7 +18,11 @@ decode as the q1 split-KV kernel (``sm103/draft/q1``).
 
 from __future__ import annotations
 
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 # the KV-length graph variants of the draft loop (2.2's graph_variants.Q1_STOCK /
 # Q1_LONG): trtllm-gen below Q1_MIN_LENGTH, SKV2-Q1 from it (2.2's
@@ -166,6 +170,10 @@ class Attention:
         self.q1 = None  # sm103.draft.q1 decode (slot draft_q1), set by DraftLoop
         # slot draft_front: 2.2's attention front writes the KV and FP8 q in one launch
         self.front = "draft_front" in parts.slots
+        # slot draft_skv2: the draft extend's split-KV decode (DraftExtendSplitKV)
+        self.skv2 = (
+            DraftExtendSplitKV.build(parts) if "draft_skv2" in parts.slots else None
+        )
 
     def __call__(
         self, x, positions, cache_loc, meta, kv, *, rows_per_request: int, o_proj=None
@@ -259,6 +267,8 @@ class Attention:
         bmm2_scale = kv.v_scale[0]
         if self.q1 is not None and rows_per_request == 1 and _q1_label() != Q1_STOCK:
             return self.q1(q8, kv, meta).view(-1, self.heads * self.head_dim)
+        if self.skv2 is not None and rows_per_request > 1 and self.skv2.long():
+            return self.skv2.run(attn, q8, kv, meta)
         kwargs = {}
         if rows_per_request != 1:
             kwargs["q_len_per_req"] = rows_per_request
@@ -296,6 +306,47 @@ class Attention:
         if attn.tp_v_head_num == 1:
             v = canonicalize_stride(v)
         return k, v
+
+
+class DraftExtendSplitKV:
+    """Slot draft_skv2: the draft extend's 7-row decode as 2.2's SKV2 (MKA_SKV2_DRAFT,
+    from 32768 tokens of KV), through the target attention package's SKV2 op
+    (``qwen3_5.attention.split_kv``, slot skv2's) on the draft's pool."""
+
+    def __init__(self, split_kv, route):
+        self.split_kv, self.route = split_kv, route
+        self._logged = False
+
+    @classmethod
+    def build(cls, parts):
+        try:
+            from sgl_nvidia_mega.qwen3_5.attention import route, split_kv
+        except ImportError as e:
+            raise RuntimeError(
+                "NVIDIA megakernel: slot draft_skv2 needs the attention package's SKV2 "
+                f"(qwen3_5.attention.split_kv): {e}"
+            ) from e
+        width = int(parts.binding.tokens_per_request)
+        why = split_kv.unsupported(parts.layer.attn, width)
+        if why:
+            raise RuntimeError(f"NVIDIA megakernel: slot draft_skv2 cannot run: {why}")
+        return cls(split_kv, route)
+
+    def long(self) -> bool:
+        """The draft-extend graph being captured is the split-KV one ("split_kv_long"),
+        or SGLang captures no label of ours (then every length, as for the verify)."""
+        label = _q1_label()
+        return label is None or label == self.route.SPLIT_KV_LONG
+
+    def run(self, attn, q8, kv, meta):
+        if not self._logged and torch.cuda.is_current_stream_capturing():
+            self._logged = True
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 MTP draft slot draft_skv2 runs the draft "
+                "extend's %d rows as SKV2",
+                q8.shape[0],
+            )
+        return self.split_kv.skv2(attn, q8, kv, meta)
 
 
 def _q1_label():

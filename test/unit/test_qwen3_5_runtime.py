@@ -56,6 +56,30 @@ def test_only_target_verify_steps_of_built_widths_are_covered():
     assert built.plan(ids, _batch(), input_embeds=None) is None
 
 
+def test_the_covered_widths_are_the_ones_the_build_returns():
+    built = _verify(widths=(7, 14, 28))
+    for rows in (7, 14, 28):
+        ids = torch.zeros(rows, dtype=torch.int64)
+        assert built.plan(ids, _batch()) == Step(mode="target_verify", rows=rows)
+    assert built.plan(torch.zeros(21, dtype=torch.int64), _batch()) is None
+
+
+def test_the_build_covers_more_requests_only_where_a_slot_runs(monkeypatch):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset())
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    # what SGLang offers for the spec's MAX_ROWS with 7 rows a request
+    ctx = SimpleNamespace(
+        widths=(7, 14, 21, 28),
+        tokens_per_request=7,
+        deadline_s=60.0,
+        binding="EagleBinding",
+    )
+    built = runtime.build(model, ctx)
+    assert built.widths == (7,) and built.summary() == "slots none (stock)"
+
+
 def test_the_build_hands_over_the_binding_and_every_entry_stays_sglangs():
     from sglang.srt.megakernels.spec import ENTRIES
 

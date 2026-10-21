@@ -178,6 +178,45 @@ def test_the_slot_plan_covers_one_request_of_7_rows():
         plan.slots(plan.MAX_ROWS + 1, plan.Facts())
 
 
+def _on(slots):
+    return sorted(name for name in plan.Slots.__struct_fields__ if getattr(slots, name))
+
+
+def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
+    every = plan.Facts(**dict.fromkeys(plan.Facts.__struct_fields__, True))
+    assert _on(plan.slots(7, every)) == sorted(plan.Slots.__struct_fields__)
+    # two requests: the 16-row router front, the GDN chain and the hop's one-shot rows
+    assert _on(plan.slots(14, every)) == ["gdn_pdl", "gdn_verify", "hop", "route"]
+    # four requests: past the router front's and the one-shot all-reduce's rows
+    assert _on(plan.slots(28, every)) == ["gdn_pdl", "gdn_verify"]
+    # SGLang offers every multiple of 7 up to MAX_ROWS; three requests are not covered
+    offered = tuple(range(7, plan.MAX_ROWS + 1, 7))
+    assert plan.candidates(offered, 7) == (7, 14, 28)
+    assert plan.covered((7, 14, 28), every, 7) == (7, 14, 28)
+    # one request is always covered, more only where a slot runs
+    assert plan.covered((7, 14, 28), plan.Facts(), 7) == (7,)
+    assert plan.covered((7, 14, 28), plan.Facts(route=True, mkm=True), 7) == (7, 14)
+    attention = plan.Facts(skv2=True, mka=True, mka_push=True, hop=True)
+    assert plan.covered((7, 14, 28), attention, 7) == (7, 14)
+    assert _on(plan.slots(14, attention)) == ["hop"]
+    # the router front and the hop's mailbox are built for the widest width they serve
+    assert plan.widest((7, 14, 28), plan.ROUTE_MAX_ROWS) == 14
+    assert plan.widest((7, 14, 28), plan.HOP_MAX_ROWS) == 14
+    assert plan.widest((28,), plan.HOP_MAX_ROWS) == 0
+
+
+def test_the_slot_plans_row_bounds_are_the_kernels():
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import mka
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm, router
+
+    assert plan.ROUTE_MAX_ROWS == router.MAX_TOKENS
+    assert plan.ROUTE_SHARED_ROWS == router.SHARED_MAX_M
+    assert plan.MKM_MAX_ROWS == mkm.MAX_TOKENS
+    assert plan.GDN_PUSH_MAX_ROWS == hop.OPROJ_MAX_M
+    assert plan.MKA_MAX_ROWS == mka.MAX_ROWS
+
+
 def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
     from sglang.srt.megakernels.spec import NumericsKind
 

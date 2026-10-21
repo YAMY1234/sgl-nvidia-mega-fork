@@ -49,6 +49,7 @@ These slots change the arithmetic (numeric: each sums in another order than SGLa
 | Slot | Rows | Kernel |
 | --- | --- | --- |
 | `gdn_push` (with `gdn_verify`, `hop`) | 7 | The GatedDeltaNet `out_proj` as the hop's GEMM, whose epilogue pushes the partial into the hop's mailbox |
+| `gdn_front` (with `gdn_verify`, `gdn_pdl`) | 7 (one request) | The GatedDeltaNet `in_proj_qkvz` (static FP8) and `in_proj_ba` (BF16) projections, the conv update and an L2 prefetch of the verify's state in one launch, then the ReplaySSM verify and the gated norm writing `out_proj`'s FP8 input, each launched dependent on the one before |
 
 `verify_sample` in the same variable offers SGLang's EAGLE entry with no step at any batch size, so SGLang's post-verify graphs run with SGLang's own sampling.
 

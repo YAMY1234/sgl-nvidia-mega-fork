@@ -31,6 +31,9 @@ OPT_IN_SLOTS: tuple[str, ...] = (
 # verify_sample has no step at any size, so it turns on SGLang's post-verify graphs
 # with SGLang's own sampling
 OPT_IN_ENTRIES: tuple[str, ...] = ("verify_sample",)
+# The MTP draft's EAGLE entries (qwen3_5/draft), requested in the same variable; the
+# draft spec's build reads them, the target's ignores them
+DRAFT_ENTRIES: tuple[str, ...] = ("draft_loop", "draft_extend")
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -48,7 +51,7 @@ SLOTS = _requested_slots()
 
 def slot_reasons() -> list[str]:
     """Why the requested slots cannot be served ([] when they can)."""
-    known = (*SHIPPED_SLOTS, *OPT_IN_SLOTS, *OPT_IN_ENTRIES)
+    known = (*SHIPPED_SLOTS, *OPT_IN_SLOTS, *OPT_IN_ENTRIES, *DRAFT_ENTRIES)
     reasons = [
         f"{SLOTS_ENV}: unknown slot {name!r} (known: {', '.join(known) or 'none'})"
         for name in sorted(SLOTS - set(known))
@@ -142,7 +145,8 @@ def build(model, ctx):
     built = msgspec.structs.asdict(facts)
     entries = tuple(name for name in OPT_IN_ENTRIES if name in SLOTS)
     # every package's build agrees across ranks, so this raises on every rank alike
-    missing = sorted(name for name in SLOTS - set(entries) if not built[name])
+    target_slots = SLOTS - set(entries) - set(DRAFT_ENTRIES)
+    missing = sorted(name for name in target_slots if not built[name])
     if missing:
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built no width (MoE: "

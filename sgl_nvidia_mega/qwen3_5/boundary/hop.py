@@ -132,10 +132,42 @@ _ENGAGED: set = set()
 _ACTIVE: Optional[object] = None
 
 
+class Hops:
+    """The hops of a build by step rows: a step runs on the narrowest mailbox that
+    serves its rows, so a one-request step keeps a mailbox of its own rows (the layout
+    a build covering one request gives it) when wider steps are covered too."""
+
+    def __init__(self, hops):
+        self.hops = tuple(sorted(hops, key=lambda hop: hop.max_m))
+
+    def at(self, m: int):
+        return next((hop for hop in self.hops if hop.supports(m)), None)
+
+    def supports(self, m: int) -> bool:
+        return self.at(m) is not None
+
+    def all_reduce_residual_rms_norm(self, *, local_contribution, **kwargs):
+        hop = self.at(int(local_contribution.shape[0]))
+        return hop.all_reduce_residual_rms_norm(
+            local_contribution=local_contribution, **kwargs
+        )
+
+    def moe_finalize_all_reduce_rms_norm(self, *, permuted_indices, **kwargs):
+        hop = self.at(int(permuted_indices.shape[0]))
+        return hop.moe_finalize_all_reduce_rms_norm(
+            permuted_indices=permuted_indices, **kwargs
+        )
+
+
 class Bound(msgspec.Struct, frozen=True):
     """The boundary package's build result (``st.bound["boundary"]``)."""
 
-    hop: Optional[object] = None  # sm103.hop.Hop for every covered width, or None
+    # sm103.hop.Hop of the narrowest covered width (one request), or None: the one the
+    # mixers push into and the MTP draft shares
+    hop: Optional[object] = None
+    # the boundary points' hop by rows: ``hop`` itself, or Hops when wider steps have a
+    # mailbox of their own
+    hops: Optional[object] = None
     reason: str = ""  # why there is no hop
 
 
@@ -150,8 +182,9 @@ def build(model, ctx) -> Bound:
 
     if "hop" not in runtime.SLOTS:
         return Bound(reason="slot off")
-    # the widest step the hop covers: its mailbox's rows
-    rows = plan.widest(ctx.widths, plan.HOP_MAX_ROWS)
+    # a mailbox of the narrowest covered step's rows and, when the hop covers wider
+    # steps, one of the widest's
+    rows = sorted({w for w in ctx.widths if w <= plan.HOP_MAX_ROWS})
     if not rows:
         return Bound(reason=f"no width of {list(ctx.widths)} within its rows")
     m = model.model
@@ -161,21 +194,25 @@ def build(model, ctx) -> Bound:
     megakernel_agree(reasons, what="hop refusals")
     if reasons:
         return Bound(reason="; ".join(reasons))
-    hop = Hop(
-        max_m=rows,
-        eps=m.flashinfer_mnnvl_cutedsl_fusion.rms_epsilon,
-        group=group.device_group,
-        device=torch.device("cuda", torch.cuda.current_device()),
-        deadline_s=ctx.deadline_s,
-    )
+    hops = [
+        Hop(
+            max_m=max_m,
+            eps=m.flashinfer_mnnvl_cutedsl_fusion.rms_epsilon,
+            group=group.device_group,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            deadline_s=ctx.deadline_s,
+        )
+        for max_m in sorted({rows[0], rows[-1]})
+    ]
     global _ACTIVE
-    _ACTIVE = hop
-    return Bound(hop=hop)
+    _ACTIVE = hops[0]
+    return Bound(hop=hops[0], hops=Hops(hops) if len(hops) > 1 else hops[0])
 
 
 def active() -> Optional[object]:
-    """The target's built hop (sm103.hop.Hop), or None: the MTP draft's hops share its
-    mailbox and stage order (built before the draft, which loads after the target)."""
+    """The target's built hop of the narrowest width (sm103.hop.Hop), or None: the MTP
+    draft's hops share its mailbox and stage order (built before the draft, which loads
+    after the target)."""
     return _ACTIVE
 
 

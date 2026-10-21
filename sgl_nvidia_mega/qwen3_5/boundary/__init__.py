@@ -50,7 +50,7 @@ def open_stream(st) -> None:
 def pre(layer, hidden, st, capture=None):
     """``layer``'s mixer input from the stream (its input norm)."""
     if st.slots.hop and capture is None:
-        x = hop.layer_input(st.bound["boundary"].hop, layer, hidden, st)
+        x = hop.layer_input(st.bound["boundary"].hops, layer, hidden, st)
         if x is not None:
             return x
     return layer.attn_boundary.prepare(hidden, st.fb, capture_gathered=capture)
@@ -60,7 +60,7 @@ def post_attn(layer, part, st):
     """The mixer's partial output into the stream; returns the MoE input."""
     hidden = layer.attn_boundary.finish(part, st.fb)
     if st.slots.hop:
-        x = hop.moe_input(st.bound["boundary"].hop, layer, hidden, st)
+        x = hop.moe_input(st.bound["boundary"].hops, layer, hidden, st)
         if x is not None:
             return x
     return layer.ffn_boundary.prepare(hidden, st.fb)
@@ -78,7 +78,7 @@ def close_stream(st, hidden):
     from sglang.srt.layers.layer_boundary.residual.batch import final_norm
 
     if st.slots.hop:
-        x = hop.final_norm(st.bound["boundary"].hop, hidden, st)
+        x = hop.final_norm(st.bound["boundary"].hops, hidden, st)
         if x is not None:
             return x
     m = st.model

@@ -2390,6 +2390,38 @@ def test_the_hop_slot_leaves_to_sglang_a_mixer_sum_it_declines(cutedsl_gates):
     assert log == [] and stream.pending is not None
 
 
+def test_each_step_runs_on_the_narrowest_hop_mailbox_that_serves_its_rows():
+    calls = []
+
+    class _Hop:
+        def __init__(self, max_m):
+            self.max_m = max_m
+
+        def supports(self, m):
+            return 1 <= m <= self.max_m
+
+        def all_reduce_residual_rms_norm(self, *, local_contribution, **kwargs):
+            calls.append(("all_reduce", self.max_m, local_contribution.shape[0]))
+
+        def moe_finalize_all_reduce_rms_norm(self, *, permuted_indices, **kwargs):
+            calls.append(("finalize", self.max_m, permuted_indices.shape[0]))
+
+    # a one-request step keeps the 7-row mailbox; a two-request step takes the 14-row one
+    hops = boundary_hop.Hops([_Hop(14), _Hop(7)])
+    assert [hops.supports(m) for m in (1, 7, 14, 15)] == [True, True, True, False]
+    for m in (1, 7, 14):
+        hops.all_reduce_residual_rms_norm(local_contribution=torch.zeros(m, 1))
+        hops.moe_finalize_all_reduce_rms_norm(permuted_indices=torch.zeros(m, 10))
+    assert calls == [
+        ("all_reduce", 7, 1),
+        ("finalize", 7, 1),
+        ("all_reduce", 7, 7),
+        ("finalize", 7, 7),
+        ("all_reduce", 14, 14),
+        ("finalize", 14, 14),
+    ]
+
+
 def test_the_hop_slot_mirrors_the_paths_sglang_binds_for_qwen3_5():
     assert boundary_hop.path_refusals(_hop_layer(SimpleNamespace())) == []
     assert boundary_hop.path_refusals(_hop_layer(None, fusions=False)) == [
@@ -2452,7 +2484,8 @@ def test_with_slot_hop_each_point_falls_back_to_sglang_where_the_hop_declines(
     st = SimpleNamespace(
         fb="fb",
         slots=plan.Slots(hop=True),
-        bound={"boundary": boundary_hop.Bound(hop="the hop")},
+        # the boundary points run on the hops by rows, not the mixers' push target
+        bound={"boundary": boundary_hop.Bound(hop="the push hop", hops="the hop")},
         model=SimpleNamespace(norm="norm", flashinfer_mnnvl_cutedsl_fusion=None),
     )
     got = (

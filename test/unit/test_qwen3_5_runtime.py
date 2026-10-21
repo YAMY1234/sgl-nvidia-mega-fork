@@ -168,6 +168,7 @@ def test_the_draft_loop_routes_q1_by_kv_length_as_2_2(
     "slots, want",
     [
         ({"draft_moe"}, "slot 'draft_moe' runs inside entry 'draft_loop'"),
+        ({"draft_loop", "draft_hop"}, "slot 'draft_hop' runs on slot 'hop''s mailbox"),
     ],
 )
 def test_the_draft_slots_name_what_they_need(monkeypatch, slots, want):

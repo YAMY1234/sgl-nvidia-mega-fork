@@ -30,7 +30,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
 # The MTP draft's EAGLE entries and kernel groups (qwen3_5/draft), requested in the same
 # variable; the draft spec's build reads them, the target's ignores them
 DRAFT_ENTRIES: tuple[str, ...] = ("draft_loop", "draft_extend")
-DRAFT_SLOTS: tuple[str, ...] = ("draft_moe", "draft_q1", "draft_xchg")
+DRAFT_SLOTS: tuple[str, ...] = ("draft_moe", "draft_q1", "draft_xchg", "draft_hop")
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -86,6 +86,8 @@ def slot_reasons() -> list[str]:
     for name in sorted(SLOTS & set(DRAFT_SLOTS)):
         if "draft_loop" not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {name!r} runs inside entry 'draft_loop'")
+    if "draft_hop" in SLOTS and "hop" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'draft_hop' runs on slot 'hop''s mailbox")
     if "mka_push" in SLOTS and not {"mka", "hop"} <= SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'mka_push' pushes slot 'mka''s epilogue into slot "

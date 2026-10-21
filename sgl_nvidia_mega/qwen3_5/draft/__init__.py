@@ -83,6 +83,10 @@ def numerics(slots: frozenset) -> Numerics:
     return Numerics(NumericsKind.TOLERANCE, {"draft_logits.rel": 2**-7})
 # the one request a draft entry serves: 2.2's draft kernels are single-row
 SERVED_BS = 1
+# the requests a draft_loop step serves (two only where plan.multi_request): two run the
+# draft steps on 2.2's two-row kernels (the split fc, the hop's all-reduce points, the
+# two-token MoE), the rest SGLang's ops
+LOOP_BS = (1, 2)
 
 
 class MtpDraft:

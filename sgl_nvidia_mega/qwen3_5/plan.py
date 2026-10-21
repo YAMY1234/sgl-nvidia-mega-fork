@@ -13,8 +13,8 @@ top-10 and both expert GEMMs in one launch, up to 7 rows) cover every width, as 
 request of 7 rows, ``route_shared`` (numeric: the shared expert's gate/up in route's
 launch) up to 8 rows. ``skv2`` runs the
 full attention's core through the split-KV attention of SGLang branch
-nvidia/qwen35-agentx-gb300, and ``mka`` the fused attention prologue and epilogue
-around it.
+nvidia/qwen35-agentx-gb300, ``mka`` the fused attention prologue and epilogue around it,
+and ``mka_push`` (with ``hop``) has the epilogue push its rows into the hop.
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ class Slots(msgspec.Struct, frozen=True):
     route_shared: bool = False
     skv2: bool = False  # the full attention's core through SKV2 (attention/split_kv.py)
     mka: bool = False  # the fused attention prologue and epilogue (attention/mka.py)
+    mka_push: bool = False  # the epilogue pushes its rows into the hop
 
 
 class Facts(msgspec.Struct, frozen=True):
@@ -64,6 +65,7 @@ class Facts(msgspec.Struct, frozen=True):
     )
     skv2: bool = False  # SKV2 for every full-attention layer
     mka: bool = False  # the fused prologue and epilogue for every full-attention layer
+    mka_push: bool = False  # with the epilogue's push into the hop
 
 
 def slots(rows: int, facts: Facts) -> Slots:
@@ -83,6 +85,7 @@ def slots(rows: int, facts: Facts) -> Slots:
         route_shared=facts.route and facts.route_shared and rows <= ROUTE_SHARED_ROWS,
         skv2=facts.skv2,
         mka=facts.mka,
+        mka_push=facts.mka and facts.mka_push and facts.hop,
     )
 
 

@@ -193,7 +193,7 @@ def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
         **spec.NUMERIC_TOLERANCES["gdn_push"],
         **spec.NUMERIC_TOLERANCES["gdn_front"],
     }
-    attention = spec.numerics(frozenset({"skv2", "mka"}))
+    attention = spec.numerics(frozenset({"skv2", "mka", "mka_push", "hop"}))
     assert attention.kind is NumericsKind.TOLERANCE
     assert dict(attention.tolerances) == {
         **spec.NUMERIC_TOLERANCES["skv2"],

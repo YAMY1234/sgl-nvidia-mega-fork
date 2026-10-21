@@ -152,6 +152,26 @@ def test_skv2_replays_in_a_cuda_graph_bit_for_bit():
         assert torch.equal(out.view(torch.int16), want.view(torch.int16)), length
 
 
+@pytest.mark.parametrize("length", [7, 2048, 32769, 131072, 150007])
+def test_skv2_as_a_programmatic_dependent_gives_the_same_bytes(length):
+    """The default plan launches the producer and the merge as programmatic dependents,
+    the producer loading its leading K / V tiles before it waits: same bytes as the plan
+    that launches them plainly."""
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.skv2 import StockSplitPlan
+
+    g = torch.Generator(device="cuda").manual_seed(100 + length)
+    q, pools, table, lengths = _inputs(length, g)
+    kv = tuple(map(_hnd, pools))
+    outs = []
+    for pdl in (False, True):
+        out = torch.empty(ROWS, HEADS, DIM, dtype=torch.bfloat16, device="cuda")
+        plan = StockSplitPlan(q, kv, table, lengths, pdl=pdl)
+        plan.run(q, kv, table, lengths, qk_scale=0.75 * SCALE, v_scale=0.5, out=out)
+        outs.append(out)
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
+
+
 HIDDEN, QKV_ROWS, POOL_SLOTS = 4096, (2 * HEADS + 2) * DIM, 1024
 
 

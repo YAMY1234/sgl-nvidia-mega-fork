@@ -62,7 +62,8 @@ API_VERSION = 1
 
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_103"}),
-    tp_sizes=frozenset({8}),
+    # TP8 over the two 4-GPU trays of one NVL72 rack, TP4 on one tray
+    tp_sizes=frozenset({4, 8}),
     dtypes=frozenset({"bfloat16"}),
     # the decode CUDA graphs the covered step is tested with (eager steps too)
     decode_graph_backends=frozenset({"full", "disabled"}),

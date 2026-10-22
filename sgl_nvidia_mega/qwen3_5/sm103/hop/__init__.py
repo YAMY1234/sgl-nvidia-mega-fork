@@ -42,7 +42,6 @@ WORLDS = (2, 4, 8)
 # the rows up to which FlashInfer's MNNVL CuTe DSL fusion runs its one-shot (LL) routes at
 # TP8 (all-reduce, finalize); past them its BT routes, which the two-shot hop equals
 ONE_SHOT_ROWS, ONE_SHOT_FINALIZE_ROWS = 15, 23
-TWO_SHOT_THREADS = 512
 
 
 class Site2(ctypes.Structure):
@@ -141,7 +140,7 @@ def _kernels(device_index: int, deadline_ns: int) -> dict[str, jit.Kernel]:
     for w in WORLDS:
         for kind in ("ar", "fin_top10", "fin"):
             name = f"q35hop2_{kind}_w{w}"
-            kernels[name] = jit.load(cubin, name, (TWO_SHOT_THREADS, 1, 1), 0)
+            kernels[name] = jit.load(cubin, name, (ROW_THREADS, 1, 1), 0)
     for s in OPROJ_STEPS:
         name = f"q35hop_oproj_push_s{s}"
         kernels[name] = jit.load(cubin, name, (OPROJ_THREADS, 1, 1), 0)
@@ -372,12 +371,7 @@ class Hop:
         return args, outs
 
     def _launch2(self, name, args):
-        jit.launch(
-            self.kernels[name],
-            (args.m, 1, 1),
-            [args],
-            torch.cuda.current_stream(self.device).cuda_stream,
-        )
+        self._launch(name, args, ROW_CTAS, cluster=(1, ROW_CTAS, 1))
 
     def _launch(self, name, args, ctas, cluster=None):
         jit.launch(

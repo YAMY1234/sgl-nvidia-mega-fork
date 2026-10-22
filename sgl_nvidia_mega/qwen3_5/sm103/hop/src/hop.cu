@@ -236,8 +236,8 @@ __device__ __forceinline__ void oproj_push_kernel(const OprojArgs& o) {
 
 // ------------------------------------------------------------------ the two-shot hop (rows past the one-shot's)
 // FlashInfer's MNNVL CuTe DSL BT protocol (kernel_bt/device_kernels.py: publish / finalize-unicast, owner reduce +
-// multicast, materialize RMSNorm) in one launch, with its arithmetic: token t's owner is rank t % W. A CTA per token,
-// one fragment (8 bf16) a thread:
+// multicast, materialize RMSNorm) in one launch, with its arithmetic: token t's owner is rank t % W. A 4-CTA cluster a
+// token, one fragment (8 bf16) a thread:
 //   1. publish: this rank's bf16 row (or its finalized MoE row, top-k weighted in k order, plus the gated shared
 //      output) unicast into the owner's contribution mailbox [stage][rank][t / W];
 //   2. on the owner: the W contributions summed in rank order (fp32 from 0) + residual, rounded to bf16 (prenorm),
@@ -271,8 +271,6 @@ struct Args2 {
   float eps;
 };
 
-constexpr int kTwoThreads = kFrags;  // 512: a fragment a thread
-constexpr int kTwoWarps = kTwoThreads / 32;
 
 __device__ __forceinline__ size_t contrib_slot(const Site2& s, uint32_t stage, int src, int local_token, int frag) {
   return ((static_cast<size_t>(stage) * s.world + src) * s.local_cap + local_token) * kHidden +
@@ -303,15 +301,48 @@ __device__ __forceinline__ uint4 poll_frag(const uint16_t* p) {
   return v;
 }
 
+// The row's sum of squares as BT's materialize reduces it: each thread sequentially over its 8 values, each warp by
+// butterfly 16..1, then the 16 warp sums of the row (BT's 1024-thread block: warps 16..31 hold zero) by butterfly
+// 16..1 over lane = warp. The warp sums cross the 4-CTA cluster by st.async (row_init armed the mbarrier).
+__device__ __forceinline__ float row_sumsq_bt(float v, RowSmem& rs) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, off));
+  if (lane < kRowCtas) {
+    const uint32_t me = cluster_ctarank();
+    const uint32_t slot_l = static_cast<uint32_t>(__cvta_generic_to_shared(&rs.xs[me][warp]));
+    const uint32_t mbar_l = static_cast<uint32_t>(__cvta_generic_to_shared(&rs.mbar));
+    uint32_t slot_r, mbar_r;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(slot_r) : "r"(slot_l), "r"(lane));
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(mbar_r) : "r"(mbar_l), "r"(lane));
+    asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];" ::"r"(slot_r), "f"(v),
+                 "r"(mbar_r)
+                 : "memory");
+  }
+  {
+    const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(&rs.mbar));
+    asm volatile(
+        "{\n\t.reg .pred P;\n\tWAIT_BT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P, [%0], 0;\n\t"
+        "@!P bra WAIT_BT;\n\t}" ::"r"(a)
+        : "memory");
+  }
+  float t = lane < kRowCtas * kRowWarps ? rs.xs[lane / kRowWarps][lane % kRowWarps] : 0.f;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) t = __fadd_rn(t, __shfl_xor_sync(0xffffffffu, t, off));
+  return t;
+}
+
+// A cluster of kRowCtas CTAs a token (grid (m, kRowCtas)), one fragment a thread: CTA c the fragments [128c, 128c + 128).
 template <int W, int TOPK, bool kFin>
 __device__ __forceinline__ void two_shot_kernel(const Args2& a) {
   constexpr int kSlots = TOPK > 0 ? TOPK : kMaxTopK;
   __shared__ int32_t rows_s[kSlots];
   __shared__ float wts_s[kSlots];
-  __shared__ float warp_sums[kTwoWarps];
-  const int token = blockIdx.x, frag = threadIdx.x;
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  __shared__ RowSmem rs;
+  const int token = blockIdx.x, frag = blockIdx.y * kRowThreads + threadIdx.x;
   const int top_k = TOPK > 0 ? TOPK : a.top_k;
+  pdl_trigger();
   if (kFin && threadIdx.x < top_k) {
     const int i = token * top_k + threadIdx.x;
     const int r = a.permuted[i];
@@ -321,8 +352,7 @@ __device__ __forceinline__ void two_shot_kernel(const Args2& a) {
   float gam[8];
   unpack8(ld_v4(a.gamma + static_cast<size_t>(frag) * kVec), gam);
   const float inv_s = a.fp8_out != nullptr ? inv_scale_of(*a.fp8_scale) : 1.f;
-  if (kFin) __syncthreads();
-  pdl_trigger();
+  row_init(rs);  // also orders the staged routing before its reads
   pdl_wait();
   const Hop h = hop_enter_two(a.site);
   // 1. publish
@@ -360,9 +390,8 @@ __device__ __forceinline__ void two_shot_kernel(const Args2& a) {
   const int owner = token % W, local_token = token / W;
   st_v4(static_cast<uint16_t*>(a.site.contrib_peer[owner]) + contrib_slot(a.site, h.stage, a.site.rank, local_token, frag),
         sanitize4(mine));
-  // 2. the owner's reduce
+  // 2. the owner's reduce: every rank's contribution requested at once, then only the pending ones again
   if (owner == a.site.rank) {
-    // every rank's contribution requested at once, then only the pending ones again (as pull_frag)
     const uint16_t* in = static_cast<const uint16_t*>(a.site.contrib_uc);
     uint4 v[W];
 #pragma unroll
@@ -416,27 +445,15 @@ __device__ __forceinline__ void two_shot_kernel(const Args2& a) {
   float sum = 0.f;
 #pragma unroll
   for (int e = 0; e < 8; ++e) sum = __fadd_rn(sum, __fmul_rn(x[e], x[e]));
-#pragma unroll
-  for (int off = 16; off > 0; off >>= 1) sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, off));
-  if (lane == 0) warp_sums[warp] = sum;
-  __syncthreads();
-  if (warp == 0) {
-    float t = lane < kTwoWarps ? warp_sums[lane] : 0.f;
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) t = __fadd_rn(t, __shfl_xor_sync(0xffffffffu, t, off));
-    if (lane == 0) warp_sums[0] = t;
-  }
-  __syncthreads();
-  const float total = warp_sums[0];
+  const float total = row_sumsq_bt(sum, rs);
   float inv;
   asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(__fadd_rn(total / static_cast<float>(kHidden), a.eps)));
   const uint4 norm = norm_apply(x, inv, gam);
   if (a.norm_out != nullptr) *reinterpret_cast<uint4*>(a.norm_out + row_elem(token, frag)) = norm;
   if (a.fp8_out != nullptr) *reinterpret_cast<uint2*>(a.fp8_out + row_elem(token, frag)) = quant_fp8(norm, inv_s);
   st_v4(pre_uc, make_uint4(kNegZeroPair, kNegZeroPair, kNegZeroPair, kNegZeroPair));
-  hop_leave_two(a.site, h, gridDim.x);
+  hop_leave_two(a.site, h, gridDim.x * gridDim.y);
 }
-
 
 __device__ __forceinline__ Hop hop_enter_two(const Site2& s) {
   Hop h;
@@ -492,13 +509,13 @@ extern "C" __global__ void __launch_bounds__(256, 1) q35hop_oproj_push_s8(OprojA
 using q35hop_kernels::Args2;
 
 #define Q35HOP2_ENTRIES(W)                                                                                      \
-  extern "C" __global__ void __launch_bounds__(q35hop_kernels::kTwoThreads, 2) q35hop2_ar_w##W(Args2 a) {        \
+  extern "C" __global__ void __launch_bounds__(q35hop::kRowThreads) q35hop2_ar_w##W(Args2 a) {        \
     q35hop_kernels::two_shot_kernel<W, 0, false>(a);                                                            \
   }                                                                                                             \
-  extern "C" __global__ void __launch_bounds__(q35hop_kernels::kTwoThreads, 2) q35hop2_fin_top10_w##W(Args2 a) { \
+  extern "C" __global__ void __launch_bounds__(q35hop::kRowThreads) q35hop2_fin_top10_w##W(Args2 a) { \
     q35hop_kernels::two_shot_kernel<W, 10, true>(a);                                                            \
   }                                                                                                             \
-  extern "C" __global__ void __launch_bounds__(q35hop_kernels::kTwoThreads, 2) q35hop2_fin_w##W(Args2 a) {       \
+  extern "C" __global__ void __launch_bounds__(q35hop::kRowThreads) q35hop2_fin_w##W(Args2 a) {       \
     q35hop_kernels::two_shot_kernel<W, 0, true>(a);                                                             \
   }
 Q35HOP2_ENTRIES(2)

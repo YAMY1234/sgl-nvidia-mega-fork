@@ -32,6 +32,11 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "skv2",
     "mka",
     "mka_push",
+    "lowm_in",
+    "lowm_out",
+    "lowm_se",
+    "lowm_push",
+    "hop_fp8",
 )
 # Steps of more than one request (TP8's decode graphs of batch sizes 2 to 32), covered only
 # when requested in the same variable: covering them costs the one-request step about
@@ -137,6 +142,13 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'draft_skv2' runs inside entry 'draft_extend'"
         )
+    if "hop_fp8" in SLOTS and "hop" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'hop_fp8' is an output of slot 'hop'")
+    if "lowm_push" in SLOTS and not {"lowm_out", "hop"} <= SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'lowm_push' pushes slot 'lowm_out''s rows into slot "
+            "'hop''s mailbox"
+        )
     if "mka_push" in SLOTS and not {"mka", "hop"} <= SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'mka_push' pushes slot 'mka''s epilogue into slot "
@@ -170,7 +182,7 @@ def build(model, ctx):
     SGLang's BuildContext."""
     import torch
 
-    from sgl_nvidia_mega.qwen3_5 import attention, boundary, gdn, moe
+    from sgl_nvidia_mega.qwen3_5 import attention, boundary, gdn, lowm, moe
     from sgl_nvidia_mega.qwen3_5 import plan as slot_plan
     from sgl_nvidia_mega.qwen3_5.runtime import parity
     from sgl_nvidia_mega.qwen3_5.runtime.executor import Qwen35Verify
@@ -196,6 +208,7 @@ def build(model, ctx):
         "gdn": gdn.build(model, pctx),
         "boundary": boundary.build(model, pctx),
         "attention": attention.build(model, pctx),
+        "lowm": lowm.build(model, pctx),
     }
     facts = slot_plan.Facts(
         route=bound["moe"].route,
@@ -216,6 +229,11 @@ def build(model, ctx):
         mka=bound["attention"].mka,
         mka_wide=bound["attention"].mka_wide,
         mka_push=bound["attention"].mka_push,
+        lowm_in=bound["lowm"].lowm_in,
+        lowm_out=bound["lowm"].lowm_out,
+        lowm_se=bound["lowm"].se,
+        lowm_push=bound["lowm"].push,
+        hop_fp8=bound["lowm"].hop_fp8,
     )
     covered = slot_plan.covered(pctx.widths, facts, pctx.tokens_per_request)
     slots = slot_plan.plan(covered, facts, pctx.tokens_per_request)
@@ -247,7 +265,8 @@ def build(model, ctx):
             f"NVIDIA megakernel: requested slots {missing} built no width (MoE: "
             f"{bound['moe'].reason or 'built'}; GDN: {bound['gdn'].reason or 'built'}; "
             f"boundary: {bound['boundary'].reason or 'built'}; "
-            f"attention: {bound['attention'].reason or 'built'})"
+            f"attention: {bound['attention'].reason or 'built'}; "
+            f"low-M: {bound['lowm'].reason or 'built'})"
         )
     checker = (
         parity.Parity(covered, torch.cuda.current_device(), model)

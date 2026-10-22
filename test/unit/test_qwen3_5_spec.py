@@ -205,9 +205,9 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(14, every)) == ["gdn_pdl", "gdn_verify", "hop", "route"]
     # four requests: past the router front's and the one-shot all-reduce's rows
     assert _on(plan.slots(28, every)) == ["gdn_pdl", "gdn_verify", "route_topk"]
-    # eight to 32 requests: past the GDN chain's checked widths
+    # eight to 32 requests: the GDN chain and route_topk
     for rows in (56, 112, 224):
-        assert _on(plan.slots(rows, every)) == ["route_topk"]
+        assert _on(plan.slots(rows, every)) == ["gdn_pdl", "gdn_verify", "route_topk"]
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]
     assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]
     # SGLang offers every multiple of 7 up to MAX_ROWS; three requests are not covered
@@ -221,7 +221,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert not plan.multi_request(4, frozenset({"multi_request"}))
     assert plan.covered((7, 14, 28), every, 7) == (7, 14, 28)
     assert plan.covered((7, 14, 28, 56, 112), every, 7) == (7, 14, 28, 56, 112)
-    assert plan.covered((7, 14, 28, 56), plan.Facts(gdn_verify=True), 7) == (7, 14, 28)
+    assert plan.covered((7, 14, 28, 56), plan.Facts(gdn_verify=True), 7) == (7, 14, 28, 56)
     # one request is always covered, more only where a slot runs
     assert plan.covered((7, 14, 28), plan.Facts(), 7) == (7,)
     assert plan.covered((7, 14, 28), plan.Facts(route=True, mkm=True), 7) == (7, 14)

@@ -565,7 +565,7 @@ def test_front_takes_its_weights_by_bulk_copy_with_the_same_bytes(pad):
             assert torch.equal(t, got[1][n]), n
 
 
-@pytest.mark.parametrize("requests", [2, 4, 8])
+@pytest.mark.parametrize("requests", [2, 3, 4])
 @pytest.mark.parametrize("pad", [False, True])
 def test_front_of_several_requests_is_each_requests_front(requests, pad):
     """One launch over several requests (grid y) writes every output and pool exactly

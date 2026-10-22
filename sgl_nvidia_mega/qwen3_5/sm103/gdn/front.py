@@ -27,7 +27,7 @@ from sgl_nvidia_mega.common import jit
 
 SOURCE = Path(__file__).parent / "src" / "front.cu"
 ROWS, HIDDEN, QKVZ, CONV, BA = 7, 4096, 2560, 1536, 16
-MAX_REQUESTS = 8  # requests of ROWS rows a launch serves (kMaxRequests)
+MAX_REQUESTS = 4  # requests of ROWS rows a launch serves (kMaxRequests)
 INBOX_BYTES = 8 * 256 * 4  # one request's split-K inbox of a projection CTA (kInboxBytes)
 THREADS, CLUSTER, CTAS = (
     256,

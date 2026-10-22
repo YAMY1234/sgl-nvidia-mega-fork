@@ -531,7 +531,7 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
 // MMAs on them, pushing request r's split-K partials into inbox r (its own mbarrier, written once a launch); the owners
 // then reduce and finish request after request. Per request, the arithmetic is front_kernel's: same MMAs in the same
 // order, same cluster-rank reduction, same conv.
-constexpr int kMaxRequests = 8;
+constexpr int kMaxRequests = 4;
 constexpr uint32_t kInboxBytes = kCluster * 256 * sizeof(float);
 
 __device__ __forceinline__ void front_multi_kernel(const Params& p, int requests) {

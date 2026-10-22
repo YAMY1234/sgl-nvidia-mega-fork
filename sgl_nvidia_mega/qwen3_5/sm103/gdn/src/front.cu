@@ -536,7 +536,7 @@ constexpr uint32_t kInboxBytes = kCluster * 256 * sizeof(float);
 
 __device__ __forceinline__ void front_multi_kernel(const Params& p, int requests) {
   if (threadIdx.x == 0) pdl_trigger();
-  __shared__ __align__(16) uint2 fragments[16][32];
+  __shared__ __align__(16) uint2 fragments[kMaxRequests][16][32];
   __shared__ __align__(8) uint64_t barriers[kMaxRequests];
   __shared__ __align__(8) uint64_t weight_barrier;
   extern __shared__ __align__(128) uint4 dyn_smem[];  // kWeightBytes of weights, then the requests' inboxes
@@ -593,6 +593,8 @@ __device__ __forceinline__ void front_multi_kernel(const Params& p, int requests
   }
   if (sticky) asm volatile("trap;");
   cluster_wait();
+  // every request's quantized rows first, then the MMAs two requests at a time (two n8 B tiles on the same A)
+#pragma unroll 1
   for (int req = 0; req < requests; ++req) {
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
@@ -602,36 +604,48 @@ __device__ __forceinline__ void front_multi_kernel(const Params& p, int requests
         const auto* x = static_cast<const __nv_bfloat16*>(p.x) + (req * p.m + g) * 4096 + rank * 512 + step * 32 + 4 * t;
         value = make_uint2(quant4_static(x, inverse), quant4_static(x + 16, inverse));
       }
-      fragments[step][lane] = value;
+      fragments[req][step][lane] = value;
     }
-    __syncthreads();
-    float chains[2][4][4] = {};
+  }
+  __syncthreads();
+#pragma unroll 1
+  for (int req = 0; req < requests; req += 2) {
+    const bool pair = req + 1 < requests;
+    float chains[2][2][4][4] = {};
 #pragma unroll
     for (int step = 0; step < 16; ++step) {
-      const uint2 b = fragments[step][lane];
-      mma_e4m3(chains[0][step & 3], weights[step][0], b.x, b.y);
-      mma_e4m3(chains[1][step & 3], weights[step][1], b.x, b.y);
-    }
-    float acc[2][4];
-#pragma unroll
-    for (int block = 0; block < 2; ++block)
-#pragma unroll
-      for (int i = 0; i < 4; ++i)
-        acc[block][i] = __fadd_rn(__fadd_rn(chains[block][0][i], chains[block][1][i]),
-                                 __fadd_rn(chains[block][2][i], chains[block][3][i]));
-    float* inbox = inboxes + req * (kCluster * 256);
-#pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      const int token = 2 * t + j;
-      if (token < p.m) {
-        const int slot = feature_owner ? token * 32 + g * 4 : warp * 32 + g * 4;
-        const unsigned destination = smem_u32(&inbox[rank * 256 + slot]);
-        const int peer = feature_owner ? warp : token;
-        push4(peer_address(destination, peer), acc[0][j], acc[0][2 + j], acc[1][j], acc[1][2 + j],
-              peer_address(smem_u32(&barriers[req]), peer));
+      const uint2 b = fragments[req][step][lane];
+      mma_e4m3(chains[0][0][step & 3], weights[step][0], b.x, b.y);
+      mma_e4m3(chains[0][1][step & 3], weights[step][1], b.x, b.y);
+      if (pair) {
+        const uint2 c = fragments[req + 1][step][lane];
+        mma_e4m3(chains[1][0][step & 3], weights[step][0], c.x, c.y);
+        mma_e4m3(chains[1][1][step & 3], weights[step][1], c.x, c.y);
       }
     }
-    __syncthreads();  // every warp has read this request's fragments
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+      if (q == 1 && !pair) break;
+      float acc[2][4];
+#pragma unroll
+      for (int block = 0; block < 2; ++block)
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+          acc[block][i] = __fadd_rn(__fadd_rn(chains[q][block][0][i], chains[q][block][1][i]),
+                                   __fadd_rn(chains[q][block][2][i], chains[q][block][3][i]));
+      float* inbox = inboxes + (req + q) * (kCluster * 256);
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const int token = 2 * t + j;
+        if (token < p.m) {
+          const int slot = feature_owner ? token * 32 + g * 4 : warp * 32 + g * 4;
+          const unsigned destination = smem_u32(&inbox[rank * 256 + slot]);
+          const int peer = feature_owner ? warp : token;
+          push4(peer_address(destination, peer), acc[0][j], acc[0][2 + j], acc[1][j], acc[1][2 + j],
+                peer_address(smem_u32(&barriers[req + q]), peer));
+        }
+      }
+    }
   }
   if (!owner) return;
   for (int req = 0; req < requests; ++req) {

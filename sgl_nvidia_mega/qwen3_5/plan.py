@@ -13,7 +13,9 @@ not, up to 224, ``mkm`` (on its outputs, the top-10 and both expert GEMMs in one
 up to 7, and with ``mkm_wide`` (its 16-token engine) up to 16. ``gdn_verify`` (the
 GatedDeltaNet verify chain with its launch choices changed) covers every width, with
 ``gdn_core`` (numeric: its ReplaySSM verify, gated norm and FP8 output in one launch), and ``hop`` (the boundary's fused all-reduce points on the decode hop) the
-widths where FlashInfer's low-latency kernels, which it equals bit for bit, run.
+widths where FlashInfer's low-latency kernels, which it equals bit for bit, run, and with
+``hop_wide`` up to 224 rows (past them its two-shot protocol, equal to FlashInfer's BT
+routes).
 ``gdn_push`` (numeric: out_proj as the hop's push GEMM, on gdn_verify's FP8 norm) runs up
 to 8 rows. ``gdn_front`` (numeric: the GDN projections and conv in one launch, then
 gdn_pdl's verify) covers one or two requests of 7 rows, ``route_shared`` (numeric: the shared
@@ -50,6 +52,8 @@ GDN_CORE_MAX_ROWS = 224  # and gdn_core's launch
 MKM_MAX_ROWS = 7
 MKM_WIDE_MAX_ROWS = 16
 HOP_MAX_ROWS = 15
+# with hop_wide: the two-shot hop past the one-shot rows (FlashInfer's BT routes, bit for bit)
+HOP_WIDE_MAX_ROWS = 224
 GDN_PUSH_MAX_ROWS = 8
 # the rows slot route_shared's shared stage fits shared memory for
 ROUTE_SHARED_ROWS = 8
@@ -95,6 +99,7 @@ class Facts(msgspec.Struct, frozen=True):
     gdn_pdl: bool = False  # with its dependent verify launch
     gdn_core: bool = False  # with the one-launch verify core
     hop: bool = False  # the decode hop, built for the widest step it covers
+    hop_wide: bool = False  # with its two-shot protocol past the one-shot rows
     gdn_push: bool = False  # out_proj packed for the push GEMM on every GDN layer
     gdn_front: bool = False  # in_proj_qkvz packed for the front on every GDN layer
     route_shared: bool = (
@@ -110,7 +115,9 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
     if not 1 <= rows <= MAX_ROWS:
         raise ValueError(f"{rows} rows are outside the covered widths 1-{MAX_ROWS}")
     route = facts.route and rows <= ROUTE_MAX_ROWS
-    hop = facts.hop and rows <= HOP_MAX_ROWS
+    hop = facts.hop and (
+        rows <= HOP_MAX_ROWS or (facts.hop_wide and rows <= HOP_WIDE_MAX_ROWS)
+    )
     mka = facts.mka and rows <= (MKA_WIDE_MAX_ROWS if facts.mka_wide else MKA_MAX_ROWS)
     gdn_verify = facts.gdn_verify and rows <= GDN_VERIFY_MAX_ROWS
     return Slots(

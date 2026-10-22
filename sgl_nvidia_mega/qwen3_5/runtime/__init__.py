@@ -23,6 +23,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "gdn_pdl",
     "gdn_core",
     "hop",
+    "hop_wide",
     "gdn_push",
     "gdn_front",
     "route_shared",
@@ -95,6 +96,8 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'route_shared' runs in slot 'route''s launch"
         )
+    if "hop_wide" in SLOTS and "hop" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'hop_wide' widens slot 'hop'")
     if "gdn_push" in SLOTS and not {"gdn_verify", "hop"} <= SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_push' pushes slot 'gdn_verify''s out_proj into "
@@ -195,6 +198,7 @@ def build(model, ctx):
         gdn_pdl=bound["gdn"].gdn_pdl,
         gdn_core=bound["gdn"].gdn_core,
         hop=bound["boundary"].hop is not None,
+        hop_wide=bound["boundary"].wide,
         gdn_push=bool(bound["gdn"].packed),
         gdn_front=bool(bound["gdn"].front),
         route_shared=bound["moe"].shared,
@@ -221,6 +225,9 @@ def build(model, ctx):
         <= slot_plan.MKM_MAX_ROWS
         else set()
     )
+    # hop_wide has nothing to serve where no covered step is past the one-shot rows
+    if max(pctx.widths) <= slot_plan.HOP_MAX_ROWS:
+        vacuous.add("hop_wide")
     # route_topk has nothing to serve where slot route covers every width
     if "route" in SLOTS and max(pctx.widths) <= slot_plan.ROUTE_MAX_ROWS:
         vacuous.add("route_topk")

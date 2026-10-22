@@ -15,6 +15,12 @@ all-reduce of that partial only consumes.
 
 A consumer that waits past the deadline faults at address 0x0 (fail-stop) instead of
 returning: the deadline is compiled in, as SGLang's ``BuildContext.deadline_s``.
+
+Built with ``wide_max_m``, the hop also serves the rows past FlashInfer's one-shot routes
+(the all-reduce past ``ONE_SHOT_ROWS``, the finalize past ``ONE_SHOT_FINALIZE_ROWS``) with
+the two-shot protocol of its BT routes in one launch (``q35hop2_*``: unicast publish to each
+token's owner rank, the owner's reduce multicast as the prenorm row, RMSNorm on every rank),
+equal to them bit for bit.
 """
 
 from __future__ import annotations
@@ -33,6 +39,24 @@ HIDDEN, STAGES, ROW_CTAS, ROW_THREADS, QUAD_CTAS, MAX_TOP_K = 4096, 3, 4, 128, 8
 OPROJ_THREADS, OPROJ_MAX_M, OPROJ_STEPS = 256, 8, (4, 8)  # K = 256 * steps
 SENTINEL = -32768  # bf16 -0.0 as int16: an empty mailbox slot
 WORLDS = (2, 4, 8)
+# the rows up to which FlashInfer's MNNVL CuTe DSL fusion runs its one-shot (LL) routes at
+# TP8 (all-reduce, finalize); past them its BT routes, which the two-shot hop equals
+ONE_SHOT_ROWS, ONE_SHOT_FINALIZE_ROWS = 15, 23
+TWO_SHOT_THREADS = 512
+
+
+class Site2(ctypes.Structure):
+    _fields_ = [
+        ("contrib_uc", ctypes.c_void_p),
+        ("contrib_peer", ctypes.c_void_p * 8),
+        ("prenorm_mc", ctypes.c_void_p),
+        ("prenorm_uc", ctypes.c_void_p),
+        ("ctrl", ctypes.c_void_p),
+        ("rank", ctypes.c_int),
+        ("world", ctypes.c_int),
+        ("m_cap", ctypes.c_int),
+        ("local_cap", ctypes.c_int),
+    ]
 
 
 class Site(ctypes.Structure):
@@ -67,6 +91,10 @@ class Args(ctypes.Structure):
         ]
         + [("m", ctypes.c_int), ("top_k", ctypes.c_int), ("eps", ctypes.c_float)]
     )
+
+
+class Args2(ctypes.Structure):
+    _fields_ = [("site", Site2)] + Args._fields_[1:]
 
 
 class OprojArgs(ctypes.Structure):
@@ -110,6 +138,10 @@ def _kernels(device_index: int, deadline_ns: int) -> dict[str, jit.Kernel]:
     names = ["q35hop_publish", "q35hop_publish_fin_top10", "q35hop_publish_fin"]
     names += [f"q35hop_consume_w{w}" for w in WORLDS]
     kernels = {n: jit.load(cubin, n, (ROW_THREADS, 1, 1), 0) for n in names}
+    for w in WORLDS:
+        for kind in ("ar", "fin_top10", "fin"):
+            name = f"q35hop2_{kind}_w{w}"
+            kernels[name] = jit.load(cubin, name, (TWO_SHOT_THREADS, 1, 1), 0)
     for s in OPROJ_STEPS:
         name = f"q35hop_oproj_push_s{s}"
         kernels[name] = jit.load(cubin, name, (OPROJ_THREADS, 1, 1), 0)
@@ -120,7 +152,16 @@ class Hop:
     """One process's mailbox and control block, shared by every hop of every step;
     construct on every rank of ``group`` (a collective) before any capture."""
 
-    def __init__(self, *, max_m: int, eps: float, group, device, deadline_s: float):
+    def __init__(
+        self,
+        *,
+        max_m: int,
+        eps: float,
+        group,
+        device,
+        deadline_s: float,
+        wide_max_m: int = 0,
+    ):
         import torch.distributed as dist
         import torch.distributed._symmetric_memory as symm_mem
 
@@ -156,11 +197,53 @@ class Hop:
             self.world,
             self.max_m,
         )
+        self.wide_max_m = int(wide_max_m)
+        self.site2 = self._two_shot(group) if self.wide_max_m else None
         torch.cuda.synchronize(self.device)
         dist.barrier(group=group)
 
+    def _two_shot(self, group) -> Site2:
+        """The two-shot protocol's mailboxes (a collective): contributions [stages, world,
+        local rows, hidden] reached by unicast, prenorm rows [stages, rows, hidden] by
+        multicast, and their control block."""
+        import torch.distributed._symmetric_memory as symm_mem
+
+        local = -(-self.wide_max_m // self.world)
+        self._contrib = symm_mem.empty(
+            (STAGES, self.world, local, HIDDEN), dtype=torch.int16, device=self.device
+        )
+        contrib = symm_mem.rendezvous(self._contrib, group)
+        self._prenorm = symm_mem.empty(
+            (STAGES, self.wide_max_m, HIDDEN), dtype=torch.int16, device=self.device
+        )
+        prenorm = symm_mem.rendezvous(self._prenorm, group)
+        multicast = int(prenorm.multicast_ptr or 0)
+        if not multicast or multicast % 16:
+            raise RuntimeError("the two-shot hop needs an NVLink multicast mapping")
+        self._contrib.fill_(SENTINEL)
+        self._prenorm.fill_(SENTINEL)
+        self._ctrl2 = torch.zeros(4, dtype=torch.int32, device=self.device)
+        self._handles2 = (contrib, prenorm)
+        peers = (ctypes.c_void_p * 8)(*[int(p) for p in contrib.buffer_ptrs])
+        return Site2(
+            self._contrib.data_ptr(),
+            peers,
+            multicast,
+            self._prenorm.data_ptr(),
+            self._ctrl2.data_ptr(),
+            self.rank,
+            self.world,
+            self.wide_max_m,
+            local,
+        )
+
     def supports(self, m: int) -> bool:
-        return 1 <= m <= self.max_m
+        return 1 <= m <= max(self.max_m, self.wide_max_m)
+
+    def _two_shot_rows(self, m: int, finalize: bool) -> bool:
+        """Whether ``m`` rows take the two-shot protocol (FlashInfer's BT routes)."""
+        bound = ONE_SHOT_FINALIZE_ROWS if finalize else ONE_SHOT_ROWS
+        return self.site2 is not None and bound < m <= self.wide_max_m
 
     def all_reduce_residual_rms_norm(
         self, *, local_contribution, residual, gamma, fp8_scale=None
@@ -168,6 +251,11 @@ class Hop:
         """(norm, residual_out[, fp8]) [M, 4096] of sum_ranks(partial) + residual; a
         partial out_proj_push returned is already in the mailbox."""
         m = int(local_contribution.shape[0])
+        if self._two_shot_rows(m, finalize=False):
+            args, outs = self._args2(m, residual, gamma, fp8_scale)
+            args.partial = local_contribution.data_ptr()
+            self._launch2(f"q35hop2_ar_w{self.world}", args)
+            return outs
         args, outs = self._args(m, residual, gamma, fp8_scale)
         if self.has_pushed(local_contribution):
             self._pushed = None
@@ -237,18 +325,23 @@ class Hop:
         if top_k > MAX_TOP_K:
             raise ValueError(f"top-{top_k} routing (at most {MAX_TOP_K})")
         self._check_consumed()
-        args, outs = self._args(m, residual, gamma, fp8_scale)
+        two = self._two_shot_rows(m, finalize=True)
+        args, outs = (self._args2 if two else self._args)(m, residual, gamma, fp8_scale)
         args.routed, args.expert_w = routed_output.data_ptr(), expert_weights.data_ptr()
         args.permuted, args.top_k = permuted_indices.data_ptr(), top_k
         args.shared = jit.null_or_pointer(gated_shared_output).value
+        if two:
+            kind = "fin_top10" if top_k == 10 else "fin"
+            self._launch2(f"q35hop2_{kind}_w{self.world}", args)
+            return outs
         name = "q35hop_publish_fin_top10" if top_k == 10 else "q35hop_publish_fin"
         self._launch(name, args, QUAD_CTAS)
         self._consume(args)
         return outs
 
-    def _args(self, m: int, residual, gamma, fp8_scale):
-        if not self.supports(m):
-            raise ValueError(f"the hop serves 1-{self.max_m} rows, not {m}")
+    def _args(self, m: int, residual, gamma, fp8_scale, check: bool = True):
+        if check and not 1 <= m <= self.max_m:
+            raise ValueError(f"the one-shot hop serves 1-{self.max_m} rows, not {m}")
         shape = (m, HIDDEN)
         outs = [
             torch.empty(shape, dtype=torch.bfloat16, device=self.device),
@@ -270,6 +363,21 @@ class Hop:
             eps=self.eps,
         )
         return args, tuple(outs)
+
+    def _args2(self, m: int, residual, gamma, fp8_scale):
+        one, outs = self._args(m, residual, gamma, fp8_scale, check=False)
+        args = Args2(site=self.site2)
+        for name, _ in Args._fields_[1:]:
+            setattr(args, name, getattr(one, name))
+        return args, outs
+
+    def _launch2(self, name, args):
+        jit.launch(
+            self.kernels[name],
+            (args.m, 1, 1),
+            [args],
+            torch.cuda.current_stream(self.device).cuda_stream,
+        )
 
     def _launch(self, name, args, ctas, cluster=None):
         jit.launch(

@@ -207,11 +207,16 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(14, every)) == sorted(
         gdn + ["gdn_front", "hop", "mka", "mka_push", "route"]
     )
-    # four to 32 requests: the GDN chain (with its one-launch core), route_topk and MKA's
-    # wide entries / front path
+    # four to 32 requests: the GDN chain (with its one-launch core), the two-shot hop,
+    # route_topk and MKA's wide entries / front path (whose flag mka_push only the wide
+    # entries act on)
     for rows in (28, 56, 112, 224):
-        assert _on(plan.slots(rows, every)) == sorted(gdn + ["mka", "route_topk"])
+        assert _on(plan.slots(rows, every)) == sorted(
+            gdn + ["hop", "mka", "mka_push", "route_topk"]
+        )
     assert _on(plan.slots(56, plan.Facts(gdn_verify=True))) == ["gdn_verify"]
+    no_wide = plan.Facts(hop=True)
+    assert _on(plan.slots(28, no_wide)) == []
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]
     assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]
     # SGLang offers every multiple of 7 up to MAX_ROWS; three requests are not covered

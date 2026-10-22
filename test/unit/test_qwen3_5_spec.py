@@ -201,14 +201,20 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(7, every)) == sorted(
         set(plan.Slots.__struct_fields__) - {"route_topk"}
     )
-    # two requests: the 16-row router front, the GDN chain and the hop's one-shot rows
+    # two requests: the 16-row router front, the GDN chain, the hop's one-shot rows and
+    # MKA's wide entries with their push
     gdn = ["gdn_core", "gdn_pdl", "gdn_verify"]
-    assert _on(plan.slots(14, every)) == sorted(gdn + ["hop", "route"])
+    assert _on(plan.slots(14, every)) == sorted(
+        gdn + ["hop", "mka", "mka_push", "route"]
+    )
     # four requests: past the router front's and the one-shot all-reduce's rows
-    assert _on(plan.slots(28, every)) == sorted(gdn + ["route_topk"])
-    # eight to 32 requests: the GDN chain (with its one-launch core) and route_topk
-    for rows in (56, 112, 224):
-        assert _on(plan.slots(rows, every)) == sorted(gdn + ["route_topk"])
+    assert _on(plan.slots(28, every)) == sorted(gdn + ["mka", "route_topk"])
+    # eight and sixteen requests: the GDN chain (with its one-launch core), route_topk and
+    # MKA's wide entries
+    for rows in (56, 112):
+        assert _on(plan.slots(rows, every)) == sorted(gdn + ["mka", "route_topk"])
+    # 32 requests: past MKA's wide entries
+    assert _on(plan.slots(224, every)) == sorted(gdn + ["route_topk"])
     assert _on(plan.slots(56, plan.Facts(gdn_verify=True))) == ["gdn_verify"]
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]
     assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]
@@ -230,6 +236,15 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     attention = plan.Facts(skv2=True, mka=True, mka_push=True, hop=True)
     assert plan.covered((7, 14, 28), attention, 7) == (7, 14)
     assert _on(plan.slots(14, attention)) == ["hop"]
+    # with its wide entries MKA covers the widths of up to 16 requests
+    wide_attention = plan.Facts(mka=True, mka_wide=True)
+    assert plan.covered((7, 14, 28, 56, 112, 224), wide_attention, 7) == (
+        7,
+        14,
+        28,
+        56,
+        112,
+    )
     # mkm_wide: mkm's 16-token engine at two requests, not past the router front's rows
     wide = plan.Facts(route=True, mkm=True, mkm_wide=True)
     assert _on(plan.slots(14, wide)) == ["mkm", "route"]
@@ -253,6 +268,7 @@ def test_the_slot_plans_row_bounds_are_the_kernels():
     assert plan.MKM_WIDE_MAX_ROWS == mkm.M16_MAX_TOKENS
     assert plan.GDN_PUSH_MAX_ROWS == hop.OPROJ_MAX_M
     assert plan.MKA_MAX_ROWS == mka.MAX_ROWS
+    assert plan.MKA_WIDE_MAX_ROWS == mka.WIDE_MAX_ROWS
 
 
 def test_a_numeric_slot_turns_the_claim_into_its_tolerances():

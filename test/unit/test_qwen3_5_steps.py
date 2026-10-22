@@ -1955,7 +1955,14 @@ def test_the_mka_slot_is_built_with_its_weights_packed_for_every_attention_layer
     monkeypatch.setattr(mka, "unsupported", lambda l: why.get(id(l), ""))
     monkeypatch.setattr(mka, "pack", packed.append)
     ctx = SimpleNamespace(tokens_per_request=7)
+    for made in layers[1:]:
+        made.num_heads = 8
+    # TP4's eight query heads a rank: the narrow kernels only
     assert attention.build(model, ctx) == attention.Bound(mka=True)
+    packed.clear()
+    for made in layers[1:]:
+        made.num_heads = 4
+    assert attention.build(model, ctx) == attention.Bound(mka=True, mka_wide=True)
     assert packed == layers[1:]
     # a layer the slot cannot serve leaves the slot unbuilt, packs nothing more
     why[id(layers[2])] = "no attention output gate"

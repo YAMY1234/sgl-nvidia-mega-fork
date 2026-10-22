@@ -30,7 +30,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "mka",
     "mka_push",
 )
-# Steps of more than one request (TP8's decode graphs of batch sizes 2 to 16), covered only
+# Steps of more than one request (TP8's decode graphs of batch sizes 2 to 32), covered only
 # when requested in the same variable: covering them costs the one-request step about
 # 0.3% at TP8
 OPT_IN_COVERAGE: tuple[str, ...] = ("multi_request",)
@@ -200,6 +200,7 @@ def build(model, ctx):
         route_shared=bound["moe"].shared,
         skv2=bound["attention"].skv2,
         mka=bound["attention"].mka,
+        mka_wide=bound["attention"].mka_wide,
         mka_push=bound["attention"].mka_push,
     )
     covered = slot_plan.covered(pctx.widths, facts, pctx.tokens_per_request)

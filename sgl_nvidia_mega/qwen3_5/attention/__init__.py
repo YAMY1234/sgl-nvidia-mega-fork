@@ -55,6 +55,7 @@ class Bound(msgspec.Struct, frozen=True):
 
     skv2: bool = False  # slot skv2 serves every full-attention layer
     mka: bool = False
+    mka_wide: bool = False  # mka's wide entries serve the steps of several requests
     mka_push: bool = False
     reason: str = ""  # why a requested slot is not built
 
@@ -90,7 +91,13 @@ def build(model, ctx) -> Bound:
     if "mka" in SLOTS:
         for _, layer in layers:
             mka.pack(layer)
-    return Bound(skv2="skv2" in SLOTS, mka="mka" in SLOTS, mka_push="mka_push" in SLOTS)
+    mka_on = "mka" in SLOTS
+    return Bound(
+        skv2="skv2" in SLOTS,
+        mka=mka_on,
+        mka_wide=mka_on and all(layer.num_heads == 4 for _, layer in layers),
+        mka_push="mka_push" in SLOTS,
+    )
 
 
 def pool_reasons(view, binding, skv2: bool = True, mka: bool = False) -> list[str]:

@@ -144,6 +144,27 @@ __device__ __forceinline__ uint32_t gate_quant4(const __nv_bfloat16* o, const __
           << 16);
 }
 
+// The same roundings on operands already in registers (the wide kernels batch their loads).
+__device__ __forceinline__ uint32_t quant4_static_r(const uint2 raw, float inv) {
+  const __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
+  const __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
+  float f[4] = {__low2float(v01), __high2float(v01), __low2float(v23), __high2float(v23)};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) f[i] = fminf(fmaxf(__fmul_rn(f[i], inv), -448.f), 448.f);
+  return e4m3x2(f[0], f[1]) | (e4m3x2(f[2], f[3]) << 16);
+}
+__device__ __forceinline__ uint32_t gate_quant4_r(const uint2 ro, const uint2 rg, float inv) {
+  const __nv_bfloat162 o01 = *reinterpret_cast<const __nv_bfloat162*>(&ro.x);
+  const __nv_bfloat162 o23 = *reinterpret_cast<const __nv_bfloat162*>(&ro.y);
+  const __nv_bfloat162 g01 = *reinterpret_cast<const __nv_bfloat162*>(&rg.x);
+  const __nv_bfloat162 g23 = *reinterpret_cast<const __nv_bfloat162*>(&rg.y);
+  return e4m3x2(gate_quant1(__low2float(o01), __low2float(g01), inv),
+                gate_quant1(__high2float(o01), __high2float(g01), inv)) |
+         (e4m3x2(gate_quant1(__low2float(o23), __low2float(g23), inv),
+                 gate_quant1(__high2float(o23), __high2float(g23), inv))
+          << 16);
+}
+
 // Inbox slot s of a 256-row tile -> row: warp w = s/32 holds rows 32w + {g, g+8, g+16, g+24}.
 __device__ __forceinline__ int slot_row(int s) { return 32 * (s >> 5) + ((s >> 2) & 7) + 8 * (s & 3); }
 
@@ -585,15 +606,29 @@ __device__ __forceinline__ void mka_prologue_wide_kernel(const ProParams p) {
       tcs[o][kHalfRot + l] = __ldg(p.cos_sin + ps * p.cs_stride + kHalfRot + l);
     }
   }
-  for (int t = 0; t < tiles; ++t) {
-    const bool tok_ok = 8 * t + g < m;
-    const __nv_bfloat16* xr = p.x + (size_t)(8 * t + g) * 4096 + rank * 512 + 4 * t4;
+  // x's tiles in batches of 4, every load of a batch in flight before its first use
+  for (int t0 = 0; t0 < tiles; t0 += 4) {
+    uint2 raw[4][2][2];
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      const int s = 2 * warp + i;
-      bfr[(t * 16 + s) * 32 + lane] = tok_ok ? make_uint2(quant4_static(xr + s * 32, inv_sx),
-                                                          quant4_static(xr + s * 32 + 16, inv_sx))
-                                             : make_uint2(0u, 0u);
+    for (int u = 0; u < 4; ++u) {
+      const bool tok_ok = 8 * (t0 + u) + g < m;
+      const __nv_bfloat16* xr = p.x + (size_t)(8 * (t0 + u) + g) * 4096 + rank * 512 + 4 * t4;
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh)
+          raw[u][i][hh] = tok_ok ? *reinterpret_cast<const uint2*>(xr + (2 * warp + i) * 32 + hh * 16)
+                                 : make_uint2(0u, 0u);
+    }
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      if (t0 + u >= tiles) break;
+      const bool tok_ok = 8 * (t0 + u) + g < m;
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+        bfr[((t0 + u) * 16 + 2 * warp + i) * 32 + lane] =
+            tok_ok ? make_uint2(quant4_static_r(raw[u][i][0], inv_sx), quant4_static_r(raw[u][i][1], inv_sx))
+                   : make_uint2(0u, 0u);
     }
   }
   __syncthreads();
@@ -713,15 +748,23 @@ __device__ __forceinline__ void mka_epilogue_wide_kernel(const EpiParams p) {
   const int m = p.m;
   const int tiles = (m + 7) >> 3;
   const int own = rank < m ? (m - rank + 7) >> 3 : 0;
-  for (int t = 0; t < tiles; ++t) {
-    const bool tok_ok = 8 * t + g < m;
-    const size_t off = (size_t)(8 * t + g) * kK + rank * (kSteps * 32) + 4 * t4;
-    uint32_t* bw = reinterpret_cast<uint32_t*>(bfr + t * kSteps * 32);
+  static_assert(2 * kSteps == 8, "one (step, half) per warp");
+  {
+    // every tile's operands in flight before the first use
+    const int s = warp >> 1, h = warp & 1;
+    uint2 ro[kWideTiles], rg[kWideTiles];
 #pragma unroll
-    for (int i = warp; i < 2 * kSteps; i += 8) {
-      const int s = i >> 1, h = i & 1;
-      bw[(s * 32 + lane) * 2 + h] =
-          tok_ok ? gate_quant4(p.attn + off + s * 32 + h * 16, p.gate + off + s * 32 + h * 16, inv_sx) : 0u;
+    for (int t = 0; t < kWideTiles; ++t) {
+      const bool ok = 8 * t + g < m;
+      const size_t off = (size_t)(8 * t + g) * kK + rank * (kSteps * 32) + 4 * t4 + s * 32 + h * 16;
+      ro[t] = ok ? *reinterpret_cast<const uint2*>(p.attn + off) : make_uint2(0u, 0u);
+      rg[t] = ok ? *reinterpret_cast<const uint2*>(p.gate + off) : make_uint2(0u, 0u);
+    }
+#pragma unroll
+    for (int t = 0; t < kWideTiles; ++t) {
+      if (t >= tiles) break;
+      uint32_t* bw = reinterpret_cast<uint32_t*>(bfr + t * kSteps * 32);
+      bw[(s * 32 + lane) * 2 + h] = 8 * t + g < m ? gate_quant4_r(ro[t], rg[t], inv_sx) : 0u;
     }
   }
   __syncthreads();

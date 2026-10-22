@@ -4,8 +4,8 @@
 
 A slot runs only where it is requested (``SGLANG_NVIDIA_MEGAKERNEL_SLOTS``), built and
 inside its row bounds; every other op is SGLang's own. The covered steps are the
-target verify of 1 to 32 requests (``REQUESTS``: SGLang's decode graphs of batch sizes
-1, 2, 4, 8, 16 and 32); a width of more than one request is covered only where a slot
+target verify of 1 to 128 requests (``REQUESTS``: SGLang's decode graphs of batch sizes
+1, 2, 4, 8, 16, 32, 64 and 128); a width of more than one request is covered only where a slot
 runs there. ``route`` (the router GEMM and the routed experts' NVFP4 input in one launch)
 runs up to 16 rows, ``route_topk`` (behind SGLang's router GEMM: the top-10 and the NVFP4
 input in one launch, then the routed experts on that routing) wherever ``route`` does
@@ -38,9 +38,9 @@ from __future__ import annotations
 
 import msgspec
 
-MAX_ROWS = 224  # the widest covered step: 32 requests of 7 verify rows (TP8 bs32)
+MAX_ROWS = 896  # the widest covered step: 128 requests of 7 verify rows (TP8 bs128)
 # the requests of a covered step (SGLang's decode graph sizes)
-REQUESTS = (1, 2, 4, 8, 16, 32)
+REQUESTS = (1, 2, 4, 8, 16, 32, 64, 128)
 # the TP sizes whose steps of more than one request are covered when requested (checked at
 # TP8); at the others a covered step is one request
 MULTI_REQUEST_TP = (8,)
@@ -53,10 +53,10 @@ GDN_FRONT_MAX_ROWS = 14  # its widest step: two requests (a cluster set a reques
 # hop the rows up to which FlashInfer's MNNVL CuTe DSL fusion runs the one-shot
 # all-reduce the hop equals bit for bit (its finalize runs one-shot up to 23 rows)
 ROUTE_MAX_ROWS = 16
-ROUTE_TOPK_MAX_ROWS = 224
+ROUTE_TOPK_MAX_ROWS = 896
 # slot route_gemm (numeric): the router front's 16-row tiles in place of the GEMM, up to here
 ROUTE_GEMM_MAX_ROWS = 32
-GDN_VERIFY_MAX_ROWS = 224  # the widths its kernels are checked at: up to 32 requests
+GDN_VERIFY_MAX_ROWS = 896  # the widths its kernels are checked at: up to 128 requests
 GDN_CORE_MAX_ROWS = 224  # and gdn_core's launch
 MKM_MAX_ROWS = 7
 MKM_WIDE_MAX_ROWS = 16
@@ -74,7 +74,7 @@ GDN_PUSH_MAX_ROWS = 8
 ROUTE_SHARED_ROWS = 8
 MKA_MAX_ROWS = 8
 # with four query heads a rank: the wide entries, then the front path (attention/mka.py)
-MKA_WIDE_MAX_ROWS = MAX_ROWS
+MKA_WIDE_MAX_ROWS = 224  # the widths its wide entries / front path are checked at
 # slots lowm / lowm_se: the rows up to which each low-M launch measured faster than SGLang's quantize +
 # cuBLAS path on GB300 (results/trt-1022/l6): the input projections (in_proj_qkvz + in_proj_ba, qkv_proj),
 # the output projections (out_proj, o_proj) and the shared expert

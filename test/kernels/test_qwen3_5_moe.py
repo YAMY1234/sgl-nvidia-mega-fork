@@ -398,7 +398,7 @@ def _topk_inputs(m, seed):
     return logits, x, torch.tensor([X_SCALE], device="cuda")
 
 
-@pytest.mark.parametrize("m", [1, 7, 17, 21, 28, 56, 112, 224])
+@pytest.mark.parametrize("m", [1, 7, 17, 21, 28, 56, 112, 224, 448, 896])
 def test_route_topk_is_the_trtllm_routing_and_the_runners_quantizer(layer, m):
     from flashinfer import fp4_quantize
 

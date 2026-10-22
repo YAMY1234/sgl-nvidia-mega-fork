@@ -17,7 +17,7 @@ nvidia/qwen35-agentx-gb300), so the shared expert on the alternate stream starts
 activation, after that launch only; the gate/up sums in another order than the FP8
 linear's GEMM.
 
-Slot ``route_topk`` serves the steps slot ``route`` does not (17 to 224 rows): behind
+Slot ``route_topk`` serves the steps slot ``route`` does not (17 to 896 rows): behind
 SGLang's own router GEMM, one launch (``sm103/moe/router.route_topk_quant``) writes each
 token's top-10 experts and renormalized weights as the trtllm-gen routing computes them
 and the NVFP4 input as the runner's quantizer does; the runner then serves the

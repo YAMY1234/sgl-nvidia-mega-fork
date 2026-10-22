@@ -230,6 +230,13 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
             + (["mkm_m32"] if rows <= plan.MKM_M32_MAX_ROWS else [])
             + (["mkm_m64"] if plan.MKM_M32_MAX_ROWS < rows <= plan.MKM_M64_MAX_ROWS else [])
         )
+    # 64 and 128 requests: the GDN chain and route_topk (gdn_core up to its rows; the
+    # hop and MKA stop at 32 requests)
+    for rows in (448, 896):
+        assert _on(plan.slots(rows, every)) == sorted(
+            ["gdn_pdl", "gdn_verify", "route_topk"]
+            + (["gdn_core"] if rows <= plan.GDN_CORE_MAX_ROWS else [])
+        )
     assert _on(plan.slots(56, plan.Facts(gdn_verify=True))) == ["gdn_verify"]
     no_wide = plan.Facts(hop=True)
     assert _on(plan.slots(28, no_wide)) == []
@@ -241,7 +248,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]
     # SGLang offers every multiple of 7 up to MAX_ROWS; three requests are not covered
     offered = tuple(range(7, plan.MAX_ROWS + 1, 7))
-    assert plan.candidates(offered, 7) == (7, 14, 28, 56, 112, 224)
+    assert plan.candidates(offered, 7) == (7, 14, 28, 56, 112, 224, 448, 896)
     assert plan.candidates(offered, 7, multi=False) == (7,)
     # more than one request only when requested, and only at TP8; TP4 keeps the
     # one-request step it is checked at
@@ -251,6 +258,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert plan.covered((7, 14, 28), every, 7) == (7, 14, 28)
     assert plan.covered((7, 14, 28, 56, 112), every, 7) == (7, 14, 28, 56, 112)
     assert plan.covered((7, 14, 28, 56), plan.Facts(gdn_verify=True), 7) == (7, 14, 28, 56)
+    assert plan.covered((7, 448, 896), plan.Facts(route_topk=True), 7) == (7, 448, 896)
     # one request is always covered, more only where a slot runs
     assert plan.covered((7, 14, 28), plan.Facts(), 7) == (7,)
     assert plan.covered((7, 14, 28), plan.Facts(route=True, mkm=True), 7) == (7, 14)

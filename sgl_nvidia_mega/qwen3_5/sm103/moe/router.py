@@ -209,7 +209,7 @@ def router_gemm_quant_shared(
 # The top-10 and NVFP4 input behind SGLang's router GEMM (slot route_topk, src/route_topk.cu)
 TOPK_SOURCE = Path(__file__).parent / "src" / "route_topk.cu"
 TOP_K = 10
-TOPK_MAX_ROWS = 224  # the widest verify step it is built for (32 requests of 7 rows)
+TOPK_MAX_ROWS = 896  # the widest verify step it is built for (128 requests of 7 rows)
 
 
 class TopkParams(ctypes.Structure):

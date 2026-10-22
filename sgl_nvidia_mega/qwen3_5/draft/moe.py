@@ -87,21 +87,23 @@ def unsupported_reason(mlp) -> Optional[str]:
     experts, shared = mlp.experts, mlp.shared_expert
     if shared is None or mlp.shared_expert_gate is None:
         return "no separate shared expert"
-    # The kernel reads W13 as [gate rows | up rows] in checkpoint order.
+    # The kernel reads W13 as [gate rows | up rows] in checkpoint order (flashinfer_trtllm's
+    # layout is put back in that order, in a copy).
     method = experts.quant_method
     if not isinstance(method, UnquantizedFusedMoEMethod):
         return f"expert weights handled by {type(method).__name__}"
-    if method.use_flashinfer_trtllm_moe or method.w13_swiglu_interleaved:
+    if method.w13_swiglu_interleaved:
         return "expert weights in a kernel-specific layout"
     if get_parallel().moe_ep_size != 1:
         return "expert parallelism"
     w13, w2 = experts.w13_weight, experts.w2_weight
     ws13, ws2 = shared.gate_up_proj.weight, shared.down_proj.weight
-    hidden, inter = w13.shape[-1], w2.shape[-1]
+    s13, s2 = _checkpoint_shapes(experts)
+    hidden, inter = s13[-1], s2[-1]
     tensors = (w13, w2, ws13, ws2, mlp.shared_expert_gate.weight)
     if any(t.dtype != torch.bfloat16 for t in tensors):
         return "non-bf16 operands"
-    if w13.dim() != 3 or tuple(w13.shape[1:]) != (2 * inter, hidden):
+    if len(s13) != 3 or s13[1:] != (2 * inter, hidden):
         return f"w13 shape {tuple(w13.shape)}"
     if tuple(ws13.shape) != (2 * inter, hidden) or tuple(ws2.shape) != (hidden, inter):
         return f"shared expert shapes {tuple(ws13.shape)} {tuple(ws2.shape)}"
@@ -120,16 +122,75 @@ def unsupported_reason(mlp) -> Optional[str]:
     return None
 
 
+# flashinfer_trtllm's BF16 expert layout (UnquantizedFusedMoEMethod.
+# process_weights_after_loading): W13 loaded up rows first, each expert's rows permuted for
+# the gated GEMM's epilogue tiles of 128, both matrices in blocks of 128 bytes of K
+TRTLLM_EPILOGUE_TILE_M = 128
+
+
+def _checkpoint_shapes(experts) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """The W13 and W2 shapes in checkpoint order, [E, 2I, H] and [E, H, I]."""
+    w13, w2 = experts.w13_weight, experts.w2_weight
+    if not experts.quant_method.use_flashinfer_trtllm_moe:
+        return tuple(w13.shape), tuple(w2.shape)
+    if w13.dim() != 4 or w2.dim() != 4:
+        return tuple(w13.shape), tuple(w2.shape)
+    # [E, K / block, rows, block]
+    return (
+        (w13.shape[0], w13.shape[2], w13.shape[1] * w13.shape[3]),
+        (w2.shape[0], w2.shape[2], w2.shape[1] * w2.shape[3]),
+    )
+
+
+def checkpoint_weights(experts) -> tuple[torch.Tensor, torch.Tensor]:
+    """W13 ([gate rows | up rows]) and W2 put back in checkpoint order from
+    flashinfer_trtllm's layout: a copy of the block's expert weights."""
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+    (e, rows13, hidden), (_, rows2, inter) = _checkpoint_shapes(experts)
+    w13 = torch.empty(
+        e, rows13, hidden, dtype=torch.bfloat16, device=experts.w13_weight.device
+    )
+    w2 = torch.empty(e, rows2, inter, dtype=torch.bfloat16, device=w13.device)
+    cache: dict = {}
+    # the single launch serves gated experts only (W13 = gate and up rows)
+    perm13 = _maybe_get_cached_w3_w1_permute_indices(
+        cache, w13[0].view(torch.uint8), TRTLLM_EPILOGUE_TILE_M, is_gated_act_gemm=True
+    )
+    perm2 = get_w2_permute_indices_with_cache(
+        cache, w2[0].view(torch.uint8), TRTLLM_EPILOGUE_TILE_M
+    )
+    half = rows13 // 2
+    w31 = torch.empty(rows13, 2 * hidden, dtype=torch.uint8, device=w13.device)
+    for x in range(e):
+        # undo convert_to_block_layout, then the row gather (row j came from row perm[j])
+        w31[perm13] = (
+            experts.w13_weight[x].view(torch.uint8).transpose(0, 1).reshape(rows13, -1)
+        )
+        up_gate = w31.view(torch.bfloat16)
+        w13[x, :half] = up_gate[half:]
+        w13[x, half:] = up_gate[:half]
+        w2[x].view(torch.uint8)[perm2] = (
+            experts.w2_weight[x].view(torch.uint8).transpose(0, 1).reshape(rows2, -1)
+        )
+    return w13, w2
+
+
 class DraftMoe:
     """The single-launch draft MoE of one block: its scratch and the per-token launch."""
 
     MAX_TOKENS = 2
 
-    def __init__(self, mlp, device: torch.device):
+    def __init__(self, mlp, device: torch.device, weights=None):
+        """weights: (W13, W2) in checkpoint order when SGLang keeps another layout."""
         self.mlp = mlp
+        self.w13, self.w2 = weights or (mlp.experts.w13_weight, mlp.experts.w2_weight)
         num_experts = mlp.gate.weight.shape[0]
         topk = mlp.topk.topk_config.top_k
-        inter = mlp.experts.w2_weight.shape[-1]
+        inter = self.w2.shape[-1]
         self.scratch = kernels.draft_moe_fused_scratch(num_experts, topk, inter, device)
         self.topk_weights = torch.empty(1, topk, dtype=torch.float32, device=device)
         self.topk_ids = torch.empty(1, topk, dtype=torch.int32, device=device)
@@ -139,13 +200,16 @@ class DraftMoe:
         """The block's single-launch MoE, compiled and checked to fit this device, or
         None (logged) when it cannot serve the block."""
         reason = unsupported_reason(mlp)
+        weights = None
         if reason is None:
-            w13 = mlp.experts.w13_weight
+            if mlp.experts.quant_method.use_flashinfer_trtllm_moe:
+                weights = checkpoint_weights(mlp.experts)
+            w13, w2 = weights or (mlp.experts.w13_weight, mlp.experts.w2_weight)
             reason = "; ".join(
                 kernels.build(
                     device_index,
                     hidden=w13.shape[-1],
-                    inter=mlp.experts.w2_weight.shape[-1],
+                    inter=w2.shape[-1],
                     experts=mlp.gate.weight.shape[0],
                     topk=mlp.topk.topk_config.top_k,
                 )
@@ -157,8 +221,14 @@ class DraftMoe:
                 reason,
             )
             return None
-        logger.info("Single-launch draft MoE active for layer %d.", mlp.layer_id)
-        return cls(mlp, torch.device("cuda", device_index))
+        logger.info(
+            "Single-launch draft MoE active for layer %d%s.",
+            mlp.layer_id,
+            " (checkpoint-order copy of flashinfer_trtllm's experts)"
+            if weights
+            else "",
+        )
+        return cls(mlp, torch.device("cuda", device_index), weights)
 
     def ready(self, num_tokens: int) -> bool:
         """Whether it runs a batch of this many tokens."""
@@ -177,8 +247,8 @@ class DraftMoe:
             kernels.draft_moe_fused(
                 hidden_states[m : m + 1],
                 mlp.gate.weight,
-                mlp.experts.w13_weight,
-                mlp.experts.w2_weight,
+                self.w13,
+                self.w2,
                 mlp.shared_expert.gate_up_proj.weight,
                 mlp.shared_expert.down_proj.weight,
                 mlp.shared_expert_gate.weight.view(-1),

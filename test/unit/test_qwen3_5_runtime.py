@@ -218,6 +218,57 @@ def test_the_draft_extend_takes_the_split_kv_variants_with_slot_draft_skv2(
     assert built.graph_variants["draft_extend"] is route.EXTEND
 
 
+def test_the_draft_decode_takes_cp_lite_where_it_serves(monkeypatch):
+    """Where SGLang built CP-lite the draft's decodes go to it, rows per request as its q
+    length; where it declines (by shape), trtllm-gen runs as before."""
+    import flashinfer
+
+    from sgl_nvidia_mega.qwen3_5.draft.attention import Attention
+
+    heads, dim, page = 2, 256, 64
+    calls, stock = [], []
+
+    class CpLite:
+        def attend(self, q, kv, pages, lens, q_len, bmm1, bmm2, ws, layer, owner):
+            calls.append((tuple(q.shape), q_len, bmm1, bmm2, owner))
+            if lens.shape[0] < 4:
+                return None
+            return torch.ones(q.shape[0], heads, dim, dtype=torch.bfloat16)
+
+    def trtllm_gen(query, **kwargs):
+        stock.append(kwargs.get("q_len_per_req", 1))
+        return torch.zeros(query.shape[0], heads, dim, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        flashinfer.decode, "trtllm_batch_decode_with_kv_cache", trtllm_gen
+    )
+    attn = Attention.__new__(Attention)
+    attn.layer = SimpleNamespace(
+        attn=SimpleNamespace(
+            scaling=0.5, sliding_window_size=-1, tp_k_head_num=1, tp_v_head_num=1
+        )
+    )
+    attn.heads, attn.head_dim, attn.page_size = heads, dim, page
+    attn.max_context_len, attn.workspace, attn.counters = 4096, None, None
+    attn.q1 = attn.skv2 = None
+    attn.cp_lite, attn._noted = CpLite(), set()
+    cache = torch.zeros(4 * page, 1, dim, dtype=torch.float8_e4m3fn)
+    kv = SimpleNamespace(k=(cache,), v=(cache,), k_scale=(2.0,), v_scale=(3.0,))
+
+    def meta(requests):
+        return SimpleNamespace(
+            page_table=torch.zeros(requests, 4, dtype=torch.int32),
+            cache_seqlens=torch.full((requests,), 100, dtype=torch.int32),
+        )
+
+    q8 = torch.zeros(4 * 7, heads * dim, dtype=torch.float8_e4m3fn)
+    out = attn.decode(q8, meta(4), kv, rows_per_request=7)
+    assert out.shape == (28, heads * dim) and bool((out == 1).all())
+    assert calls == [((28, heads, dim), 7, 1.0, 3.0, attn)] and stock == []
+    out = attn.decode(q8[:2], meta(2), kv, rows_per_request=1)
+    assert bool((out == 0).all()) and len(calls) == 2 and stock == [1]
+
+
 @pytest.mark.parametrize(
     "slots, want",
     [

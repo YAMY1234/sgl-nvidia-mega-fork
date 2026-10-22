@@ -18,6 +18,7 @@ decode as the q1 split-KV kernel (``sm103/draft/q1``).
 
 from __future__ import annotations
 
+import importlib
 import logging
 
 import torch
@@ -129,6 +130,17 @@ SGLANG_MIRRORS = {
 }
 
 
+def _cp_lite():
+    """The process's CP-lite (TRT-L1's read-split decode for replicated KV heads, which
+    SGLang's TRT-LLM MHA backends share) when the backend built one: only an SGLang tree
+    with q35_cp_lite has it, so it is looked up, not imported."""
+    try:
+        module = importlib.import_module("sglang.srt.layers.attention.q35_cp_lite")
+    except ImportError:
+        return None
+    return module.CpLite._instance
+
+
 def _context_len(draft) -> int:
     """The max_seq_len SGLang's TRT-LLM MHA backend gives trtllm-gen: the draft's
     ModelConfig.context_len, which it writes into the HF config the build gets."""
@@ -185,6 +197,9 @@ class Attention:
         self.skv2 = (
             DraftExtendSplitKV.build(parts) if "draft_skv2" in parts.slots else None
         )
+        # SGLang's draft decodes take CP-lite where it is on; so do these (it declines
+        # by shape alone, e.g. below its minimum batch, so every rank agrees)
+        self.cp_lite = _cp_lite()
 
     def __call__(
         self, x, positions, cache_loc, meta, kv, *, rows_per_request: int, o_proj=None
@@ -314,6 +329,22 @@ class Attention:
             and self.skv2.long()
         ):
             return self.skv2.run(attn, q8, kv, meta)
+        if self.cp_lite is not None:
+            o = self.cp_lite.attend(
+                q8,
+                self._paged(k_cache, v_cache),
+                meta.page_table,
+                meta.cache_seqlens,
+                rows_per_request,
+                bmm1_scale,
+                bmm2_scale,
+                self.workspace,
+                attn,
+                self,
+            )
+            if o is not None:
+                self._note(f"decode of {rows_per_request}-row requests runs CP-lite")
+                return o.view(-1, self.heads * self.head_dim)
         kwargs = {}
         if rows_per_request != 1:
             kwargs["q_len_per_req"] = rows_per_request

@@ -362,10 +362,34 @@ __device__ __forceinline__ void two_shot_kernel(const Args2& a) {
         sanitize4(mine));
   // 2. the owner's reduce
   if (owner == a.site.rank) {
+    // every rank's contribution requested at once, then only the pending ones again (as pull_frag)
     const uint16_t* in = static_cast<const uint16_t*>(a.site.contrib_uc);
     uint4 v[W];
 #pragma unroll
-    for (int r = 0; r < W; ++r) v[r] = poll_frag(in + contrib_slot(a.site, h.stage, r, local_token, frag));
+    for (int r = 0; r < W; ++r) v[r] = ld_volatile_v4(in + contrib_slot(a.site, h.stage, r, local_token, frag));
+    uint32_t pending = 0;
+#pragma unroll
+    for (int r = 0; r < W; ++r) pending |= frag_has_negzero(v[r]) ? (1u << r) : 0u;
+    unsigned long long t0 = 0;
+    uint32_t spins = 0;
+    while (pending) {
+#pragma unroll
+      for (int r = 0; r < W; ++r)
+        if (pending & (1u << r)) v[r] = ld_volatile_v4(in + contrib_slot(a.site, h.stage, r, local_token, frag));
+      uint32_t still = 0;
+#pragma unroll
+      for (int r = 0; r < W; ++r)
+        if ((pending & (1u << r)) && frag_has_negzero(v[r])) still |= 1u << r;
+      pending = still;
+      if (Q35_HOP_DEADLINE_NS != 0 && pending && ((++spins & 255u) == 0)) {
+        const unsigned long long now = gtimer();
+        if (t0 == 0) {
+          t0 = now;
+        } else if (now - t0 > Q35_HOP_DEADLINE_NS) {
+          fault_at_null();
+        }
+      }
+    }
     float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
     for (int r = 0; r < W; ++r) {

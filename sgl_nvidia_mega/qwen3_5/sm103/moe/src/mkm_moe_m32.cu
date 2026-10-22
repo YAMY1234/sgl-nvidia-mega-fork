@@ -212,7 +212,10 @@ constexpr int kARow = 260;  // FC1 accumulator row stride in floats: 16 B aligne
 #ifndef STAGE_STAMPS  // DIAG: per-stage issue (slots 64 + st) and landing (16 + st, seen by warp 4) stamps
 #define STAGE_STAMPS 0
 #endif
-constexpr int kTraceStride = STAGE_STAMPS ? 128 : 16;
+#ifndef DIAG_SPEC  // DIAG: warp 1's speculative ranking, stamps 16 = logits loaded, 17 = keys, 18 = top-10 (stride 32)
+#define DIAG_SPEC 0
+#endif
+constexpr int kTraceStride = STAGE_STAMPS ? 128 : DIAG_SPEC ? 32 : 16;
 #ifndef SMEM_SPACE  // 1: shared-memory accesses through Smem compile to shared-space instructions
 #define SMEM_SPACE 1
 #endif
@@ -235,10 +238,13 @@ static_assert(DRAIN_SMEM == 0, "x's shared memory holds the next item's rows whi
 #ifndef EARLY_SF2  // FC2 stages whose scale factors are staged before the h epilogue (old order: 2)
 #define EARLY_SF2 0
 #endif
-#ifndef ITEM_PF  // later items' weights to L2: 1 = all of them as item 0's stream starts, 2 = item it + 1's FC1 at item it's FC2
-#define ITEM_PF 0
+#ifndef GATHER_BATCH  // x row granules each gathering thread loads before storing them
+#define GATHER_BATCH 8
 #endif
-#ifndef DIAG_ROUTE  // DIAG: stamps 13 = warp 0's routing rounds done, 14 = item 0's rows gathered (in place of 13 / 14)
+#ifndef SPEC_PF  // stages of the speculated expert past the first ring fill prefetched to L2 while the routing runs
+#define SPEC_PF 8
+#endif
+#ifndef DIAG_ROUTE  // DIAG: stamps 13 = warp 0's routing rounds done, 15 = their barrier, 14 = item 0's rows gathered
 #define DIAG_ROUTE 0
 #endif
 #ifndef FC2_PF  // FC2 tiles (beyond the first kStages) prefetched to L2 ahead of the ring; 0 = off
@@ -279,6 +285,7 @@ struct __align__(1024) Smem {
   uint32_t item_mask[kMaxItems];        // tokens of each item (bit t)
   int nrows[2], rtok[2][kRows], rkslot[2][kRows];  // rows of the current / next item (by item parity)
   int first[kE];                        // first slot of each expert (atomicMin)
+  uint32_t fbits[kMaxTok];              // token t: its top-k slots that are their expert's first (bit k)
   alignas(16) uint32_t cand[8][32];  // read as uint4 by the rank-based top-k
   int32_t ids[kMaxTok][kTopK];
 };
@@ -558,6 +565,17 @@ __device__ __forceinline__ uint32_t warp_top10_redux(uint32_t (&keys)[16], uint3
   }
   return mine;
 }
+// The top-10 keys of one logits row (16 bf16 a lane in v0, v1), lane k < 10 holding the k-th largest
+__device__ __forceinline__ uint32_t row_top10(const uint4 v0, const uint4 v1, uint32_t lane, uint32_t* s_cand) {
+  uint32_t keys[16];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const uint32_t w = i < 4 ? (&v0.x)[i] : (&v1.x)[i - 4];
+    keys[2 * i] = topk_key(w & 0xFFFFu, lane * 16 + 2 * i);
+    keys[2 * i + 1] = topk_key(w >> 16, lane * 16 + 2 * i + 1);
+  }
+  return TOPK_RANK ? warp_top10(keys, lane, s_cand) : warp_top10_redux(keys, lane, s_cand);
+}
 // FlashInfer calcSoftmax (bf16 scores) as built with -use_fast_math: expf -> ex2.approx.ftz of x * log2(e),
 // division -> div.full.ftz; reductions are cooperative_groups::reduce like the reference.
 __device__ __forceinline__ float fast_expf(float x) {
@@ -774,19 +792,56 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       bulk_prefetch_l2(p.w2_sf + (size_t)e * (kH * 8) + (size_t)(row0 / 128) * 2 * 512, 4096);
     }
   };
+  // Rows of an item (the tokens of mask in increasing order, at most 16) into row buffer rb, by one warp
+  auto set_rows = [&](int rb, uint32_t mask, int ei) {
+    if (lane < M && ((mask >> lane) & 1u)) {
+      int ks = 0;
+#pragma unroll
+      for (int k = 0; k < kTopK; ++k)
+        if (s.ids[lane][k] == ei) ks = k;
+      const int r = __popc(mask & ((1u << lane) - 1u));
+      s.rtok[rb][r] = lane;
+      s.rkslot[rb][r] = ks;
+    }
+    if (lane == 0) s.nrows[rb] = __popc(mask);
+  };
+  // their x rows and scale bytes into xa / xsf, by threads tid = 0 .. nt - 1
+  auto copy_rows = [&](int rb, int tid, int nt) {
+    const int n1 = s.nrows[rb] * 128, n = s.nrows[rb] * 144;  // 16-B granules: x rows, then their scale bytes
+    // GATHER_BATCH loads a thread ahead of their stores: the global latency is paid once a batch
+    for (int i0 = tid; i0 < n; i0 += GATHER_BATCH * nt) {
+      uint4 v[GATHER_BATCH];
+#pragma unroll
+      for (int j = 0; j < GATHER_BATCH; ++j) {
+        const int idx = i0 + j * nt;
+        if (idx < n1) {  // row r, K chunk c (128 B), 16-B granule q of the chunk
+          const int r = idx >> 7, c = (idx >> 3) & 15, q = idx & 7;
+          v[j] = *reinterpret_cast<const uint4*>(p.x_fp4 + (size_t)s.rtok[rb][r] * (kH / 2) + c * 128 + q * 16);
+        } else if (idx < n) {
+          const int r = (idx - n1) >> 4, q = (idx - n1) & 15;
+          v[j] = *reinterpret_cast<const uint4*>(p.x_sf + (size_t)s.rtok[rb][r] * (kH / 16) + q * 16);
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < GATHER_BATCH; ++j) {
+        const int idx = i0 + j * nt;
+        if (idx < n1) {
+          const int r = idx >> 7, c = (idx >> 3) & 15, q = idx & 7;
+          *reinterpret_cast<uint4*>(s.xa + c * 2048 + (r / 8) * 1024 + (r % 8) * 128 + ((q ^ (r % 8)) * 16)) = v[j];
+        } else if (idx < n) {
+          const int r = (idx - n1) >> 4, q = (idx - n1) & 15;
+          *reinterpret_cast<uint4*>(&s.xsf[r][q * 16]) = v[j];
+        }
+      }
+    }
+    fence_proxy_async_smem();  // the tensor core reads xa through the async proxy
+  };
   // routing: warps 0, 2..7 take tokens 0..31 (DynBlock-exact top-10 + softmax), up to kRounds rounds; warp 1 recomputes
   // token my_t's top-10 and starts this CTA's weight stream at once (a wrong guess only wastes its first ring fill)
   asm volatile("griddepcontrol.wait;" ::: "memory");
   if (threadIdx.x == 32) stamp(p, 10);
   auto top10v = [&](const uint4 v0, const uint4 v1) -> uint32_t {
-    uint32_t keys[16];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const uint32_t w = i < 4 ? (&v0.x)[i] : (&v1.x)[i - 4];
-      keys[2 * i] = topk_key(w & 0xFFFFu, (uint32_t)(lane * 16 + 2 * i));
-      keys[2 * i + 1] = topk_key(w >> 16, (uint32_t)(lane * 16 + 2 * i + 1));
-    }
-    return TOPK_RANK ? warp_top10(keys, (uint32_t)lane, s.cand[warp]) : warp_top10_redux(keys, (uint32_t)lane, s.cand[warp]);
+    return row_top10(v0, v1, (uint32_t)lane, s.cand[warp]);
   };
   auto top10 = [&](int rtok) -> uint32_t {
     const uint4* src = reinterpret_cast<const uint4*>(p.logits + (size_t)rtok * kE + lane * 16);
@@ -794,7 +849,16 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
   };
   if (warp == 1) {
     // speculate on this CTA's own slot: its expert's weight stream starts before the routing verdict
-    const uint32_t key = top10(my_t);
+    uint32_t key;
+    if (DIAG_SPEC) {
+      const uint4* src = reinterpret_cast<const uint4*>(p.logits + (size_t)my_t * kE + lane * 16);
+      const uint4 v0 = src[0], v1 = src[1];
+      if (lane == 0) stamp_dep(p, 16, (v0.x | v0.y | v0.z | v0.w | v1.x | v1.y | v1.z | v1.w) | 1u);
+      key = top10v(v0, v1);
+      if (lane == 0) stamp_dep(p, 18, key | 1u);
+    } else {
+      key = top10(my_t);
+    }
     uint32_t bits, espec;
     topk_unkey(__shfl_sync(0xffffffffu, key, my_k), bits, espec);
     if (lane == 0) {
@@ -804,6 +868,9 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
         issue_stage(st, st, (int)espec, pol);
         if (STAGE_STAMPS) stamp(p, 64 + st);
       }
+      // HBM is otherwise idle until the routing is done: the next stages go to L2 now (another CTA streams the
+      // expert when this slot is not its first)
+      for (int st = SPEC_STAGES; st < SPEC_STAGES + SPEC_PF && st < kTotStages; ++st) prefetch_stage(st, (int)espec);
       stamp(p, 2);
     }
     mbar_wait(&s.route_done, 0);
@@ -829,7 +896,10 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       const uint32_t key = top10v(lv[r][0], lv[r][1]);
       uint32_t bits, expert;
       topk_unkey(key, bits, expert);
-      if (lane < kTopK) s.ids[rtok][lane] = (int32_t)expert;
+      if (lane < kTopK) {
+        s.ids[rtok][lane] = (int32_t)expert;
+        atomicMin(&s.first[expert], rtok * kTopK + lane);
+      }
       if (writer) {
         const uint16_t wbits = softmax_topk((uint16_t)bits, (uint32_t)lane);
         if (lane < kTopK) {
@@ -841,48 +911,62 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     }
     if (DIAG_ROUTE && threadIdx.x == 0) stamp(p, 13);
     named_bar(4, 224);
+    if (DIAG_ROUTE && threadIdx.x == 0) stamp(p, 15);
+    // each routing warp marks its tokens' slots that are their expert's first (s.first is final after the barrier)
+#pragma unroll
+    for (int r = 0; r < kRounds; ++r) {
+      const int rtok = base + 7 * r;
+      if (rtok >= M) break;
+      const uint32_t f = __ballot_sync(0xffffffffu, lane < kTopK && s.first[s.ids[rtok][lane]] == rtok * kTopK + lane);
+      if (lane == 0) s.fbits[rtok] = f;
+    }
+    named_bar(4, 224);
     if (warp == 0) {
       // Work items. Distinct experts in order of their first slot; slot c's first-occurrence expert belongs to CTA c
       // (whose speculative stream already carries it). Experts first seen at slots >= G ("orphans") go to the CTAs
       // whose own slot repeats an earlier expert, in order; orphans beyond those CTAs become further items of CTAs
       // 0, 1, ... Every CTA derives the same assignment from the same routing.
-      const int S = M * kTopK, G = (int)gridDim.x;
-      for (int s2 = lane; s2 < S; s2 += 32) atomicMin(&s.first[s.ids[s2 / kTopK][s2 % kTopK]], s2);
-      __syncwarp();
-      auto below = [&](int n) -> uint32_t { return n <= 0 ? 0u : n >= 32 ? 0xffffffffu : (1u << n) - 1u; };
-      int nf_c = 0, nf_g = 0;  // first-occurrence slots before this CTA's slot / before G
-      for (int b0 = 0; b0 < S; b0 += 32) {
-        const int s2 = b0 + lane;
-        const bool f = s2 < S && s.first[s.ids[s2 / kTopK][s2 % kTopK]] == s2;
-        const uint32_t bal = __ballot_sync(0xffffffffu, f);
-        nf_c += __popc(bal & below(slot - b0));
-        nf_g += __popc(bal & below(G - b0));
+      const int G = (int)gridDim.x;
+      const uint32_t fb = lane < M ? s.fbits[lane] : 0u;
+      int incl = __popc(fb);  // first-occurrence slots up to token `lane`'s, inclusive
+#pragma unroll
+      for (int d = 1; d < 32; d <<= 1) {
+        const int up = __shfl_up_sync(0xffffffffu, incl, d);
+        incl += lane >= d ? up : 0;
       }
+      const int excl = incl - __popc(fb);
+      const int U = __shfl_sync(0xffffffffu, incl, M - 1);  // distinct experts
+      auto before = [&](int s2) -> int {  // first-occurrence slots before slot s2 (s2 <= M * 10)
+        const int t = s2 / kTopK, tt = t < M ? t : M - 1;
+        const int ex = __shfl_sync(0xffffffffu, excl, tt);
+        const uint32_t ft = __shfl_sync(0xffffffffu, fb, tt);
+        return t < M ? ex + __popc(ft & ((1u << (s2 % kTopK)) - 1u)) : U;
+      };
+      auto nth_first = [&](int n) -> int {  // the slot of the n-th (0-based) first occurrence, n < U
+        const int t = __popc(__ballot_sync(0xffffffffu, lane < M && incl <= n));
+        uint32_t ft = __shfl_sync(0xffffffffu, fb, t);
+        for (int i = __shfl_sync(0xffffffffu, excl, t); i < n; ++i) ft &= ft - 1u;
+        return t * kTopK + __ffs(ft) - 1;
+      };
+      const int nf_c = before(slot), nf_g = before(G);
       const int xc = s.ids[my_t][my_k];
       const bool owner = s.first[xc] == slot;
-      const int D = G - nf_g, dc = slot - nf_c;  // duplicate CTAs; this CTA's rank among them
-      if (lane == 0) {
-        s.item_e[0] = owner ? xc : -1;
-        for (int i = 1; i < kMaxItems; ++i) s.item_e[i] = -1;
+      const int D = G - nf_g, dc = slot - nf_c, O = U - nf_g;  // duplicate CTAs, this one's rank among them; orphans
+      // the whole warp walks the items (nth_first is warp-collective); lane 0 writes them
+      int ni = 0;
+      if (owner || dc < O) {
+        const int s2 = owner ? slot : nth_first(nf_g + dc);
+        if (lane == 0) s.item_e[ni] = s.ids[s2 / kTopK][s2 % kTopK];
+        ++ni;
       }
-      __syncwarp();
-      int ob = 0;  // orphans seen
-      for (int b0 = G; b0 < S; b0 += 32) {
-        const int s2 = b0 + lane;
-        const bool f = s2 < S && s.first[s.ids[s2 / kTopK][s2 % kTopK]] == s2;
-        const uint32_t bal = __ballot_sync(0xffffffffu, f);
-        const int o = ob + __popc(bal & below(lane));
-        if (f) {
-          const int ex = s.ids[s2 / kTopK][s2 % kTopK];
-          if (!owner && o == dc) s.item_e[0] = ex;
-          else if (o >= D && (o - D) % G == slot) {
-            const int i = 1 + (o - D) / G;
-            if (i >= kMaxItems) __trap();
-            s.item_e[i] = ex;
-          }
-        }
-        ob += __popc(bal);
+      for (int o = D + slot; o < O; o += G) {
+        if (ni >= kMaxItems) __trap();
+        const int s2 = nth_first(nf_g + o);
+        if (lane == 0) s.item_e[ni] = s.ids[s2 / kTopK][s2 % kTopK];
+        ++ni;
       }
+      if (lane == 0)
+        for (int i = ni; i < kMaxItems; ++i) s.item_e[i] = -1;
       __syncwarp();
       // token masks; an expert with more than 16 tokens is split into row groups (the second one appended)
       int n = 0;
@@ -896,13 +980,12 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
           for (int k = 0; k < kTopK; ++k) has |= s.ids[lane][k] == ei;
         }
         const uint32_t mask = __ballot_sync(0xffffffffu, has);
-        if (__popc(mask) <= kRows) {
-          if (lane == 0) s.item_mask[i] = mask;
-        } else {
-          uint32_t lo = mask;
-          for (int k = 0; k < __popc(mask) - kRows; ++k) lo &= ~(0x80000000u >> __clz(lo));  // keep the 16 lowest
+        uint32_t lo = mask;  // the 16 lowest tokens; the rest are a further item
+        for (int k = __popc(mask) - kRows; k > 0; --k) lo &= ~(0x80000000u >> __clz(lo));
+        if (lane == 0) s.item_mask[i] = lo;
+        if (mask != lo) {
           if (nall >= kMaxItems) __trap();
-          if (lane == 0) { s.item_mask[i] = lo; s.item_e[nall] = ei; s.item_mask[nall] = mask & ~lo; }
+          if (lane == 0) { s.item_e[nall] = ei; s.item_mask[nall] = mask & ~lo; }
           ++nall;
         }
         __syncwarp();
@@ -999,34 +1082,9 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
   // row info is double-buffered by item parity (the previous item's FC2 drains still read theirs).
   auto gather = [&](int it) {
     const int rb = it & 1;
-    if (warp == 0) {
-      const uint32_t mask = s.item_mask[it];
-      const int ei = s.item_e[it];
-      const bool mine = lane < M && ((mask >> lane) & 1u);
-      int ks = 0;
-      if (mine) {
-#pragma unroll
-        for (int k = 0; k < kTopK; ++k)
-          if (s.ids[lane][k] == ei) ks = k;
-        const int r = __popc(mask & ((1u << lane) - 1u));
-        s.rtok[rb][r] = lane;
-        s.rkslot[rb][r] = ks;
-      }
-      if (lane == 0) s.nrows[rb] = __popc(mask);
-    }
+    if (warp == 0) set_rows(rb, s.item_mask[it], s.item_e[it]);
     named_bar(5, 64);
-    const int nr = s.nrows[rb], tid = (warp == 0 ? 0 : 32) + lane;
-    for (int idx = tid; idx < nr * 128; idx += 64) {  // row r, K chunk c (128 B), 16-B granule q of the chunk
-      const int r = idx >> 7, c = (idx >> 3) & 15, q = idx & 7;
-      const uint4 v = *reinterpret_cast<const uint4*>(p.x_fp4 + (size_t)s.rtok[rb][r] * (kH / 2) + c * 128 + q * 16);
-      *reinterpret_cast<uint4*>(s.xa + c * 2048 + (r / 8) * 1024 + (r % 8) * 128 + ((q ^ (r % 8)) * 16)) = v;
-    }
-    for (int idx = tid; idx < nr * 16; idx += 64) {
-      const int r = idx >> 4, q = idx & 15;
-      *reinterpret_cast<uint4*>(&s.xsf[r][q * 16]) =
-          *reinterpret_cast<const uint4*>(p.x_sf + (size_t)s.rtok[rb][r] * (kH / 16) + q * 16);
-    }
-    fence_proxy_async_smem();  // the tensor core reads xa through the async proxy
+    copy_rows(rb, (warp == 0 ? 0 : 32) + lane, 64);
     named_bar(5, 64);
     if (warp == 0 && lane == 0) {
       mbar_arrive(&s.x_full);
@@ -1052,17 +1110,6 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
             // these stages wait for MMAs that are slow to start after a phase change; let HBM fetch them meanwhile
             const int n = st == st0 ? PF_N1 : st == kFc1Stages + 4 ? PF_N2 : 4;
             for (int k = st; k < st + n && k < kTotStages; ++k) prefetch_stage(k, e);
-          }
-          if (ITEM_PF == 2 && st == kFc1Stages && it + 1 < nitems) {
-            // the next item's FC1 to L2 while this item's h and FC2 run
-            for (int k = 0; k < kFc1Stages; ++k) prefetch_stage(k, s.item_e[it + 1]);
-          }
-          if (ITEM_PF == 1 && it == 0 && st == st0) {
-            // a CTA with more than one item streams its first while the others go to L2: the later items then run at
-            // L2 rather than HBM latency once most CTAs are done
-            for (int j = 1; j < nitems; ++j)
-              if (s.item_e[j] != s.item_e[j - 1])
-                for (int k = 0; k < kTotStages; ++k) prefetch_stage(k, s.item_e[j]);
           }
           if (g >= kStages) mbar_wait(&s.empty[g % kStages], ((g / kStages) - 1) & 1);
           issue_stage(g, st, e, pol);
@@ -1170,7 +1217,6 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     }
     for (int it = 0; it < nitems; ++it) {
       const int base = base0 + it * kTotStages, par = it & 1, rb = it & 1;
-      const bool last = it + 1 == nitems;
       load_scales(it);
       mbar_wait(&s.x_full, par);
       const int nrows = s.nrows[rb];
@@ -1253,7 +1299,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       tc_fence_before();
       __syncwarp();
       if (lane == 0) mbar_arrive(&s.h_ready);
-      if (q == 0 && lane == 0 && it == 0) stamp(p, 15);
+      if (q == 0 && lane == 0 && it == 0 && !DIAG_ROUTE) stamp(p, 15);
       for (int st = kFc1Stages + EARLY_SF2; st < kTotStages; ++st) {
         if (st == kFc1Stages + 4) {
           // pass 0 is fully staged; drain it once its MMAs are done, then free the accumulator for pass 1
@@ -1270,7 +1316,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       mbar_wait(&s.fc2_pass[1], par);
       tc_fence_after();
       if (q == 0 && lane == 0 && it == 0) stamp(p, 12);
-      if (TAIL8 && last) fc2_drain16<0, 2>(p, s, tm, q, lane, 1, a2, rb);
+      if (TAIL8 && it + 1 == nitems) fc2_drain16<0, 2>(p, s, tm, q, lane, 1, a2, rb);
       else fc2_drain16<0, 4>(p, s, tm, q, lane, 1, a2, rb);
       tc_fence_before();
       __syncwarp();

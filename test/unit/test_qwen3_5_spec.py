@@ -219,6 +219,10 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(56, plan.Facts(gdn_verify=True))) == ["gdn_verify"]
     no_wide = plan.Facts(hop=True)
     assert _on(plan.slots(28, no_wide)) == []
+    # hop_mid: the one-shot hop up to four requests, not past them
+    mid = plan.Facts(hop=True, hop_mid=True)
+    assert _on(plan.slots(28, mid)) == ["hop"]
+    assert _on(plan.slots(56, mid)) == []
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]
     assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]
     # SGLang offers every multiple of 7 up to MAX_ROWS; three requests are not covered

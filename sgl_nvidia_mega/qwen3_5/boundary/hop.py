@@ -137,6 +137,7 @@ class Bound(msgspec.Struct, frozen=True):
 
     hop: Optional[object] = None  # sm103.hop.Hop for every covered width, or None
     wide: bool = False  # the hop serves the two-shot rows too (slot hop_wide)
+    mid: bool = False  # its one-shot mailbox serves past 15 rows (slot hop_mid)
     reason: str = ""  # why there is no hop
 
 
@@ -152,13 +153,17 @@ def build(model, ctx) -> Bound:
     if "hop" not in runtime.SLOTS:
         return Bound(reason="slot off")
     # the widest step the hop covers: its mailbox's rows; with hop_wide the one-shot
-    # mailbox takes the finalize's one-shot rows and the two-shot one the rest
+    # mailbox takes the finalize's one-shot rows and the two-shot one the rest; with
+    # hop_mid the one-shot mailbox takes up to HOP_MID_MAX_ROWS
     wide = "hop_wide" in runtime.SLOTS
     from sgl_nvidia_mega.qwen3_5.sm103.hop import ONE_SHOT_FINALIZE_ROWS
 
-    rows = plan.widest(
-        ctx.widths, ONE_SHOT_FINALIZE_ROWS if wide else plan.HOP_MAX_ROWS
-    )
+    one_shot = plan.HOP_MAX_ROWS
+    if wide:
+        one_shot = ONE_SHOT_FINALIZE_ROWS
+    elif "hop_mid" in runtime.SLOTS:
+        one_shot = plan.HOP_MID_MAX_ROWS
+    rows = plan.widest(ctx.widths, one_shot)
     wide_rows = plan.widest(ctx.widths, plan.HOP_WIDE_MAX_ROWS) if wide else 0
     if wide_rows <= plan.HOP_MAX_ROWS:
         wide_rows = 0
@@ -181,7 +186,7 @@ def build(model, ctx) -> Bound:
     )
     global _ACTIVE
     _ACTIVE = hop
-    return Bound(hop=hop, wide=bool(wide_rows))
+    return Bound(hop=hop, wide=bool(wide_rows), mid=not wide and rows > plan.HOP_MAX_ROWS)
 
 
 def active() -> Optional[object]:

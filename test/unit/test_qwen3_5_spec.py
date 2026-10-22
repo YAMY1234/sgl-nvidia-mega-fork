@@ -211,7 +211,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     # four to 32 requests: the GDN chain (with its one-launch core), the two-shot hop,
     # route_topk and MKA's front path (whose flag mka_push only the wide entries act on),
     # with the router front's tiles up to its rows; the low-M output projections (with their
-    # push) up to four requests, the low-M shared expert up to eight
+    # push) up to four requests, the low-M shared expert up to two
     for rows in (28, 56, 112, 224):
         assert _on(plan.slots(rows, every)) == sorted(
             gdn

@@ -74,7 +74,9 @@ MKA_WIDE_MAX_ROWS = MAX_ROWS
 LOWM_IN_MAX_ROWS = 14
 LOWM_OUTPROJ_MAX_ROWS = 28
 LOWM_OPROJ_MAX_ROWS = 28
-LOWM_SE_MAX_ROWS = 56
+# the shared expert only up to two requests: at four (TP8 static, batch 3: hop_mid and route_gemm on the main
+# stream) its launches on the alternate stream cost the step 0.21 ms a round; at eight they gain nothing
+LOWM_SE_MAX_ROWS = 14
 
 
 class Slots(msgspec.Struct, frozen=True):

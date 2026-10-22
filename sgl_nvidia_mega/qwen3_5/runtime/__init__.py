@@ -16,6 +16,7 @@ import msgspec
 SHIPPED_SLOTS: tuple[str, ...] = ()
 OPT_IN_SLOTS: tuple[str, ...] = (
     "route",
+    "route_topk",
     "mkm",
     "mkm_wide",
     "gdn_verify",
@@ -174,6 +175,7 @@ def build(model, ctx):
     }
     facts = slot_plan.Facts(
         route=bound["moe"].route,
+        route_topk=bound["moe"].topk,
         mkm=bool(bound["moe"].mkm),
         mkm_wide=bound["moe"].mkm_wide,
         gdn_verify=bound["gdn"].gdn_verify,
@@ -204,6 +206,9 @@ def build(model, ctx):
         <= slot_plan.MKM_MAX_ROWS
         else set()
     )
+    # route_topk has nothing to serve where slot route covers every width
+    if "route" in SLOTS and max(pctx.widths) <= slot_plan.ROUTE_MAX_ROWS:
+        vacuous.add("route_topk")
     missing = sorted(name for name in target_slots - vacuous if not built[name])
     if missing:
         raise RuntimeError(

@@ -16,6 +16,13 @@ projection in the router front's launch (SGLANG_Q35MF_ROUTE_SHARED on SGLang bra
 nvidia/qwen35-agentx-gb300), so the shared expert on the alternate stream starts at its
 activation, after that launch only; the gate/up sums in another order than the FP8
 linear's GEMM.
+
+Slot ``route_topk`` serves the steps slot ``route`` does not (17 to 224 rows): behind
+SGLang's own router GEMM, one launch (``sm103/moe/router.route_topk_quant``) writes each
+token's top-10 experts and renormalized weights as the trtllm-gen routing computes them
+and the NVFP4 input as the runner's quantizer does; the runner then serves the
+materialized routing (FlashInfer's routed MoE), which skips its own top-k kernel. The
+logits are SGLang's, so the step's output is the stock one's.
 """
 
 from __future__ import annotations
@@ -47,7 +54,11 @@ SGLANG_READS = {
         "_silu_fp4_quant_fused",
     ),
     "srt/models/qwen3_5.py": ("layers", "start_layer", "end_layer", "mlp"),
-    "srt/layers/moe/topk.py": ("TopKOutputChecker", "format_is_bypassed"),
+    "srt/layers/moe/topk.py": (
+        "TopKOutputChecker",
+        "format_is_bypassed",
+        "StandardTopKOutput",
+    ),
     "srt/layers/moe/fused_moe_triton/layer.py": (
         "dispatcher",
         "run_moe_core",
@@ -99,6 +110,7 @@ class Bound(msgspec.Struct, frozen=True):
     # [160] int32 0, 1, ...: slot mkm's rows are in expert order
     identity: object = None
     shared: bool = False  # slot route_shared: the shared gate/up in the router launch
+    topk: bool = False  # slot route_topk: the top-10 + NVFP4 input launch built
     reason: str = ""  # why a requested slot is not built
 
 
@@ -180,6 +192,21 @@ def unsupported(mlp) -> str:
         return "per-token activation scales"
     if not mlp.supports_deferred_finalize:
         return "no deferred finalize"
+    return ""
+
+
+def topk_unsupported(model) -> str:
+    """Why slot route_topk cannot serve every MoE layer of ``model`` ("" when it can):
+    the router front's gate and input quantizer, and the trtllm-gen weights with a
+    softmax top-10 renormalized over 512 local experts (mkm.unsupported)."""
+    from sgl_nvidia_mega.qwen3_5.moe import mkm
+
+    m = model.model
+    for i in range(m.start_layer, m.end_layer):
+        mlp = m.layers[i].mlp
+        reason = unsupported(mlp) or mkm.unsupported(mlp)
+        if reason:
+            return f"layer {i}: {reason}"
     return ""
 
 
@@ -280,6 +307,38 @@ def _routed_experts(mlp, x, fused, logits, x_fp4, x_sf):
     topk_output = mlp.topk(x, logits)
     if not TopKOutputChecker.format_is_bypassed(topk_output):
         raise RuntimeError("the router front requires logits-based bypassed TopK")
+    dispatch_output = experts.dispatcher.dispatch(
+        hidden_states=x, topk_output=topk_output
+    )._replace(hidden_states=x_fp4, hidden_states_scale=x_sf.view(torch.float8_e4m3fn))
+    with flashinfer_trtllm_deferred_finalize_context():
+        combine_input = experts.run_moe_core(dispatch_output=dispatch_output)
+    return experts.dispatcher.combine(combine_input=combine_input)
+
+
+def routed_topk(mlp, x: torch.Tensor):
+    """``FusedMoE.forward_deferred_finalize`` of ``mlp``'s routed experts on ``x``
+    [rows, hidden] with SGLang's router GEMM, then slot route_topk's launch (the top-10
+    and the NVFP4 input), and the runner on the materialized routing."""
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        flashinfer_trtllm_deferred_finalize_context,
+    )
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    if ("route_topk", x.shape[0]) not in _ENGAGED:
+        _ENGAGED.add(("route_topk", x.shape[0]))
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 slot route_topk runs at %d rows", x.shape[0]
+        )
+    experts = mlp.experts
+    logits, _ = mlp.gate(x)
+    ids, weights, x_fp4, x_sf = router.route_topk_quant(
+        logits, x, experts.w13_input_scale_quant.reshape(1)
+    )
+    topk_output = StandardTopKOutput(
+        topk_weights=weights, topk_ids=ids, router_logits=logits
+    )
     dispatch_output = experts.dispatcher.dispatch(
         hidden_states=x, topk_output=topk_output
     )._replace(hidden_states=x_fp4, hidden_states_scale=x_sf.view(torch.float8_e4m3fn))

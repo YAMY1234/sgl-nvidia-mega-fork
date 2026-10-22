@@ -304,3 +304,92 @@ def test_router_gemm_quant_shared_replays_from_a_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
     assert all(torch.equal(a, b) for a, b in zip(eager, captured))
+
+
+# ---------------------------------------------------------------- slot route_topk
+
+
+def _routed_stock(layer, routing, x_fp4, x_sf):
+    """``_stock`` on a materialized routing (ids int32, weights bf16 [M, 10]): the
+    runner's routed path (FlashInfer's routed MoE, as SGLang calls it)."""
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+    from flashinfer.fused_moe.core import ActivationType
+
+    m = x_fp4.shape[0]
+    rows, weights, permuted = trtllm_fp4_block_scale_routed_moe(
+        topk_ids=routing,
+        routing_bias=None,
+        hidden_states=x_fp4,
+        hidden_states_scale=x_sf.view(torch.float8_e4m3fn),
+        gemm1_weights=layer["w13"],
+        gemm1_weights_scale=layer["w13_sf"],
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=layer["w2"],
+        gemm2_weights_scale=layer["w2_sf"],
+        gemm2_bias=None,
+        output1_scale_scalar=layer["g1c"],
+        output1_scale_gate_scalar=layer["g1"],
+        output2_scale_scalar=layer["g2"],
+        per_token_scale=None,
+        num_experts=E,
+        top_k=TOP_K,
+        n_group=0,
+        topk_group=0,
+        intermediate_size=layer["inter"],
+        local_expert_offset=0,
+        local_num_experts=E,
+        routed_scaling_factor=None,
+        routing_method_type=1,
+        do_finalize=False,
+        activation_type=ActivationType.Swiglu,
+        tune_max_num_tokens=max(8, m),
+        enable_pdl=True,
+    )[:3]
+    return rows[permuted.reshape(-1).long()[: m * TOP_K]], weights
+
+
+def _topk_inputs(m, seed):
+    """Router logits with ties (a bf16 grid) and a row with -inf / equal scores, the
+    input rows and the routed experts' input scale."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    logits = (torch.randn(m, E, device="cuda", generator=g) * 2).to(torch.bfloat16)
+    logits[0, ::3] = logits[0, 1]  # many ties
+    if m > 2:
+        logits[1] = 0.5  # every score equal: the lowest expert ids
+    x = torch.randn(m, H, device="cuda", generator=g).to(torch.bfloat16)
+    x[0, :32] = 0
+    x[-1, 32:48] *= 1e4
+    return logits, x, torch.tensor([X_SCALE], device="cuda")
+
+
+@pytest.mark.parametrize("m", [1, 7, 17, 21, 28, 56, 112, 224])
+def test_route_topk_is_the_trtllm_routing_and_the_runners_quantizer(layer, m):
+    from flashinfer import fp4_quantize
+
+    for seed in range(2):
+        logits, x, scale = _topk_inputs(m, seed=1000 * m + seed)
+        ids, weights, x_fp4, x_sf = router.route_topk_quant(logits, x, scale)
+        q, q_sf = fp4_quantize(x, scale, 16, False, False)
+        assert torch.equal(x_fp4, q.view(torch.uint8).reshape(m, -1))
+        assert torch.equal(x_sf, q_sf.view(torch.uint8).reshape(m, -1))
+        # the routed experts on this routing equal the runner's own routing from the
+        # logits, row for row, weights included
+        want_rows, want_w = _stock(layer, logits, x_fp4, x_sf)
+        got_rows, got_w = _routed_stock(layer, (ids, weights), x_fp4, x_sf)
+        assert torch.equal(got_w.view(torch.int16), want_w.view(torch.int16))
+        assert torch.equal(got_rows.view(torch.int16), want_rows.view(torch.int16))
+
+
+def test_route_topk_replays_from_a_cuda_graph():
+    logits, x, scale = _topk_inputs(56, seed=3)
+    router.build_topk(x.device.index)
+    eager = router.route_topk_quant(logits, x, scale)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = router.route_topk_quant(logits, x, scale)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(eager, captured))

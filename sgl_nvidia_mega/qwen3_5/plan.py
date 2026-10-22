@@ -4,12 +4,14 @@
 
 A slot runs only where it is requested (``SGLANG_NVIDIA_MEGAKERNEL_SLOTS``), built and
 inside its row bounds; every other op is SGLang's own. The covered steps are the
-target verify of 1, 2 or 4 requests (``REQUESTS``: SGLang's decode graphs of batch
-sizes 1, 2 and 4); a width of 2 or 4 requests is covered only where a slot runs there.
-``route`` (the router GEMM and the routed experts' NVFP4 input in one launch) runs up to
-16 rows, ``mkm`` (on its outputs, the top-10 and both expert GEMMs in one launch) up to
-7, and with ``mkm_wide`` (its 16-token engine) up to 16. ``gdn_verify`` (the GatedDeltaNet verify chain with its launch choices changed) covers
-every width, and ``hop`` (the boundary's fused all-reduce points on the decode hop) the
+target verify of 1 to 32 requests (``REQUESTS``: SGLang's decode graphs of batch sizes
+1, 2, 4, 8, 16 and 32); a width of more than one request is covered only where a slot
+runs there. ``route`` (the router GEMM and the routed experts' NVFP4 input in one launch)
+runs up to 16 rows, ``route_topk`` (behind SGLang's router GEMM: the top-10 and the NVFP4
+input in one launch, then the routed experts on that routing) wherever ``route`` does
+not, up to 224, ``mkm`` (on its outputs, the top-10 and both expert GEMMs in one launch)
+up to 7, and with ``mkm_wide`` (its 16-token engine) up to 16. ``gdn_verify`` (the
+GatedDeltaNet verify chain with its launch choices changed) covers up to four requests, and ``hop`` (the boundary's fused all-reduce points on the decode hop) the
 widths where FlashInfer's low-latency kernels, which it equals bit for bit, run.
 ``gdn_push`` (numeric: out_proj as the hop's push GEMM, on gdn_verify's FP8 norm) runs up
 to 8 rows. ``gdn_front`` (numeric: the GDN projections and conv in one launch, then
@@ -25,8 +27,9 @@ from __future__ import annotations
 
 import msgspec
 
-MAX_ROWS = 28  # the widest covered step: four requests of 7 verify rows (TP8 bs4)
-REQUESTS = (1, 2, 4)  # the requests of a covered step (SGLang's decode graph sizes)
+MAX_ROWS = 224  # the widest covered step: 32 requests of 7 verify rows (TP8 bs32)
+# the requests of a covered step (SGLang's decode graph sizes)
+REQUESTS = (1, 2, 4, 8, 16, 32)
 # the TP sizes whose steps of more than one request are covered when requested (checked at
 # TP8); at the others a covered step is one request
 MULTI_REQUEST_TP = (8,)
@@ -38,6 +41,8 @@ GDN_FRONT_ROWS = 7  # the rows slot gdn_front's front is built for
 # hop the rows up to which FlashInfer's MNNVL CuTe DSL fusion runs the one-shot
 # all-reduce the hop equals bit for bit (its finalize runs one-shot up to 23 rows)
 ROUTE_MAX_ROWS = 16
+ROUTE_TOPK_MAX_ROWS = 224
+GDN_VERIFY_MAX_ROWS = 28  # the widths its kernels are checked at: up to four requests
 MKM_MAX_ROWS = 7
 MKM_WIDE_MAX_ROWS = 16
 HOP_MAX_ROWS = 15
@@ -51,6 +56,8 @@ class Slots(msgspec.Struct, frozen=True):
     """The kernels that fill one width's step."""
 
     route: bool = False  # router GEMM + NVFP4 input quantization (sm103/moe/router.py)
+    # behind SGLang's router GEMM: top-10 + NVFP4 input in one launch (moe/route.py)
+    route_topk: bool = False
     mkm: bool = (
         False  # top-10 + FC1 + SwiGLU + FC2 on route's outputs (sm103/moe/mkm.py)
     )
@@ -73,6 +80,7 @@ class Facts(msgspec.Struct, frozen=True):
     function runs its stock code."""
 
     route: bool = False  # the router front built for every MoE layer
+    route_topk: bool = False  # the top-10 + NVFP4 input launch built for every MoE layer
     mkm: bool = False  # the fused routed experts built for every MoE layer
     mkm_wide: bool = False  # with their 16-token engine
     gdn_verify: bool = False  # the GDN verify slot built for every GDN layer
@@ -94,19 +102,21 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
     route = facts.route and rows <= ROUTE_MAX_ROWS
     hop = facts.hop and rows <= HOP_MAX_ROWS
     mka = facts.mka and rows <= MKA_MAX_ROWS
+    gdn_verify = facts.gdn_verify and rows <= GDN_VERIFY_MAX_ROWS
     return Slots(
         route=route,
+        route_topk=facts.route_topk and not route and rows <= ROUTE_TOPK_MAX_ROWS,
         mkm=route
         and facts.mkm
         and rows <= (MKM_WIDE_MAX_ROWS if facts.mkm_wide else MKM_MAX_ROWS),
-        gdn_verify=facts.gdn_verify,
-        gdn_pdl=facts.gdn_verify and facts.gdn_pdl,
+        gdn_verify=gdn_verify,
+        gdn_pdl=gdn_verify and facts.gdn_pdl,
         hop=hop,
-        gdn_push=facts.gdn_verify
+        gdn_push=gdn_verify
         and hop
         and facts.gdn_push
         and rows <= GDN_PUSH_MAX_ROWS,
-        gdn_front=facts.gdn_verify
+        gdn_front=gdn_verify
         and facts.gdn_pdl
         and facts.gdn_front
         and rows == GDN_FRONT_ROWS,

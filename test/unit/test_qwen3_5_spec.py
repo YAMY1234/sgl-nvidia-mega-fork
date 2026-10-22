@@ -207,14 +207,9 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(14, every)) == sorted(
         gdn + ["gdn_front", "hop", "mka", "mka_push", "route"]
     )
-    # four and eight requests: past the router front's and the one-shot all-reduce's rows
-    for rows in (28, 56):
-        assert _on(plan.slots(rows, every)) == sorted(
-            gdn + ["gdn_front", "mka", "route_topk"]
-        )
-    # 16 and 32 requests: the GDN chain (with its one-launch core), route_topk and MKA's
-    # front path
-    for rows in (112, 224):
+    # four to 32 requests: the GDN chain (with its one-launch core), route_topk and MKA's
+    # wide entries / front path
+    for rows in (28, 56, 112, 224):
         assert _on(plan.slots(rows, every)) == sorted(gdn + ["mka", "route_topk"])
     assert _on(plan.slots(56, plan.Facts(gdn_verify=True))) == ["gdn_verify"]
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]

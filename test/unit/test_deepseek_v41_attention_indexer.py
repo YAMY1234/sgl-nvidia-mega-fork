@@ -24,6 +24,7 @@ def _paged(chunked=False):
         max_compressed_seq_len=40,
         compressed_page_size=64,
         topk_metadata="tm",
+        rows_per_request=1,
     )
 
 
@@ -125,6 +126,32 @@ def _ops_modules(log):
         m.__dict__.update(attrs)
         patched[name] = m
     return mock.patch.dict(sys.modules, patched)
+
+
+def test_paged_logits_groups_consecutive_rows_by_request():
+    data = indexer.Query(
+        torch.arange(6 * 4 * 64).view(6, 1, 4, 64),
+        torch.arange(6 * 4).view(6, 1, 4),
+        torch.zeros(6, 4),
+    )
+    paged = _paged()
+    paged.rows_per_request = 3
+    paged.compressed_seq_lens = torch.arange(40, 46).view(6, 1)
+    paged.page_table = torch.arange(6 * 8).view(6, 8)
+    with (
+        _ops_modules([]),
+        mock.patch.object(
+            sys.modules["sglang.kernels.ops.attention.dsv4.index_logits"],
+            "deep_gemm_fp4_paged_mqa_logits",
+        ) as logits,
+    ):
+        indexer.StepIndexer._paged_logits(data, "k", paged)
+    logits.assert_called_once()
+    (q_fp4, q_sf), _, _, lens, table, _, _ = logits.call_args.args
+    torch.testing.assert_close(q_fp4, data.q_fp4.view(2, 3, 4, 64))
+    torch.testing.assert_close(q_sf, data.q_sf.view(2, 3, 4))
+    torch.testing.assert_close(lens, paged.compressed_seq_lens.view(2, 3))
+    torch.testing.assert_close(table, paged.page_table[::3])
 
 
 @pytest.mark.parametrize(

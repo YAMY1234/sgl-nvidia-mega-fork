@@ -61,6 +61,7 @@ SGLANG_READS = {
         "max_compressed_seq_len",
         "compressed_page_size",
         "topk_metadata",
+        "rows_per_request",
     ),
     "srt/layers/attention/dsv4/dsv41_sparse.py": (
         "is_candidate_source",
@@ -279,12 +280,23 @@ class StepIndexer:
             deep_gemm_fp4_paged_mqa_logits,
         )
 
+        # the schedule plans rows_per_request consecutive rows per request, so the
+        # operands are grouped the same way (DeepGEMMDecodeData.paged_logits_args)
+        q_fp4, q_sf = data.q_fp4, data.q_sf
+        lens, table = paged.compressed_seq_lens, paged.page_table
+        n = paged.rows_per_request
+        if n > 1:
+            heads = q_fp4.shape[2]
+            q_fp4 = q_fp4.view(-1, n, heads, 64)
+            q_sf = q_sf.view(-1, n, heads)
+            lens = lens.view(-1, n)
+            table = table[::n]
         return deep_gemm_fp4_paged_mqa_logits(
-            (data.q_fp4, data.q_sf),
+            (q_fp4, q_sf),
             k_cache,
             data.weights,
-            paged.compressed_seq_lens,
-            paged.page_table,
+            lens,
+            table,
             paged.deep_gemm_metadata,
             paged.max_compressed_seq_len,
         )

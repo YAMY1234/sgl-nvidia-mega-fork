@@ -393,3 +393,30 @@ def test_route_topk_replays_from_a_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
     assert all(torch.equal(a, b) for a, b in zip(eager, captured))
+
+
+@pytest.mark.parametrize("m", [17, 21, 28, 35, 49, 56])
+def test_router_front_tiles_are_its_16_row_launches(m):
+    """Slot route_gemm (numeric past 16 rows): the router front over 16-row token tiles in
+    one launch equals the 16-row launch on each tile, bit for bit; its NVFP4 input is the
+    runner's quantizer's; its logits stay within a bf16 ulp of cuBLAS's GEMM; and
+    route_topk's routing-only launch routes as its quantizing launch."""
+    from flashinfer import fp4_quantize
+
+    x, w, scale = _router_inputs(m, seed=900 + m)
+    router.build(x.device.index, 16)
+    logits, x_fp4, x_sf = router.router_gemm_quant_tiled(x, w, scale)
+    for t0 in range(0, m, 16):
+        tile = router.router_gemm_quant(x[t0 : t0 + 16].contiguous(), w, scale)
+        for a, b in zip((logits, x_fp4, x_sf), tile):
+            assert torch.equal(a[t0 : t0 + 16], b)
+    q, q_sf = fp4_quantize(x, scale, 16, False, False)
+    assert torch.equal(x_fp4, q.view(torch.uint8).reshape(m, -1))
+    assert torch.equal(x_sf, q_sf.view(torch.uint8).reshape(m, -1))
+    stock = torch.nn.functional.linear(x, w).float()
+    ulp = stock.abs().clamp_min(1e-30) * 2.0**-7
+    assert ((logits.float() - stock).abs() <= ulp).all()
+    routed = router.route_topk_quant(logits, x, scale)
+    only = router.route_topk_quant(logits, x, scale, quantize=False)
+    assert only[2] is None and only[3] is None
+    assert torch.equal(routed[0], only[0]) and torch.equal(routed[1], only[1])

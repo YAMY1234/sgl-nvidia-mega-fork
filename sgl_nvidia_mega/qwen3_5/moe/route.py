@@ -111,6 +111,7 @@ class Bound(msgspec.Struct, frozen=True):
     identity: object = None
     shared: bool = False  # slot route_shared: the shared gate/up in the router launch
     topk: bool = False  # slot route_topk: the top-10 + NVFP4 input launch built
+    gemm: bool = False  # slot route_gemm: the router front's 16-row tiles stand in for the GEMM
     reason: str = ""  # why a requested slot is not built
 
 
@@ -315,10 +316,12 @@ def _routed_experts(mlp, x, fused, logits, x_fp4, x_sf):
     return experts.dispatcher.combine(combine_input=combine_input)
 
 
-def routed_topk(mlp, x: torch.Tensor):
+def routed_topk(mlp, x: torch.Tensor, gemm: bool = False):
     """``FusedMoE.forward_deferred_finalize`` of ``mlp``'s routed experts on ``x``
     [rows, hidden] with SGLang's router GEMM, then slot route_topk's launch (the top-10
-    and the NVFP4 input), and the runner on the materialized routing."""
+    and the NVFP4 input), and the runner on the materialized routing. With ``gemm``
+    (slot route_gemm, numeric) the router front's GEMM and quantizer in 16-row tiles
+    stand in for SGLang's router GEMM, and route_topk's launch only routes."""
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         flashinfer_trtllm_deferred_finalize_context,
     )
@@ -332,10 +335,13 @@ def routed_topk(mlp, x: torch.Tensor):
             "NVIDIA megakernel: Qwen3.5 slot route_topk runs at %d rows", x.shape[0]
         )
     experts = mlp.experts
-    logits, _ = mlp.gate(x)
-    ids, weights, x_fp4, x_sf = router.route_topk_quant(
-        logits, x, experts.w13_input_scale_quant.reshape(1)
-    )
+    scale = experts.w13_input_scale_quant.reshape(1)
+    if gemm:
+        logits, x_fp4, x_sf = router.router_gemm_quant_tiled(x, mlp.gate.weight, scale)
+        ids, weights, _, _ = router.route_topk_quant(logits, x, scale, quantize=False)
+    else:
+        logits, _ = mlp.gate(x)
+        ids, weights, x_fp4, x_sf = router.route_topk_quant(logits, x, scale)
     topk_output = StandardTopKOutput(
         topk_weights=weights, topk_ids=ids, router_logits=logits
     )

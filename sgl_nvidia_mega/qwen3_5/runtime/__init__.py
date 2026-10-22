@@ -17,6 +17,7 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 OPT_IN_SLOTS: tuple[str, ...] = (
     "route",
     "route_topk",
+    "route_gemm",
     "mkm",
     "mkm_wide",
     "gdn_verify",
@@ -96,6 +97,8 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'route_shared' runs in slot 'route''s launch"
         )
+    if "route_gemm" in SLOTS and "route_topk" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'route_gemm' runs inside slot 'route_topk'")
     if "hop_wide" in SLOTS and "hop" not in SLOTS:
         reasons.append(f"{SLOTS_ENV}: slot 'hop_wide' widens slot 'hop'")
     if "gdn_push" in SLOTS and not {"gdn_verify", "hop"} <= SLOTS:
@@ -192,6 +195,7 @@ def build(model, ctx):
     facts = slot_plan.Facts(
         route=bound["moe"].route,
         route_topk=bound["moe"].topk,
+        route_gemm=bound["moe"].gemm,
         mkm=bool(bound["moe"].mkm),
         mkm_wide=bound["moe"].mkm_wide,
         gdn_verify=bound["gdn"].gdn_verify,
@@ -230,7 +234,7 @@ def build(model, ctx):
         vacuous.add("hop_wide")
     # route_topk has nothing to serve where slot route covers every width
     if "route" in SLOTS and max(pctx.widths) <= slot_plan.ROUTE_MAX_ROWS:
-        vacuous.add("route_topk")
+        vacuous.update({"route_topk", "route_gemm"})
     missing = sorted(name for name in target_slots - vacuous if not built[name])
     if missing:
         raise RuntimeError(

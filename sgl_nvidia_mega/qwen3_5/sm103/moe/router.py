@@ -247,12 +247,16 @@ def build_topk(device_index: int) -> None:
 
 
 def route_topk_quant(
-    logits: torch.Tensor, x: torch.Tensor, global_scale: torch.Tensor
+    logits: torch.Tensor,
+    x: torch.Tensor,
+    global_scale: torch.Tensor,
+    quantize: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """logits [M, 512] bf16 (the router GEMM's), x [M, 4096] bf16, global_scale [1]
     fp32: (topk_ids int32 [M, 10], topk_weights bf16 [M, 10], x_fp4 uint8 [M, 2048],
     x_sf uint8 [M, 256]); the routing equals the trtllm-gen RenormalizeNaive routing's
-    and the input the runner's NVFP4 quantizer's, bit for bit."""
+    and the input the runner's NVFP4 quantizer's, bit for bit. Without ``quantize`` only
+    the routing (x_fp4 / x_sf None)."""
     m = x.shape[0]
     for t, shape in ((logits, (m, EXPERTS)), (x, (m, HIDDEN))):
         if t.dtype != torch.bfloat16 or tuple(t.shape) != shape or not t.is_contiguous():
@@ -261,16 +265,18 @@ def route_topk_quant(
         raise ValueError(f"route_topk: {m} rows (1-{TOPK_MAX_ROWS})")
     ids = torch.empty((m, TOP_K), dtype=torch.int32, device=x.device)
     weights = torch.empty((m, TOP_K), dtype=torch.bfloat16, device=x.device)
-    x_fp4 = torch.empty((m, HIDDEN // 2), dtype=torch.uint8, device=x.device)
-    x_sf = torch.empty((m, HIDDEN // 16), dtype=torch.uint8, device=x.device)
+    x_fp4 = x_sf = None
+    if quantize:
+        x_fp4 = torch.empty((m, HIDDEN // 2), dtype=torch.uint8, device=x.device)
+        x_sf = torch.empty((m, HIDDEN // 16), dtype=torch.uint8, device=x.device)
     p = TopkParams(
         logits=logits.data_ptr(),
         x=x.data_ptr(),
         global_scale=global_scale.data_ptr(),
         topk_ids=ids.data_ptr(),
         topk_weights=weights.data_ptr(),
-        x_fp4=x_fp4.data_ptr(),
-        x_sf=x_sf.data_ptr(),
+        x_fp4=jit.null_or_pointer(x_fp4).value,
+        x_sf=jit.null_or_pointer(x_sf).value,
     )
     jit.launch(
         _topk_kernel(x.device.index),
@@ -279,3 +285,42 @@ def route_topk_quant(
         torch.cuda.current_stream().cuda_stream,
     )
     return ids, weights, x_fp4, x_sf
+
+
+GEMM_MAX_ROWS = 56  # slot route_gemm: the router front in tiles of 16 rows up to here
+
+
+def router_gemm_quant_tiled(
+    x: torch.Tensor, weight: torch.Tensor, global_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``router_gemm_quant`` past 16 rows (up to GEMM_MAX_ROWS): one launch of the
+    16-row front over token tiles (grid y). Each tile's logits sum as the 16-row front's,
+    in another order than SGLang's cuBLAS GEMM at these rows (numeric)."""
+    m = x.shape[0]
+    if x.dtype != torch.bfloat16 or x.shape[1:] != (HIDDEN,) or not x.is_contiguous():
+        raise ValueError(
+            f"router front: x {x.dtype} {tuple(x.stride())} {tuple(x.shape)}"
+        )
+    if not 1 <= m <= GEMM_MAX_ROWS:
+        raise ValueError(f"tiled router front: {m} rows (1-{GEMM_MAX_ROWS})")
+    logits = torch.empty((m, EXPERTS), dtype=torch.bfloat16, device=x.device)
+    x_fp4 = torch.empty((m, HIDDEN // 2), dtype=torch.uint8, device=x.device)
+    x_sf = torch.empty((m, HIDDEN // 16), dtype=torch.uint8, device=x.device)
+    p = Params(
+        x=x.data_ptr(),
+        weight=weight.data_ptr(),
+        global_scale=global_scale.data_ptr(),
+        logits=logits.data_ptr(),
+        x_fp4=x_fp4.data_ptr(),
+        x_sf=x_sf.data_ptr(),
+        num_tokens=m,
+        mode=MODE_QUANT,
+    )
+    tiles = -(-m // MAX_TOKENS)
+    jit.launch(
+        _kernel(x.device.index, MAX_TOKENS),
+        (CTAS, tiles, 1),
+        [p],
+        torch.cuda.current_stream().cuda_stream,
+    )
+    return logits, x_fp4, x_sf

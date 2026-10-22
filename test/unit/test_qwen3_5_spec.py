@@ -199,7 +199,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     )
     # route_topk serves only where route does not
     assert _on(plan.slots(7, every)) == sorted(
-        set(plan.Slots.__struct_fields__) - {"route_topk"}
+        set(plan.Slots.__struct_fields__) - {"route_topk", "route_gemm"}
     )
     # two requests: the 16-row router front, the GDN chain, the hop's one-shot rows and
     # MKA's wide entries with their push
@@ -208,11 +208,13 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
         gdn + ["gdn_front", "hop", "mka", "mka_push", "route"]
     )
     # four to 32 requests: the GDN chain (with its one-launch core), the two-shot hop,
-    # route_topk and MKA's wide entries / front path (whose flag mka_push only the wide
-    # entries act on)
+    # route_topk and MKA's front path (whose flag mka_push only the wide entries act on),
+    # with the router front's tiles up to its rows
     for rows in (28, 56, 112, 224):
         assert _on(plan.slots(rows, every)) == sorted(
-            gdn + ["hop", "mka", "mka_push", "route_topk"]
+            gdn
+            + ["hop", "mka", "mka_push", "route_topk"]
+            + (["route_gemm"] if rows <= plan.ROUTE_GEMM_MAX_ROWS else [])
         )
     assert _on(plan.slots(56, plan.Facts(gdn_verify=True))) == ["gdn_verify"]
     no_wide = plan.Facts(hop=True)
@@ -259,6 +261,7 @@ def test_the_slot_plans_row_bounds_are_the_kernels():
 
     assert plan.ROUTE_MAX_ROWS == router.MAX_TOKENS
     assert plan.ROUTE_TOPK_MAX_ROWS == router.TOPK_MAX_ROWS
+    assert plan.ROUTE_GEMM_MAX_ROWS == router.GEMM_MAX_ROWS
     assert plan.ROUTE_SHARED_ROWS == router.SHARED_MAX_M
     assert plan.MKM_MAX_ROWS == mkm.MAX_TOKENS
     assert plan.MKM_WIDE_MAX_ROWS == mkm.M16_MAX_TOKENS

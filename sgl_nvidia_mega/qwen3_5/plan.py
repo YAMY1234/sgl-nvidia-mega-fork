@@ -47,6 +47,8 @@ GDN_FRONT_MAX_ROWS = 14  # its widest step: two requests (a cluster set a reques
 # all-reduce the hop equals bit for bit (its finalize runs one-shot up to 23 rows)
 ROUTE_MAX_ROWS = 16
 ROUTE_TOPK_MAX_ROWS = 224
+# slot route_gemm (numeric): the router front's 16-row tiles in place of the GEMM, up to here
+ROUTE_GEMM_MAX_ROWS = 56
 GDN_VERIFY_MAX_ROWS = 224  # the widths its kernels are checked at: up to 32 requests
 GDN_CORE_MAX_ROWS = 224  # and gdn_core's launch
 MKM_MAX_ROWS = 7
@@ -68,6 +70,7 @@ class Slots(msgspec.Struct, frozen=True):
     route: bool = False  # router GEMM + NVFP4 input quantization (sm103/moe/router.py)
     # behind SGLang's router GEMM: top-10 + NVFP4 input in one launch (moe/route.py)
     route_topk: bool = False
+    route_gemm: bool = False  # with the router front's tiles in place of that GEMM
     mkm: bool = (
         False  # top-10 + FC1 + SwiGLU + FC2 on route's outputs (sm103/moe/mkm.py)
     )
@@ -93,6 +96,7 @@ class Facts(msgspec.Struct, frozen=True):
 
     route: bool = False  # the router front built for every MoE layer
     route_topk: bool = False  # the top-10 + NVFP4 input launch built for every MoE layer
+    route_gemm: bool = False  # and the router front's tiles
     mkm: bool = False  # the fused routed experts built for every MoE layer
     mkm_wide: bool = False  # with their 16-token engine
     gdn_verify: bool = False  # the GDN verify slot built for every GDN layer
@@ -120,9 +124,11 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
     )
     mka = facts.mka and rows <= (MKA_WIDE_MAX_ROWS if facts.mka_wide else MKA_MAX_ROWS)
     gdn_verify = facts.gdn_verify and rows <= GDN_VERIFY_MAX_ROWS
+    route_topk = facts.route_topk and not route and rows <= ROUTE_TOPK_MAX_ROWS
     return Slots(
         route=route,
-        route_topk=facts.route_topk and not route and rows <= ROUTE_TOPK_MAX_ROWS,
+        route_topk=route_topk,
+        route_gemm=route_topk and facts.route_gemm and rows <= ROUTE_GEMM_MAX_ROWS,
         mkm=route
         and facts.mkm
         and rows <= (MKM_WIDE_MAX_ROWS if facts.mkm_wide else MKM_MAX_ROWS),

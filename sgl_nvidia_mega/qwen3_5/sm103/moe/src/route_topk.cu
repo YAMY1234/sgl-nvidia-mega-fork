@@ -237,7 +237,7 @@ __device__ __forceinline__ void route_topk_quant(const Params& p) {
       p.topk_ids[t * kTopK + lane] = static_cast<int32_t>(expert);
       p.topk_weights[t * kTopK + lane] = wbits;
     }
-  } else {
+  } else if (p.x_fp4 != nullptr) {  // null: the router front already quantized the rows
     const float gs = p.global_scale[0];
     const __nv_bfloat16* row = p.x + static_cast<size_t>(t) * kHidden;
     for (uint32_t blk = threadIdx.x - 32; blk < kBlocksPerRow; blk += kThreads - 32) {

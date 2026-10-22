@@ -64,6 +64,9 @@ class Parts:
         self.moe: Optional[Any] = None  # draft.moe.DraftMoe (slot draft_moe)
         self.hop: Optional[Any] = None  # draft.hop.DraftHop (slot draft_hop)
         self.mkd: Optional[Any] = None  # draft.xchg.MkdBoundary (slot draft_xchg)
+        # sm103.draft.top1.Top1Exchange: the multi-request steps' sharded top-1 (slot
+        # draft_multi)
+        self.top1x: Optional[Any] = None
         # (entry, bs) pairs whose capture logged the engagement line
         self.engaged: set = set()
 
@@ -86,6 +89,8 @@ class Parts:
             parts.hop = parts._build_hop()
         if "draft_xchg" in slots:
             parts.mkd = parts._build_mkd()
+        if "draft_multi" in slots:
+            parts.top1x = parts._build_top1x()
         logger.info(
             "NVIDIA megakernel: Qwen3.5 MTP draft parts built (slots %s; MoE %s, hop "
             "%s, exchange %s)",
@@ -174,6 +179,31 @@ class Parts:
                 + ("; ".join(refused) or "see the MKD draft boundary warning")
             )
         return mkd
+
+    def _build_top1x(self):
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.top1 import Top1Exchange
+
+        lm, b = self.lm, self.binding
+        rows = int(lm.lm_head.weight.shape[0])
+        start = int(lm.lm_head.shard_indices.org_vocab_start_index)
+        vocab = int(lm.logits_processor.vocab_size)
+        # the shard layout the all-gathered logits have: rank-major, no padding rows
+        if start != b.tp_rank * rows or rows * b.tp_size != vocab:
+            raise RuntimeError(
+                "NVIDIA megakernel: slot draft_multi cannot run: the LM head's "
+                f"{rows}-row shard at {start} is not rank {b.tp_rank}'s slice of "
+                f"{vocab} ids"
+            )
+        return Top1Exchange(
+            world=b.tp_size,
+            rank=b.tp_rank,
+            vocab_local=rows,
+            vocab_start=start,
+            vocab_size=vocab,
+            group=b.tp_device_group,
+            cpu_group=b.tp_cpu_group,
+            device=self.device,
+        )
 
     def note_engaged(self, entry: str, bs: int) -> None:
         """Log once per (entry, bs) captured: the engagement line every rank prints."""

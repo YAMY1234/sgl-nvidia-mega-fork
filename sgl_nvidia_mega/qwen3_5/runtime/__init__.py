@@ -17,12 +17,15 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 OPT_IN_SLOTS: tuple[str, ...] = (
     "route",
     "route_topk",
+    "route_gemm",
     "mkm",
     "mkm_wide",
     "gdn_verify",
     "gdn_pdl",
     "gdn_core",
     "hop",
+    "hop_wide",
+    "hop_mid",
     "gdn_push",
     "gdn_front",
     "route_shared",
@@ -30,7 +33,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "mka",
     "mka_push",
 )
-# Steps of more than one request (TP8's decode graphs of batch sizes 2 to 16), covered only
+# Steps of more than one request (TP8's decode graphs of batch sizes 2 to 32), covered only
 # when requested in the same variable: covering them costs the one-request step about
 # 0.3% at TP8
 OPT_IN_COVERAGE: tuple[str, ...] = ("multi_request",)
@@ -95,6 +98,14 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'route_shared' runs in slot 'route''s launch"
         )
+    if "route_gemm" in SLOTS and "route_topk" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'route_gemm' runs inside slot 'route_topk'")
+    if "hop_wide" in SLOTS and "hop" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'hop_wide' widens slot 'hop'")
+    if "hop_mid" in SLOTS and "hop" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'hop_mid' widens slot 'hop'")
+    if "hop_mid" in SLOTS and "hop_wide" in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slots 'hop_mid' and 'hop_wide' both take rows past 15")
     if "gdn_push" in SLOTS and not {"gdn_verify", "hop"} <= SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_push' pushes slot 'gdn_verify''s out_proj into "
@@ -189,17 +200,21 @@ def build(model, ctx):
     facts = slot_plan.Facts(
         route=bound["moe"].route,
         route_topk=bound["moe"].topk,
+        route_gemm=bound["moe"].gemm,
         mkm=bool(bound["moe"].mkm),
         mkm_wide=bound["moe"].mkm_wide,
         gdn_verify=bound["gdn"].gdn_verify,
         gdn_pdl=bound["gdn"].gdn_pdl,
         gdn_core=bound["gdn"].gdn_core,
         hop=bound["boundary"].hop is not None,
+        hop_wide=bound["boundary"].wide,
+        hop_mid=bound["boundary"].mid,
         gdn_push=bool(bound["gdn"].packed),
         gdn_front=bool(bound["gdn"].front),
         route_shared=bound["moe"].shared,
         skv2=bound["attention"].skv2,
         mka=bound["attention"].mka,
+        mka_wide=bound["attention"].mka_wide,
         mka_push=bound["attention"].mka_push,
     )
     covered = slot_plan.covered(pctx.widths, facts, pctx.tokens_per_request)
@@ -220,9 +235,12 @@ def build(model, ctx):
         <= slot_plan.MKM_MAX_ROWS
         else set()
     )
+    # hop_wide has nothing to serve where no covered step is past the one-shot rows
+    if max(pctx.widths) <= slot_plan.HOP_MAX_ROWS:
+        vacuous.update({"hop_wide", "hop_mid"})
     # route_topk has nothing to serve where slot route covers every width
     if "route" in SLOTS and max(pctx.widths) <= slot_plan.ROUTE_MAX_ROWS:
-        vacuous.add("route_topk")
+        vacuous.update({"route_topk", "route_gemm"})
     missing = sorted(name for name in target_slots - vacuous if not built[name])
     if missing:
         raise RuntimeError(

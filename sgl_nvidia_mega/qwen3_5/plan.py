@@ -13,15 +13,18 @@ not, up to 224, ``mkm`` (on its outputs, the top-10 and both expert GEMMs in one
 up to 7, and with ``mkm_wide`` (its 16-token engine) up to 16. ``gdn_verify`` (the
 GatedDeltaNet verify chain with its launch choices changed) covers every width, with
 ``gdn_core`` (numeric: its ReplaySSM verify, gated norm and FP8 output in one launch), and ``hop`` (the boundary's fused all-reduce points on the decode hop) the
-widths where FlashInfer's low-latency kernels, which it equals bit for bit, run.
+widths where FlashInfer's low-latency kernels, which it equals bit for bit, run, and with
+``hop_wide`` up to 224 rows (past them its two-shot protocol, equal to FlashInfer's BT
+routes), or with ``hop_mid`` (numeric: its one-shot protocol past FlashInfer's) up to 28.
 ``gdn_push`` (numeric: out_proj as the hop's push GEMM, on gdn_verify's FP8 norm) runs up
 to 8 rows. ``gdn_front`` (numeric: the GDN projections and conv in one launch, then
-gdn_pdl's verify) covers one request of 7 rows, ``route_shared`` (numeric: the shared
+gdn_pdl's verify) covers one or two requests of 7 rows, ``route_shared`` (numeric: the shared
 expert's gate/up in route's launch) up to 8 rows. ``skv2`` runs the full attention's core
 of one request through the split-KV attention of SGLang branch
 nvidia/qwen35-agentx-gb300, ``mka`` the fused attention prologue and epilogue around it
-(up to 8 rows), and ``mka_push`` (with ``hop``) has the epilogue push its rows into the
-hop.
+(up to 8 rows; with four query heads a rank, its wide entries up to 14 rows and past
+them its front path, bit for bit SGLang's, at every width), and ``mka_push`` (with
+``hop``) has the epilogue push its rows into the hop.
 """
 
 from __future__ import annotations
@@ -36,22 +39,31 @@ REQUESTS = (1, 2, 4, 8, 16, 32)
 MULTI_REQUEST_TP = (8,)
 # the name that requests them in the slot list
 MULTI_REQUEST = "multi_request"
-GDN_FRONT_ROWS = 7  # the rows slot gdn_front's front is built for
+GDN_FRONT_ROWS = 7  # the rows of one request slot gdn_front's front is built for
+GDN_FRONT_MAX_ROWS = 14  # its widest step: two requests (a cluster set a request pays past two)
 # Each slot's widest step: its launcher's bound (sm103/moe/router.py MAX_TOKENS,
 # sm103/moe/mkm.py MAX_TOKENS, sm103/hop OPROJ_MAX_M, sm103/attention/mka.py), and for
 # hop the rows up to which FlashInfer's MNNVL CuTe DSL fusion runs the one-shot
 # all-reduce the hop equals bit for bit (its finalize runs one-shot up to 23 rows)
 ROUTE_MAX_ROWS = 16
 ROUTE_TOPK_MAX_ROWS = 224
+# slot route_gemm (numeric): the router front's 16-row tiles in place of the GEMM, up to here
+ROUTE_GEMM_MAX_ROWS = 32
 GDN_VERIFY_MAX_ROWS = 224  # the widths its kernels are checked at: up to 32 requests
 GDN_CORE_MAX_ROWS = 224  # and gdn_core's launch
 MKM_MAX_ROWS = 7
 MKM_WIDE_MAX_ROWS = 16
 HOP_MAX_ROWS = 15
+# with hop_wide: the two-shot hop past the one-shot rows (FlashInfer's BT routes, bit for bit)
+HOP_WIDE_MAX_ROWS = 224
+# with hop_mid (numeric): the one-shot hop up to four requests (in place of the BT routes)
+HOP_MID_MAX_ROWS = 28
 GDN_PUSH_MAX_ROWS = 8
 # the rows slot route_shared's shared stage fits shared memory for
 ROUTE_SHARED_ROWS = 8
 MKA_MAX_ROWS = 8
+# with four query heads a rank: the wide entries, then the front path (attention/mka.py)
+MKA_WIDE_MAX_ROWS = MAX_ROWS
 
 
 class Slots(msgspec.Struct, frozen=True):
@@ -60,6 +72,7 @@ class Slots(msgspec.Struct, frozen=True):
     route: bool = False  # router GEMM + NVFP4 input quantization (sm103/moe/router.py)
     # behind SGLang's router GEMM: top-10 + NVFP4 input in one launch (moe/route.py)
     route_topk: bool = False
+    route_gemm: bool = False  # with the router front's tiles in place of that GEMM
     mkm: bool = (
         False  # top-10 + FC1 + SwiGLU + FC2 on route's outputs (sm103/moe/mkm.py)
     )
@@ -85,12 +98,15 @@ class Facts(msgspec.Struct, frozen=True):
 
     route: bool = False  # the router front built for every MoE layer
     route_topk: bool = False  # the top-10 + NVFP4 input launch built for every MoE layer
+    route_gemm: bool = False  # and the router front's tiles
     mkm: bool = False  # the fused routed experts built for every MoE layer
     mkm_wide: bool = False  # with their 16-token engine
     gdn_verify: bool = False  # the GDN verify slot built for every GDN layer
     gdn_pdl: bool = False  # with its dependent verify launch
     gdn_core: bool = False  # with the one-launch verify core
     hop: bool = False  # the decode hop, built for the widest step it covers
+    hop_wide: bool = False  # with its two-shot protocol past the one-shot rows
+    hop_mid: bool = False  # with its one-shot protocol up to HOP_MID_MAX_ROWS
     gdn_push: bool = False  # out_proj packed for the push GEMM on every GDN layer
     gdn_front: bool = False  # in_proj_qkvz packed for the front on every GDN layer
     route_shared: bool = (
@@ -98,6 +114,7 @@ class Facts(msgspec.Struct, frozen=True):
     )
     skv2: bool = False  # SKV2 for every full-attention layer
     mka: bool = False  # the fused prologue and epilogue for every full-attention layer
+    mka_wide: bool = False  # with its wide entries (four query heads a rank)
     mka_push: bool = False  # with the epilogue's push into the hop
 
 
@@ -105,12 +122,17 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
     if not 1 <= rows <= MAX_ROWS:
         raise ValueError(f"{rows} rows are outside the covered widths 1-{MAX_ROWS}")
     route = facts.route and rows <= ROUTE_MAX_ROWS
-    hop = facts.hop and rows <= HOP_MAX_ROWS
-    mka = facts.mka and rows <= MKA_MAX_ROWS
+    hop = facts.hop and (
+        rows <= (HOP_MID_MAX_ROWS if facts.hop_mid else HOP_MAX_ROWS)
+        or (facts.hop_wide and rows <= HOP_WIDE_MAX_ROWS)
+    )
+    mka = facts.mka and rows <= (MKA_WIDE_MAX_ROWS if facts.mka_wide else MKA_MAX_ROWS)
     gdn_verify = facts.gdn_verify and rows <= GDN_VERIFY_MAX_ROWS
+    route_topk = facts.route_topk and not route and rows <= ROUTE_TOPK_MAX_ROWS
     return Slots(
         route=route,
-        route_topk=facts.route_topk and not route and rows <= ROUTE_TOPK_MAX_ROWS,
+        route_topk=route_topk,
+        route_gemm=route_topk and facts.route_gemm and rows <= ROUTE_GEMM_MAX_ROWS,
         mkm=route
         and facts.mkm
         and rows <= (MKM_WIDE_MAX_ROWS if facts.mkm_wide else MKM_MAX_ROWS),
@@ -125,7 +147,8 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         gdn_front=gdn_verify
         and facts.gdn_pdl
         and facts.gdn_front
-        and rows == GDN_FRONT_ROWS,
+        and rows % GDN_FRONT_ROWS == 0
+        and rows <= GDN_FRONT_MAX_ROWS,
         route_shared=route and facts.route_shared and rows <= ROUTE_SHARED_ROWS,
         # SKV2 attends one sequence
         skv2=facts.skv2 and rows <= tokens_per_request,

@@ -175,7 +175,7 @@ def test_the_slot_plan_covers_one_request_of_7_rows():
         7: plan.Slots(**both, gdn_push=True)
     }
     assert not plan.slots(7, plan.Facts(gdn_verify=True, gdn_push=True)).gdn_push
-    # gdn_front runs gdn_pdl's verify, for one request of 7 rows only
+    # gdn_front runs gdn_pdl's verify, for requests of 7 rows
     front = dict(gdn_verify=True, gdn_pdl=True, gdn_front=True)
     assert plan.plan((7,), plan.Facts(**front)) == {7: plan.Slots(**front)}
     assert not plan.slots(4, plan.Facts(**front)).gdn_front
@@ -199,17 +199,30 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     )
     # route_topk serves only where route does not
     assert _on(plan.slots(7, every)) == sorted(
-        set(plan.Slots.__struct_fields__) - {"route_topk"}
+        set(plan.Slots.__struct_fields__) - {"route_topk", "route_gemm"}
     )
-    # two requests: the 16-row router front, the GDN chain and the hop's one-shot rows
+    # two requests: the 16-row router front, the GDN chain, the hop's one-shot rows and
+    # MKA's wide entries with their push
     gdn = ["gdn_core", "gdn_pdl", "gdn_verify"]
-    assert _on(plan.slots(14, every)) == sorted(gdn + ["hop", "route"])
-    # four requests: past the router front's and the one-shot all-reduce's rows
-    assert _on(plan.slots(28, every)) == sorted(gdn + ["route_topk"])
-    # eight to 32 requests: the GDN chain (with its one-launch core) and route_topk
-    for rows in (56, 112, 224):
-        assert _on(plan.slots(rows, every)) == sorted(gdn + ["route_topk"])
+    assert _on(plan.slots(14, every)) == sorted(
+        gdn + ["gdn_front", "hop", "mka", "mka_push", "route"]
+    )
+    # four to 32 requests: the GDN chain (with its one-launch core), the two-shot hop,
+    # route_topk and MKA's front path (whose flag mka_push only the wide entries act on),
+    # with the router front's tiles up to its rows
+    for rows in (28, 56, 112, 224):
+        assert _on(plan.slots(rows, every)) == sorted(
+            gdn
+            + ["hop", "mka", "mka_push", "route_topk"]
+            + (["route_gemm"] if rows <= plan.ROUTE_GEMM_MAX_ROWS else [])
+        )
     assert _on(plan.slots(56, plan.Facts(gdn_verify=True))) == ["gdn_verify"]
+    no_wide = plan.Facts(hop=True)
+    assert _on(plan.slots(28, no_wide)) == []
+    # hop_mid: the one-shot hop up to four requests, not past them
+    mid = plan.Facts(hop=True, hop_mid=True)
+    assert _on(plan.slots(28, mid)) == ["hop"]
+    assert _on(plan.slots(56, mid)) == []
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]
     assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]
     # SGLang offers every multiple of 7 up to MAX_ROWS; three requests are not covered
@@ -230,6 +243,10 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     attention = plan.Facts(skv2=True, mka=True, mka_push=True, hop=True)
     assert plan.covered((7, 14, 28), attention, 7) == (7, 14)
     assert _on(plan.slots(14, attention)) == ["hop"]
+    # with its wide entries and front path MKA covers every width
+    wide_attention = plan.Facts(mka=True, mka_wide=True)
+    widths = (7, 14, 28, 56, 112, 224)
+    assert plan.covered(widths, wide_attention, 7) == widths
     # mkm_wide: mkm's 16-token engine at two requests, not past the router front's rows
     wide = plan.Facts(route=True, mkm=True, mkm_wide=True)
     assert _on(plan.slots(14, wide)) == ["mkm", "route"]
@@ -248,11 +265,16 @@ def test_the_slot_plans_row_bounds_are_the_kernels():
 
     assert plan.ROUTE_MAX_ROWS == router.MAX_TOKENS
     assert plan.ROUTE_TOPK_MAX_ROWS == router.TOPK_MAX_ROWS
+    assert plan.ROUTE_GEMM_MAX_ROWS == router.GEMM_MAX_ROWS
     assert plan.ROUTE_SHARED_ROWS == router.SHARED_MAX_M
     assert plan.MKM_MAX_ROWS == mkm.MAX_TOKENS
     assert plan.MKM_WIDE_MAX_ROWS == mkm.M16_MAX_TOKENS
     assert plan.GDN_PUSH_MAX_ROWS == hop.OPROJ_MAX_M
     assert plan.MKA_MAX_ROWS == mka.MAX_ROWS
+    from sgl_nvidia_mega.qwen3_5.attention import mka as mka_step
+
+    assert plan.MKA_WIDE_MAX_ROWS == plan.MAX_ROWS
+    assert mka_step.FUSED_MAX_ROWS <= mka.WIDE_MAX_ROWS
 
 
 def test_a_numeric_slot_turns_the_claim_into_its_tolerances():

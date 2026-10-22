@@ -98,6 +98,9 @@ def build(model, ctx) -> route.Bound:
 
         router.build_topk(torch.cuda.current_device())
         bound = msgspec.structs.replace(bound, topk=True)
+        if "route_gemm" in SLOTS:
+            router.build(torch.cuda.current_device(), router.MAX_TOKENS)
+            bound = msgspec.structs.replace(bound, gemm=True)
     return bound
 
 
@@ -192,7 +195,7 @@ def _router_experts(mlp, x, defer: bool, st):
     if defer and st.slots.route:
         return route.routed(mlp, x, st.bound["moe"] if st.slots.mkm else None)
     if defer and st.slots.route_topk:
-        return route.routed_topk(mlp, x)
+        return route.routed_topk(mlp, x, gemm=st.slots.route_gemm)
     router_logits, _ = mlp.gate(x)
     topk_output = mlp.topk(x, router_logits)
     if defer:

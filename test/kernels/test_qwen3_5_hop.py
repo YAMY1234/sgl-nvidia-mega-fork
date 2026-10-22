@@ -27,6 +27,9 @@ from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import publish_build_topology
 
 HIDDEN, TOP_K, EPS, MAX_M = 4096, 10, 1e-6, 15
+# the one-shot mailbox's rows with the two-shot hop built (the finalize's one-shot rows), and
+# the two-shot hop's
+ONE_SHOT_M, WIDE_M = 23, 224
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10),
@@ -72,13 +75,20 @@ def pair(rank):
         fusion = FlashInferMNNVLCuteDSLARFusion(
             hidden_size=HIDDEN,
             top_k=TOP_K,
-            max_m=MAX_M + 1,
+            max_m=WIDE_M + 1,
             rms_epsilon=EPS,
             weight_bias=0.0,
             process_group=group,
             device=device,
         )
-    hop = Hop(max_m=MAX_M, eps=EPS, group=group, device=device, deadline_s=30.0)
+    hop = Hop(
+        max_m=ONE_SHOT_M,
+        eps=EPS,
+        group=group,
+        device=device,
+        deadline_s=30.0,
+        wide_max_m=WIDE_M,
+    )
     return fusion, hop
 
 
@@ -150,6 +160,62 @@ def test_hop_matches_flashinfer_fusion(rank, pair):
             if quantize:
                 fp8, _ = static_quant_fp8(want[0], scale, repeat_scale=False)
                 assert torch.equal(got[2].view(torch.uint8), fp8.view(torch.uint8))
+        torch.cuda.synchronize()
+
+
+def test_two_shot_hop_matches_flashinfer_fusion(rank, pair):
+    """Past the one-shot rows the hop runs FlashInfer's BT protocol in one launch: the
+    all-reduce past 15 rows and the finalize past 23, bit for bit (the finalize's 16-23 rows
+    stay one-shot, as FlashInfer's LL route), over the three stages, a late rank in turn,
+    with and without the static FP8 output."""
+    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+
+    fusion, hop = pair
+    world = ps.get_tp_group().world_size
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    scale = torch.tensor([0.05], device=device)
+    rows = (16, 21, 23, 24, 28, 56, 57, 112, 224)
+    calls = [(op, m) for m in rows for op in ("all_reduce", "finalize")]
+    with torch.inference_mode():
+        for i, (op, m) in enumerate(calls):
+            x = _operands(m, device, rank, seed=500 + i)
+            want = _run(fusion, op, x)
+            if i % (world + 1) == rank:
+                torch.cuda._sleep(2_000_000)  # this rank publishes late
+            quantize = i % 3 == 0
+            got = _run(hop, op, x, fp8_scale=scale if quantize else None)
+            _same(got[:2], want)
+            if quantize:
+                fp8, _ = static_quant_fp8(want[0], scale, repeat_scale=False)
+                assert torch.equal(got[2].view(torch.uint8), fp8.view(torch.uint8))
+        torch.cuda.synchronize()
+
+
+def test_two_shot_hop_replays_from_a_cuda_graph(rank, pair):
+    fusion, hop = pair
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    # one-shot and two-shot hops interleaved, more than the mailboxes' stages
+    shape = (("all_reduce", 56), ("finalize", 56), ("all_reduce", 7), ("finalize", 112))
+    shape += (("all_reduce", 28), ("finalize", 14))
+    with torch.inference_mode():
+        static = [_operands(m, device, rank, seed=700 + i) for i, (_, m) in enumerate(shape)]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for (op, _), x in zip(shape, static):
+                _run(hop, op, x)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = [_run(hop, op, x) for (op, _), x in zip(shape, static)]
+        for replay in range(3):
+            for i, ((_, m), x) in enumerate(zip(shape, static)):
+                fresh = _operands(m, device, rank, seed=800 + 10 * replay + i)
+                for name, tensor in x.items():
+                    tensor.copy_(fresh[name])
+            graph.replay()
+            for (op, _), x, got in zip(shape, static, outputs):
+                _same(got, _run(fusion, op, x))
         torch.cuda.synchronize()
 
 

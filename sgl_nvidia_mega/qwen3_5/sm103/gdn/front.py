@@ -27,6 +27,8 @@ from sgl_nvidia_mega.common import jit
 
 SOURCE = Path(__file__).parent / "src" / "front.cu"
 ROWS, HIDDEN, QKVZ, CONV, BA = 7, 4096, 2560, 1536, 16
+MAX_REQUESTS = 4  # requests of ROWS rows a launch serves (kMaxRequests)
+INBOX_BYTES = 8 * 256 * 4  # one request's split-K inbox of a projection CTA (kInboxBytes)
 THREADS, CLUSTER, CTAS = (
     256,
     8,
@@ -126,9 +128,27 @@ def _kernel(device_index: int, tma: bool = True) -> jit.Kernel:
     return jit.load(cubin, "q35_gdn_front", (THREADS, 1, 1), 0)
 
 
+@cache
+def _multi_kernel(device_index: int) -> jit.Kernel:
+    major, minor = torch.cuda.get_device_capability(device_index)
+    cubin = jit.compile_source(
+        SOURCE.read_text(),
+        "q35_gdn_front",
+        f"sm_{major}{minor}a",
+        ("-std=c++17", "-default-device"),
+    )
+    return jit.load(
+        cubin,
+        "q35_gdn_front_multi",
+        (THREADS, 1, 1),
+        WEIGHT_BYTES + MAX_REQUESTS * INBOX_BYTES,
+    )
+
+
 def build(device_index: int) -> None:
     """Compile the front (no compile inside a step)."""
     _kernel(device_index, True)
+    _multi_kernel(device_index)
 
 
 def _prefetch(t: torch.Tensor, ring: int):
@@ -170,23 +190,30 @@ def front(
     pad_slot: int = -1,
     tma: bool = True,
 ) -> None:
-    """The front of the BF16 rows ``x`` [7, 4096] (contiguous) into the caller's
-    buffers: ``projected`` [7, 2560] BF16 (q / k / v / z), ``conv_out`` [7, 1536] BF16,
-    ``ba_out`` [7, 16] BF16 (b then a), and the conv update of ``conv_state``
-    [slots, 1536, 3] and ``windows`` [slots, 7, 1536, 3] (strides [s, 1, 9, 1]) at
-    ``state_indices[0]`` / ``replay_indices[0]`` (one int32 / int64 each; a state index
-    of ``pad_slot`` skips the conv writes). ``error`` is an int32 word, zero before
-    capture, that a timed-out wait sets before trapping. The ReplaySSM verify's
-    ``checkpoint`` (by state index) and ``history_*`` rings (by ``ring_indices[0]``) are
-    prefetched into L2: a hint, nothing is written. ``tma`` False takes the weights by
-    register loads instead of the bulk copy (same values)."""
+    """The front of the BF16 rows ``x`` [R * 7, 4096] (contiguous; R requests of 7 rows,
+    R <= MAX_REQUESTS) into the caller's buffers: ``projected`` [R * 7, 2560] BF16
+    (q / k / v / z), ``conv_out`` [R * 7, 1536] BF16, ``ba_out`` [R * 7, 16] BF16 (b then
+    a), and the conv update of ``conv_state`` [slots, 1536, 3] and ``windows``
+    [slots, 7, 1536, 3] (strides [s, 1, 9, 1]) at request r's ``state_indices[r]`` /
+    ``replay_indices[r]`` (int32 / int64; a state index of ``pad_slot`` skips that
+    request's conv writes). Every request's arithmetic is the one-request front's; past
+    one request a launch reads the weights once (10 projection clusters for all the
+    requests, a side-projection cluster a request).
+    ``error`` is an int32 word, zero before capture, that a timed-out wait sets before
+    trapping. The ReplaySSM verify's ``checkpoint`` (by state index) and ``history_*``
+    rings (by ``ring_indices[r]``) are prefetched into L2: a hint, nothing is written.
+    ``tma`` False takes the weights by register loads instead of the bulk copy (same
+    values)."""
+    requests = x.shape[0] // ROWS
     if (
         x.dtype != torch.bfloat16
-        or tuple(x.shape) != (ROWS, HIDDEN)
+        or tuple(x.shape) != (requests * ROWS, HIDDEN)
+        or not 1 <= requests <= MAX_REQUESTS
         or not x.is_contiguous()
     ):
         raise ValueError(
-            f"the GDN front takes BF16 [7, 4096] rows, not {x.dtype} {tuple(x.shape)}"
+            f"the GDN front takes BF16 [R * 7, 4096] rows (R <= {MAX_REQUESTS}), not "
+            f"{x.dtype} {tuple(x.shape)}"
         )
     if windows.stride()[1:] != (1, 9, 1) or windows.stride(0) < CONV * 9:
         raise ValueError(f"windows {tuple(windows.stride())} are not deduplicated")
@@ -237,10 +264,16 @@ def front(
     )
     p.state_stride[:] = list(conv_state.stride())
     p.window_stride[:] = [windows.stride(0), 9]
+    if requests == 1:
+        kernel, grid, args = _kernel(x.device.index, tma), (CTAS, 1, 1), [p]
+    else:
+        kernel = _multi_kernel(x.device.index)
+        grid = (CTAS - CLUSTER + CLUSTER * requests, 1, 1)
+        args = [p, ctypes.c_int(requests)]
     jit.launch(
-        _kernel(x.device.index, tma),
-        (CTAS, 1, 1),
-        [p],
+        kernel,
+        grid,
+        args,
         torch.cuda.current_stream(x.device).cuda_stream,
         (CLUSTER, 1, 1),
     )

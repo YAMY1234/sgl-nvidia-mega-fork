@@ -3,7 +3,7 @@
 # Adapted from python/sglang/srt/models/qwen3_5.py (Qwen3_5GatedDeltaNet._try_fused_verify)
 # of SGLang branch nvidia/qwen35-agentx-gb300 and SGLang's
 # python/sglang/srt/layers/attention/linear/gdn_backend.py (GDNAttnBackend.forward_extend).
-"""Slot ``gdn_front`` (numeric): slot gdn_verify's step for one request of 7 rows with
+"""Slot ``gdn_front`` (numeric): slot gdn_verify's step for requests of 7 rows with
 the fused GDN front of SGLang branch nvidia/qwen35-agentx-gb300 (SGLANG_Q35MF_MKG_FUSED +
 MKG_BA_TC + MKM_GDN_FRONT):
 
@@ -190,9 +190,9 @@ def build(model, gdns) -> dict:
 
 
 def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
-    """``Qwen3_5GatedDeltaNet.forward`` of a target-verify step of 7 rows on the front:
-    the TP-partial output [7, hidden] of the normed BF16 rows x; ``opts`` is slot
-    gdn_verify's (the verify's tiles, and ``push`` for slot gdn_push)."""
+    """``Qwen3_5GatedDeltaNet.forward`` of a target-verify step of requests of 7 rows on
+    the front: the TP-partial output [rows, hidden] of the normed BF16 rows x; ``opts``
+    is slot gdn_verify's (the verify's tiles, and ``push`` for slot gdn_push)."""
     from sgl_nvidia_mega.qwen3_5.gdn import replayssm
     from sgl_nvidia_mega.qwen3_5.gdn.front_norm import norm
     from sgl_nvidia_mega.qwen3_5.gdn.verify import _out_proj
@@ -206,9 +206,11 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
     attn, bound = gdn.attn, st.bound["gdn"]
     meta, pools = st.view.gdn, st.view.mamba
     li = pools.layer_ids.index(attn.layer_id)
-    projected = x.new_empty((ROWS, 2560))
-    conv = x.new_empty((ROWS, CONV_CHANNELS))
-    ba = x.new_empty((ROWS, 16))
+    rows = x.shape[0]
+    requests = rows // ROWS
+    projected = x.new_empty((rows, 2560))
+    conv = x.new_empty((rows, CONV_CHANNELS))
+    ba = x.new_empty((rows, 16))
     front.front(
         x,
         bound.front[attn.layer_id],
@@ -217,8 +219,8 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
         attn.conv_weights,
         pools.conv[0][li],
         pools.intermediate_conv_window[0][li],
-        meta.state_indices[:1],
-        meta.intermediate_indices[:1],
+        meta.state_indices[:requests],
+        meta.intermediate_indices[:requests],
         projected,
         conv,
         bound.error,
@@ -228,7 +230,7 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
         history_d=pools.ring_d[li],
         history_k=pools.ring_k[li],
         history_g=pools.ring_g[li],
-        ring_indices=st.fb.req_pool_indices[:1],
+        ring_indices=st.fb.req_pool_indices[:requests],
         pad_slot=meta.pad_slot_id,
     )
     if opts.core:
@@ -238,7 +240,7 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
         return _fused(
             gdn,
             conv,
-            projected[:, CONV_CHANNELS:].view(ROWS, attn.num_v_heads, attn.head_v_dim),
+            projected[:, CONV_CHANNELS:].view(rows, attn.num_v_heads, attn.head_v_dim),
             ba[:, 8:],
             ba[:, :8],
             st,
@@ -248,16 +250,16 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
     H, K = attn.num_k_heads, attn.head_k_dim
     HV, V = attn.num_v_heads, attn.head_v_dim
     d_cache = pools.ring_d[li]
-    core = query.new_empty(ROWS, HV, V)
+    core = query.new_empty(rows, HV, V)
 
     def ring(t):
         return None if t is None else t[li]
 
     # b / a in the front's b8 / a8 order
     replayssm.verify(
-        query.reshape(ROWS, H, K),
-        key.reshape(ROWS, H, K),
-        value.reshape(ROWS, HV, V),
+        query.reshape(rows, H, K),
+        key.reshape(rows, H, K),
+        value.reshape(rows, HV, V),
         ba[:, 8:],
         ba[:, :8],
         attn.A_log,
@@ -285,18 +287,18 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
         pdl=True,
         wait_for_gate_producer=True,
     )
-    quant = torch.empty((ROWS * HV, V), dtype=torch.float8_e4m3fn, device=x.device)
-    rstd = torch.empty((ROWS * HV,), dtype=torch.float32, device=x.device)
+    quant = torch.empty((rows * HV, V), dtype=torch.float8_e4m3fn, device=x.device)
+    rstd = torch.empty((rows * HV,), dtype=torch.float32, device=x.device)
     norm(
-        core.view(ROWS * HV, V),
-        projected[:, CONV_CHANNELS:].view(ROWS, HV, V),
+        core.view(rows * HV, V),
+        projected[:, CONV_CHANNELS:].view(rows, HV, V),
         gdn.norm.weight,
         gdn.out_proj.input_scale,
         quant,
         rstd,
         gdn.norm.eps,
     )
-    x_fp8 = quant.view(ROWS, HV * V)
+    x_fp8 = quant.view(rows, HV * V)
     if opts.push:
         return st.bound["boundary"].hop.out_proj_push(
             x_fp8=x_fp8,

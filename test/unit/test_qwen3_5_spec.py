@@ -148,6 +148,11 @@ def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
             {"route", "mkm", "mkm_wide"},
             "slot 'mkm_wide' serves the steps of more than one request ('multi_request')",
         ),
+        ({"mkm_m32"}, "slot 'mkm_m32' takes slot 'route_topk''s rows"),
+        (
+            {"route_topk", "mkm_m32"},
+            "slot 'mkm_m32' serves the steps of more than two requests ('multi_request')",
+        ),
     ],
 )
 def test_a_slot_set_that_cannot_run_is_refused_before_the_load(
@@ -197,9 +202,9 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     every = plan.Facts(
         **{**dict.fromkeys(plan.Facts.__struct_fields__, True), "mkm_wide": False}
     )
-    # route_topk serves only where route does not
+    # route_topk (and mkm_m32 in its place) serves only where route does not
     assert _on(plan.slots(7, every)) == sorted(
-        set(plan.Slots.__struct_fields__) - {"route_topk", "route_gemm"}
+        set(plan.Slots.__struct_fields__) - {"route_topk", "route_gemm", "mkm_m32"}
     )
     # two requests: the 16-row router front, the GDN chain, the hop's one-shot rows and
     # MKA's wide entries with their push
@@ -209,12 +214,13 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     )
     # four to 32 requests: the GDN chain (with its one-launch core), the two-shot hop,
     # route_topk and MKA's front path (whose flag mka_push only the wide entries act on),
-    # with the router front's tiles up to its rows
+    # with the router front's tiles and mkm's 32-token engine up to their rows
     for rows in (28, 56, 112, 224):
         assert _on(plan.slots(rows, every)) == sorted(
             gdn
             + ["hop", "mka", "mka_push", "route_topk"]
             + (["route_gemm"] if rows <= plan.ROUTE_GEMM_MAX_ROWS else [])
+            + (["mkm_m32"] if rows <= plan.MKM_M32_MAX_ROWS else [])
         )
     assert _on(plan.slots(56, plan.Facts(gdn_verify=True))) == ["gdn_verify"]
     no_wide = plan.Facts(hop=True)
@@ -252,6 +258,12 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(14, wide)) == ["mkm", "route"]
     assert _on(plan.slots(28, wide)) == []
     assert _on(plan.slots(14, plan.Facts(route=True, mkm=True))) == ["route"]
+    # mkm_m32: mkm's 32-token engine in route_topk's place at 17 to 32 rows only
+    m32 = plan.Facts(route_topk=True, mkm_m32=True)
+    assert _on(plan.slots(28, m32)) == ["mkm_m32", "route_topk"]
+    assert _on(plan.slots(14, m32)) == ["route_topk"]
+    assert _on(plan.slots(56, m32)) == ["route_topk"]
+    assert _on(plan.slots(28, plan.Facts(mkm_m32=True))) == []
     # the router front and the hop's mailbox are built for the widest width they serve
     assert plan.widest((7, 14, 28), plan.ROUTE_MAX_ROWS) == 14
     assert plan.widest((7, 14, 28), plan.HOP_MAX_ROWS) == 14
@@ -269,6 +281,7 @@ def test_the_slot_plans_row_bounds_are_the_kernels():
     assert plan.ROUTE_SHARED_ROWS == router.SHARED_MAX_M
     assert plan.MKM_MAX_ROWS == mkm.MAX_TOKENS
     assert plan.MKM_WIDE_MAX_ROWS == mkm.M16_MAX_TOKENS
+    assert plan.MKM_M32_MAX_ROWS == mkm.M32_MAX_TOKENS
     assert plan.GDN_PUSH_MAX_ROWS == hop.OPROJ_MAX_M
     assert plan.MKA_MAX_ROWS == mka.MAX_ROWS
     from sgl_nvidia_mega.qwen3_5.attention import mka as mka_step

@@ -10,7 +10,9 @@ runs there. ``route`` (the router GEMM and the routed experts' NVFP4 input in on
 runs up to 16 rows, ``route_topk`` (behind SGLang's router GEMM: the top-10 and the NVFP4
 input in one launch, then the routed experts on that routing) wherever ``route`` does
 not, up to 224, ``mkm`` (on its outputs, the top-10 and both expert GEMMs in one launch)
-up to 7, and with ``mkm_wide`` (its 16-token engine) up to 16. ``gdn_verify`` (the
+up to 7, and with ``mkm_wide`` (its 16-token engine) up to 16; ``mkm_m32`` (its 32-token
+engine, on route_topk's widths: the top-10 and both expert GEMMs in one launch on the
+router GEMM's logits and the NVFP4 input) runs 17 to 32 rows. ``gdn_verify`` (the
 GatedDeltaNet verify chain with its launch choices changed) covers every width, with
 ``gdn_core`` (numeric: its ReplaySSM verify, gated norm and FP8 output in one launch), and ``hop`` (the boundary's fused all-reduce points on the decode hop) the
 widths where FlashInfer's low-latency kernels, which it equals bit for bit, run, and with
@@ -53,6 +55,8 @@ GDN_VERIFY_MAX_ROWS = 224  # the widths its kernels are checked at: up to 32 req
 GDN_CORE_MAX_ROWS = 224  # and gdn_core's launch
 MKM_MAX_ROWS = 7
 MKM_WIDE_MAX_ROWS = 16
+# slot mkm_m32: the 32-token engine past the 16-token one, on route_topk's widths
+MKM_M32_MAX_ROWS = 32
 HOP_MAX_ROWS = 15
 # with hop_wide: the two-shot hop past the one-shot rows (FlashInfer's BT routes, bit for bit)
 HOP_WIDE_MAX_ROWS = 224
@@ -76,6 +80,8 @@ class Slots(msgspec.Struct, frozen=True):
     mkm: bool = (
         False  # top-10 + FC1 + SwiGLU + FC2 on route's outputs (sm103/moe/mkm.py)
     )
+    # in route_topk's place: the 32-token engine on the router GEMM's logits (moe/route.py)
+    mkm_m32: bool = False
     gdn_verify: bool = False  # the GDN verify chain's launch choices (gdn/verify.py)
     gdn_pdl: bool = False  # its ReplaySSM verify launched dependent on the conv
     # its ReplaySSM verify, gated norm and FP8 output in one launch (sm103/gdn/core.py)
@@ -101,6 +107,7 @@ class Facts(msgspec.Struct, frozen=True):
     route_gemm: bool = False  # and the router front's tiles
     mkm: bool = False  # the fused routed experts built for every MoE layer
     mkm_wide: bool = False  # with their 16-token engine
+    mkm_m32: bool = False  # the 32-token engine built for every MoE layer
     gdn_verify: bool = False  # the GDN verify slot built for every GDN layer
     gdn_pdl: bool = False  # with its dependent verify launch
     gdn_core: bool = False  # with the one-launch verify core
@@ -136,6 +143,9 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         mkm=route
         and facts.mkm
         and rows <= (MKM_WIDE_MAX_ROWS if facts.mkm_wide else MKM_MAX_ROWS),
+        mkm_m32=route_topk
+        and facts.mkm_m32
+        and MKM_WIDE_MAX_ROWS < rows <= MKM_M32_MAX_ROWS,
         gdn_verify=gdn_verify,
         gdn_pdl=gdn_verify and facts.gdn_pdl,
         gdn_core=gdn_verify and facts.gdn_core and rows <= GDN_CORE_MAX_ROWS,

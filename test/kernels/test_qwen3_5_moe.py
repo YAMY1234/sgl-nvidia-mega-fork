@@ -9,8 +9,8 @@ replayed from a CUDA graph:
   SGLang serves Qwen3.5 at TP8 and TP4 (intermediate 128 / 256 a rank; routing from the
   logits, RenormalizeNaive, deferred finalize): each token's 10 expert rows and their
   weights, at 1, 4 and 7 rows (the 2-CTA engines) and at TP8 also 8, 14 and 16 rows (the
-  16-token engine), also with every token routed to the same experts; graph replay of
-  both;
+  16-token engine) and 17, 21, 28 and 32 rows (the 32-token engine), also with every
+  token routed to the same experts; graph replay of each;
 - the router front with the shared gate/up stage (slot route_shared, numeric): its
   logits and NVFP4 input bit for bit the plain launch's, and its gate/up rows against
   fp64 on SGLang's static FP8 quantization of the rows, at most 1.05 x the mean relative
@@ -166,12 +166,12 @@ def _stock(layer, logits, x_fp4, x_sf):
     return rows[permuted.reshape(-1).long()[: m * TOP_K]], weights
 
 
-@pytest.mark.parametrize("m", [1, 4, 7, 8, 14, 16])
+@pytest.mark.parametrize("m", [1, 4, 7, 8, 14, 16, 17, 21, 28, 32])
 @pytest.mark.parametrize("seed", [0, 1])
 @pytest.mark.parametrize("shared_route", [False, True])
 def test_mkm_is_the_trtllm_routed_experts(layer, m, seed, shared_route):
-    if m > mkm.max_tokens(layer["inter"]):
-        pytest.skip("no 16-token engine at this intermediate")
+    if m > mkm.max_tokens(layer["inter"], m32=True):
+        pytest.skip("no engine for these rows at this intermediate")
     logits, x_fp4, x_sf = _inputs(m, seed)
     if shared_route:
         # every token routes to the same 10 experts: one slot computes each for all rows
@@ -184,10 +184,10 @@ def test_mkm_is_the_trtllm_routed_experts(layer, m, seed, shared_route):
     assert not differ.any(), f"rows {differ.nonzero().flatten().tolist()} differ"
 
 
-@pytest.mark.parametrize("m", [7, 14])
+@pytest.mark.parametrize("m", [7, 14, 28])
 def test_mkm_replays_from_a_cuda_graph(layer, m):
-    if m > mkm.max_tokens(layer["inter"]):
-        pytest.skip("no 16-token engine at this intermediate")
+    if m > mkm.max_tokens(layer["inter"], m32=True):
+        pytest.skip("no engine for these rows at this intermediate")
     logits, x_fp4, x_sf = _inputs(m, 2)
     eager = _fused(layer, logits, x_fp4, x_sf)
     graph = torch.cuda.CUDAGraph()

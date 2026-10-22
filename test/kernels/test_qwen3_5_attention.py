@@ -444,3 +444,59 @@ def test_front_with_the_cache_write_replays_in_a_cuda_graph_bit_for_bit():
         assert _bits(a, b)
     for a, b in zip(eager[2:], pools):
         assert _bits(a[rows], b[rows])
+
+
+@pytest.mark.parametrize("rows", [7, 14, 28, 56, 112])
+def test_front_with_the_cache_write_is_sglangs_front_then_fp8_kv_write(rows):
+    """The front with its FP8 KV write (one launch) gives the bytes of SGLang's front
+    followed by its fused FP8 q / k / v + KV write, at every covered width."""
+    from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+        fused_qk_gemma_rmsnorm_rope_gate as sglang_front,
+    )
+    from sglang.kernels.ops.kvcache.fused_fp8_qkv_kv_cache import (
+        fused_fp8_qkv_kv_cache,
+    )
+
+    from sgl_nvidia_mega.qwen3_5.sm103.draft.front import (
+        fused_qk_gemma_rmsnorm_rope_gate,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(300 + rows)
+    args, axis, v, pools, loc = _front_operands(rows, g, slots=64 * 32)
+    scales = [torch.full((1,), s, device="cuda") for s in (0.8, 1.3)]
+    want_pools = tuple(p.clone() for p in pools)
+    q, k, gate = sglang_front(*args, has_gate=True, mrope_axis_map=axis)
+    q8 = fused_fp8_qkv_kv_cache(
+        q.reshape(rows, -1), k.reshape(rows, -1), v, *want_pools, loc, *scales
+    )
+    got8, _, got_gate = fused_qk_gemma_rmsnorm_rope_gate(
+        *args,
+        has_gate=True,
+        mrope_axis_map=axis,
+        v=v,
+        kv_cache=pools,
+        cache_loc=loc,
+        k_scale=scales[0],
+        v_scale=scales[1],
+    )
+    torch.cuda.synchronize()
+    assert _bits(q8.reshape(rows, -1), got8.reshape(rows, -1))
+    assert _bits(gate.reshape(rows, -1), got_gate.reshape(rows, -1))
+    rows_written = loc.long()
+    for a, b in zip(want_pools, pools):
+        assert _bits(a[rows_written], b[rows_written])
+
+
+@pytest.mark.parametrize("rows", [7, 14, 28, 56, 112])
+def test_gate_quant_is_sglangs_sigmoid_mul_then_static_quant(rows):
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.gate_quant import gate_quant
+
+    g = torch.Generator(device="cuda").manual_seed(400 + rows)
+    attn = (torch.randn(rows, HEADS * DIM, device="cuda", generator=g) * 4).bfloat16()
+    gate = (torch.randn(rows, HEADS * DIM, device="cuda", generator=g) * 3).bfloat16()
+    scale = torch.full((1,), 0.013, device="cuda")
+    want, _ = static_quant_fp8(fused_sigmoid_mul(attn, gate), scale)
+    assert _bits(want, gate_quant(attn, gate, scale))

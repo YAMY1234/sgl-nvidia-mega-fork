@@ -20,8 +20,9 @@ gdn_pdl's verify) covers one request of 7 rows, ``route_shared`` (numeric: the s
 expert's gate/up in route's launch) up to 8 rows. ``skv2`` runs the full attention's core
 of one request through the split-KV attention of SGLang branch
 nvidia/qwen35-agentx-gb300, ``mka`` the fused attention prologue and epilogue around it
-(up to 8 rows; with four query heads a rank, its wide entries up to 112), and
-``mka_push`` (with ``hop``) has the epilogue push its rows into the hop.
+(up to 8 rows; with four query heads a rank, its wide entries up to 14 rows and past
+them its front path, bit for bit SGLang's, at every width), and ``mka_push`` (with
+``hop``) has the epilogue push its rows into the hop.
 """
 
 from __future__ import annotations
@@ -52,7 +53,8 @@ GDN_PUSH_MAX_ROWS = 8
 # the rows slot route_shared's shared stage fits shared memory for
 ROUTE_SHARED_ROWS = 8
 MKA_MAX_ROWS = 8
-MKA_WIDE_MAX_ROWS = 112  # sm103/attention/mka.py WIDE_MAX_ROWS (four query heads a rank)
+# with four query heads a rank: the wide entries, then the front path (attention/mka.py)
+MKA_WIDE_MAX_ROWS = MAX_ROWS
 
 
 class Slots(msgspec.Struct, frozen=True):

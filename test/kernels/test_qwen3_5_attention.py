@@ -446,7 +446,7 @@ def test_front_with_the_cache_write_replays_in_a_cuda_graph_bit_for_bit():
         assert _bits(a[rows], b[rows])
 
 
-@pytest.mark.parametrize("rows", [7, 14, 28, 56, 112])
+@pytest.mark.parametrize("rows", [7, 14, 28, 56, 112, 224])
 def test_front_with_the_cache_write_is_sglangs_front_then_fp8_kv_write(rows):
     """The front with its FP8 KV write (one launch) gives the bytes of SGLang's front
     followed by its fused FP8 q / k / v + KV write, at every covered width."""
@@ -487,7 +487,7 @@ def test_front_with_the_cache_write_is_sglangs_front_then_fp8_kv_write(rows):
         assert _bits(a[rows_written], b[rows_written])
 
 
-@pytest.mark.parametrize("rows", [7, 14, 28, 56, 112])
+@pytest.mark.parametrize("rows", [7, 14, 28, 56, 112, 224])
 def test_gate_quant_is_sglangs_sigmoid_mul_then_static_quant(rows):
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
     from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8

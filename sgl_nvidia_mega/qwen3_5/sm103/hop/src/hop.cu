@@ -46,7 +46,6 @@ struct Args {
 constexpr int kMaxTopK = 16;
 
 struct Site2;
-__device__ __forceinline__ Hop hop_enter_two(const Site2& s);
 __device__ __forceinline__ void hop_leave_two(const Site2& s, const Hop& h, uint32_t participants);
 
 __device__ __forceinline__ uint4 ld_v4(const void* p) { return *static_cast<const uint4*>(p); }
@@ -352,9 +351,14 @@ __device__ __forceinline__ void two_shot_kernel(const Args2& a) {
   float gam[8];
   unpack8(ld_v4(a.gamma + static_cast<size_t>(frag) * kVec), gam);
   const float inv_s = a.fp8_out != nullptr ? inv_scale_of(*a.fp8_scale) : 1.f;
-  row_init(rs);  // also orders the staged routing before its reads
   pdl_wait();
-  const Hop h = hop_enter_two(a.site);
+  // every CTA reads the stage, then the cluster barrier; only cluster rank 0 takes a ticket, so the last ticket
+  // (the one that advances the stage) comes after every CTA of every cluster read it
+  Hop h;
+  h.stage = ld_volatile_u32(&a.site.ctrl->stage);
+  h.seq = ld_volatile_u32(&a.site.ctrl->seq);
+  row_init(rs);  // also orders the staged routing before its reads
+  h.ticket = (threadIdx.x == 0 && blockIdx.y == 0) ? atomicAdd(&a.site.ctrl->arrive, 1u) : 0u;
   // 1. publish
   uint4 mine;
   if constexpr (kFin) {
@@ -452,16 +456,9 @@ __device__ __forceinline__ void two_shot_kernel(const Args2& a) {
   if (a.norm_out != nullptr) *reinterpret_cast<uint4*>(a.norm_out + row_elem(token, frag)) = norm;
   if (a.fp8_out != nullptr) *reinterpret_cast<uint2*>(a.fp8_out + row_elem(token, frag)) = quant_fp8(norm, inv_s);
   st_v4(pre_uc, make_uint4(kNegZeroPair, kNegZeroPair, kNegZeroPair, kNegZeroPair));
-  hop_leave_two(a.site, h, gridDim.x * gridDim.y);
+  if (blockIdx.y == 0) hop_leave_two(a.site, h, gridDim.x);
 }
 
-__device__ __forceinline__ Hop hop_enter_two(const Site2& s) {
-  Hop h;
-  h.stage = ld_volatile_u32(&s.ctrl->stage);
-  h.seq = ld_volatile_u32(&s.ctrl->seq);
-  h.ticket = threadIdx.x == 0 ? atomicAdd(&s.ctrl->arrive, 1u) : 0u;
-  return h;
-}
 __device__ __forceinline__ void hop_leave_two(const Site2& s, const Hop& h, uint32_t participants) {
   if (threadIdx.x == 0 && h.ticket == participants - 1) {
     s.ctrl->arrive = 0;

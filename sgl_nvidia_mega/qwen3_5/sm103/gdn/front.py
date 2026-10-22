@@ -27,7 +27,8 @@ from sgl_nvidia_mega.common import jit
 
 SOURCE = Path(__file__).parent / "src" / "front.cu"
 ROWS, HIDDEN, QKVZ, CONV, BA = 7, 4096, 2560, 1536, 16
-MAX_REQUESTS = 16  # requests of ROWS rows a launch serves (grid y)
+MAX_REQUESTS = 8  # requests of ROWS rows a launch serves (kMaxRequests)
+INBOX_BYTES = 8 * 256 * 4  # one request's split-K inbox of a projection CTA (kInboxBytes)
 THREADS, CLUSTER, CTAS = (
     256,
     8,
@@ -127,9 +128,27 @@ def _kernel(device_index: int, tma: bool = True) -> jit.Kernel:
     return jit.load(cubin, "q35_gdn_front", (THREADS, 1, 1), 0)
 
 
+@cache
+def _multi_kernel(device_index: int) -> jit.Kernel:
+    major, minor = torch.cuda.get_device_capability(device_index)
+    cubin = jit.compile_source(
+        SOURCE.read_text(),
+        "q35_gdn_front",
+        f"sm_{major}{minor}a",
+        ("-std=c++17", "-default-device"),
+    )
+    return jit.load(
+        cubin,
+        "q35_gdn_front_multi",
+        (THREADS, 1, 1),
+        WEIGHT_BYTES + MAX_REQUESTS * INBOX_BYTES,
+    )
+
+
 def build(device_index: int) -> None:
     """Compile the front (no compile inside a step)."""
     _kernel(device_index, True)
+    _multi_kernel(device_index)
 
 
 def _prefetch(t: torch.Tensor, ring: int):
@@ -177,7 +196,9 @@ def front(
     a), and the conv update of ``conv_state`` [slots, 1536, 3] and ``windows``
     [slots, 7, 1536, 3] (strides [s, 1, 9, 1]) at request r's ``state_indices[r]`` /
     ``replay_indices[r]`` (int32 / int64; a state index of ``pad_slot`` skips that
-    request's conv writes). Each request runs the one-request front on its own rows.
+    request's conv writes). Every request's arithmetic is the one-request front's; past
+    one request a launch reads the weights once (10 projection clusters for all the
+    requests, a side-projection cluster a request).
     ``error`` is an int32 word, zero before capture, that a timed-out wait sets before
     trapping. The ReplaySSM verify's ``checkpoint`` (by state index) and ``history_*``
     rings (by ``ring_indices[r]``) are prefetched into L2: a hint, nothing is written.
@@ -243,10 +264,16 @@ def front(
     )
     p.state_stride[:] = list(conv_state.stride())
     p.window_stride[:] = [windows.stride(0), 9]
+    if requests == 1:
+        kernel, grid, args = _kernel(x.device.index, tma), (CTAS, 1, 1), [p]
+    else:
+        kernel = _multi_kernel(x.device.index)
+        grid = (CTAS - CLUSTER + CLUSTER * requests, 1, 1)
+        args = [p, ctypes.c_int(requests)]
     jit.launch(
-        _kernel(x.device.index, tma),
-        (CTAS, requests, 1),
-        [p],
+        kernel,
+        grid,
+        args,
         torch.cuda.current_stream(x.device).cuda_stream,
         (CLUSTER, 1, 1),
     )

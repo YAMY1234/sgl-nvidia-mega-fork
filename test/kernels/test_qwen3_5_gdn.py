@@ -386,23 +386,32 @@ def test_core_is_gdn_verify_numerically(pad, history, bs):
 
 # ------------------------------------------------------------------- slot gdn_front
 
-FRONT_SLOTS = 5
+FRONT_SLOTS = 12
+# the slots of up to eight requests: rolling state, window and ring
+FRONT_STATES, FRONT_WINDOWS, FRONT_RINGS = (
+    (3, 0, 4, 9, 6, 11, 1, 8),
+    (1, 5, 0, 2, 10, 3, 7, 4),
+    (2, 6, 9, 0, 11, 5, 3, 10),
+)
 
 
-def _front_operands(seed, *, pad=False, index_dtype=torch.int32):
-    """One request of 7 rows at TP8: the normed rows, the static FP8 in_proj_qkvz
-    [2560, 4096] with its scales, the BF16 in_proj_ba [16, 4096], the conv weights, the
-    pools (rolling states, deduplicated windows, the verify's checkpoint and ring) and
-    the step's slots."""
+def _front_operands(seed, *, pad=False, index_dtype=torch.int32, requests=1):
+    """``requests`` requests of 7 rows at TP8: the normed rows, the static FP8
+    in_proj_qkvz [2560, 4096] with its scales, the BF16 in_proj_ba [16, 4096], the conv
+    weights, the pools (rolling states, deduplicated windows, the verify's checkpoint
+    and ring) and the step's slots; ``pad`` pads the last request."""
     g = torch.Generator(device="cuda").manual_seed(seed)
 
     def rand(*shape, scale=1.0):
         return torch.randn(*shape, device="cuda", generator=g) * scale
 
     phys = rand(FRONT_SLOTS, D, 9).to(torch.bfloat16)
-    index = lambda i: torch.tensor([i], dtype=index_dtype, device="cuda")  # noqa: E731
+    index = lambda i: torch.tensor(i, dtype=index_dtype, device="cuda")  # noqa: E731
+    states = list(FRONT_STATES[:requests])
+    if pad:
+        states[-1] = -1
     return dict(
-        x=rand(DRAFT, 4096).to(torch.bfloat16),
+        x=rand(requests * DRAFT, 4096).to(torch.bfloat16),
         w=rand(2560, 4096, scale=0.05).clamp(-440, 440).to(torch.float8_e4m3fn),
         sx=torch.tensor([0.01], device="cuda"),
         sw=torch.tensor([0.002], device="cuda"),
@@ -415,9 +424,9 @@ def _front_operands(seed, *, pad=False, index_dtype=torch.int32):
         ring_d=rand(FRONT_SLOTS, HV, 16, V).to(torch.bfloat16),
         ring_k=rand(FRONT_SLOTS, H, 16, K).to(torch.bfloat16),
         ring_g=rand(FRONT_SLOTS, HV, 16),
-        states=index(-1 if pad else 3),
-        inter=index(1),
-        req=index(2),
+        states=index(states),
+        inter=index(FRONT_WINDOWS[:requests]),
+        req=index(FRONT_RINGS[:requests]),
     )
 
 
@@ -448,11 +457,12 @@ def _run_front(o, packed, outs, **kw):
     )
 
 
-def _front_outputs():
+def _front_outputs(requests=1):
+    rows = requests * DRAFT
     return dict(
-        projected=torch.empty(DRAFT, 2560, dtype=torch.bfloat16, device="cuda"),
-        conv=torch.empty(DRAFT, D, dtype=torch.bfloat16, device="cuda"),
-        ba=torch.empty(DRAFT, 16, dtype=torch.bfloat16, device="cuda"),
+        projected=torch.empty(rows, 2560, dtype=torch.bfloat16, device="cuda"),
+        conv=torch.empty(rows, D, dtype=torch.bfloat16, device="cuda"),
+        ba=torch.empty(rows, 16, dtype=torch.bfloat16, device="cuda"),
         error=torch.zeros(1, dtype=torch.int32, device="cuda"),
     )
 
@@ -553,6 +563,41 @@ def test_front_takes_its_weights_by_bulk_copy_with_the_same_bytes(pad):
             got.append({**outs, "state": o["state"].clone(), "phys": o["phys"].clone()})
         for n, t in got[0].items():
             assert torch.equal(t, got[1][n]), n
+
+
+@pytest.mark.parametrize("requests", [2, 4, 8])
+@pytest.mark.parametrize("pad", [False, True])
+def test_front_of_several_requests_is_each_requests_front(requests, pad):
+    """One launch over several requests (grid y) writes every output and pool exactly
+    as one launch per request on that request's rows and slots."""
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front
+
+    o = _front_operands(40 + requests, pad=pad, requests=requests)
+    packed = front.pack(o["w"])
+    start = {n: o[n].clone() for n in ("state", "phys")}
+    outs = _front_outputs(requests)
+    for t in outs.values():  # a padded request leaves its conv rows unwritten
+        t.zero_()
+    _run_front(o, packed, outs)
+    torch.cuda.synchronize()
+    assert outs["error"].item() == 0
+    got = {"state": o["state"].clone(), "phys": o["phys"].clone()}
+    for n, t in start.items():
+        o[n].copy_(t)
+    for r in range(requests):
+        rows = slice(DRAFT * r, DRAFT * (r + 1))
+        one = dict(o, x=o["x"][rows])
+        for n in ("states", "inter", "req"):
+            one[n] = o[n][r : r + 1]
+        part = _front_outputs()
+        for t in part.values():
+            t.zero_()
+        _run_front(one, packed, part)
+        torch.cuda.synchronize()
+        for n in ("projected", "conv", "ba"):
+            assert torch.equal(outs[n][rows], part[n]), (n, r)
+    for n in got:
+        assert torch.equal(got[n], o[n]), n
 
 
 def test_front_replays_from_a_cuda_graph():

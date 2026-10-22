@@ -175,7 +175,7 @@ def test_the_slot_plan_covers_one_request_of_7_rows():
         7: plan.Slots(**both, gdn_push=True)
     }
     assert not plan.slots(7, plan.Facts(gdn_verify=True, gdn_push=True)).gdn_push
-    # gdn_front runs gdn_pdl's verify, for one request of 7 rows only
+    # gdn_front runs gdn_pdl's verify, for requests of 7 rows
     front = dict(gdn_verify=True, gdn_pdl=True, gdn_front=True)
     assert plan.plan((7,), plan.Facts(**front)) == {7: plan.Slots(**front)}
     assert not plan.slots(4, plan.Facts(**front)).gdn_front
@@ -205,13 +205,16 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     # MKA's wide entries with their push
     gdn = ["gdn_core", "gdn_pdl", "gdn_verify"]
     assert _on(plan.slots(14, every)) == sorted(
-        gdn + ["hop", "mka", "mka_push", "route"]
+        gdn + ["gdn_front", "hop", "mka", "mka_push", "route"]
     )
-    # four requests: past the router front's and the one-shot all-reduce's rows
-    assert _on(plan.slots(28, every)) == sorted(gdn + ["mka", "route_topk"])
-    # eight to 32 requests: the GDN chain (with its one-launch core), route_topk and MKA's
+    # four and eight requests: past the router front's and the one-shot all-reduce's rows
+    for rows in (28, 56):
+        assert _on(plan.slots(rows, every)) == sorted(
+            gdn + ["gdn_front", "mka", "route_topk"]
+        )
+    # 16 and 32 requests: the GDN chain (with its one-launch core), route_topk and MKA's
     # front path
-    for rows in (56, 112, 224):
+    for rows in (112, 224):
         assert _on(plan.slots(rows, every)) == sorted(gdn + ["mka", "route_topk"])
     assert _on(plan.slots(56, plan.Facts(gdn_verify=True))) == ["gdn_verify"]
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]

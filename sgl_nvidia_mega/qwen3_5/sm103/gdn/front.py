@@ -27,6 +27,7 @@ from sgl_nvidia_mega.common import jit
 
 SOURCE = Path(__file__).parent / "src" / "front.cu"
 ROWS, HIDDEN, QKVZ, CONV, BA = 7, 4096, 2560, 1536, 16
+MAX_REQUESTS = 16  # requests of ROWS rows a launch serves (grid y)
 THREADS, CLUSTER, CTAS = (
     256,
     8,
@@ -170,23 +171,28 @@ def front(
     pad_slot: int = -1,
     tma: bool = True,
 ) -> None:
-    """The front of the BF16 rows ``x`` [7, 4096] (contiguous) into the caller's
-    buffers: ``projected`` [7, 2560] BF16 (q / k / v / z), ``conv_out`` [7, 1536] BF16,
-    ``ba_out`` [7, 16] BF16 (b then a), and the conv update of ``conv_state``
-    [slots, 1536, 3] and ``windows`` [slots, 7, 1536, 3] (strides [s, 1, 9, 1]) at
-    ``state_indices[0]`` / ``replay_indices[0]`` (one int32 / int64 each; a state index
-    of ``pad_slot`` skips the conv writes). ``error`` is an int32 word, zero before
-    capture, that a timed-out wait sets before trapping. The ReplaySSM verify's
-    ``checkpoint`` (by state index) and ``history_*`` rings (by ``ring_indices[0]``) are
-    prefetched into L2: a hint, nothing is written. ``tma`` False takes the weights by
-    register loads instead of the bulk copy (same values)."""
+    """The front of the BF16 rows ``x`` [R * 7, 4096] (contiguous; R requests of 7 rows,
+    R <= MAX_REQUESTS) into the caller's buffers: ``projected`` [R * 7, 2560] BF16
+    (q / k / v / z), ``conv_out`` [R * 7, 1536] BF16, ``ba_out`` [R * 7, 16] BF16 (b then
+    a), and the conv update of ``conv_state`` [slots, 1536, 3] and ``windows``
+    [slots, 7, 1536, 3] (strides [s, 1, 9, 1]) at request r's ``state_indices[r]`` /
+    ``replay_indices[r]`` (int32 / int64; a state index of ``pad_slot`` skips that
+    request's conv writes). Each request runs the one-request front on its own rows.
+    ``error`` is an int32 word, zero before capture, that a timed-out wait sets before
+    trapping. The ReplaySSM verify's ``checkpoint`` (by state index) and ``history_*``
+    rings (by ``ring_indices[r]``) are prefetched into L2: a hint, nothing is written.
+    ``tma`` False takes the weights by register loads instead of the bulk copy (same
+    values)."""
+    requests = x.shape[0] // ROWS
     if (
         x.dtype != torch.bfloat16
-        or tuple(x.shape) != (ROWS, HIDDEN)
+        or tuple(x.shape) != (requests * ROWS, HIDDEN)
+        or not 1 <= requests <= MAX_REQUESTS
         or not x.is_contiguous()
     ):
         raise ValueError(
-            f"the GDN front takes BF16 [7, 4096] rows, not {x.dtype} {tuple(x.shape)}"
+            f"the GDN front takes BF16 [R * 7, 4096] rows (R <= {MAX_REQUESTS}), not "
+            f"{x.dtype} {tuple(x.shape)}"
         )
     if windows.stride()[1:] != (1, 9, 1) or windows.stride(0) < CONV * 9:
         raise ValueError(f"windows {tuple(windows.stride())} are not deduplicated")
@@ -239,7 +245,7 @@ def front(
     p.window_stride[:] = [windows.stride(0), 9]
     jit.launch(
         _kernel(x.device.index, tma),
-        (CTAS, 1, 1),
+        (CTAS, requests, 1),
         [p],
         torch.cuda.current_stream(x.device).cuda_stream,
         (CLUSTER, 1, 1),

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// The GatedDeltaNet verify front of Qwen3.5 at TP8 for one request of 7 rows, in one launch of 11
-// clusters of 8 CTAs: the static-FP8 in_proj_qkvz projection (BF16 input quantized in-kernel, e4m3
+// The GatedDeltaNet verify front of Qwen3.5 at TP8 for requests of 7 rows, in one launch of 11
+// clusters of 8 CTAs a request (grid y): the static-FP8 in_proj_qkvz projection (BF16 input quantized in-kernel, e4m3
 // tensor-core split-K reduced in fixed cluster-rank order), the causal conv update of its q / k / v
 // channels (output, rolling state, deduplicated intermediate windows), the BF16 in_proj_ba side
 // projection on tensor cores (cluster 10), and an L2 prefetch of the ReplaySSM verify's checkpoint
@@ -99,7 +99,7 @@ __device__ __forceinline__ void mma(float (&d)[4], unsigned a0, unsigned a1,
 template <int Threads = 256>
 __device__ __forceinline__ void ba_cluster_stage(
     const Params& p, int rank, int tid, float* partial, float* inbox,
-    uint64_t* barrier, unsigned* error, uint64_t timeout) {
+    uint64_t* barrier, unsigned* error, uint64_t timeout, int req) {
   static_assert(Threads == 256);
   const int lane = tid & 31, warp = tid >> 5;
   const int group = lane >> 2, pair = 2 * (lane & 3);
@@ -128,7 +128,7 @@ __device__ __forceinline__ void ba_cluster_stage(
   for (int step = 0; step < 8; ++step) {
     unsigned low = 0, high = 0;
     if (group < p.rows) {
-      const auto* row = p.input + group * p.input_stride;
+      const auto* row = p.input + (req * p.rows + group) * p.input_stride;
       const int k = rank * 512 + split * 128 + step * 16 + pair;
       low = *reinterpret_cast<const unsigned*>(row + k);
       high = *reinterpret_cast<const unsigned*>(row + k + 8);
@@ -155,12 +155,12 @@ __device__ __forceinline__ void ba_cluster_stage(
   if (tid == 0) wait(barrier, error, timeout);
   __syncthreads();
   if (rank == 7 && tid < p.prefetches) {
-    const int64_t state = p.state_index64 ? static_cast<const int64_t*>(p.state_indices)[0]
-                                          : static_cast<const int32_t*>(p.state_indices)[0];
+    const int64_t state = p.state_index64 ? static_cast<const int64_t*>(p.state_indices)[req]
+                                          : static_cast<const int32_t*>(p.state_indices)[req];
     if (state != p.pad_slot) {
       const Prefetch f = p.prefetch[tid];
-      const int64_t slot = f.ring ? (p.ring_index64 ? static_cast<const int64_t*>(p.ring_indices)[0]
-                                                    : static_cast<const int32_t*>(p.ring_indices)[0])
+      const int64_t slot = f.ring ? (p.ring_index64 ? static_cast<const int64_t*>(p.ring_indices)[req]
+                                                    : static_cast<const int32_t*>(p.ring_indices)[req])
                                   : state;
       if (slot >= 0) prefetch_l2(f.base + slot * f.slot_stride, f.bytes);
     }
@@ -170,7 +170,7 @@ __device__ __forceinline__ void ba_cluster_stage(
       float value = 0.f;
 #pragma unroll
       for (int source = 0; source < 8; ++source) value = __fadd_rn(value, inbox[source * 256 + tid]);
-      p.output[tid] = __float2bfloat16_rn(value);
+      p.output[req * p.rows * 16 + tid] = __float2bfloat16_rn(value);
     }
     __syncthreads();
     if (tid > 0 && tid < 8)
@@ -321,7 +321,8 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
   extern __shared__ __align__(128) uint4 weight_smem[];  // kWeightBytes when Tma
   __shared__ float conv_stage[32][8];  // per channel: state taps 0..2, weights 3..6
   __shared__ int64_t conv_meta[3];     // valid, state slot, replay slot
-  const int rank = cluster_rank(), unit = blockIdx.x / kCluster;
+  // request blockIdx.y: its 7 rows of every input and output, its slots in the index arrays
+  const int rank = cluster_rank(), unit = blockIdx.x / kCluster, req = blockIdx.y;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int g = lane >> 2, t = lane & 3;
   if constexpr (InlineBa) {
@@ -329,7 +330,7 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
     if (unit == 10) {
       gdn_ba::ba_cluster_stage<kThreads>(p.ba,rank,tid,
           reinterpret_cast<float*>(fragments),reinterpret_cast<float*>(inbox),
-          &barrier,p.error,p.timeout);
+          &barrier,p.error,p.timeout,req);
       return;
     }
   }
@@ -375,10 +376,10 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
   // Both indices are read now (independently) and used only after the projection.
   int64_t conv_slot = 0, conv_replay = 0;
   if (conv_reader) {
-    conv_slot = p.state_index64 ? static_cast<const int64_t*>(p.state_indices)[0]
-                                : static_cast<const int32_t*>(p.state_indices)[0];
-    conv_replay = p.replay_index64 ? static_cast<const int64_t*>(p.replay_indices)[0]
-                                   : static_cast<const int32_t*>(p.replay_indices)[0];
+    conv_slot = p.state_index64 ? static_cast<const int64_t*>(p.state_indices)[req]
+                                : static_cast<const int32_t*>(p.state_indices)[req];
+    conv_replay = p.replay_index64 ? static_cast<const int64_t*>(p.replay_indices)[req]
+                                   : static_cast<const int32_t*>(p.replay_indices)[req];
   }
   const float inverse = div_full(1.0f, sx);
 #pragma unroll
@@ -386,7 +387,7 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
     const int step = 2 * warp + i;
     uint2 value = make_uint2(0u, 0u);
     if (g < p.m) {
-      const int offset = g * 4096 + rank * 512 + step * 32 + 4 * t;
+      const int offset = (req * p.m + g) * 4096 + rank * 512 + step * 32 + 4 * t;
       if constexpr (Quantized) {
         const uint8_t* x = static_cast<const uint8_t*>(p.x) + offset;
         value = make_uint2(*reinterpret_cast<const uint32_t*>(x),
@@ -484,7 +485,7 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
         if (j == 3) rounded = r;
       }
     }
-    p.output[token * 2560 + channel] = rounded;
+    p.output[(req * p.m + token) * 2560 + channel] = rounded;
     if (valid) {
       const int64_t state_base = conv_meta[1] * p.state_stride[0] + channel * p.state_stride[1];
       __nv_bfloat16* window = p.windows + conv_meta[2] * p.window_stride[0] + channel * p.window_stride[1];
@@ -507,7 +508,7 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
       const float exponent = __fmul_rn(accumulator,__int_as_float(0xBFB8AA3B));
       asm("ex2.approx.f32 %0, %1;" : "=f"(exponential) : "f"(exponent));
       const float activated = div_full(accumulator, __fadd_rn(1.f, exponential));
-      p.conv_output[token * 1536 + channel] = __float2bfloat16_rn(activated);
+      p.conv_output[(req * p.m + token) * 1536 + channel] = __float2bfloat16_rn(activated);
       window[token + 2] = rounded;
       if (token == 6) {
         p.conv_state[state_base] = __float2bfloat16_rn(value[1]);
@@ -520,7 +521,7 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
 #pragma unroll
     for (int source = 0; source < kCluster; ++source) sum = __fadd_rn(sum, inbox[source][tid]);
     const int feature = 32 * warp + ((lane >> 2) & 7) + 8 * (lane & 3);
-    p.output[rank * 2560 + unit * 256 + feature] = __float2bfloat16_rn(__fmul_rn(sum, alpha));
+    p.output[(req * p.m + rank) * 2560 + unit * 256 + feature] = __float2bfloat16_rn(__fmul_rn(sum, alpha));
   }
 }
 
@@ -528,7 +529,7 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
 
 }  // namespace sglang
 
-// The verify front of 7 BF16 rows: grid 88 (11 clusters of 8), 256 threads, with PDL.
+// The verify front of requests of 7 BF16 rows: grid (88, requests) (11 clusters of 8 a request), 256 threads, with PDL.
 extern "C" __global__ __launch_bounds__(sglang::gdn_pdl_front_ba_mkm_detail::kThreads, 1) void q35_gdn_front(
     const __grid_constant__ sglang::gdn_pdl_front_ba_mkm_detail::Params p) {
   sglang::gdn_pdl_front_ba_mkm_detail::front_kernel<false, true, true>(p);

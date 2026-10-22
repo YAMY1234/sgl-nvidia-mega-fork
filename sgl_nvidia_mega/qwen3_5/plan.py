@@ -16,7 +16,7 @@ GatedDeltaNet verify chain with its launch choices changed) covers every width, 
 widths where FlashInfer's low-latency kernels, which it equals bit for bit, run.
 ``gdn_push`` (numeric: out_proj as the hop's push GEMM, on gdn_verify's FP8 norm) runs up
 to 8 rows. ``gdn_front`` (numeric: the GDN projections and conv in one launch, then
-gdn_pdl's verify) covers one request of 7 rows, ``route_shared`` (numeric: the shared
+gdn_pdl's verify) covers up to eight requests of 7 rows, ``route_shared`` (numeric: the shared
 expert's gate/up in route's launch) up to 8 rows. ``skv2`` runs the full attention's core
 of one request through the split-KV attention of SGLang branch
 nvidia/qwen35-agentx-gb300, ``mka`` the fused attention prologue and epilogue around it
@@ -37,7 +37,8 @@ REQUESTS = (1, 2, 4, 8, 16, 32)
 MULTI_REQUEST_TP = (8,)
 # the name that requests them in the slot list
 MULTI_REQUEST = "multi_request"
-GDN_FRONT_ROWS = 7  # the rows slot gdn_front's front is built for
+GDN_FRONT_ROWS = 7  # the rows of one request slot gdn_front's front is built for
+GDN_FRONT_MAX_ROWS = 56  # its widest step: eight requests
 # Each slot's widest step: its launcher's bound (sm103/moe/router.py MAX_TOKENS,
 # sm103/moe/mkm.py MAX_TOKENS, sm103/hop OPROJ_MAX_M, sm103/attention/mka.py), and for
 # hop the rows up to which FlashInfer's MNNVL CuTe DSL fusion runs the one-shot
@@ -129,7 +130,8 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         gdn_front=gdn_verify
         and facts.gdn_pdl
         and facts.gdn_front
-        and rows == GDN_FRONT_ROWS,
+        and rows % GDN_FRONT_ROWS == 0
+        and rows <= GDN_FRONT_MAX_ROWS,
         route_shared=route and facts.route_shared and rows <= ROUTE_SHARED_ROWS,
         # SKV2 attends one sequence
         skv2=facts.skv2 and rows <= tokens_per_request,

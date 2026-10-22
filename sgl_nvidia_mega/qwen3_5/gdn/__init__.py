@@ -62,6 +62,7 @@ class Bound(msgspec.Struct, frozen=True):
 
     gdn_verify: bool = False  # slot gdn_verify serves every GDN layer
     gdn_pdl: bool = False  # and launches its verify dependent on the conv
+    gdn_core: bool = False  # and runs its verify, gated norm and FP8 in one launch
     # slot gdn_push: layer id -> out_proj's weights packed for the hop's push GEMM
     packed: dict = msgspec.field(default_factory=dict)
     # slot gdn_front: layer id -> in_proj_qkvz's weights packed for the front
@@ -113,9 +114,24 @@ def build(model, ctx) -> Bound:
                 return Bound(reason=f"gdn_front: layer {i}: {reason}")
         front_packed = front.build(model, gdns)
         error = torch.zeros(1, dtype=torch.int32, device="cuda")
+    core = "gdn_core" in SLOTS
+    if core:
+        import torch
+
+        from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
+
+        attn = gdns[0][1].attn
+        core_kernel.build(
+            torch.cuda.current_device(),
+            ctx.tokens_per_request,
+            attn.num_k_heads,
+            attn.num_v_heads,
+            gdns[0][1].norm.weight.dtype == torch.float32,
+        )
     return Bound(
         gdn_verify=True,
         gdn_pdl="gdn_pdl" in SLOTS,
+        gdn_core=core,
         packed=packed,
         front=front_packed,
         error=error,
@@ -130,6 +146,9 @@ def step(layer, x, st):
         from sgl_nvidia_mega.qwen3_5.gdn import verify
 
         opts = verify.SLOT_PDL if st.slots.gdn_pdl else verify.SLOT
+        if st.slots.gdn_core:
+            opts = msgspec.structs.replace(opts, core=True)
+            verify.engaged("gdn_core", x.shape[0])
         # push only where the MoE input's all-reduce will consume on the hop
         if st.slots.gdn_push and hop.takes_moe_input(
             st.bound["boundary"].hop, layer, st, x.shape[0]

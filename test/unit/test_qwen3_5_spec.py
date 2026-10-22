@@ -202,12 +202,14 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
         set(plan.Slots.__struct_fields__) - {"route_topk"}
     )
     # two requests: the 16-row router front, the GDN chain and the hop's one-shot rows
-    assert _on(plan.slots(14, every)) == ["gdn_pdl", "gdn_verify", "hop", "route"]
+    gdn = ["gdn_core", "gdn_pdl", "gdn_verify"]
+    assert _on(plan.slots(14, every)) == sorted(gdn + ["hop", "route"])
     # four requests: past the router front's and the one-shot all-reduce's rows
-    assert _on(plan.slots(28, every)) == ["gdn_pdl", "gdn_verify", "route_topk"]
-    # eight to 32 requests: the GDN chain and route_topk
+    assert _on(plan.slots(28, every)) == sorted(gdn + ["route_topk"])
+    # eight to 32 requests: the GDN chain (with its one-launch core) and route_topk
     for rows in (56, 112, 224):
-        assert _on(plan.slots(rows, every)) == ["gdn_pdl", "gdn_verify", "route_topk"]
+        assert _on(plan.slots(rows, every)) == sorted(gdn + ["route_topk"])
+    assert _on(plan.slots(56, plan.Facts(gdn_verify=True))) == ["gdn_verify"]
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]
     assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]
     # SGLang offers every multiple of 7 up to MAX_ROWS; three requests are not covered

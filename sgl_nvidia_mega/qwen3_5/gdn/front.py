@@ -240,7 +240,7 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
         return _fused(
             gdn,
             conv,
-            projected[:, CONV_CHANNELS:].view(ROWS, attn.num_v_heads, attn.head_v_dim),
+            projected[:, CONV_CHANNELS:].view(rows, attn.num_v_heads, attn.head_v_dim),
             ba[:, 8:],
             ba[:, :8],
             st,

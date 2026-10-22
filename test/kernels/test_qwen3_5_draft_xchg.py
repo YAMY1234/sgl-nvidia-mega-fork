@@ -11,7 +11,10 @@ SM100-family GPUs (GB300) with NVLink multicast, against torch on the same input
 - the memo rows equal the split fc's partials summed in rank order (checked at
   construction), and the split fc's gather and rank-order sum are exact;
 - a whole draft round (five steps, the extend exchange with extend fc) replays from a CUDA
-  graph with fresh inputs, equal to its eager run.
+  graph with fresh inputs, equal to its eager run;
+- the sharded top-1 of slot draft_multi (``sm103/draft/top1``) picks, for 1-16 rows, the
+  argmax of the all-gathered logits under both NaN rules (ties to the lowest id, -0.0 as
+  +0.0), writes the token column, 1.0 and positions + 1, and replays from a CUDA graph.
 
 The bitwise comparison with the kernels of SGLang branch nvidia/qwen35-agentx-gb300 needs that
 branch installed as ``sglang`` and is not part of this test.
@@ -296,6 +299,131 @@ def test_round_replays_from_a_cuda_graph(ranks, boundary):
                     got.view(torch.int16) if got.dtype == torch.bfloat16 else got,
                     want.view(torch.int16) if want.dtype == torch.bfloat16 else want,
                 )
+            dist.barrier(group=cpu_group)
+
+
+V_TOP1 = 31040  # TP8's LM head shard rows
+
+
+@pytest.fixture(scope="module")
+def top1x(ranks):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft.top1 import Top1Exchange
+
+    rank, world, group, cpu_group = ranks
+    return Top1Exchange(
+        world=world,
+        rank=rank,
+        vocab_local=V_TOP1,
+        vocab_start=rank * V_TOP1,
+        vocab_size=world * V_TOP1,
+        group=group,
+        cpu_group=cpu_group,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+
+
+def _top1_logits(rank, m, case):
+    g = _gen(7000 + 31 * rank + m)
+    logits = _randn(m, V_TOP1, g=g)
+    if case == "ties":  # equal maxima inside a shard and across ranks
+        logits = (torch.round(logits.float() * 2) / 2).to(torch.bfloat16)
+    elif case == "nan":
+        if rank == 1:
+            logits[0, 17] = float("nan")
+            logits[m - 1, 5] = float("nan")
+        if rank == 2:
+            logits[0, 3] = float("nan")
+    elif case == "zero":  # -0.0 ties +0.0: the lower id wins
+        logits = torch.full_like(logits, -1.0)
+        if rank == 2:
+            logits[:, 40] = -0.0
+        if rank == 3:
+            logits[:, 10] = 0.0
+    return logits
+
+
+def _top1_want(logits, group, nan):
+    full = _all_gather(logits, group).permute(1, 0, 2).reshape(logits.shape[0], -1)
+    full = full.float()
+    if nan == "split":
+        full = torch.where(torch.isnan(full), torch.full_like(full, -1e30), full)
+    return torch.argmax(full, dim=1)  # the first maximum (a NaN first under torch's rule)
+
+
+@pytest.mark.parametrize("case", ["random", "ties", "nan", "zero"])
+@pytest.mark.parametrize("nan", ["split", "torch"])
+@pytest.mark.parametrize("m", [1, 4, 8, 16])
+def test_sharded_top1_is_the_gathered_argmax(ranks, top1x, m, nan, case):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import top1
+
+    rank, world, group, _ = ranks
+    key = top1.NAN_KEY_SPLIT_ARGMAX if nan == "split" else top1.NAN_KEY_TORCH_ARGMAX
+    with torch.inference_mode():
+        logits = _top1_logits(rank, m, case)
+        tokens = torch.full((m, NUM_STEPS), -1, dtype=torch.int64, device="cuda")
+        topk_p = torch.zeros(m, 1, dtype=torch.float32, device="cuda")
+        positions = torch.arange(m, dtype=torch.int64, device="cuda") * 10
+        mrope = torch.arange(3 * (m + 1), dtype=torch.int64, device="cuda").view(3, -1)
+        mrope0 = mrope.clone()
+        top1x(
+            logits,
+            tokens,
+            3,
+            nan_key=key,
+            topk_p=topk_p,
+            positions=positions,
+            mrope_positions=mrope[:, :m],
+        )
+        torch.cuda.synchronize()
+        want = _top1_want(logits, group, nan)
+        assert torch.equal(tokens[:, 3], want)
+        assert (tokens[:, [0, 1, 2, 4, 5]] == -1).all()
+        assert (topk_p == 1.0).all()
+        assert torch.equal(positions, torch.arange(m, device="cuda") * 10 + 1)
+        assert torch.equal(mrope[:, :m], mrope0[:, :m] + 1)
+        assert torch.equal(mrope[:, m:], mrope0[:, m:])
+
+
+def test_sharded_top1_replays_from_a_cuda_graph(ranks, top1x):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import top1
+
+    rank, world, group, cpu_group = ranks
+    m = 8
+    with torch.inference_mode():
+        logits = _top1_logits(rank, m, "random")
+        tokens = torch.zeros(m, NUM_STEPS, dtype=torch.int64, device="cuda")
+        positions = torch.zeros(m, dtype=torch.int64, device="cuda")
+
+        def run():
+            for col in range(1, NUM_STEPS):
+                top1x(
+                    logits,
+                    tokens,
+                    col,
+                    nan_key=top1.NAN_KEY_SPLIT_ARGMAX,
+                    positions=positions,
+                )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        dist.barrier(group=cpu_group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        for case in ("random", "ties", "nan"):
+            logits.copy_(_top1_logits(rank, m, case))
+            positions.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            want = _top1_want(logits, group, "split")
+            for col in range(1, NUM_STEPS):
+                assert torch.equal(tokens[:, col], want)
+            assert (positions == NUM_STEPS - 1).all()
             dist.barrier(group=cpu_group)
 
 

@@ -89,6 +89,9 @@ SERVED_BS = 1
 # draft steps on 2.2's two-row kernels (the split fc, the hop's all-reduce points, the
 # two-token MoE), the rest SGLang's ops
 LOOP_BS = (1, 2)
+# with slot draft_multi, the draft graphs of more requests draft_loop also serves: their
+# steps run SGLang's ops but for the split fc and the sharded top-1 exchange
+MULTI_LOOP_BS = (4, 8, 16)
 
 
 class MtpDraft:

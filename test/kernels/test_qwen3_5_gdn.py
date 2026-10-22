@@ -31,7 +31,7 @@ import torch
 
 H, K, HV, V = 2, 128, 8, 128  # per rank at TP8: 16 / 64 heads over 8
 D = 2 * H * K + HV * V  # the conv's q / k / v channels
-DRAFT, WIDTH, SLOTS = 7, 4, 9
+DRAFT, WIDTH, SLOTS = 7, 4, 40
 
 
 def _gpu_ready() -> bool:
@@ -56,11 +56,11 @@ def _projection(bs, views, g):
     return qkvz[:, :D] if views else qkvz[:, :D].contiguous()
 
 
-# a covered step's requests (slot gdn_verify covers B1, B2 and B4) and their slots
-REQUESTS = (1, 2, 4)
-STATE_SLOTS = (4, 7, 0, 8)
-RING_SLOTS = (3, 5, 0, 8)
-REPLAY_SLOTS = (1, 2, 4, 6)
+# a covered step's requests (slot gdn_verify covers B1 to B32) and their slots
+REQUESTS = (1, 2, 4, 8, 16, 32)
+STATE_SLOTS = (4, 7, 0, 8, *range(39, 11, -1))
+RING_SLOTS = (3, 5, 0, 8, *range(12, 40))
+REPLAY_SLOTS = (1, 2, 4, 6, *range(10, 38))
 
 
 @pytest.mark.parametrize("bs", REQUESTS)
@@ -166,7 +166,7 @@ def test_replayssm_verify_is_sglangs(pdl, gate, bs):
     g = torch.Generator(device="cuda").manual_seed(
         3 + int(pdl) + 2 * int(gate) + 10 * bs
     )
-    ring_len, slots = 16, 9
+    ring_len, slots = 16, SLOTS
     tokens = bs * DRAFT
 
     def rand(*shape, dtype=torch.bfloat16):
@@ -257,6 +257,131 @@ def test_replayssm_verify_is_sglangs(pdl, gate, bs):
     )
     assert torch.equal(got, want)
     assert all(torch.equal(x, y) for x, y in zip(got_ring, want_ring))
+
+
+# -------------------------------------------------------------------- slot gdn_core
+
+
+@pytest.mark.parametrize("bs", REQUESTS)
+@pytest.mark.parametrize("history", [False, True])
+@pytest.mark.parametrize("pad", [False, True])
+def test_core_is_gdn_verify_numerically(pad, history, bs):
+    """Slot gdn_core's one launch against slot gdn_verify's verify (32-wide value tiles,
+    2 warps) and FP8 gated norm on the same inputs: the replay output and the FP8 bytes
+    up to rounding, this step's ring entries (update and key high + low parts, log-decay)
+    up to FP32 summation order; a padded request writes zeros and leaves its ring alone.
+    History: an empty ring (BF16 checkpoints fold every commit) or 1-9 committed steps."""
+    from sgl_nvidia_mega.qwen3_5.gdn import replayssm
+    from sgl_nvidia_mega.qwen3_5.gdn.norm_fp8 import rms_norm_gated_fp8
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn.core import core
+
+    if pad and bs == 1:
+        pytest.skip("a padded single request leaves nothing to compare")
+    g = torch.Generator(device="cuda").manual_seed(100 * bs + 10 * history + pad)
+    ring_len, slots, tokens = 16, bs + 3, bs * DRAFT
+
+    def rand(*shape, scale=1.0):
+        return (torch.randn(*shape, device="cuda", generator=g) * scale).to(
+            torch.bfloat16
+        )
+
+    qkvz = rand(tokens, D + HV * V)  # the convolved q / k / v rows and the gate z
+    qkv, z = qkvz[:, :D], qkvz[:, D:].view(tokens, HV, V)
+    ba = rand(tokens, 2 * HV)
+    b, a = ba[:, :HV], ba[:, HV:]
+    A_log = torch.rand(HV, device="cuda", generator=g)
+    dt_bias = torch.rand(HV, device="cuda", generator=g)
+    state = rand(slots, HV, V, K, scale=0.05)
+    ring = [
+        rand(slots, HV, ring_len, V, scale=0.05),
+        rand(slots, H, ring_len, K, scale=0.09),
+        -torch.rand(slots, HV, ring_len, device="cuda", generator=g) * 0.5,
+        rand(slots, HV, ring_len, V, scale=1e-4),
+        rand(slots, H, ring_len, K, scale=1e-4),
+    ]
+    states = torch.randperm(slots, device="cuda", generator=g)[:bs].to(torch.int32)
+    replay = torch.randperm(slots, device="cuda", generator=g)[:bs]
+    if pad:
+        states[-1] = -1
+    low = 1 if history else 0
+    write_pos = torch.randint(
+        low, ring_len - DRAFT + 1 if history else 1, (slots,), device="cuda", generator=g
+    ).to(torch.int32)
+    cache_base = torch.randint(0, ring_len, (slots,), device="cuda", generator=g)
+    cache_base = cache_base.to(torch.int32)
+    is_flush = torch.zeros(slots, dtype=torch.int8, device="cuda")
+    qsl = torch.arange(0, tokens + 1, DRAFT, dtype=torch.int32, device="cuda")
+    weight = rand(V)
+    scale = torch.tensor([0.02], device="cuda")
+    want_ring, got_ring = [t.clone() for t in ring], [t.clone() for t in ring]
+    o_want = torch.zeros(tokens, HV, V, dtype=torch.bfloat16, device="cuda")
+    replayssm.verify(
+        qkv[:, : H * K].view(tokens, H, K),
+        qkv[:, H * K : 2 * H * K].view(tokens, H, K),
+        qkv[:, 2 * H * K :].view(tokens, HV, V),
+        a,
+        b,
+        A_log,
+        dt_bias,
+        o_want,
+        state,
+        *want_ring,
+        None,
+        qsl,
+        states,
+        replay,
+        write_pos,
+        cache_base,
+        is_flush,
+        max_cache_len=ring_len,
+        max_spec_len=DRAFT,
+        scale=K**-0.5,
+        null_block_id=-1,
+        block_v=32,
+        num_warps=2,
+    )
+    y_want = rms_norm_gated_fp8(o_want.view(-1, V), weight, 1e-6, z, scale)
+    o_got = torch.zeros_like(o_want)
+    y_got = torch.empty(tokens, HV * V, dtype=torch.float8_e4m3fn, device="cuda")
+    core(
+        qkv,
+        z,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        *got_ring,
+        states,
+        replay,
+        write_pos,
+        cache_base,
+        is_flush,
+        weight,
+        scale,
+        1e-6,
+        y_got,
+        rows_per_request=DRAFT,
+        num_k_heads=H,
+        o_out=o_got,
+    )
+    live = torch.ones(tokens, dtype=torch.bool, device="cuda")
+    if pad:
+        live[-DRAFT:] = False
+        assert not y_got[~live].float().any()
+    ow, og = o_want[live].float(), o_got[live].float()
+    assert (og - ow).norm() <= 2e-3 * ow.norm()
+    same = y_got.view(torch.uint8)[live] == y_want.view(torch.uint8).view(tokens, -1)[live]
+    assert same.float().mean() >= 0.99
+    yw, yg = y_want.view(tokens, -1)[live].float(), y_got[live].float()
+    assert (yg - yw).norm() <= 2e-2 * yw.norm()
+    # the ring: updates and keys as high + low, the log-decays as written
+    for hi, lo, tol in ((0, 3, 5e-3), (1, 4, 1e-5)):
+        w = want_ring[hi].float() + want_ring[lo].float()
+        o = got_ring[hi].float() + got_ring[lo].float()
+        changed = w - (ring[hi].float() + ring[lo].float())
+        assert (o - w).norm() <= tol * max(changed.norm().item(), 1e-30)
+    assert torch.allclose(got_ring[2], want_ring[2], rtol=0, atol=1e-5)
 
 
 # ------------------------------------------------------------------- slot gdn_front

@@ -204,3 +204,78 @@ def router_gemm_quant_shared(
     kernel = _shared_kernel(x.device.index, max_m_bucket(m))
     jit.launch(kernel, (CTAS, 1, 1), [p], torch.cuda.current_stream().cuda_stream)
     return logits, x_fp4, x_sf, gate_up
+
+
+# The top-10 and NVFP4 input behind SGLang's router GEMM (slot route_topk, src/route_topk.cu)
+TOPK_SOURCE = Path(__file__).parent / "src" / "route_topk.cu"
+TOP_K = 10
+TOPK_MAX_ROWS = 224  # the widest verify step it is built for (32 requests of 7 rows)
+
+
+class TopkParams(ctypes.Structure):
+    """q35_route_topk::Params."""
+
+    _fields_ = [
+        (name, ctypes.c_void_p)
+        for name in (
+            "logits",
+            "x",
+            "global_scale",
+            "topk_ids",
+            "topk_weights",
+            "x_fp4",
+            "x_sf",
+        )
+    ]
+
+
+@cache
+def _topk_kernel(device_index: int) -> jit.Kernel:
+    major, minor = torch.cuda.get_device_capability(device_index)
+    cubin = jit.compile_source(
+        TOPK_SOURCE.read_text(),
+        "q35_route_topk",
+        f"sm_{major}{minor}a",
+        ("-std=c++17", "-default-device"),
+    )
+    return jit.load(cubin, "q35_route_topk_quant", (THREADS, 1, 1), 0)
+
+
+def build_topk(device_index: int) -> None:
+    """Compile slot route_topk's launch (no compile inside a step)."""
+    _topk_kernel(device_index)
+
+
+def route_topk_quant(
+    logits: torch.Tensor, x: torch.Tensor, global_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """logits [M, 512] bf16 (the router GEMM's), x [M, 4096] bf16, global_scale [1]
+    fp32: (topk_ids int32 [M, 10], topk_weights bf16 [M, 10], x_fp4 uint8 [M, 2048],
+    x_sf uint8 [M, 256]); the routing equals the trtllm-gen RenormalizeNaive routing's
+    and the input the runner's NVFP4 quantizer's, bit for bit."""
+    m = x.shape[0]
+    for t, shape in ((logits, (m, EXPERTS)), (x, (m, HIDDEN))):
+        if t.dtype != torch.bfloat16 or tuple(t.shape) != shape or not t.is_contiguous():
+            raise ValueError(f"route_topk: {t.dtype} {tuple(t.shape)}, want {shape}")
+    if not 1 <= m <= TOPK_MAX_ROWS:
+        raise ValueError(f"route_topk: {m} rows (1-{TOPK_MAX_ROWS})")
+    ids = torch.empty((m, TOP_K), dtype=torch.int32, device=x.device)
+    weights = torch.empty((m, TOP_K), dtype=torch.bfloat16, device=x.device)
+    x_fp4 = torch.empty((m, HIDDEN // 2), dtype=torch.uint8, device=x.device)
+    x_sf = torch.empty((m, HIDDEN // 16), dtype=torch.uint8, device=x.device)
+    p = TopkParams(
+        logits=logits.data_ptr(),
+        x=x.data_ptr(),
+        global_scale=global_scale.data_ptr(),
+        topk_ids=ids.data_ptr(),
+        topk_weights=weights.data_ptr(),
+        x_fp4=x_fp4.data_ptr(),
+        x_sf=x_sf.data_ptr(),
+    )
+    jit.launch(
+        _topk_kernel(x.device.index),
+        (m, 1, 1),
+        [p],
+        torch.cuda.current_stream().cuda_stream,
+    )
+    return ids, weights, x_fp4, x_sf

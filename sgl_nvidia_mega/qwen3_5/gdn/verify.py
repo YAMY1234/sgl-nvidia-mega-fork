@@ -159,6 +159,7 @@ class Options(msgspec.Struct, frozen=True):
     norm_fp8: bool  # the gated norm writes out_proj's static FP8 input
     pdl: bool = False  # the verify launches dependent on the conv (slot gdn_pdl)
     push: bool = False  # out_proj pushes its partial into the hop (slot gdn_push)
+    core: bool = False  # verify, gated norm and FP8 in one launch (slot gdn_core)
 
 
 STOCK = Options(views=False, block_n=256, block_v=64, num_warps=1, norm_fp8=False)
@@ -218,6 +219,20 @@ def pool_reasons(pools, tokens_per_request: int) -> list[str]:
     return reasons
 
 
+def core_pool_reasons(pools) -> list[str]:
+    """Why slot gdn_core cannot write this step's ring entries ([] when it can): the
+    compact ring (update / key low parts, no exact-replay buffers) of BF16 checkpoints,
+    int32 cursors and int8 flush flags."""
+    reasons = []
+    if pools.ring_beta is not None or pools.ring_rawk is None or pools.ring_rawv is None:
+        reasons.append("not the compact (low-part) ReplaySSM ring")
+    if pools.ring_write_pos.dtype != torch.int32 or pools.ring_cache_base.dtype != torch.int32:
+        reasons.append("ring cursors are not int32")
+    if pools.ring_is_flush.dtype != torch.int8:
+        reasons.append("ring flush flags are not int8")
+    return reasons
+
+
 def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
     """``Qwen3_5GatedDeltaNet.forward`` of a target-verify step with the launch
     choices ``opts``: the TP-partial output [rows, hidden] of the normed input x."""
@@ -248,6 +263,8 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
         gdn.head_k_dim,
         gdn.head_v_dim,
     )
+    if opts.core:
+        return _fused(gdn, _conv(gdn.attn, mixed_qkv, st, opts), z, a, b, st, opts)
     core = _core(gdn.attn, mixed_qkv, a, b, st, opts)
     core = core.reshape(-1, core.shape[-1])
     nv = gdn.num_v_heads // gdn.attn_tp_size
@@ -295,6 +312,85 @@ def _out_proj(out_proj, fp8: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         return flashinfer_bmm_fp8(
             fp8, out_proj.weight, out_proj.input_scale, out_proj.weight_scale, dtype
         )
+
+
+def _conv(attn, mixed_qkv, st, opts) -> torch.Tensor:
+    """The causal conv update of the step's q / k / v rows: [rows, channels], token-major
+    with ``opts.views``."""
+    from sgl_nvidia_mega.qwen3_5.gdn.conv import conv_update
+
+    meta, pools = st.view.gdn, st.view.mamba
+    li = pools.layer_ids.index(attn.layer_id)
+    seq_len = mixed_qkv.shape[0]
+    draft = st.binding.tokens_per_request
+    bs = seq_len // draft
+    states = meta.state_indices
+    y = conv_update(
+        mixed_qkv.view(bs, draft, -1).transpose(1, 2),
+        pools.conv[0][li],
+        attn.conv_weights,
+        attn.bias,
+        attn.activation,
+        states[:bs],
+        pools.intermediate_conv_window[0][li],
+        meta.intermediate_indices[:bs],
+        block_n=opts.block_n,
+        token_major_out=opts.views,
+    )
+    return y.transpose(1, 2).view(seq_len, -1)
+
+
+def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
+    """Slot gdn_core: the ReplaySSM verify of the convolved rows ``qkv``, the gated norm
+    and its static FP8 output in one launch (``sm103/gdn/core.py``), then ``out_proj``
+    (FlashInfer's BMM, or the hop's push GEMM with ``opts.push``)."""
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn.core import core
+
+    attn, pools = gdn.attn, st.view.mamba
+    li = pools.layer_ids.index(attn.layer_id)
+    rows = qkv.shape[0]
+    nv = gdn.num_v_heads // gdn.attn_tp_size
+    x = torch.empty(
+        (rows, nv * gdn.head_v_dim), dtype=torch.float8_e4m3fn, device=qkv.device
+    )
+
+    def ring(t):
+        return None if t is None else t[li]
+
+    core(
+        qkv,
+        z,
+        a,
+        b,
+        attn.A_log,
+        attn.dt_bias,
+        pools.temporal[li],
+        pools.ring_d[li],
+        pools.ring_k[li],
+        pools.ring_g[li],
+        ring(pools.ring_rawv),
+        ring(pools.ring_rawk),
+        st.view.gdn.state_indices,
+        st.fb.req_pool_indices,
+        pools.ring_write_pos,
+        pools.ring_cache_base,
+        pools.ring_is_flush,
+        gdn.norm.weight,
+        gdn.out_proj.input_scale,
+        gdn.norm.eps,
+        x,
+        rows_per_request=st.binding.tokens_per_request,
+        num_k_heads=attn.num_k_heads,
+        early_dependents=opts.push,
+    )
+    if opts.push:
+        return st.bound["boundary"].hop.out_proj_push(
+            x_fp8=x,
+            packed_w=st.bound["gdn"].packed[attn.layer_id],
+            input_scale=gdn.out_proj.input_scale,
+            weight_scale=gdn.out_proj.weight_scale,
+        )
+    return _out_proj(gdn.out_proj, x, qkv.dtype)
 
 
 def _core(attn, mixed_qkv, a, b, st, opts):

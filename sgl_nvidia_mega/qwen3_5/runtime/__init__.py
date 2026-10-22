@@ -16,10 +16,12 @@ import msgspec
 SHIPPED_SLOTS: tuple[str, ...] = ()
 OPT_IN_SLOTS: tuple[str, ...] = (
     "route",
+    "route_topk",
     "mkm",
     "mkm_wide",
     "gdn_verify",
     "gdn_pdl",
+    "gdn_core",
     "hop",
     "gdn_push",
     "gdn_front",
@@ -28,7 +30,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "mka",
     "mka_push",
 )
-# Steps of more than one request (TP8's decode graphs of batch sizes 2 and 4), covered only
+# Steps of more than one request (TP8's decode graphs of batch sizes 2 to 16), covered only
 # when requested in the same variable: covering them costs the one-request step about
 # 0.3% at TP8
 OPT_IN_COVERAGE: tuple[str, ...] = ("multi_request",)
@@ -98,6 +100,10 @@ def slot_reasons() -> list[str]:
     if "gdn_front" in SLOTS and not {"gdn_verify", "gdn_pdl"} <= SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_front' runs slot 'gdn_pdl''s dependent verify"
+        )
+    if "gdn_core" in SLOTS and "gdn_verify" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'gdn_core' runs slot 'gdn_verify''s step in one launch"
         )
     if "gdn_pdl" in SLOTS and "gdn_verify" not in SLOTS:
         reasons.append(
@@ -174,10 +180,12 @@ def build(model, ctx):
     }
     facts = slot_plan.Facts(
         route=bound["moe"].route,
+        route_topk=bound["moe"].topk,
         mkm=bool(bound["moe"].mkm),
         mkm_wide=bound["moe"].mkm_wide,
         gdn_verify=bound["gdn"].gdn_verify,
         gdn_pdl=bound["gdn"].gdn_pdl,
+        gdn_core=bound["gdn"].gdn_core,
         hop=bound["boundary"].hop is not None,
         gdn_push=bool(bound["gdn"].packed),
         gdn_front=bool(bound["gdn"].front),
@@ -204,6 +212,9 @@ def build(model, ctx):
         <= slot_plan.MKM_MAX_ROWS
         else set()
     )
+    # route_topk has nothing to serve where slot route covers every width
+    if "route" in SLOTS and max(pctx.widths) <= slot_plan.ROUTE_MAX_ROWS:
+        vacuous.add("route_topk")
     missing = sorted(name for name in target_slots - vacuous if not built[name])
     if missing:
         raise RuntimeError(

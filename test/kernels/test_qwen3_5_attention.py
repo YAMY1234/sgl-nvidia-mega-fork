@@ -297,6 +297,69 @@ def test_mka_replays_in_a_cuda_graph_bit_for_bit():
         assert torch.isfinite(step.out.float()).all()
 
 
+@pytest.mark.parametrize("m", [9, 14, 28, 56, 112])
+def test_wide_mka_is_the_narrow_mka_on_each_8_row_chunk(m):
+    """The wide entries (several requests' verify rows in one launch) give the bytes of
+    the narrow kernels called on rows [8t, 8t + 8), eagerly and replayed in a CUDA
+    graph on new inputs."""
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import mka
+
+    g = torch.Generator(device="cuda").manual_seed(m)
+    ops = _mka_operands(g)
+    step = _MkaStep(m, g)
+
+    def chunked():
+        k, v = step.k.clone(), step.v.clone()
+        q, gate, out = (torch.empty_like(t) for t in (step.q, step.gate, step.out))
+        for s in range(0, m, 8):
+            e = min(s + 8, m)
+            mka.prologue(
+                x=step.x[s:e],
+                w_packed=ops["w_qkv"],
+                sx=ops["qkv_sx"],
+                sw=ops["qkv_sw"],
+                q_norm_w=ops["qnw"],
+                k_norm_w=ops["knw"],
+                cos_sin=ops["cos_sin"],
+                positions=step.pos[:, s:e],
+                axis_map=ops["axis"],
+                cache_loc=step.loc[s:e],
+                k_cache=k,
+                v_cache=v,
+                k_scale=ops["k_scale"],
+                v_scale=ops["v_scale"],
+                q_out=q[s:e],
+                gate_out=gate[s:e],
+                nq=HEADS,
+                eps=1e-6,
+            )
+            mka.epilogue(
+                attn=step.attn[s:e],
+                gate=gate[s:e],
+                w_packed=ops["w_o"],
+                sx=ops["o_sx"],
+                sw=ops["o_sw"],
+                out=out[s:e],
+                nq=HEADS,
+            )
+        torch.cuda.synchronize()
+        rows = (k[step.loc], v[step.loc])
+        return [t.clone().view(torch.uint8) for t in (q, gate, *rows, out)]
+
+    want = chunked()
+    step.run(ops)
+    assert _same(want, step.bits())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step.run(ops)
+    for _ in range(2):
+        step.fill(g)
+        graph.replay()
+        replayed = step.bits()
+        assert _same(chunked(), replayed)
+        assert torch.isfinite(step.out.float()).all()
+
+
 def _bits(a, b):
     """Whether two tensors (of any dtype, FP8 too) hold the same bytes."""
     if a is None or b is None:

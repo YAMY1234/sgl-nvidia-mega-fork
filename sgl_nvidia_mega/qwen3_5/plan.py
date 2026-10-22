@@ -48,7 +48,7 @@ GDN_FRONT_MAX_ROWS = 14  # its widest step: two requests (a cluster set a reques
 ROUTE_MAX_ROWS = 16
 ROUTE_TOPK_MAX_ROWS = 224
 # slot route_gemm (numeric): the router front's 16-row tiles in place of the GEMM, up to here
-ROUTE_GEMM_MAX_ROWS = 56
+ROUTE_GEMM_MAX_ROWS = 32
 GDN_VERIFY_MAX_ROWS = 224  # the widths its kernels are checked at: up to 32 requests
 GDN_CORE_MAX_ROWS = 224  # and gdn_core's launch
 MKM_MAX_ROWS = 7

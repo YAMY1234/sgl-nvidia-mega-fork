@@ -2268,7 +2268,7 @@ def _pushing_hop(log):
     from sgl_nvidia_mega.qwen3_5.sm103 import hop as sm103_hop
 
     hop = object.__new__(sm103_hop.Hop)
-    hop.max_m, hop._pushed = 8, None
+    hop.max_m, hop._pushed, hop.wide_max_m, hop.site2 = 8, None, 0, None
     hop._args = lambda m, residual, gamma, scale: (SimpleNamespace(m=m), ("out",))
     hop._launch = lambda name, args, ctas, cluster=None: log.append(name)
     hop._consume = lambda args: log.append("consume")

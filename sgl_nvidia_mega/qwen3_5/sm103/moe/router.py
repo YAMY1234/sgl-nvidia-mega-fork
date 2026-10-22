@@ -287,7 +287,7 @@ def route_topk_quant(
     return ids, weights, x_fp4, x_sf
 
 
-GEMM_MAX_ROWS = 56  # slot route_gemm: the router front in tiles of 16 rows up to here
+GEMM_MAX_ROWS = 32  # slot route_gemm: the router front in tiles of 16 rows up to here (one wave)
 
 
 def router_gemm_quant_tiled(

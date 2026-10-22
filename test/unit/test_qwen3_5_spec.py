@@ -308,7 +308,8 @@ def test_the_slot_plans_row_bounds_are_the_kernels():
     assert plan.MKA_MAX_ROWS == mka.MAX_ROWS
     from sgl_nvidia_mega.qwen3_5.attention import mka as mka_step
 
-    assert plan.MKA_WIDE_MAX_ROWS == plan.MAX_ROWS
+    # MKA's wide entries and front path at the widths they are checked at (32 requests)
+    assert plan.MKA_WIDE_MAX_ROWS == 224 <= plan.MAX_ROWS
     assert mka_step.FUSED_MAX_ROWS <= mka.WIDE_MAX_ROWS
 
 

@@ -101,6 +101,7 @@ def build(model, ctx) -> route.Bound:
         from sgl_nvidia_mega.qwen3_5.sm103.moe import router
 
         router.build_topk(torch.cuda.current_device())
+        route.load_pinned_routing()
         bound = msgspec.structs.replace(bound, topk=True)
         if "route_gemm" in SLOTS:
             router.build(torch.cuda.current_device(), router.MAX_TOKENS)

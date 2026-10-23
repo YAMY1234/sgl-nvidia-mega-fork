@@ -38,6 +38,7 @@ launch, bit for bit the runner's rows.
 from __future__ import annotations
 
 import logging
+import os
 
 import msgspec
 import torch
@@ -109,6 +110,30 @@ SGLANG_MIRRORS = {
 
 # the (slot, rows) that have run (each logged once, as engagement evidence)
 _ENGAGED: set = set()
+
+# Timing knob (static A/Bs): the expert ids of every route_topk step come from this int32 table [layers, rows, 10]
+# (.npy) in place of route_topk's, so both arms route alike; the weights stay route_topk's
+PIN_ROUTING_ENV = "SGLANG_Q35_MOE_PIN_ROUTING"
+_PIN: list = []
+
+
+def load_pinned_routing() -> None:
+    """Load the pinned routing table (``PIN_ROUTING_ENV``) to the GPU, once, before capture."""
+    path = os.environ.get(PIN_ROUTING_ENV)
+    if path and not _PIN:
+        import numpy as np
+
+        _PIN.append(torch.from_numpy(np.load(path).astype(np.int32)).cuda())
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 MoE routing pinned to %s %s", path, tuple(_PIN[0].shape)
+        )
+
+
+def _pinned(mlp, ids: torch.Tensor) -> torch.Tensor:
+    if not _PIN:
+        return ids
+    table = _PIN[0]
+    return table[mlp.layer_id % table.shape[0], : ids.shape[0]]
 
 
 class Bound(msgspec.Struct, frozen=True):
@@ -407,6 +432,7 @@ def routed_topk(mlp, x: torch.Tensor, gemm: bool = False):
     else:
         logits, _ = mlp.gate(x)
         ids, weights, x_fp4, x_sf = router.route_topk_quant(logits, x, scale)
+    ids = _pinned(mlp, ids)
     topk_output = StandardTopKOutput(
         topk_weights=weights, topk_ids=ids, router_logits=logits
     )
@@ -457,6 +483,7 @@ def routed_given(mlp, x: torch.Tensor, bound: Bound, slot: str):
     ids, weights, x_fp4, x_sf = router.route_topk_quant(
         logits, x, mlp.experts.w13_input_scale_quant.reshape(1)
     )
+    ids = _pinned(mlp, ids)
     return mkm.routed(
         mlp,
         bound.m32[mlp.layer_id],

@@ -199,21 +199,24 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
     from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
     from sgl_nvidia_mega.qwen3_5.sm103.gdn import front
 
-    if x.shape[0] not in _ENGAGED:
-        _ENGAGED.add(x.shape[0])
+    rows = x.shape[0]
+    requests = rows // ROWS
+    # the L2 prefetch of the checkpoint / ring in front of slot gdn_core is left out with the early history (the core
+    # holds those loads ahead of its wait) and for the pinned one-request front (which completes later with it)
+    prefetch = not (opts.core and (core_kernel.EARLY or (front.PIN and requests == 1)))
+    if rows not in _ENGAGED:
+        _ENGAGED.add(rows)
         logger.info(
             "NVIDIA megakernel: Qwen3.5 slot gdn_front runs at %d rows "
             "(SGLANG_PERFLL_GDN_PIN=%d, SGLANG_PERFLL_GDN_CORE_EARLY=%d, prefetch=%d)",
-            x.shape[0],
+            rows,
             front.PIN,
             core_kernel.EARLY,
-            int(not (opts.core and (core_kernel.EARLY or front.PIN))),
+            int(prefetch),
         )
     attn, bound = gdn.attn, st.bound["gdn"]
     meta, pools = st.view.gdn, st.view.mamba
     li = pools.layer_ids.index(attn.layer_id)
-    rows = x.shape[0]
-    requests = rows // ROWS
     projected = x.new_empty((rows, 2560))
     conv = x.new_empty((rows, CONV_CHANNELS))
     ba = x.new_empty((rows, 16))
@@ -238,9 +241,7 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
         history_g=pools.ring_g[li],
         ring_indices=st.fb.req_pool_indices[:requests],
         pad_slot=meta.pad_slot_id,
-        # no L2 prefetch of the checkpoint / ring in front of slot gdn_core with the pinned front or the early
-        # history: the core loads them before its own wait, and the late prefetch only delays this launch's completion
-        prefetch=not (opts.core and (core_kernel.EARLY or front.PIN)),
+        prefetch=prefetch,
     )
     if opts.core:
         from sgl_nvidia_mega.qwen3_5.gdn.verify import _fused

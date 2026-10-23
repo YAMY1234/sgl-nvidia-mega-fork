@@ -520,5 +520,82 @@ def test_embedding_exchange_replays_from_a_cuda_graph(ranks, embedx):
         dist.barrier(group=cpu_group)
 
 
+def _full_table_parts(ranks, table, slots=frozenset({"draft_embed_full"})):
+    """A Parts with only what slot draft_embed_full's build and lookup read: the shard
+    (padded by 8 rows, as VocabParallelEmbedding pads) and the binding."""
+    from types import SimpleNamespace
+
+    from sgl_nvidia_mega.qwen3_5.draft.parts import Parts
+
+    rank, world, group, _ = ranks
+    padded = torch.cat([table, torch.full_like(table[:8], 7.0)])
+    shard = SimpleNamespace(
+        org_vocab_start_index=rank * V_EMBED,
+        org_vocab_end_index=(rank + 1) * V_EMBED,
+        added_vocab_start_index=world * V_EMBED,
+        added_vocab_end_index=world * V_EMBED,
+    )
+    parts = Parts.__new__(Parts)
+    parts.slots, parts.embedx = slots, None
+    parts.device = torch.device("cuda", torch.cuda.current_device())
+    parts.binding = SimpleNamespace(tp_size=world, tp_rank=rank, tp_device_group=group)
+    parts.model = SimpleNamespace(
+        embed_tokens=SimpleNamespace(
+            weight=torch.nn.Parameter(padded, requires_grad=False), shard_indices=shard
+        )
+    )
+    parts.embed_full = parts._build_embed_full()
+    return parts
+
+
+@pytest.mark.parametrize("m", [1, 2, 7, 16, 28, 112, 128, 448])
+def test_full_table_is_the_vocab_parallel_embedding(ranks, embedx, m):
+    rank, world, group, cpu_group = ranks
+    _, table = embedx
+    parts = _full_table_parts(ranks, table)
+    assert parts.embed_full.shape == (world * V_EMBED, H)
+    ids = _embed_ids(world, m, 9400 + m)
+    tokens = torch.zeros(m, NUM_STEPS, dtype=torch.int64, device="cuda")
+    tokens[:, 2] = ids  # a strided column, as the draft tokens' next column
+    got = parts.embed(tokens[:, 2])
+    want = _embed_want(table, ids, rank, group)
+    torch.cuda.synchronize()
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+    dist.barrier(group=cpu_group)
+
+
+def test_full_table_replays_from_a_cuda_graph(ranks, embedx):
+    rank, world, group, cpu_group = ranks
+    _, table = embedx
+    parts = _full_table_parts(ranks, table)
+    m = 16
+    ids = torch.zeros(m, dtype=torch.int64, device="cuda")
+    outs = []
+
+    def run():
+        outs.clear()
+        for _ in range(NUM_STEPS - 1):
+            outs.append(parts.embed(ids))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    torch.cuda.synchronize()
+    for seed in (1, 2, 3):
+        ids.copy_(_embed_ids(world, m, 9500 + seed))
+        graph.replay()
+        torch.cuda.synchronize()
+        want = _embed_want(table, ids, rank, group)
+        assert all(
+            torch.equal(o.view(torch.int16), want.view(torch.int16)) for o in outs
+        )
+    dist.barrier(group=cpu_group)
+
+
 if __name__ == "__main__":
     multigpu_pytest_main(__name__, __file__, num_gpus=(4,))

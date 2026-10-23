@@ -84,7 +84,14 @@ class DraftLoop:
     @torch.no_grad()
     def step(self, io) -> None:
         parts = self.parts
-        parts.note_engaged("draft_loop", io.num_requests)
+        n = io.num_requests
+        parts.note_engaged(
+            "draft_loop",
+            n,
+            ""
+            if parts.mkd is not None and n == SERVED_BS
+            else f"{parts.embed_path(n)}, fc {self._fc_path(n)}",
+        )
         steps = io.num_steps - 1
         tokens = io.draft_tokens_out
         tokens[:, :1].copy_(io.topk_index)
@@ -112,15 +119,23 @@ class DraftLoop:
         if mrope is not None:
             mrope.sub_(steps)
 
-    def _fc(self, token, hidden):
-        """A step's fc output outside the exchange: slot draft_xchg's row-split fc up to
-        its widest batch, else SGLang's."""
+    def _fc_path(self, rows: int) -> str:
         from sgl_nvidia_mega.qwen3_5.draft.xchg import FC_SPLIT_MAX_TOKENS
 
-        mkd = self.parts.mkd
-        if mkd is None or token.shape[0] > FC_SPLIT_MAX_TOKENS:
+        if (
+            self.parts.mkd is None
+            or rows > FC_SPLIT_MAX_TOKENS
+            or self.parts.fc_replicated(rows)
+        ):
+            return "replicated"
+        return "row-split"
+
+    def _fc(self, token, hidden):
+        """A step's fc output outside the exchange: slot draft_xchg's row-split fc up to
+        its widest batch (below slot draft_fc_rep's rows), else SGLang's."""
+        if self._fc_path(token.shape[0]) == "replicated":
             return layer.fc_input(self.parts, token, hidden)
-        return mkd.split_fc(self.parts.embed(token), hidden)
+        return self.parts.mkd.split_fc(self.parts.embed(token), hidden)
 
     def _model_step(self, io, i: int, x):
         """Draft step i's decoder layer on its fc output ``x``: the final-norm rows."""

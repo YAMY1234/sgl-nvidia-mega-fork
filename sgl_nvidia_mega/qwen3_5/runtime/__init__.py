@@ -61,6 +61,12 @@ DRAFT_SLOTS: tuple[str, ...] = (
     # the multi-request steps' and extends' embedding rows multicast by the rank holding
     # the token, in place of the vocabulary-parallel embedding's all-reduce (draft_multi)
     "draft_embed",
+    # every draft embedding row read from a full table on every rank (2 GB at TP8): no
+    # cross-rank point in the lookup
+    "draft_embed_full",
+    # multi-request draft steps of at least DRAFT_FC_REP_MIN_ROWS rows take SGLang's
+    # replicated fc (no cross-rank point) in place of the row-split fc (draft_embed_full)
+    "draft_fc_rep",
 )
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
@@ -168,6 +174,11 @@ def slot_reasons() -> list[str]:
     if "draft_embed" in SLOTS and "draft_multi" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'draft_embed' runs in slot 'draft_multi''s steps"
+        )
+    if "draft_fc_rep" in SLOTS and not {"draft_multi", "draft_embed_full"} <= SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'draft_fc_rep' runs in slot 'draft_multi''s steps on "
+            "slot 'draft_embed_full''s rows"
         )
     if "draft_skv2" in SLOTS and "draft_extend" not in SLOTS:
         reasons.append(

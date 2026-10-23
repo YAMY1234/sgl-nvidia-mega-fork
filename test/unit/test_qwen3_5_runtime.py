@@ -287,6 +287,11 @@ def test_the_draft_decode_takes_cp_lite_where_it_serves(monkeypatch):
             {"draft_loop", "multi_request", "draft_embed"},
             "slot 'draft_embed' runs in slot 'draft_multi''s steps",
         ),
+        (
+            {"draft_loop", "multi_request", "draft_multi", "draft_fc_rep"},
+            "slot 'draft_fc_rep' runs in slot 'draft_multi''s steps on slot "
+            "'draft_embed_full''s rows",
+        ),
     ],
 )
 def test_the_draft_slots_name_what_they_need(monkeypatch, slots, want):

@@ -68,13 +68,25 @@ class DraftExtend:
     @torch.no_grad()
     def step(self, io) -> None:
         parts = self.parts
-        parts.note_engaged("draft_extend", io.num_requests)
+        sglang_embed = (
+            io.num_requests == SERVED_BS and parts.mkd is not None and parts.embed_full is None
+        )
+        parts.note_engaged(
+            "draft_extend",
+            io.num_requests,
+            "embedding SGLang's" if sglang_embed else parts.embed_path(io.input_ids.shape[0]),
+        )
         if io.num_requests > SERVED_BS:
             self._multi_step(io)
             return
         mkd = parts.mkd
         if mkd is not None:
-            embeds = parts.model.embed_tokens(io.input_ids)
+            # slot draft_embed_full: the table's rows equal the vocabulary-parallel ones
+            embeds = (
+                parts.embed(io.input_ids)
+                if parts.embed_full is not None
+                else parts.model.embed_tokens(io.input_ids)
+            )
             x = mkd.split_fc(embeds, io.hidden_states)
         else:
             x = layer.fc_input(parts, io.input_ids, io.hidden_states)

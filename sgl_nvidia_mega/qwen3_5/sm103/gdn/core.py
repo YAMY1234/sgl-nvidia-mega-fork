@@ -80,6 +80,7 @@ def _kernel(
     store_o: bool,
     prof: bool = False,
     warps: int = 4,
+    min_blocks: int = 1,
 ) -> jit.Kernel:
     major, minor = torch.cuda.get_device_capability(device_index)
     defines = dict(
@@ -91,6 +92,7 @@ def _kernel(
         STORE_O=int(store_o),
         PROF=int(prof),
         NW=warps,
+        MINB=min_blocks,
     )
     source = "".join(f"#define {k} {v}\n" for k, v in defines.items())
     cubin = jit.compile_source(
@@ -103,10 +105,22 @@ def _kernel(
 
 
 def build(device_index: int, rows: int, hk: int, hv: int, norm_f32: bool) -> None:
-    """Compile the core for a step shape, both dependent releases (no compile inside a
-    step: CUDA-graph capture refuses it)."""
+    """Compile the core for a step shape, both dependent releases and both register caps
+    (no compile inside a step: CUDA-graph capture refuses it)."""
     for trigger in (0, 2):
-        _kernel(device_index, rows, hk, hv, norm_f32, trigger, False)
+        for min_blocks in (1, 3):
+            _kernel(device_index, rows, hk, hv, norm_f32, trigger, False, min_blocks=min_blocks)
+
+
+@cache
+def _sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _min_blocks(device_index: int, ctas: int) -> int:
+    """Three CTAs an SM (168 registers) once two an SM take more than two waves (128 requests
+    at TP8): past that the third resident CTA wins; below it the uncapped registers do."""
+    return 3 if ctas > 4 * _sms(device_index) else 1
 
 
 def _slot_stride(t: Optional[torch.Tensor]) -> int:
@@ -142,6 +156,7 @@ def core(
     o_out: Optional[torch.Tensor] = None,
     _profile: Optional[torch.Tensor] = None,
     warps: int = 4,
+    min_blocks: Optional[int] = None,
 ) -> torch.Tensor:
     """Write the gated RMSNorm of the verify output as FP8 into ``out`` [rows, HV * V].
 
@@ -240,6 +255,7 @@ def core(
         o_out is not None,
         _profile is not None,
         warps,
+        _min_blocks(qkv.device.index, n * HV) if min_blocks is None else min_blocks,
     )
     jit.launch(kernel, (n * HV, 1, 1), [p], torch.cuda.current_stream(qkv.device).cuda_stream)
     return out

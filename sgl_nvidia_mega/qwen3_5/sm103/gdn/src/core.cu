@@ -27,6 +27,9 @@ typedef unsigned int u32;
 #define KD 128
 #define VD 128
 #define RING 16
+#ifndef MINB
+#define MINB 1  // resident CTAs an SM the registers are capped for
+#endif
 #ifndef NW
 #define NW 4  // warps; each owns VD / NW value columns as MT m16 tiles
 #endif
@@ -140,8 +143,8 @@ __device__ __forceinline__ long long load_index(const void* p, int i, bool i64) 
 #define STAMP(i, dep) do { } while (0)
 #endif
 
-// three CTAs an SM (168 registers, no spill): 128 requests take three waves of 456 CTAs instead of four of 304
-extern "C" __global__ void __launch_bounds__(NW * 32, 3) q35_gdn_core(const Params p) {
+// MINB 3: three CTAs an SM (168 registers, no spill), for grids past two waves of two an SM
+extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const Params p) {
   constexpr int GRP = HV / HK;
   const int cta = blockIdx.x;
   const int n = cta / HV;

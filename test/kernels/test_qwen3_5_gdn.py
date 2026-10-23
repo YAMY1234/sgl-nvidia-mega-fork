@@ -365,6 +365,33 @@ def test_core_is_gdn_verify_numerically(pad, history, bs):
         num_k_heads=H,
         o_out=o_got,
     )
+    # the register cap of the widest grids (three CTAs an SM) leaves every byte as it was
+    capped = [t.clone() for t in ring]
+    y_cap = torch.empty_like(y_got)
+    core(
+        qkv,
+        z,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        *capped,
+        states,
+        replay,
+        write_pos,
+        cache_base,
+        is_flush,
+        weight,
+        scale,
+        1e-6,
+        y_cap,
+        rows_per_request=DRAFT,
+        num_k_heads=H,
+        min_blocks=3,
+    )
+    assert torch.equal(y_cap.view(torch.uint8), y_got.view(torch.uint8))
+    assert all(torch.equal(c, g) for c, g in zip(capped, got_ring))
     live = torch.ones(tokens, dtype=torch.bool, device="cuda")
     if pad:
         live[-DRAFT:] = False

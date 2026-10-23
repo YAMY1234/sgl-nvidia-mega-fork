@@ -16,6 +16,7 @@ turn and gathering each one's token rows).
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 from functools import cache
 from pathlib import Path
@@ -24,6 +25,8 @@ from typing import NamedTuple
 import torch
 
 from sgl_nvidia_mega.common import jit
+
+logger = logging.getLogger(__name__)
 
 HIDDEN, EXPERTS, TOP_K, MAX_TOKENS = 4096, 512, 10, 7
 W13_ROWS = 256  # an expert's gate and up rows at TP8 (intermediate 128 per rank)
@@ -120,6 +123,29 @@ RESERVED_SMS = {
     M256_MAX_TOKENS: 0 if _RESERVED is None else int(_RESERVED),
     M512_MAX_TOKENS: 0 if _RESERVED is None else int(_RESERVED),
 }
+# PERF-SM knob: the 32-token engine's reserve by rows, "<rows>:<sms>,..." (the first entry whose rows bound covers m;
+# past every bound, RESERVED_SMS): e.g. "21:0" gives the engine every SM up to three requests (the low-M shared
+# expert then shares the SMs), where its distinct experts (~137 at 21 rows) fit one per CTA
+M32_RESERVE_BY_ROWS = tuple(
+    tuple(int(v) for v in item.split(":"))
+    for item in os.environ.get("SGLANG_Q35_MKM_M32_RESERVE", "").split(",")
+    if item
+)
+
+
+_LOGGED: set = set()
+
+
+def reserved_sms(rows: int, m: int) -> int:
+    """The SMs the ``rows``-token engine leaves free at ``m`` rows."""
+    if rows == M32_MAX_TOKENS:
+        for bound, sms in M32_RESERVE_BY_ROWS:
+            if m <= bound:
+                if m not in _LOGGED:
+                    _LOGGED.add(m)
+                    logger.info("NVIDIA megakernel: Qwen3.5 32-token engine leaves %d SMs free at %d rows", sms, m)
+                return sms
+    return RESERVED_SMS[rows]
 
 
 class Params(ctypes.Structure):
@@ -370,7 +396,7 @@ def mkm_moe(
     if rows in (M32_MAX_TOKENS, M64_MAX_TOKENS, M128_MAX_TOKENS) + WIDE_ROWS:
         # min(M * 10, SMs) CTAs, one per SM, each running its share of the distinct experts
         # (the wide engines: every SM, CTA c running experts c, c + G, ...)
-        sms = torch.cuda.get_device_properties(device).multi_processor_count - RESERVED_SMS[rows]
+        sms = torch.cuda.get_device_properties(device).multi_processor_count - reserved_sms(rows, m)
         ids_in = 0 if routing is None else routing[0].data_ptr()
         if rows in WIDE_ROWS and not (
             routing[0].is_contiguous() and ids_in % 16 == 0 and sms >= WIDE_MIN_SMS

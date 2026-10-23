@@ -352,7 +352,7 @@ def _top1_want(logits, group, nan):
 
 @pytest.mark.parametrize("case", ["random", "ties", "nan", "zero"])
 @pytest.mark.parametrize("nan", ["split", "torch"])
-@pytest.mark.parametrize("m", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 32, 64, 128])
 def test_sharded_top1_is_the_gathered_argmax(ranks, top1x, m, nan, case):
     from sgl_nvidia_mega.qwen3_5.sm103.draft import top1
 

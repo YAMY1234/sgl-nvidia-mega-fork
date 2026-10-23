@@ -29,7 +29,7 @@ namespace sglang {
 namespace draft_top1 {
 
 inline constexpr int kSlots = 3;
-inline constexpr int kMaxRows = 16;  // the draft graphs' widest batch
+inline constexpr int kMaxRows = 128;  // the draft graphs' widest batch
 inline constexpr int kThreads = 256;
 inline constexpr int kVec = 8;  // bf16 per 16-byte load
 inline constexpr uint32_t kSpinLimit = 1u << 27;

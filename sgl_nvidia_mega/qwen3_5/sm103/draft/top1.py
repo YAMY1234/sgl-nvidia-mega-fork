@@ -27,7 +27,7 @@ __all__ = ["NAN_KEY_SPLIT_ARGMAX", "NAN_KEY_TORCH_ARGMAX", "Top1Exchange"]
 
 # draft_top1::kSlots / kMaxRows / kThreads * kVec
 SLOTS = 3
-MAX_ROWS = 16
+MAX_ROWS = 128
 THREADS = 256
 CHUNK = THREADS * 8
 

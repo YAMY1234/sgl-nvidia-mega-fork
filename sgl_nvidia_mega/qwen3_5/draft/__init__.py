@@ -90,9 +90,9 @@ SERVED_BS = 1
 # two-token MoE), the rest SGLang's ops
 LOOP_BS = (1, 2)
 # with slot draft_multi, the draft graphs of two or more requests whose top-1 is the sharded
-# exchange in place of the logits all-gather; the steps of 4, 8 and 16 run SGLang's ops but
-# for the split fc
-MULTI_LOOP_BS = (2, 4, 8, 16)
+# exchange in place of the logits all-gather; the steps of 4 to 128 run SGLang's ops but for
+# the split fc (up to its widest batch)
+MULTI_LOOP_BS = (2, 4, 8, 16, 32, 64, 128)
 
 
 class MtpDraft:

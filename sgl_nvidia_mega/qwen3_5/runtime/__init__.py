@@ -53,8 +53,8 @@ DRAFT_SLOTS: tuple[str, ...] = (
     "draft_hop",
     "draft_front",
     "draft_skv2",
-    # draft_loop also serves TP8's draft graphs of 4, 8 and 16 requests, and those of
-    # two or more take the sharded top-1 (with multi_request)
+    # draft_loop and draft_extend also serve TP8's draft graphs of 4 to 128 requests,
+    # and those of two or more take the sharded top-1 (with multi_request)
     "draft_multi",
 )
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"

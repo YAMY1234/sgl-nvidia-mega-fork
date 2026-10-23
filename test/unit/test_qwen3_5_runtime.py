@@ -372,7 +372,7 @@ def test_the_draft_loop_writes_each_steps_token_and_restores_the_positions(
         (8, {"multi_request"}, (1, 2)),
         (8, set(), (1,)),
         (4, {"multi_request"}, (1,)),
-        (8, {"multi_request", "draft_multi"}, (1, 2, 4, 8, 16)),
+        (8, {"multi_request", "draft_multi"}, (1, 2, 4, 8, 16, 32, 64, 128)),
         (4, {"multi_request", "draft_multi"}, (1,)),
     ],
 )
@@ -383,14 +383,14 @@ def test_the_draft_loop_serves_two_requests_at_tp8_on_request(
 
     monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
     loop = DraftLoop(_DraftParts(slots=frozenset(slots), tp_size=tp_size), num_steps=4)
-    sizes = (1, 2, 4, 8, 16)
+    sizes = (1, 2, 4, 8, 16, 32, 64, 128)
     assert tuple(bs for bs in sizes if loop.step_for(bs) == loop.step) == served
 
 
 @pytest.mark.parametrize(
     "tp_size, slots, built, served",
     [
-        (8, {"multi_request", "draft_multi"}, True, (1, 2, 4, 8, 16)),
+        (8, {"multi_request", "draft_multi"}, True, (1, 2, 4, 8, 16, 32, 64, 128)),
         (8, {"multi_request", "draft_multi"}, False, (1,)),
         (4, {"multi_request", "draft_multi"}, True, (1,)),
         (8, {"draft_multi"}, True, (1,)),
@@ -405,7 +405,7 @@ def test_the_draft_extend_serves_more_requests_with_draft_multi(
     parts = _DraftParts(slots=frozenset(slots), tp_size=tp_size)
     parts.top1x = object() if built else None
     extend = DraftExtend(parts, tokens_per_request=7)
-    sizes = (1, 2, 4, 8, 16)
+    sizes = (1, 2, 4, 8, 16, 32, 64, 128)
     assert tuple(bs for bs in sizes if extend.step_for(bs) == extend.step) == served
 
 
@@ -451,6 +451,22 @@ def test_a_multi_request_draft_loop_takes_the_sharded_top1(monkeypatch):
     # the request-major slots of step i, made dense
     assert [c[2] for c in calls if c[0] == "layer"] == [[0, 3, 6, 9], [1, 4, 7, 10]]
     assert io.positions.tolist() == [10, 20, 30, 40]
+
+
+@pytest.mark.parametrize("requests, split", [(16, True), (32, False)])
+def test_the_split_fc_takes_the_draft_steps_up_to_its_widest_batch(
+    monkeypatch, requests, split
+):
+    from sgl_nvidia_mega.qwen3_5.draft.loop import DraftLoop
+
+    calls = []
+    _stub_model_step(monkeypatch, calls)
+    parts = _DraftParts(slots=frozenset({"draft_multi"}))
+    parts.model = SimpleNamespace(embed_tokens=lambda t: t)
+    parts.mkd = SimpleNamespace(split_fc=lambda e, h: calls.append(("split",)) or h)
+    loop = DraftLoop(parts, num_steps=2)
+    loop._fc(torch.zeros(requests, dtype=torch.int64), torch.zeros(requests, 1))
+    assert [c[0] for c in calls] == (["split"] if split else ["fc"])
 
 
 @pytest.mark.parametrize("split_fc", [False, True])

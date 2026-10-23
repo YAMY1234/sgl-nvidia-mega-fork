@@ -107,10 +107,12 @@ class DraftLoop:
             mrope.sub_(steps)
 
     def _fc(self, token, hidden):
-        """A step's fc output outside the exchange: slot draft_xchg's row-split fc, else
-        SGLang's."""
+        """A step's fc output outside the exchange: slot draft_xchg's row-split fc up to
+        its widest batch, else SGLang's."""
+        from sgl_nvidia_mega.qwen3_5.draft.xchg import FC_SPLIT_MAX_TOKENS
+
         mkd = self.parts.mkd
-        if mkd is None:
+        if mkd is None or token.shape[0] > FC_SPLIT_MAX_TOKENS:
             return layer.fc_input(self.parts, token, hidden)
         return mkd.split_fc(self.parts.model.embed_tokens(token), hidden)
 

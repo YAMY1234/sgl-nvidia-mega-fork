@@ -65,9 +65,11 @@ M32_ENGINES = {
         "mkm_moe_m32.cu", "q35_mkm_moe_m32", 224256, "CU_TENSOR_MAP_SWIZZLE_64B"
     ),
 }
-# SMs the 32 / 64-token engines leave to the alternate stream's shared expert (whose GEMMs do not fit beside an
-# engine CTA on an SM); experiment knob while its value is measured in serving
-RESERVED_SMS = int(os.environ.get("SGLANG_Q35_MKM_RESERVED_SMS", "0"))
+# SMs the 32-token engine leaves to the alternate stream's shared expert, whose GEMMs do not fit beside an engine
+# CTA on an SM (B4 at TP8: -0.09 ms a round; the extra items the engine's CTAs then run overlap its tail). The
+# 64-token engine keeps every SM: at 56 rows its CTAs already run two items. SGLANG_Q35_MKM_RESERVED_SMS overrides
+# both (measurement knob).
+_RESERVED = os.environ.get("SGLANG_Q35_MKM_RESERVED_SMS")
 # each CTA of the 32-token engine runs at most 3 distinct experts (src/mkm_moe_m32.cu
 # kMaxItems): it needs 32 * 10 / 3 SMs; the 64-token engine's 8 items fit as well
 M32_MIN_SMS = 107
@@ -77,6 +79,10 @@ M64_ENGINES = {
     128: Engine(
         "mkm_moe_m64.cu", "q35_mkm_moe_m64", 228352, "CU_TENSOR_MAP_SWIZZLE_64B"
     ),
+}
+RESERVED_SMS = {
+    M32_MAX_TOKENS: 32 if _RESERVED is None else int(_RESERVED),
+    M64_MAX_TOKENS: 0 if _RESERVED is None else int(_RESERVED),
 }
 
 
@@ -155,7 +161,9 @@ def m32_unsupported(device_index: int, intermediate: int) -> str:
     it can)."""
     if intermediate not in M32_ENGINES:
         return f"no 32-token engine at intermediate {intermediate} per rank"
-    sms = torch.cuda.get_device_properties(device_index).multi_processor_count - RESERVED_SMS
+    sms = torch.cuda.get_device_properties(device_index).multi_processor_count - max(
+        RESERVED_SMS.values()
+    )
     if sms < M32_MIN_SMS:
         return f"{sms} SMs (the 32-token engine needs {M32_MIN_SMS})"
     return ""
@@ -279,7 +287,7 @@ def mkm_moe(
     stream = torch.cuda.current_stream().cuda_stream
     if rows in (M32_MAX_TOKENS, M64_MAX_TOKENS):
         # min(M * 10, SMs) CTAs, one per SM, each running its share of the distinct experts
-        sms = torch.cuda.get_device_properties(device).multi_processor_count - RESERVED_SMS
+        sms = torch.cuda.get_device_properties(device).multi_processor_count - RESERVED_SMS[rows]
         ids_in = 0 if routing is None else routing[0].data_ptr()
         p = ParamsM32(x_fp4=x_fp4.data_ptr(), ids_in=ids_in, **fields)
         jit.launch(kernel, (min(m * TOP_K, sms), 1, 1), [*maps, p], stream)

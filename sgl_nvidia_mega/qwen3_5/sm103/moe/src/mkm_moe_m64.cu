@@ -217,7 +217,10 @@ constexpr int kARow = 260;  // FC1 accumulator row stride in floats: 16 B aligne
 #ifndef DIAG_SPEC  // DIAG: warp 1's speculative ranking, stamps 16 = logits loaded, 17 = keys, 18 = top-10 (stride 32)
 #define DIAG_SPEC 0
 #endif
-constexpr int kTraceStride = STAGE_STAMPS ? 128 : DIAG_SPEC ? 32 : 16;
+#ifndef DIAG_ROUTE  // DIAG: stamps 13 = warp 0's routing rounds done, 15 = their barrier, 14 = item 0's rows gathered
+#define DIAG_ROUTE 0
+#endif
+constexpr int kTraceStride = STAGE_STAMPS ? 128 : (DIAG_SPEC || DIAG_ROUTE) ? 32 : 16;
 #ifndef SMEM_SPACE  // 1: shared-memory accesses through Smem compile to shared-space instructions
 #define SMEM_SPACE 1
 #endif
@@ -245,9 +248,6 @@ static_assert(DRAIN_SMEM == 0, "x's shared memory holds the next item's rows whi
 #endif
 #ifndef SPEC_PF  // stages of the speculated expert past the first ring fill prefetched to L2 while the routing runs
 #define SPEC_PF 8
-#endif
-#ifndef DIAG_ROUTE  // DIAG: stamps 13 = warp 0's routing rounds done, 15 = their barrier, 14 = item 0's rows gathered
-#define DIAG_ROUTE 0
 #endif
 #ifndef FC2_PF  // FC2 tiles (beyond the first kStages) prefetched to L2 ahead of the ring; 0 = off
 #define FC2_PF 0
@@ -739,6 +739,10 @@ q35_mkm_moe_m64(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     s.first[i] = 0x7FFFFFFF;
     s.cnt[i] = 0;
   }
+  if (threadIdx.x < kMaxTok) {
+    s.fbits[threadIdx.x] = 0u;
+    s.ounits[threadIdx.x] = 0;
+  }
   if (threadIdx.x == 0) {
     stamp(p, 0);
     for (int i = 0; i < kStages; ++i) {
@@ -892,17 +896,19 @@ q35_mkm_moe_m64(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     }
     mbar_wait(&s.route_done, 0);
   } else if (p.ids_in) {
-    // the routing as given: each routing warp copies its tokens' ids and counts them
-    const int base = warp == 0 ? 0 : warp - 1;
+    // the routing as given: the 224 routing threads load every slot's expert at once, then record and count them
+    const int tid = (warp == 0 ? 0 : warp - 1) * 32 + lane, S = M * kTopK;
+    constexpr int kPer = (kMaxTok * kTopK + 223) / 224;
+    int ex[kPer];
 #pragma unroll
-    for (int r = 0; r < kRounds; ++r) {
-      const int rtok = base + 7 * r;
-      if (rtok >= M) break;
-      if (lane < kTopK) {
-        const int expert = p.ids_in[rtok * kTopK + lane];
-        s.ids[rtok][lane] = expert;
-        atomicMin(&s.first[expert], rtok * kTopK + lane);
-        atomicAdd(&s.cnt[expert], 1);
+    for (int j = 0; j < kPer; ++j) ex[j] = tid + 224 * j < S ? p.ids_in[tid + 224 * j] : 0;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+      const int s2 = tid + 224 * j;
+      if (s2 < S) {
+        s.ids[s2 / kTopK][s2 % kTopK] = ex[j];
+        atomicMin(&s.first[ex[j]], s2);
+        atomicAdd(&s.cnt[ex[j]], 1);
       }
     }
   } else {
@@ -951,23 +957,25 @@ q35_mkm_moe_m64(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     // s.cnt are final after the barrier): a first occurrence at slot s2 of an expert with n tokens hands out its
     // ceil(n / 16) row groups, less the first one when s2 < G (that CTA runs it)
     const int G = (int)gridDim.x;
+    {  // every slot at once over the 224 routing threads (per-token sums by shared-memory atomics)
+      const int tid = base * 32 + lane, S = M * kTopK;
 #pragma unroll
-    for (int r = 0; r < kRounds; ++r) {
-      const int rtok = base + 7 * r;
-      if (rtok >= M) break;
-      const int s2 = rtok * kTopK + lane;
-      const int e2 = lane < kTopK ? s.ids[rtok][lane] : 0;
-      const bool f = lane < kTopK && s.first[e2] == s2;
-      const int u = f ? (s.cnt[e2] + kRows - 1) / kRows - (s2 < G ? 1 : 0) : 0;
-      const uint32_t fb = __ballot_sync(0xffffffffu, f);
-      const int ut = (int)warp_sum_u32((uint32_t)u);
-      if (lane < kTopK) s.uslot[rtok][lane] = (uint8_t)u;
-      if (lane == 0) {
-        s.fbits[rtok] = fb;
-        s.ounits[rtok] = ut;
+      for (int j = 0; j < (kMaxTok * kTopK + 223) / 224; ++j) {
+        const int s2 = tid + 224 * j;
+        if (s2 < S) {
+          const int t = s2 / kTopK, k = s2 % kTopK, e2 = s.ids[t][k];
+          const bool f = s.first[e2] == s2;
+          const int u = f ? (s.cnt[e2] + kRows - 1) / kRows - (s2 < G ? 1 : 0) : 0;
+          s.uslot[t][k] = (uint8_t)u;
+          if (f) {
+            atomicOr(&s.fbits[t], 1u << k);
+            atomicAdd(&s.ounits[t], u);
+          }
+        }
       }
     }
     named_bar(4, 224);
+    if (DIAG_ROUTE && threadIdx.x == 0) stamp(p, 20);
     if (warp == 0) {
       // Work items: (expert, row group) units. Slot c's expert's first unit belongs to CTA c when c is the expert's first
       // slot (its speculative stream already carries it). The other units, in order of their expert's first slot then
@@ -1018,6 +1026,7 @@ q35_mkm_moe_m64(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
         grp = left + (t * kTopK + k < G ? 1 : 0);  // the first group of a slot below G is its own CTA's
       };
       const int nf_c = before(slot), nf_g = before(G);
+      if (DIAG_ROUTE && lane == 0) stamp(p, 21);
       const int xc = s.ids[my_t][my_k];
       const bool owner = s.first[xc] == slot;
       const int D = G - nf_g, dc = slot - nf_c;  // duplicate CTAs; this one's rank among them

@@ -229,7 +229,8 @@ constexpr int kTraceStride = STAGE_STAMPS ? 128 : DIAG_SPEC ? 32 : 16;
 #define PF_N2 4
 #endif
 #ifndef TAILV  // FC2 drains: bit 0 = last pass on all 8 warps; bit 1 = TMEM loads double-buffered; bit 2 = coalesced stores
-#define TAILV 3
+// (0: measured at 28 / 56 rows, the plain drains cost the least)
+#define TAILV 0
 #endif
 #define TAIL8 (TAILV & 1)
 #define DRAIN_PIPE ((TAILV >> 1) & 1)

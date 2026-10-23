@@ -45,9 +45,18 @@ class Engine(NamedTuple):
     defines: tuple = ()  # extra compile options
 
 
+# SGLANG_Q35_MKM7_DEFS: extra -D defines of the TP8 7-row engine ("+"-joined NAME=VALUE, e.g.
+# "SPEC_STAGES=3+PACE_D=4+FC2SF_PRE=0": the weight stream's issue and scale-factor staging knobs of src/mkm_moe.cu, which
+# keep its rows bit for bit); default none
+MKM7_DEFINES = tuple(
+    f"-D{d}" for d in os.environ.get("SGLANG_Q35_MKM7_DEFS", "").split("+") if d
+)
+
 # per intermediate size a rank holds (TP8, TP4)
 ENGINES = {
-    128: Engine("mkm_moe.cu", "q35_mkm_moe", 211968, "CU_TENSOR_MAP_SWIZZLE_64B"),
+    128: Engine(
+        "mkm_moe.cu", "q35_mkm_moe", 211968, "CU_TENSOR_MAP_SWIZZLE_64B", MKM7_DEFINES
+    ),
     256: Engine(
         "mkm_moe_tp4.cu", "q35_mkm_moe_tp4", 216064, "CU_TENSOR_MAP_SWIZZLE_128B"
     ),

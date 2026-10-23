@@ -134,15 +134,18 @@ class MtpDraft:
         # (2.2 routes the draft steps' q1 decode by KV length)
         self.graph_variants = None
         if "draft_loop" in slots and "draft_q1" in slots:
+            from sgl_nvidia_mega.qwen3_5.attention import route
             from sgl_nvidia_mega.qwen3_5.draft.attention import Q1Variants
 
-            self.graph_variants = {"draft_loop": Q1Variants()}
+            self.graph_variants = {
+                "draft_loop": Q1Variants(cp_min_length=route.cp_min_length("draft"))
+            }
         if "draft_extend" in slots and "draft_skv2" in slots:
             from sgl_nvidia_mega.qwen3_5.attention import route
 
             self.graph_variants = {
                 **(self.graph_variants or {}),
-                "draft_extend": route.EXTEND,
+                "draft_extend": route.extend_variants(),
             }
 
     def summary(self) -> str:

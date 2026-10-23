@@ -47,7 +47,7 @@ SGLANG_MIRRORS = {
     "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer.self_attention": "db0f4d98e0fb1abf",
 }
 
-ATTENTION_SLOTS = ("skv2", "mka", "mka_push")
+ATTENTION_SLOTS = ("skv2", "skv2_cp", "mka", "mka_push")
 
 
 class Bound(msgspec.Struct, frozen=True):
@@ -88,6 +88,10 @@ def build(model, ctx) -> Bound:
             )
         if reason:
             return Bound(reason=f"layer {i}: {reason}")
+    if "skv2_cp" in SLOTS:
+        reason = split_kv.cp_reason()
+        if reason:
+            return Bound(reason=f"slot skv2_cp: {reason}")
     if "mka" in SLOTS:
         for _, layer in layers:
             mka.pack(layer)

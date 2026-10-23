@@ -37,6 +37,9 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "gdn_front",
     "route_shared",
     "skv2",
+    # one request from SGLANG_PERFLL_CP_B1_MIN_KV's "verify" length: CP-lite in place of
+    # SKV2, in a graph variant of its own (attention/route.py)
+    "skv2_cp",
     "mka",
     "mka_push",
     "lowm_in",
@@ -78,6 +81,10 @@ DRAFT_SLOTS: tuple[str, ...] = (
     # rows GEMV, which pushes its rows into the hop: no separate gate, GEMM or publish
     # (draft_hop, draft_multi)
     "draft_push_rows",
+    # one request from SGLANG_PERFLL_CP_B1_MIN_KV's "draft" / "extend" length: its steps'
+    # / extend's decode as CP-lite in place of q1 / SKV2 (graph variants of their own)
+    "draft_q1_cp",
+    "draft_skv2_cp",
 )
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
@@ -182,7 +189,7 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_pdl' launches slot 'gdn_verify''s verify"
         )
-    for name in sorted(SLOTS & set(DRAFT_SLOTS) - {"draft_skv2"}):
+    for name in sorted(SLOTS & set(DRAFT_SLOTS) - {"draft_skv2", "draft_skv2_cp"}):
         if "draft_loop" not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {name!r} runs inside entry 'draft_loop'")
     if "draft_hop" in SLOTS and "hop" not in SLOTS:
@@ -212,6 +219,16 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'draft_skv2' runs inside entry 'draft_extend'"
         )
+    for name, base in (
+        ("skv2_cp", "skv2"),
+        ("draft_q1_cp", "draft_q1"),
+        ("draft_skv2_cp", "draft_skv2"),
+    ):
+        if name in SLOTS and base not in SLOTS:
+            reasons.append(
+                f"{SLOTS_ENV}: slot {name!r} takes slot {base!r}'s long-KV graph "
+                "variant's place from its length up"
+            )
     if "hop_fp8" in SLOTS and "hop" not in SLOTS:
         reasons.append(f"{SLOTS_ENV}: slot 'hop_fp8' is an output of slot 'hop'")
     if "lowm_push" in SLOTS and not {"lowm_out", "hop"} <= SLOTS:

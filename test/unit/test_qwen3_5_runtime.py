@@ -256,7 +256,7 @@ def test_the_draft_decode_takes_cp_lite_where_it_serves(monkeypatch):
     )
     attn.heads, attn.head_dim, attn.page_size = heads, dim, page
     attn.max_context_len, attn.workspace, attn.counters = 4096, None, None
-    attn.q1 = attn.skv2 = None
+    attn.q1 = attn.skv2 = attn.cp_b1 = None
     attn.cp_lite, attn._noted = CpLite(), set()
     cache = torch.zeros(4 * page, 1, dim, dtype=torch.float8_e4m3fn)
     kv = SimpleNamespace(k=(cache,), v=(cache,), k_scale=(2.0,), v_scale=(3.0,))
@@ -273,6 +273,105 @@ def test_the_draft_decode_takes_cp_lite_where_it_serves(monkeypatch):
     assert calls == [((28, heads, dim), 7, 1.0, 3.0, attn)] and stock == []
     out = attn.decode(q8[:2], meta(2), kv, rows_per_request=1)
     assert bool((out == 0).all()) and len(calls) == 2 and stock == [1]
+
+
+@pytest.mark.parametrize("rows, label", [(1, "q1_cp"), (7, "split_kv_cp")])
+def test_the_draft_decode_takes_cp_lite_for_one_request_in_its_cp_variant(
+    monkeypatch, rows, label
+):
+    """Slots draft_q1_cp / draft_skv2_cp: in the draft loop's / extend's CP variant the
+    one request's rows go to CP-lite at one request, ahead of q1 / SKV2."""
+    from sgl_nvidia_mega.qwen3_5.attention import route, split_kv
+    from sgl_nvidia_mega.qwen3_5.draft import attention as draft_attention
+
+    heads, dim, page = 4, 256, 64
+    calls = []
+
+    class CpLite:
+        def attend(
+            self, q, kv, pages, lens, q_len, bmm1, bmm2, ws, layer, owner, min_bs=None
+        ):
+            calls.append((tuple(q.shape), q_len, bmm1, bmm2, min_bs))
+            return torch.ones(q.shape[0], heads, dim, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(split_kv, "cp_lite", CpLite)
+    monkeypatch.setattr(draft_attention, "_q1_label", lambda: label)
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_buffer", lambda name, make: None
+    )
+    attn = draft_attention.Attention.__new__(draft_attention.Attention)
+    attn.layer = SimpleNamespace(
+        attn=SimpleNamespace(
+            layer_id=5,
+            scaling=0.5,
+            sliding_window_size=-1,
+            tp_q_head_num=heads,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            head_dim=dim,
+        )
+    )
+    attn.heads, attn.head_dim, attn.page_size = heads, dim, page
+    attn.q1 = attn.skv2 = attn.cp_lite = None
+    attn._noted = set()
+    attn.cp_b1 = draft_attention.DraftCP(split_kv, route, steps=True, extend=True)
+    cache = torch.zeros(4 * page, 1, dim, dtype=torch.float8_e4m3fn)
+    kv = SimpleNamespace(
+        layer_ids=(5,), k=(cache,), v=(cache,), k_scale=(2.0,), v_scale=(3.0,)
+    )
+    meta = SimpleNamespace(
+        page_table=torch.zeros(1, 4, dtype=torch.int32),
+        cache_seqlens=torch.full((1,), 100, dtype=torch.int32),
+    )
+    q8 = torch.zeros(rows, heads * dim, dtype=torch.float8_e4m3fn)
+    out = attn.decode(q8, meta, kv, rows_per_request=rows)
+    assert out.shape == (rows, heads * dim) and bool((out == 1).all())
+    assert calls == [((rows, heads, dim), rows, 1.0, 3.0, 1)]
+
+
+def test_the_cp_slots_offer_the_draft_runners_a_cp_variant(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import draft
+    from sgl_nvidia_mega.qwen3_5.attention import route
+
+    slots = {"draft_loop", "draft_q1", "draft_q1_cp", "draft_extend", "draft_skv2"}
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots | {"draft_skv2_cp"}))
+    monkeypatch.setenv(route.CP_MIN_KV_ENV, "draft:65536,extend:98304")
+    assert runtime.slot_reasons() == []
+    built = draft.SPEC.build("lm", SimpleNamespace(context_len=4096), _draft_ctx())
+    loop, extend = (
+        built.graph_variants["draft_loop"],
+        built.graph_variants["draft_extend"],
+    )
+    assert loop.capture_labels == ("q1_stock", "q1_long", "q1_cp")
+    assert extend.capture_labels == ("split_kv_stock", "split_kv_long", "split_kv_cp")
+
+    def one(n):
+        return SimpleNamespace(
+            batch_size=1, attention_kv_len_lower_bound=n, seq_lens_cpu=None
+        )
+
+    assert [loop.select(one(n)) for n in (100, 16384, 65535, 65536)] == [
+        "q1_stock",
+        "q1_long",
+        "q1_long",
+        "q1_cp",
+    ]
+    assert [extend.select(one(n)) for n in (32767, 32768, 98303, 98304)] == [
+        "split_kv_stock",
+        "split_kv_long",
+        "split_kv_long",
+        "split_kv_cp",
+    ]
+    # each CP slot takes over the long-KV variant of the slot it names
+    monkeypatch.setattr(
+        runtime, "SLOTS", frozenset({"draft_loop", "draft_q1_cp", "skv2_cp"})
+    )
+    assert sorted(r.split(": ", 1)[1] for r in runtime.slot_reasons()) == [
+        "slot 'draft_q1_cp' takes slot 'draft_q1''s long-KV graph variant's place from "
+        "its length up",
+        "slot 'skv2_cp' takes slot 'skv2''s long-KV graph variant's place from its "
+        "length up",
+    ]
 
 
 @pytest.mark.parametrize(

@@ -85,6 +85,16 @@ def test_tp4_on_one_tray_is_accepted():
     assert _refusal(tp_size=4, nnodes=1) == ""
 
 
+def test_the_decode_side_of_pd_is_accepted():
+    assert _refusal(disaggregation_mode="decode") == ""
+
+
+def test_the_prefill_side_of_pd_is_refused():
+    # SGLang refuses ReplaySSM on a PD prefill server itself
+    message = _refusal(disaggregation_mode="prefill", enable_linear_replayssm_spec=False)
+    assert "a PD prefill server runs no covered step" in message, message
+
+
 BREAKABLE = with_phase(
     default_cuda_graph_config(), Phase.DECODE, backend=Backend.BREAKABLE
 )

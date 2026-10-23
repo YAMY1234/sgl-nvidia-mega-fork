@@ -1624,7 +1624,11 @@ def test_slot_skv2_cp_adds_a_cp_variant_from_its_kv_length(monkeypatch):
     # slot draft_skv2_cp is not requested
     assert route.extend_variants() is route.EXTEND
     sites = ("verify", "draft", "extend")
-    assert route.parse_cp_min_kv("") == dict.fromkeys(sites, route.CP_MIN_KV_DEFAULT)
+    assert route.parse_cp_min_kv("") == route.CP_MIN_KV_DEFAULT
+    assert sorted(route.CP_MIN_KV_DEFAULT) == sorted(sites)
+    assert (
+        route.parse_cp_min_kv("draft:1")["verify"] == route.CP_MIN_KV_DEFAULT["verify"]
+    )
     assert route.parse_cp_min_kv("131072") == dict.fromkeys(sites, 131072)
     with pytest.raises(ValueError):
         route.parse_cp_min_kv("verfy:1")

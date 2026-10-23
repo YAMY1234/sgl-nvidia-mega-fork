@@ -47,8 +47,10 @@ SPLIT_KV_CP = "split_kv_cp"
 # "<kv>" for every CP slot, or "verify:<kv>,draft:<kv>,extend:<kv>" (slots skv2_cp,
 # draft_q1_cp, draft_skv2_cp): the committed KV length from which one request takes CP-lite
 CP_MIN_KV_ENV = "SGLANG_PERFLL_CP_B1_MIN_KV"
-CP_MIN_KV_DEFAULT = 65536
 CP_SITES = {"verify": "skv2_cp", "draft": "draft_q1_cp", "extend": "draft_skv2_cp"}
+# TP8 static A/B crossovers against SKV2 / SKV2-Q1 (10-23, CP-lite with the PDL gather and
+# the early merge): verify ~135K, draft step ~180K, extend ~240K
+CP_MIN_KV_DEFAULT = {"verify": 139264, "draft": 184320, "extend": 245760}
 
 
 class SplitKVGraphVariants(msgspec.Struct, frozen=True):
@@ -75,7 +77,7 @@ class SplitKVCPGraphVariants(SplitKVGraphVariants, frozen=True):
     """``SplitKVGraphVariants`` with ``SPLIT_KV_CP`` for one request from
     ``cp_min_length`` tokens of KV."""
 
-    cp_min_length: int = CP_MIN_KV_DEFAULT
+    cp_min_length: int = CP_MIN_KV_DEFAULT["verify"]
     capture_labels: ClassVar[tuple[str, ...]] = (
         SPLIT_KV_STOCK,
         SPLIT_KV_LONG,
@@ -114,13 +116,14 @@ EXTEND = SplitKVGraphVariants(min_length=32768)
 
 
 def parse_cp_min_kv(spec: str) -> dict:
-    """``CP_MIN_KV_ENV``'s value -> {site: length} for every site of ``CP_SITES``."""
+    """``CP_MIN_KV_ENV``'s value -> {site: length} for every site of ``CP_SITES`` (a site
+    the value does not name keeps ``CP_MIN_KV_DEFAULT``'s)."""
     spec = spec.strip()
     if not spec:
-        return dict.fromkeys(CP_SITES, CP_MIN_KV_DEFAULT)
+        return dict(CP_MIN_KV_DEFAULT)
     if ":" not in spec:
         return dict.fromkeys(CP_SITES, int(spec))
-    out = dict.fromkeys(CP_SITES, CP_MIN_KV_DEFAULT)
+    out = dict(CP_MIN_KV_DEFAULT)
     for item in spec.split(","):
         site, _, value = item.partition(":")
         if site.strip() not in CP_SITES:

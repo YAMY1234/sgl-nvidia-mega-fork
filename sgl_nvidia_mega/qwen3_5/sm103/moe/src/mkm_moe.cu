@@ -213,6 +213,9 @@ constexpr int kARow = 132;  // FC1 accumulator row stride in floats: 16 B aligne
 #ifndef DIAG_NO_MMA  // timing diagnostic only: no MMAs, stages are released as soon as they land
 #define DIAG_NO_MMA 0
 #endif
+#ifndef FC2_OWN_FIRST  // 1: each CTA runs its own k-block's FC2 MMAs (every tile) while the peer's half of h travels,
+#define FC2_OWN_FIRST 0  // then the peer's (rank 1 sums k-block 1 before 0: another FP32 order); needs FC2SF_PRE 0
+#endif
 #ifndef DRAIN2  // 1: the FC1 accumulator drain split across the two lane-quarter-0 warps (warp 4: columns 0..63, warp 0:
 #define DRAIN2 0  // 64..127) instead of warp 4 alone
 #endif
@@ -247,6 +250,9 @@ struct __align__(1024) Smem {
   uint32_t hsf[8][2];           // h scale words: token t, k-block kb (4 e4m3 bytes)
   uint64_t full[kStages], empty[kStages], sf_full[kStages];
   uint64_t x_full, sfa_ready, fc1_done, h_peer, h_ready, fc2_done, route_done;
+#if FC2_OWN_FIRST
+  uint64_t h_own;  // this CTA's half of h and its scale atoms are in place (the 4 TMEM-side warps arrive)
+#endif
   uint32_t tmem;
   int expert;
   uint32_t tokmask;
@@ -649,6 +655,9 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
     mbar_init(&s.fc1_done, 1);
     mbar_init(&s.h_peer, 1);
     mbar_init(&s.h_ready, 4);
+#if FC2_OWN_FIRST
+    mbar_init(&s.h_own, 4);
+#endif
     mbar_init(&s.fc2_done, 1);
     mbar_init(&s.route_done, 1);
     mbar_expect_tx(&s.h_peer, 16 * 16 + 8 * 4);  // the peer's half of h (8 rows x 32 B) and its 8 scale words
@@ -817,6 +826,38 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
         tc_commit(&s.empty[b]);
       }
       tc_commit(&s.fc1_done);
+#if FC2_OWN_FIRST
+      // own k-block (kb = rank) over every tile as its stages land, then the peer's k-block once its h arrived
+      mbar_wait(&s.h_own, 0);
+      tc_fence_after();
+      stamp(p, 6);
+      for (int st = kFc1Stages; st < kTotStages; ++st) {
+        const int b = st % kStages;
+        mbar_wait(&s.full[b], (st / kStages) & 1);
+        mbar_wait(&s.sf_full[b], (st / kStages) & 1);
+        tc_fence_after();
+#pragma unroll
+        for (int tl = 0; tl < 2; ++tl) {
+          const int j = (st - kFc1Stages) * 2 + tl, kb = (int)rank;
+          umma_nvf4(tm, make_sdesc(smem_u32(s.ha) + kb * 32, 0, 0, 2),
+                    make_sdesc(smem_u32(s.ring[b] + tl * 16384) + kb * 32, 0, 512, 4), idesc,
+                    tm + kColSfa + (j * 2 + kb) * 4, tm + kColSfb + (uint32_t)((32 + j * 2 + kb) % kSfbSlots) * 8, j != 0);
+        }
+      }
+      mbar_wait(&s.h_ready, 0);
+      tc_fence_after();
+      for (int st = kFc1Stages; st < kTotStages; ++st) {
+        const int b = st % kStages;
+#pragma unroll
+        for (int tl = 0; tl < 2; ++tl) {
+          const int j = (st - kFc1Stages) * 2 + tl, kb = (int)rank ^ 1;
+          umma_nvf4(tm, make_sdesc(smem_u32(s.ha) + kb * 32, 0, 0, 2),
+                    make_sdesc(smem_u32(s.ring[b] + tl * 16384) + kb * 32, 0, 512, 4), idesc,
+                    tm + kColSfa + (j * 2 + kb) * 4, tm + kColSfb + (uint32_t)((32 + j * 2 + kb) % kSfbSlots) * 8, 1u);
+        }
+        tc_commit(&s.empty[b]);
+      }
+#else
       mbar_wait(&s.h_ready, 0);
       tc_fence_after();
       stamp(p, 6);
@@ -839,6 +880,7 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
         }
         tc_commit(&s.empty[b]);
       }
+#endif
       tc_commit(&s.fc2_done);
       if (PDL_TRIGGER) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
@@ -970,6 +1012,25 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
       if (hf == 0) reinterpret_cast<uint8_t*>(&s.hsf[row][gblk / 4])[gblk % 4] = (uint8_t)sf;
     }
     named_bar(1, 128);
+#if FC2_OWN_FIRST
+    {  // this CTA's k-block of h: its 8 scale atoms (2 jt + rank) now, for the FC2 MMAs that need no peer data
+#pragma unroll
+      for (int jt = 0; jt < 8; ++jt) {
+        uint32_t v[4];
+#pragma unroll
+        for (int col = 0; col < 4; ++col) {
+          const int row = 32 * col + lane;
+          v[col] = (row / 8 == jt) ? s.hsf[row % 8][rank] : 0u;
+        }
+        tmem_st_x4(tm + lane_addr + kColSfa + (uint32_t)((2 * jt + (int)rank) * 4), make_uint4(v[0], v[1], v[2], v[3]));
+      }
+      tmem_st_wait();
+    }
+    fence_proxy_async_smem();
+    tc_fence_before();
+    __syncwarp();
+    if (lane == 0) mbar_arrive(&s.h_own);
+#endif
     if (q == 0) {
       // send this CTA's k-block of h (8 rows x two 16-B chunks) and its scale words into the peer's buffers
       cluster_wait();  // phase 1: the peer's barriers are initialized
@@ -984,6 +1045,26 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
       }
       __syncwarp();
     }
+#if FC2_OWN_FIRST
+    // FC2 weight scale factors first (the own k-block's MMAs need them), then the peer's half of h
+    for (int st = kFc1Stages; st < kTotStages; ++st) stage_sf(st, 32 + (st - kFc1Stages) * 4, 4, 1, 1024);
+    mbar_wait(&s.h_peer, 0);
+    if (threadIdx.x == 128) stamp(p, 5);
+    {
+#pragma unroll
+      for (int jt = 0; jt < 8; ++jt) {
+        uint32_t v[4];
+#pragma unroll
+        for (int col = 0; col < 4; ++col) {
+          const int row = 32 * col + lane;
+          v[col] = (row / 8 == jt) ? s.hsf[row % 8][rank ^ 1u] : 0u;
+        }
+        tmem_st_x4(tm + lane_addr + kColSfa + (uint32_t)((2 * jt + (int)(rank ^ 1u)) * 4),
+                   make_uint4(v[0], v[1], v[2], v[3]));
+      }
+      tmem_st_wait();
+    }
+#else
     mbar_wait(&s.h_peer, 0);  // the peer's half of h and its scale words
     if (threadIdx.x == 128) stamp(p, 5);
     // h scale factors: 16 atoms (tile jt, k-block kb) of 4 columns; row m = 32 c + lane is nonzero only in its tile
@@ -1002,13 +1083,15 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
       }
       tmem_st_wait();
     }
+#endif
     fence_proxy_async_smem();
     tc_fence_before();
     __syncwarp();
     if (lane == 0) mbar_arrive(&s.h_ready);
     // FC2 weight scale factors (the MMA issuer waits for each stage's)
-    for (int st = kFc1Stages + (FC2SF_PRE ? 2 : 0); st < kTotStages; ++st)
-      stage_sf(st, 32 + (st - kFc1Stages) * 4, 4, 1, 1024);
+    if (!FC2_OWN_FIRST)
+      for (int st = kFc1Stages + (FC2SF_PRE ? 2 : 0); st < kTotStages; ++st)
+        stage_sf(st, 32 + (st - kFc1Stages) * 4, 4, 1, 1024);
 
     if (q < 2) fc2_drain(p, s, tm, q, lane, 0, a2, rank, e);
   }
@@ -1041,6 +1124,7 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
 
 static_assert(sizeof(Smem) + 1024 == Q35_MKM_SMEM_BYTES, "the launcher's dynamic shared memory size");
 static_assert(SPEC_STAGES >= 1 && SPEC_STAGES <= kStages && PACE_D >= 0 && PACE_D < kStages, "stage issue knobs");
+static_assert(!(FC2_OWN_FIRST && FC2SF_PRE), "FC2_OWN_FIRST stages the FC2 scale factors before the peer's h itself");
 
 }  // namespace qwen_mkm_moe
 

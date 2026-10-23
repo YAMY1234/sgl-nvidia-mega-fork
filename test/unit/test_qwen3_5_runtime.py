@@ -304,13 +304,24 @@ class _DraftParts:
 
     def __init__(self, slots=frozenset(), tp_size=8):
         self.slots, self.mkd, self.top1x, self.engaged = slots, None, None, []
+        self.embedx = self.embed_full = None
         self.binding = SimpleNamespace(tp_size=tp_size)
 
-    def note_engaged(self, entry, bs):
+    def note_engaged(self, entry, bs, paths=""):
         self.engaged.append((entry, bs))
 
     def embed(self, token_ids):
         return self.model.embed_tokens(token_ids)
+
+    def embed_path(self, rows):
+        from sgl_nvidia_mega.qwen3_5.draft.parts import Parts
+
+        return Parts.embed_path(self, rows)
+
+    def fc_replicated(self, rows):
+        from sgl_nvidia_mega.qwen3_5.draft.parts import Parts
+
+        return Parts.fc_replicated(self, rows)
 
 
 def _stub_model_step(monkeypatch, calls):
@@ -472,7 +483,7 @@ def test_the_draft_embeds_through_the_exchange_where_it_fits():
     calls = []
     parts = Parts.__new__(Parts)
     parts.model = SimpleNamespace(embed_tokens=lambda t: calls.append("sglang") or t)
-    parts.embedx = None
+    parts.embedx = parts.embed_full = None
     parts.embed(torch.zeros(4, dtype=torch.int64))
     parts.embedx = lambda t: calls.append("exchange") or t
     parts.embed(torch.zeros(MAX_ROWS, dtype=torch.int64))
@@ -480,15 +491,37 @@ def test_the_draft_embeds_through_the_exchange_where_it_fits():
     assert calls == ["sglang", "exchange", "sglang"]
 
 
-@pytest.mark.parametrize("requests, split", [(16, True), (32, False)])
+def test_the_full_table_serves_every_draft_embedding_where_it_is_built():
+    from sgl_nvidia_mega.qwen3_5.draft.parts import Parts
+
+    parts = Parts.__new__(Parts)
+    parts.model = SimpleNamespace(embed_tokens=lambda t: pytest.fail("SGLang's"))
+    parts.embedx = lambda t: pytest.fail("the exchange")
+    parts.embed_full = torch.arange(12.0).view(6, 2)
+    ids = torch.tensor([[5, 0], [1, 0], [5, 0]])[:, 0]  # a strided column
+    assert parts.embed(ids).tolist() == [[10.0, 11.0], [2.0, 3.0], [10.0, 11.0]]
+    assert parts.embed_path(1000) == "embedding full table"
+
+
+@pytest.mark.parametrize(
+    "requests, slots, split",
+    [
+        (16, {"draft_multi"}, True),
+        (32, {"draft_multi"}, False),
+        # slot draft_fc_rep: SGLang's fc from FC_REP_MIN_ROWS (8) rows
+        (4, {"draft_multi", "draft_embed_full", "draft_fc_rep"}, True),
+        (8, {"draft_multi", "draft_embed_full", "draft_fc_rep"}, False),
+        (16, {"draft_multi", "draft_embed_full", "draft_fc_rep"}, False),
+    ],
+)
 def test_the_split_fc_takes_the_draft_steps_up_to_its_widest_batch(
-    monkeypatch, requests, split
+    monkeypatch, requests, slots, split
 ):
     from sgl_nvidia_mega.qwen3_5.draft.loop import DraftLoop
 
     calls = []
     _stub_model_step(monkeypatch, calls)
-    parts = _DraftParts(slots=frozenset({"draft_multi"}))
+    parts = _DraftParts(slots=frozenset(slots))
     parts.model = SimpleNamespace(embed_tokens=lambda t: t)
     parts.mkd = SimpleNamespace(split_fc=lambda e, h: calls.append(("split",)) or h)
     loop = DraftLoop(parts, num_steps=2)

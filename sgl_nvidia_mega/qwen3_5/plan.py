@@ -57,7 +57,7 @@ ROUTE_TOPK_MAX_ROWS = 896
 # slot route_gemm (numeric): the router front's 16-row tiles in place of the GEMM, up to here
 ROUTE_GEMM_MAX_ROWS = 32
 GDN_VERIFY_MAX_ROWS = 896  # the widths its kernels are checked at: up to 128 requests
-GDN_CORE_MAX_ROWS = 224  # and gdn_core's launch
+GDN_CORE_MAX_ROWS = 896  # and gdn_core's launch (TRT-L4: checked at 64 and 128 requests)
 MKM_MAX_ROWS = 7
 MKM_WIDE_MAX_ROWS = 16
 # slot mkm_m32: the 32-token engine past the 16-token one, on route_topk's widths

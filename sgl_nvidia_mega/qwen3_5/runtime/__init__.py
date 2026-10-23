@@ -21,6 +21,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "mkm",
     "mkm_wide",
     "mkm_m32",
+    "mkm_m64",
     "gdn_verify",
     "gdn_pdl",
     "gdn_core",
@@ -105,6 +106,13 @@ def slot_reasons() -> list[str]:
     if "mkm_m32" in SLOTS and "multi_request" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'mkm_m32' serves the steps of more than two requests "
+            "('multi_request')"
+        )
+    if "mkm_m64" in SLOTS and "route_topk" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'mkm_m64' runs on slot 'route_topk''s routing")
+    if "mkm_m64" in SLOTS and "multi_request" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'mkm_m64' serves the steps of more than four requests "
             "('multi_request')"
         )
     if "route_shared" in SLOTS and "route" not in SLOTS:
@@ -224,7 +232,11 @@ def build(model, ctx):
         route_gemm=bound["moe"].gemm,
         mkm=bool(bound["moe"].mkm),
         mkm_wide=bound["moe"].mkm_wide,
-        mkm_m32=bool(bound["moe"].m32),
+        mkm_m32=bool(bound["moe"].m32)
+        and slot_plan.widest(pctx.widths, slot_plan.MKM_M32_MAX_ROWS)
+        > slot_plan.MKM_WIDE_MAX_ROWS
+        and "mkm_m32" in SLOTS,
+        mkm_m64=bound["moe"].m64,
         gdn_verify=bound["gdn"].gdn_verify,
         gdn_pdl=bound["gdn"].gdn_pdl,
         gdn_core=bound["gdn"].gdn_core,
@@ -268,6 +280,12 @@ def build(model, ctx):
         <= slot_plan.MKM_WIDE_MAX_ROWS
     ):
         vacuous.add("mkm_m32")
+    # mkm_m64 has nothing to serve where no covered step has 33 to 64 rows
+    if (
+        slot_plan.widest(pctx.widths, slot_plan.MKM_M64_MAX_ROWS)
+        <= slot_plan.MKM_M32_MAX_ROWS
+    ):
+        vacuous.add("mkm_m64")
     # hop_wide has nothing to serve where no covered step is past the one-shot rows
     if max(pctx.widths) <= slot_plan.HOP_MAX_ROWS:
         vacuous.update({"hop_wide", "hop_mid"})

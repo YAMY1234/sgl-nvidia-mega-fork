@@ -131,6 +131,13 @@ M32_RESERVE_BY_ROWS = tuple(
     for item in os.environ.get("SGLANG_Q35_MKM_M32_RESERVE", "").split(",")
     if item
 )
+# PERF-SM knob: the 64-token engine's reserve by rows, as SGLANG_Q35_MKM_M32_RESERVE (e.g. "35:32,42:16": SGLang's shared
+# expert on the alternate stream gets SMs of its own at five and six requests)
+M64_RESERVE_BY_ROWS = tuple(
+    tuple(int(v) for v in item.split(":"))
+    for item in os.environ.get("SGLANG_Q35_MKM_M64_RESERVE", "").split(",")
+    if item
+)
 
 
 _LOGGED: set = set()
@@ -138,13 +145,13 @@ _LOGGED: set = set()
 
 def reserved_sms(rows: int, m: int) -> int:
     """The SMs the ``rows``-token engine leaves free at ``m`` rows."""
-    if rows == M32_MAX_TOKENS:
-        for bound, sms in M32_RESERVE_BY_ROWS:
-            if m <= bound:
-                if m not in _LOGGED:
-                    _LOGGED.add(m)
-                    logger.info("NVIDIA megakernel: Qwen3.5 32-token engine leaves %d SMs free at %d rows", sms, m)
-                return sms
+    table = {M32_MAX_TOKENS: M32_RESERVE_BY_ROWS, M64_MAX_TOKENS: M64_RESERVE_BY_ROWS}.get(rows, ())
+    for bound, sms in table:
+        if m <= bound:
+            if (rows, m) not in _LOGGED:
+                _LOGGED.add((rows, m))
+                logger.info("NVIDIA megakernel: Qwen3.5 %d-token engine leaves %d SMs free at %d rows", rows, sms, m)
+            return sms
     return RESERVED_SMS[rows]
 
 

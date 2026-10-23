@@ -160,7 +160,18 @@ __device__ __forceinline__ long long prof_time() {
   return clock64();
 #endif
 }
+#ifdef PROF_GT
+// the timer read predicated on a test of `dep`: stamped once dep is available
+__device__ __forceinline__ long long prof_time_after(float dep) {
+  unsigned long long t;
+  asm volatile("{ .reg .pred p; setp.ne.f32 p, %1, 0f7F7FFFFF; @p mov.u64 %0, %%globaltimer; "
+               "@!p mov.u64 %0, %%globaltimer; }" : "=l"(t) : "f"(dep));
+  return (long long)t;
+}
+#define STAMP(i, dep) do { if (lane == 0) st_[i] = prof_time_after((float)(dep)); } while (0)
+#else
 #define STAMP(i, dep) do { if (lane == 0) { asm volatile("" ::"f"((float)(dep))); st_[i] = prof_time(); } } while (0)
+#endif
 #else
 #define STAMP(i, dep) do { } while (0)
 #endif

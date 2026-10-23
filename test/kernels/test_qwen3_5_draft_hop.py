@@ -306,6 +306,77 @@ def test_draft_step_replays_from_a_cuda_graph(rank, draft):
         torch.cuda.synchronize()
 
 
+@gpu
+@pytest.mark.parametrize("m", [2, 3, MAX_M])
+@pytest.mark.parametrize("gated", [False, True])
+def test_draft_rows_gemv_pushes_each_row_as_the_one_row_gemv(rank, draft, m, gated):
+    """Slot draft_push_rows: the rows GEMV's output rows equal the one-row GEMV's bit for
+    bit, and the hop consume of the pushed rows equals publish + consume of those rows,
+    eagerly and from a CUDA graph."""
+    from sgl_nvidia_mega.qwen3_5.draft.hop import DraftHop
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import hop as kernels
+
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    rows = DraftHop(draft.hop, o_proj_k=O_PROJ_K)
+    assert rows.rows_push(m) and not rows.rows_push(1)
+    with torch.inference_mode():
+        for seed in range(3):
+            x = _operands(m, device, rank, seed=900 + 10 * m + seed)
+            norm = _Norm(x["weight"])
+            g = torch.Generator(device=device).manual_seed(950 + seed + rank)
+            attn = torch.randn(m, O_PROJ_K, device=device, generator=g).bfloat16()
+            gate = None
+            if gated:
+                gate = (
+                    8.0 * torch.randn(m, O_PROJ_K, device=device, generator=g)
+                ).bfloat16()
+                gate[0, :4] = torch.tensor([-0.0, 0.0, 100.0, -100.0])
+            plain = torch.empty(m, HIDDEN, dtype=torch.bfloat16, device=device)
+            for t in range(m):
+                kernels.draft_gemv(
+                    attn[t : t + 1],
+                    x["o_proj"],
+                    plain[t : t + 1],
+                    gate=None if gate is None else gate[t : t + 1].contiguous(),
+                )
+            want = kernels.draft_all_reduce_rms_norm(
+                draft.hop,
+                local_contribution=plain,
+                residual=x["residual"],
+                gamma=norm.gemma_weight,
+                eps=EPS,
+                weight_bias=0.0,
+                add_norm=False,
+            )
+            pushed = rows.o_proj(attn, x["o_proj"], gate=gate)
+            assert rows.has_pushed(pushed)
+            got = rows.ffn_input(pushed, x["residual"], norm, moe_single_launch=False)
+            _same((pushed,), (plain,))
+            _same(got, want)
+
+            out = {}
+
+            def step():
+                p = rows.o_proj(attn, x["o_proj"], gate=gate)
+                out["got"] = rows.ffn_input(
+                    p, x["residual"], norm, moe_single_launch=False
+                )
+
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                step()
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                step()
+            for _ in range(2):
+                graph.replay()
+                torch.cuda.synchronize()
+                _same(out["got"], want)
+        torch.cuda.synchronize()
+
+
 if __name__ == "__main__":
     from sglang.test.kernels.utils import multigpu_pytest_main
 

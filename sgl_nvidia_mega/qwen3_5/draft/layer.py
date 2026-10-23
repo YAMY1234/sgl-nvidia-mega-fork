@@ -100,6 +100,15 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
     # a draft step of one request pushes its o_proj into the hop and releases the next
     # launch early; of two requests it takes only the hop's all-reduce points
     push = hop if x.shape[0] == 1 else None
+    # slot draft_push_rows: a multi-request step's o_proj pushes its rows into the hop
+    rows_push = (
+        hop
+        if push is None
+        and hop is not None
+        and "draft_push_rows" in parts.slots
+        and hop.rows_push(rows)
+        else None
+    )
     extend_hop = (
         parts.hop
         if rows_per_request > 1
@@ -118,6 +127,8 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         o_proj=(
             partial(push.o_proj, weight=lay.o_proj.weight)
             if push is not None and push.gemv
+            else partial(rows_push.o_proj, weight=lay.o_proj.weight)
+            if rows_push is not None
             else None
         ),
     )

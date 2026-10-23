@@ -296,6 +296,11 @@ def test_the_draft_decode_takes_cp_lite_where_it_serves(monkeypatch):
             {"draft_loop", "draft_fin"},
             "slot 'draft_fin' runs on slot 'draft_hop''s hop",
         ),
+        (
+            {"draft_loop", "hop", "draft_hop", "draft_push_rows"},
+            "slot 'draft_push_rows' pushes slot 'draft_multi''s steps into slot "
+            "'draft_hop''s hop",
+        ),
     ],
 )
 def test_the_draft_slots_name_what_they_need(monkeypatch, slots, want):

@@ -70,6 +70,10 @@ DRAFT_SLOTS: tuple[str, ...] = (
     # numeric: the multi-request steps' MoE finalize in the final norm's hop launch
     # (SGLang's deferred finalize, as its CuTe DSL fusion takes it; draft_hop)
     "draft_fin",
+    # numeric: a multi-request draft step's o_proj (with the output gate) as the hop's
+    # rows GEMV, which pushes its rows into the hop: no separate gate, GEMM or publish
+    # (draft_hop, draft_multi)
+    "draft_push_rows",
 )
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
@@ -173,6 +177,11 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'draft_multi' serves the draft steps of two or more "
             "requests ('multi_request')"
+        )
+    if "draft_push_rows" in SLOTS and not {"draft_hop", "draft_multi"} <= SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'draft_push_rows' pushes slot 'draft_multi''s steps into "
+            "slot 'draft_hop''s hop"
         )
     if "draft_fin" in SLOTS and "draft_hop" not in SLOTS:
         reasons.append(f"{SLOTS_ENV}: slot 'draft_fin' runs on slot 'draft_hop''s hop")

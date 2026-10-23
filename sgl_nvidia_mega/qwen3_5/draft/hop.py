@@ -23,11 +23,15 @@ build on every rank alike.
 
 from __future__ import annotations
 
+import logging
+
 from typing import Optional
 
 import torch
 
 from sgl_nvidia_mega.qwen3_5.sm103.draft import hop as kernels
+
+logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -58,9 +62,12 @@ class DraftHop:
         early_head: bool = False,
         delay_ns: int = 0,
         gemv: bool = True,
+        o_proj_k: Optional[int] = None,
     ):
         self.hop = hop  # the target's sm103.hop.Hop
         self.gemv = gemv  # the o_proj GEMV built: o_proj() pushes into ffn_input's hop
+        self.o_proj_k = o_proj_k
+        self._rows_noted: set = set()
         self.early = early
         self.early_head = early and early_head
         self.delay_ns = delay_ns  # diagnostic: hold the consume's output stores
@@ -96,12 +103,28 @@ class DraftHop:
             gemv_ks=() if o_proj_k is None else (o_proj_k,),
         )
         return (
-            cls(hop, early=early, early_head=early_head, gemv=o_proj_k is not None),
+            cls(
+                hop,
+                early=early,
+                early_head=early_head,
+                gemv=o_proj_k is not None,
+                o_proj_k=o_proj_k,
+            ),
             "",
         )
 
     def supports(self, m: int) -> bool:
         return 1 <= m <= MAX_M and self.hop.supports(m)
+
+    def rows_push(self, m: int) -> bool:
+        """Whether a multi-request step's o_proj of ``m`` rows can push into this hop
+        (slot draft_push_rows): the rows GEMV is built and the hop takes the rows."""
+        return (
+            self.gemv
+            and self.o_proj_k is not None
+            and 2 <= m <= kernels.rows_max_m(self.o_proj_k)
+            and self.hop.supports(m)
+        )
 
     def attn_push_target(self, m: int) -> Optional[DraftHop]:
         """This hop when the attention output's producer may push its m rows into it,
@@ -134,7 +157,26 @@ class DraftHop:
     ) -> torch.Tensor:
         """The one-row o_proj partial [1, N] bf16 (``weight`` [N, K] bf16), pushed into
         the FFN input's hop when that hop takes the row; with ``gate`` [1, K] its input
-        is ``attn_output`` * sigmoid(``gate``)."""
+        is ``attn_output`` * sigmoid(``gate``). More rows (slot draft_push_rows): the
+        rows GEMV, every row pushed."""
+        m = int(attn_output.shape[0])
+        if m > 1:
+            if torch.cuda.is_current_stream_capturing() and m not in self._rows_noted:
+                self._rows_noted.add(m)
+                logger.info(
+                    "NVIDIA megakernel: Qwen3.5 MTP draft step of %d rows: o_proj%s "
+                    "pushes into the hop (slot draft_push_rows)",
+                    m,
+                    " with the output gate" if gate is not None else "",
+                )
+            out = torch.empty(
+                m, weight.shape[0], dtype=torch.bfloat16, device=weight.device
+            )
+            kernels.draft_gemv_rows(
+                attn_output.contiguous(), weight, out, self.hop.site, gate=gate
+            )
+            self.mark_pushed(out)
+            return out
         out = torch.empty(
             1, weight.shape[0], dtype=torch.bfloat16, device=weight.device
         )

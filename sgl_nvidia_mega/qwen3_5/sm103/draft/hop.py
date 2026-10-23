@@ -58,6 +58,7 @@ class GemvParams(ctypes.Structure):
         ("n", ctypes.c_int),
         ("hop", decode_hop.Site),
         ("hop_token", ctypes.c_int),
+        ("m", ctypes.c_int),
     ]
 
 
@@ -85,20 +86,42 @@ def _consume_kernels(device_index: int, deadline_ns: int) -> dict[str, jit.Kerne
 
 
 @cache
-def _gemv_kernels(
-    device_index: int, k: int, gate: bool = False
-) -> tuple[jit.Kernel, jit.Kernel, int]:
-    """(plain, pushing, the plain kernel's grid cap: resident CTAs on the device), the
-    gated twins with ``gate``."""
+def _gemv_cubin(device_index: int, k: int):
     if k % 256:
         raise ValueError(f"draft GEMV: K {k} is not a multiple of 256")
     major, minor = torch.cuda.get_device_capability(device_index)
-    cubin = jit.compile_source(
+    return jit.compile_source(
         GEMV_SOURCE.read_text(),
         f"q35_draft_gemv_k{k}",
         f"sm_{major}{minor}a",
         ("-std=c++17", "-default-device", f"-DQ35_DRAFT_GEMV_K={k}"),
     )
+
+
+def rows_max_m(k: int) -> int:
+    """The pushing rows GEMV's token cap at reduction length ``k`` (kRowsMaxM)."""
+    return 16384 // k
+
+
+@cache
+def _gemv_rows_kernel(device_index: int, k: int, gate: bool = False) -> jit.Kernel:
+    """The pushing GEMV of up to ``rows_max_m(k)`` input rows (its gated twin with
+    ``gate``)."""
+    return jit.load(
+        _gemv_cubin(device_index, k),
+        f"q35_draft_gemv_push_rows{'_gate' if gate else ''}",
+        (GEMV_PUSH_ROWS * 32, 1, 1),
+        0,
+    )
+
+
+@cache
+def _gemv_kernels(
+    device_index: int, k: int, gate: bool = False
+) -> tuple[jit.Kernel, jit.Kernel, int]:
+    """(plain, pushing, the plain kernel's grid cap: resident CTAs on the device), the
+    gated twins with ``gate``."""
+    cubin = _gemv_cubin(device_index, k)
     suffix = "_gate" if gate else ""
     plain = jit.load(cubin, f"q35_draft_gemv{suffix}", (GEMV_ROWS * 32, 1, 1), 0)
     push = jit.load(
@@ -126,6 +149,7 @@ def build(device_index: int, deadline_ns: int, gemv_ks: tuple[int, ...] = ()) ->
     for k in gemv_ks:
         for gate in (False, True):
             _gemv_kernels(device_index, int(k), gate)
+            _gemv_rows_kernel(device_index, int(k), gate)
 
 
 def draft_all_reduce_rms_norm(
@@ -263,5 +287,62 @@ def draft_gemv(
         kernel, grid = plain, min((n + GEMV_ROWS - 1) // GEMV_ROWS, resident)
     jit.launch(
         kernel, (grid, 1, 1), [params], torch.cuda.current_stream(x.device).cuda_stream
+    )
+    return out
+
+
+def draft_gemv_rows(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    hop_site: decode_hop.Site,
+    gate: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """``out`` [m, 4096] bf16 = ``x`` [m, K] @ ``weight`` [4096, K]^T, each row as
+    ``draft_gemv`` computes it (bit for bit), every row also pushed into the hop as hop
+    rows 0 .. m - 1, whose all-reduce then only consumes. ``gate`` [m, K]: the input is
+    ``x`` * sigmoid(``gate``), as ``draft_gemv``'s."""
+    m, k = int(x.shape[0]), int(x.shape[-1])
+    n = int(weight.shape[0])
+    if (
+        x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or out.dtype != torch.bfloat16
+        or x.dim() != 2
+        or tuple(weight.shape) != (HIDDEN, k)
+        or tuple(out.shape) != (m, HIDDEN)
+        or not 1 <= m <= min(rows_max_m(k), hop_site.m_cap)
+        or not (x.is_contiguous() and weight.is_contiguous() and out.is_contiguous())
+        or x.data_ptr() % 16
+        or weight.data_ptr() % 16
+        or out.data_ptr() % 16
+    ):
+        raise ValueError(
+            f"draft rows GEMV: x {x.dtype} {tuple(x.shape)}, weight {weight.dtype} "
+            f"{tuple(weight.shape)}, out {out.dtype} {tuple(out.shape)}, hop rows "
+            f"{hop_site.m_cap}"
+        )
+    if gate is not None and (
+        gate.dtype != torch.bfloat16
+        or tuple(gate.shape) != (m, k)
+        or not gate.is_contiguous()
+        or gate.data_ptr() % 16
+    ):
+        raise ValueError(f"draft rows GEMV: gate {gate.dtype} {tuple(gate.shape)}")
+    params = GemvParams(
+        x=x.data_ptr(),
+        gate=gate.data_ptr() if gate is not None else x.data_ptr(),
+        w=weight.data_ptr(),
+        y=out.data_ptr(),
+        n=n,
+        hop=hop_site,
+        hop_token=0,
+        m=m,
+    )
+    jit.launch(
+        _gemv_rows_kernel(x.device.index, k, gate is not None),
+        (n // GEMV_PUSH_ROWS, 1, 1),
+        [params],
+        torch.cuda.current_stream(x.device).cuda_stream,
     )
     return out

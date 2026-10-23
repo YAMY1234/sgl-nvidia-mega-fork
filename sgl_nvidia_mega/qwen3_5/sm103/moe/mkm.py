@@ -143,6 +143,24 @@ M64_RESERVE_BY_ROWS = tuple(
 _LOGGED: set = set()
 
 
+# PERF-SM: build options of the 32-token engine, bit for bit either way. THR_D: a CTA with one expert, while some CTA
+# runs two, keeps at most this many ring stages in flight (0 = off); TOPK_NOINLINE: the row top-10 out of line.
+ENGINE_THR_D = int(os.environ.get("SGLANG_Q35_MKM_THR_D", "0"))
+ENGINE_TOPK_NOINLINE = os.environ.get("SGLANG_Q35_MKM_TOPK_NOINLINE", "0") == "1"
+
+
+def engine_options(rows: int) -> tuple:
+    """The extra defines of the ``rows``-token engine."""
+    opts = ()
+    if ENGINE_THR_D and rows == M32_MAX_TOKENS:
+        opts += (f"-DTHR_D={ENGINE_THR_D}",)
+    if ENGINE_TOPK_NOINLINE and rows == M32_MAX_TOKENS:
+        opts += ("-DTOPK_NOINLINE=1",)
+    if opts:
+        logger.info("NVIDIA megakernel: Qwen3.5 %d-token engine built with %s", rows, " ".join(opts))
+    return opts
+
+
 def reserved_sms(rows: int, m: int) -> int:
     """The SMs the ``rows``-token engine leaves free at ``m`` rows."""
     table = {M32_MAX_TOKENS: M32_RESERVE_BY_ROWS, M64_MAX_TOKENS: M64_RESERVE_BY_ROWS}.get(rows, ())
@@ -225,7 +243,8 @@ def _kernel(device_index: int, intermediate: int, rows: int) -> jit.Kernel:
             "-default-device",
             f"-DQ35_MKM_SMEM_BYTES={engine.smem_bytes}",
         )
-        + engine.defines,
+        + engine.defines
+        + engine_options(rows),
     )
     return jit.load(cubin, engine.kernel, (THREADS, 1, 1), engine.smem_bytes)
 

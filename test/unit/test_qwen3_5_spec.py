@@ -278,9 +278,10 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(56, mid)) == []
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]
     assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]
-    # SGLang offers every multiple of 7 up to MAX_ROWS; three requests are not covered
+    # SGLang offers every multiple of 7 up to MAX_ROWS; every request count is a candidate
     offered = tuple(range(7, plan.MAX_ROWS + 1, 7))
-    assert plan.candidates(offered, 7) == (7, 14, 28, 56, 112, 224, 448, 896)
+    assert plan.candidates(offered, 7) == offered
+    assert plan.candidates(offered + (903,), 7) == offered
     assert plan.candidates(offered, 7, multi=False) == (7,)
     # more than one request only when requested, and only at TP8; TP4 keeps the
     # one-request step it is checked at
@@ -299,8 +300,11 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(14, attention)) == ["hop"]
     # with its wide entries and front path MKA covers every width
     wide_attention = plan.Facts(mka=True, mka_wide=True)
-    widths = (7, 14, 28, 56, 112, 224, 448, 896)
-    assert plan.covered(widths, wide_attention, 7) == widths
+    assert plan.covered(offered, wide_attention, 7) == offered
+    # a width between two powers of two takes the slots of its row range: 3 requests
+    # those of 4, 5 to 7 those of 8, 9 those of 8, 10 to 15 those of 16
+    for lo, hi in ((21, 28), (35, 56), (49, 56), (63, 56), (70, 112), (105, 112)):
+        assert plan.slots(lo, every) == plan.slots(hi, every)
     # mkm_wide: mkm's 16-token engine at two requests, not past the router front's rows
     wide = plan.Facts(route=True, mkm=True, mkm_wide=True)
     assert _on(plan.slots(14, wide)) == ["mkm", "route"]

@@ -4,8 +4,8 @@
 
 A slot runs only where it is requested (``SGLANG_NVIDIA_MEGAKERNEL_SLOTS``), built and
 inside its row bounds; every other op is SGLang's own. The covered steps are the
-target verify of 1 to 128 requests (``REQUESTS``: SGLang's decode graphs of batch sizes
-1, 2, 4, 8, 16, 32, 64 and 128); a width of more than one request is covered only where a slot
+target verify of 1 to 128 requests (``REQUESTS``: every decode graph batch size SGLang
+captures up to 128); a width of more than one request is covered only where a slot
 runs there. ``route`` (the router GEMM and the routed experts' NVFP4 input in one launch)
 runs up to 16 rows, ``route_topk`` (behind SGLang's router GEMM: the top-10 and the NVFP4
 input in one launch, then the routed experts on that routing) wherever ``route`` does
@@ -41,8 +41,9 @@ from __future__ import annotations
 import msgspec
 
 MAX_ROWS = 896  # the widest covered step: 128 requests of 7 verify rows (TP8 bs128)
-# the requests of a covered step (SGLang's decode graph sizes)
-REQUESTS = (1, 2, 4, 8, 16, 32, 64, 128)
+# the requests of a covered step: every decode graph size, so no batch pads to the next
+# power of two to reach a covered one (each slot's bounds are row ranges)
+REQUESTS = tuple(range(1, 129))
 # the TP sizes whose steps of more than one request are covered when requested (checked at
 # TP8); at the others a covered step is one request
 MULTI_REQUEST_TP = (8,)

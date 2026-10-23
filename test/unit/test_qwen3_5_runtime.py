@@ -187,6 +187,12 @@ def test_the_draft_loop_routes_q1_by_kv_length_as_2_2(
     built = draft.SPEC.build("lm", SimpleNamespace(context_len=4096), _draft_ctx())
     variants = built.graph_variants["draft_loop"]
     assert variants.capture_labels == ("q1_stock", "q1_long")
+    # past max_batch_size every batch takes q1_stock, so SGLang captures one graph there
+    assert variants.max_batch_size == 1
+    long = SimpleNamespace(attention_kv_len_lower_bound=10**6, seq_lens_cpu=None)
+    for bs in range(variants.max_batch_size + 1, 129):
+        long.batch_size = bs
+        assert variants.select(long) == "q1_stock"
     batch = SimpleNamespace(
         batch_size=batch_size,
         attention_kv_len_lower_bound=lower_bound,
@@ -379,7 +385,7 @@ def test_the_draft_loop_writes_each_steps_token_and_restores_the_positions(
         (8, {"multi_request"}, (1, 2)),
         (8, set(), (1,)),
         (4, {"multi_request"}, (1,)),
-        (8, {"multi_request", "draft_multi"}, (1, 2, 4, 8, 16, 32, 64, 128)),
+        (8, {"multi_request", "draft_multi"}, tuple(range(1, 129))),
         (4, {"multi_request", "draft_multi"}, (1,)),
     ],
 )
@@ -390,14 +396,14 @@ def test_the_draft_loop_serves_two_requests_at_tp8_on_request(
 
     monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
     loop = DraftLoop(_DraftParts(slots=frozenset(slots), tp_size=tp_size), num_steps=4)
-    sizes = (1, 2, 4, 8, 16, 32, 64, 128)
+    sizes = tuple(range(1, 130))
     assert tuple(bs for bs in sizes if loop.step_for(bs) == loop.step) == served
 
 
 @pytest.mark.parametrize(
     "tp_size, slots, built, served",
     [
-        (8, {"multi_request", "draft_multi"}, True, (1, 2, 4, 8, 16, 32, 64, 128)),
+        (8, {"multi_request", "draft_multi"}, True, tuple(range(1, 129))),
         (8, {"multi_request", "draft_multi"}, False, (1,)),
         (4, {"multi_request", "draft_multi"}, True, (1,)),
         (8, {"draft_multi"}, True, (1,)),
@@ -412,7 +418,7 @@ def test_the_draft_extend_serves_more_requests_with_draft_multi(
     parts = _DraftParts(slots=frozenset(slots), tp_size=tp_size)
     parts.top1x = object() if built else None
     extend = DraftExtend(parts, tokens_per_request=7)
-    sizes = (1, 2, 4, 8, 16, 32, 64, 128)
+    sizes = tuple(range(1, 130))
     assert tuple(bs for bs in sizes if extend.step_for(bs) == extend.step) == served
 
 

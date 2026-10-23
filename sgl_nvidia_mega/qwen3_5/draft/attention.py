@@ -48,6 +48,9 @@ class Q1Variants:
 
     # stock first, as 2.2 captures them (variants share a graph memory pool)
     capture_labels = (Q1_STOCK, Q1_LONG)
+    # select picks Q1_STOCK past one request (q1 decodes one row), so SGLang captures
+    # one graph at every larger batch size
+    max_batch_size = 1
 
     def __init__(self, min_length: int = Q1_MIN_LENGTH):
         self.min_length = min_length

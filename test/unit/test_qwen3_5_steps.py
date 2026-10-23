@@ -1585,7 +1585,11 @@ def test_the_split_kv_variants_select_on_host_state_only():
     assert route.VERIFY.select(batch(bound=8192)) == "split_kv_long"
     assert route.VERIFY.select(batch(bound=8191)) == "split_kv_stock"
     assert route.EXTEND.select(batch(bound=32767)) == "split_kv_stock"
-    assert route.VERIFY.select(batch(bs=2, bound=10**6)) == "split_kv_stock"
+    # past max_batch_size every batch takes the stock label, so SGLang captures one graph there
+    assert route.SplitKVGraphVariants.max_batch_size == 1
+    for bs in range(route.SplitKVGraphVariants.max_batch_size + 1, 129):
+        assert route.VERIFY.select(batch(bs=bs, bound=10**6)) == "split_kv_stock"
+        assert route.EXTEND.select(batch(bs=bs, bound=10**6)) == "split_kv_stock"
     assert route.VERIFY.select(batch(lens=torch.tensor([8192]))) == "split_kv_long"
     assert route.VERIFY.select(batch(lens=torch.tensor([9000, 9000]))) == (
         "split_kv_stock"

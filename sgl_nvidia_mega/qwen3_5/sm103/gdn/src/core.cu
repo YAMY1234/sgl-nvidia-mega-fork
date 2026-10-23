@@ -140,7 +140,8 @@ __device__ __forceinline__ long long load_index(const void* p, int i, bool i64) 
 #define STAMP(i, dep) do { } while (0)
 #endif
 
-extern "C" __global__ void __launch_bounds__(NW * 32, 1) q35_gdn_core(const Params p) {
+// three CTAs an SM (168 registers, no spill): 128 requests take three waves of 456 CTAs instead of four of 304
+extern "C" __global__ void __launch_bounds__(NW * 32, 3) q35_gdn_core(const Params p) {
   constexpr int GRP = HV / HK;
   const int cta = blockIdx.x;
   const int n = cta / HV;

@@ -254,6 +254,9 @@ static_assert(DRAIN_SMEM == 0, "x's shared memory holds the next item's rows whi
 #ifndef SPEC_PF  // stages of the speculated expert past the first ring fill prefetched to L2 while the routing runs
 #define SPEC_PF 4
 #endif
+#ifndef THR_D  // a CTA with one item, in a grid where some CTAs have two, keeps at most THR_D ring stages in flight
+#define THR_D 0  // (its HBM share goes to the CTAs on the critical path); 0 = off
+#endif
 #ifndef FC2_PF  // FC2 tiles (beyond the first kStages) prefetched to L2 ahead of the ring; 0 = off
 #define FC2_PF 0
 #endif
@@ -1090,7 +1093,7 @@ q35_mkm_moe_m64(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       const int nall = ni;
       if (lane == 0) {
         s.nitems = nall;
-        s.spec_ok = owner ? 1 : 0;
+        s.spec_ok = (owner ? 1 : 0) | (O > G ? 2 : 0);  // bit 1: some CTA runs more than one unit
         stamp(p, 1);
         if (DIAG_ROUTE && p.trace) {  // DIAG values (not times): 22 = items, 23 = speculation kept
           p.trace[blockIdx.x * kTraceStride + 22] = nall;
@@ -1113,7 +1116,8 @@ q35_mkm_moe_m64(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     return;
   }
   tc_fence_after();
-  const bool spec_ok = s.spec_ok != 0;
+  const bool spec_ok = (s.spec_ok & 1) != 0;
+  const bool thr = THR_D > 0 && nitems == 1 && (s.spec_ok & 2) != 0;
   // ring stage of item 0's stage 0: the speculative fill (stages 0 .. SPEC_STAGES - 1) is item 0's own only if spec_ok
   const int base0 = spec_ok ? 0 : SPEC_STAGES;
   float ag = 0.f, sc = 0.f, a2 = 0.f;
@@ -1214,6 +1218,7 @@ q35_mkm_moe_m64(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
             for (int k = st; k < st + n && k < kTotStages; ++k) prefetch_stage(k, e);
           }
           if (g >= kStages) mbar_wait(&s.empty[g % kStages], ((g / kStages) - 1) & 1);
+          if (thr && g >= THR_D) mbar_wait(&s.full[(g - THR_D) % kStages], ((g - THR_D) / kStages) & 1);
           issue_stage(g, st, e, pol);
           if (STAGE_STAMPS && it == 0) stamp(p, 64 + st);
         }

@@ -118,9 +118,17 @@ def step(layer, x, st):
         from sgl_nvidia_mega.qwen3_5.attention import mka
 
         return mka.step(layer, x, st)
-    q, k, v, gate = layer._prepare_qkv_gate(
-        positions=st.positions, hidden_states=x, forward_batch=st.fb
-    )
+    from sgl_nvidia_mega.qwen3_5 import lowm
+
+    x8 = lowm.take_fp8(st, x) if st.slots.hop_fp8 else None
+    if st.slots.lowm_in or x8 is not None:
+        q, k, v, gate = lowm.prepare_qkv_gate(
+            layer, st.positions, x, x8, low_m=st.slots.lowm_in
+        )
+    else:
+        q, k, v, gate = layer._prepare_qkv_gate(
+            positions=st.positions, hidden_states=x, forward_batch=st.fb
+        )
     if st.slots.skv2:
         from sgl_nvidia_mega.qwen3_5.attention import split_kv
 
@@ -129,5 +137,15 @@ def step(layer, x, st):
         o = layer.attn(q, k, v, st.fb)
     if layer.attn_output_gate:
         o = fused_sigmoid_mul(o, gate, inplace=True)
+    if st.slots.lowm_oproj:
+        from sgl_nvidia_mega.qwen3_5 import lowm
+        from sgl_nvidia_mega.qwen3_5.boundary import hop as hop_step
+
+        hop = None
+        if st.slots.lowm_push and hop_step.takes_moe_input(
+            st.bound["boundary"].hop, layer, st, o.shape[0]
+        ):
+            hop = st.bound["boundary"].hop
+        return lowm.row_parallel(layer.o_proj, o, o.dtype, "o_proj", hop)
     out, _ = layer.o_proj(o)
     return out

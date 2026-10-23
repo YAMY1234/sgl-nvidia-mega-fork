@@ -206,15 +206,16 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(7, every)) == sorted(
         set(plan.Slots.__struct_fields__) - {"route_topk", "route_gemm", "mkm_m32"}
     )
-    # two requests: the 16-row router front, the GDN chain, the hop's one-shot rows and
-    # MKA's wide entries with their push
+    # two requests: the 16-row router front, the GDN chain, the hop's one-shot rows,
+    # MKA's wide entries with their push, every low-M launch and the hop's FP8 copy
     gdn = ["gdn_core", "gdn_pdl", "gdn_verify"]
+    lowm = ["lowm_in", "lowm_oproj", "lowm_outproj", "lowm_push", "lowm_se"]
     assert _on(plan.slots(14, every)) == sorted(
-        gdn + ["gdn_front", "hop", "mka", "mka_push", "route"]
+        gdn + lowm + ["gdn_front", "hop", "hop_fp8", "mka", "mka_push", "route"]
     )
     # four to 32 requests: the GDN chain (with its one-launch core), the two-shot hop,
     # route_topk and MKA's front path (whose flag mka_push only the wide entries act on),
-    # with the router front's tiles and mkm's 32-token engine up to their rows
+    # with the router front's tiles and mkm's 32-token engine up to their rows; no low-M launch past two requests
     for rows in (28, 56, 112, 224):
         assert _on(plan.slots(rows, every)) == sorted(
             gdn

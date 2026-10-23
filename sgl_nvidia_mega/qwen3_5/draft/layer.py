@@ -15,14 +15,20 @@
   and their arg-max (``torch.argmax``'s choice, as SGLang's top-1).
 
 Stock: the ops SGLang's draft runs for these rows, in its order. Slot ``draft_moe``
-replaces the MoE, slot ``draft_hop`` the two all-reduce points and ``o_proj``.
+replaces the MoE, slot ``draft_hop`` the two all-reduce points and ``o_proj``; slot
+``draft_fin`` (numeric) hands the MoE's finalize to the hop's final norm launch, as
+SGLang's CuTe DSL fusion takes a deferred finalize (the norm then scales by the bf16
+``gemma_weight``, as there).
 """
 
 from __future__ import annotations
 
+import logging
 from functools import partial
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -43,6 +49,15 @@ SGLANG_READS = {
         "tensor_model_parallel_all_reduce",
         "tensor_model_parallel_all_gather",
     ),
+    "srt/models/qwen2_moe.py": ("supports_deferred_finalize",),
+    "srt/layers/layer_boundary/fusions/cutedsl.py": (
+        "routed_output",
+        "expert_weights",
+        "permuted_indices",
+        "gated_shared_output",
+        "complete",
+    ),
+    "srt/layers/layernorm.py": ('"gemma_weight"',),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
@@ -128,7 +143,27 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         moe_in, residual = lay.post_attention_layernorm(
             tensor_model_parallel_all_reduce(attn_out), residual
         )
-    moe_out = moe(moe_in) if moe is not None else lay.mlp(moe_in)
+    fin = hop is not None and moe is None and "draft_fin" in parts.slots
+    if fin and not lay.mlp.supports_deferred_finalize:
+        _note_fin(rows, "SGLang's: the experts do not defer their finalize")
+        fin = False
+    if fin:
+        owed = lay.mlp(moe_in, defer_finalize=True)
+        if _hop_takes(hop.hop, owed):
+            _note_fin(rows, "in the final norm's hop (slot draft_fin)")
+            out, _ = hop.hop.moe_finalize_all_reduce_rms_norm(
+                routed_output=owed.routed_output,
+                expert_weights=owed.expert_weights,
+                permuted_indices=owed.permuted_indices,
+                gated_shared_output=owed.gated_shared_output,
+                residual=residual,
+                gamma=parts.model.norm.gemma_weight,
+            )
+            return out
+        _note_fin(rows, "SGLang's: the hop does not read this deferred output")
+        moe_out = owed.complete()
+    else:
+        moe_out = moe(moe_in) if moe is not None else lay.mlp(moe_in)
     if hop is not None:
         out, _ = hop.final_norm(
             moe_out,
@@ -141,6 +176,32 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         return out
     out, _ = parts.model.norm(tensor_model_parallel_all_reduce(moe_out), residual)
     return out
+
+
+_FIN_NOTED: set = set()
+
+
+def _note_fin(rows: int, where: str) -> None:
+    """Log once per captured row count where slot draft_fin's MoE finalize ran."""
+    if torch.cuda.is_current_stream_capturing() and rows not in _FIN_NOTED:
+        _FIN_NOTED.add(rows)
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 MTP draft step of %d rows: MoE finalize %s",
+            rows,
+            where,
+        )
+
+
+def _hop_takes(hop, owed) -> bool:
+    """Whether the hop's finalize reads this deferred MoE output as SGLang wrote it."""
+    shared = owed.gated_shared_output
+    return (
+        hop.supports(owed.m)
+        and owed.routed_output.dtype == torch.bfloat16
+        and owed.expert_weights.dtype == torch.bfloat16
+        and owed.permuted_indices.dtype == torch.int32
+        and (shared is None or shared.dtype == torch.bfloat16)
+    )
 
 
 def top1(parts, hidden):

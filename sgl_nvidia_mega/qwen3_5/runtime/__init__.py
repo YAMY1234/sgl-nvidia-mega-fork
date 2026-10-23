@@ -67,6 +67,9 @@ DRAFT_SLOTS: tuple[str, ...] = (
     # multi-request draft steps of at least DRAFT_FC_REP_MIN_ROWS rows take SGLang's
     # replicated fc (no cross-rank point) in place of the row-split fc (draft_embed_full)
     "draft_fc_rep",
+    # numeric: the multi-request steps' MoE finalize in the final norm's hop launch
+    # (SGLang's deferred finalize, as its CuTe DSL fusion takes it; draft_hop)
+    "draft_fin",
 )
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
@@ -171,6 +174,8 @@ def slot_reasons() -> list[str]:
             f"{SLOTS_ENV}: slot 'draft_multi' serves the draft steps of two or more "
             "requests ('multi_request')"
         )
+    if "draft_fin" in SLOTS and "draft_hop" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'draft_fin' runs on slot 'draft_hop''s hop")
     if "draft_embed" in SLOTS and "draft_multi" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'draft_embed' runs in slot 'draft_multi''s steps"

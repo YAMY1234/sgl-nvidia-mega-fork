@@ -292,6 +292,10 @@ def test_the_draft_decode_takes_cp_lite_where_it_serves(monkeypatch):
             "slot 'draft_fc_rep' runs in slot 'draft_multi''s steps on slot "
             "'draft_embed_full''s rows",
         ),
+        (
+            {"draft_loop", "draft_fin"},
+            "slot 'draft_fin' runs on slot 'draft_hop''s hop",
+        ),
     ],
 )
 def test_the_draft_slots_name_what_they_need(monkeypatch, slots, want):
@@ -474,6 +478,33 @@ def test_a_multi_request_draft_loop_takes_the_sharded_top1(monkeypatch):
     # the request-major slots of step i, made dense
     assert [c[2] for c in calls if c[0] == "layer"] == [[0, 3, 6, 9], [1, 4, 7, 10]]
     assert io.positions.tolist() == [10, 20, 30, 40]
+
+
+@pytest.mark.parametrize(
+    "rows, routed, weights, perm, shared, want",
+    [
+        (4, torch.bfloat16, torch.bfloat16, torch.int32, torch.bfloat16, True),
+        (4, torch.bfloat16, torch.bfloat16, torch.int32, None, True),
+        (32, torch.bfloat16, torch.bfloat16, torch.int32, torch.bfloat16, False),
+        (4, torch.float32, torch.bfloat16, torch.int32, torch.bfloat16, False),
+        (4, torch.bfloat16, torch.float32, torch.int32, torch.bfloat16, False),
+        (4, torch.bfloat16, torch.bfloat16, torch.int64, torch.bfloat16, False),
+    ],
+)
+def test_slot_draft_fin_hands_the_hop_only_the_deferred_output_it_reads(
+    rows, routed, weights, perm, shared, want
+):
+    from sgl_nvidia_mega.qwen3_5.draft import layer
+
+    hop = SimpleNamespace(supports=lambda m: m <= 14)
+    owed = SimpleNamespace(
+        m=rows,
+        routed_output=torch.zeros(1, dtype=routed),
+        expert_weights=torch.zeros(1, dtype=weights),
+        permuted_indices=torch.zeros(1, dtype=perm),
+        gated_shared_output=None if shared is None else torch.zeros(1, dtype=shared),
+    )
+    assert layer._hop_takes(hop, owed) is want
 
 
 def test_the_draft_embeds_through_the_exchange_where_it_fits():

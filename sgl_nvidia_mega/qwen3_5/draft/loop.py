@@ -120,7 +120,7 @@ class DraftLoop:
         mkd = self.parts.mkd
         if mkd is None or token.shape[0] > FC_SPLIT_MAX_TOKENS:
             return layer.fc_input(self.parts, token, hidden)
-        return mkd.split_fc(self.parts.model.embed_tokens(token), hidden)
+        return mkd.split_fc(self.parts.embed(token), hidden)
 
     def _model_step(self, io, i: int, x):
         """Draft step i's decoder layer on its fc output ``x``: the final-norm rows."""

@@ -57,7 +57,7 @@ def fc_input(parts, token_ids, hidden):
     """The fc output [rows, hidden] of the tokens ``token_ids`` [rows] and the hidden
     rows ``hidden`` [rows, hidden] they follow."""
     lm = parts.lm
-    embeds = lm.pre_fc_norm_embedding(parts.model.embed_tokens(token_ids))
+    embeds = lm.pre_fc_norm_embedding(parts.embed(token_ids))
     hidden = lm.pre_fc_norm_hidden(hidden)
     return lm.fc(torch.cat([embeds, hidden], dim=-1))
 

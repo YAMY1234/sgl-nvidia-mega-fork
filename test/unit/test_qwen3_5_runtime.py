@@ -283,6 +283,10 @@ def test_the_draft_decode_takes_cp_lite_where_it_serves(monkeypatch):
             "slot 'draft_multi' serves the draft steps of two or more requests "
             "('multi_request')",
         ),
+        (
+            {"draft_loop", "multi_request", "draft_embed"},
+            "slot 'draft_embed' runs in slot 'draft_multi''s steps",
+        ),
     ],
 )
 def test_the_draft_slots_name_what_they_need(monkeypatch, slots, want):
@@ -299,6 +303,9 @@ class _DraftParts:
 
     def note_engaged(self, entry, bs):
         self.engaged.append((entry, bs))
+
+    def embed(self, token_ids):
+        return self.model.embed_tokens(token_ids)
 
 
 def _stub_model_step(monkeypatch, calls):
@@ -451,6 +458,21 @@ def test_a_multi_request_draft_loop_takes_the_sharded_top1(monkeypatch):
     # the request-major slots of step i, made dense
     assert [c[2] for c in calls if c[0] == "layer"] == [[0, 3, 6, 9], [1, 4, 7, 10]]
     assert io.positions.tolist() == [10, 20, 30, 40]
+
+
+def test_the_draft_embeds_through_the_exchange_where_it_fits():
+    from sgl_nvidia_mega.qwen3_5.draft.parts import Parts
+    from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import MAX_ROWS
+
+    calls = []
+    parts = Parts.__new__(Parts)
+    parts.model = SimpleNamespace(embed_tokens=lambda t: calls.append("sglang") or t)
+    parts.embedx = None
+    parts.embed(torch.zeros(4, dtype=torch.int64))
+    parts.embedx = lambda t: calls.append("exchange") or t
+    parts.embed(torch.zeros(MAX_ROWS, dtype=torch.int64))
+    parts.embed(torch.zeros(MAX_ROWS + 1, dtype=torch.int64))
+    assert calls == ["sglang", "exchange", "sglang"]
 
 
 @pytest.mark.parametrize("requests, split", [(16, True), (32, False)])

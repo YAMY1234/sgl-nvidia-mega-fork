@@ -140,20 +140,51 @@ M32_RESERVE_BY_ROWS = tuple(
     for item in os.environ.get("SGLANG_Q35_MKM_M32_RESERVE", "").split(",")
     if item
 )
+# PERF-SM knob: the 64-token engine's reserve by rows, as SGLANG_Q35_MKM_M32_RESERVE (e.g. "35:32,42:16": SGLang's shared
+# expert on the alternate stream gets SMs of its own at five and six requests)
+M64_RESERVE_BY_ROWS = tuple(
+    tuple(int(v) for v in item.split(":"))
+    for item in os.environ.get("SGLANG_Q35_MKM_M64_RESERVE", "").split(",")
+    if item
+)
 
 
 _LOGGED: set = set()
 
 
+# PERF-SM: build options of the 32 / 64-token engines, bit for bit either way. THR_D (32-token): a CTA with one expert,
+# while some CTA runs two, keeps at most this many ring stages in flight (0 = off); TOPK_NOINLINE (32-token): the row
+# top-10 out of line; ONEPASS (32 / 64-token): an item of at most 8 rows runs FC2 in one pass of 16 tiles.
+ENGINE_THR_D = int(os.environ.get("SGLANG_Q35_MKM_THR_D", "0"))
+ENGINE_TOPK_NOINLINE = os.environ.get("SGLANG_Q35_MKM_TOPK_NOINLINE", "0") == "1"
+ENGINE_ONEPASS = os.environ.get("SGLANG_Q35_MKM_ONEPASS", "0") == "1"
+# ONEPASS in the 64-token engine only up to this many rows (past it, the plain build: B8's 56 rows lost 0.04 ms a round)
+ENGINE_ONEPASS_MAX_ROWS = int(os.environ.get("SGLANG_Q35_MKM_ONEPASS_MAX_ROWS", "64"))
+
+
+def engine_options(rows: int, plain: bool = False) -> tuple:
+    """The extra defines of the ``rows``-token engine (``plain``: without ONEPASS)."""
+    opts = ()
+    if ENGINE_THR_D and rows == M32_MAX_TOKENS:
+        opts += (f"-DTHR_D={ENGINE_THR_D}",)
+    if ENGINE_TOPK_NOINLINE and rows == M32_MAX_TOKENS:
+        opts += ("-DTOPK_NOINLINE=1",)
+    if ENGINE_ONEPASS and not plain and rows in (M32_MAX_TOKENS, M64_MAX_TOKENS):
+        opts += ("-DONEPASS=1",)
+    if opts:
+        logger.info("NVIDIA megakernel: Qwen3.5 %d-token engine built with %s", rows, " ".join(opts))
+    return opts
+
+
 def reserved_sms(rows: int, m: int) -> int:
     """The SMs the ``rows``-token engine leaves free at ``m`` rows."""
-    if rows == M32_MAX_TOKENS:
-        for bound, sms in M32_RESERVE_BY_ROWS:
-            if m <= bound:
-                if m not in _LOGGED:
-                    _LOGGED.add(m)
-                    logger.info("NVIDIA megakernel: Qwen3.5 32-token engine leaves %d SMs free at %d rows", sms, m)
-                return sms
+    table = {M32_MAX_TOKENS: M32_RESERVE_BY_ROWS, M64_MAX_TOKENS: M64_RESERVE_BY_ROWS}.get(rows, ())
+    for bound, sms in table:
+        if m <= bound:
+            if (rows, m) not in _LOGGED:
+                _LOGGED.add((rows, m))
+                logger.info("NVIDIA megakernel: Qwen3.5 %d-token engine leaves %d SMs free at %d rows", rows, sms, m)
+            return sms
     return RESERVED_SMS[rows]
 
 
@@ -205,8 +236,13 @@ def engine_rows(m: int) -> int:
     return next(r for r in ENGINE_ROWS if m <= r)
 
 
+def onepass_plain(rows: int, m: int) -> bool:
+    """Whether ``m`` rows of the ``rows``-token engine run its build without ONEPASS (SGLANG_Q35_MKM_ONEPASS_MAX_ROWS)."""
+    return ENGINE_ONEPASS and rows == M64_MAX_TOKENS and m > ENGINE_ONEPASS_MAX_ROWS
+
+
 @cache
-def _kernel(device_index: int, intermediate: int, rows: int) -> jit.Kernel:
+def _kernel(device_index: int, intermediate: int, rows: int, plain: bool = False) -> jit.Kernel:
     """The engine of ``engine_rows`` bound ``rows`` at ``intermediate`` per rank."""
     engine = {
         MAX_TOKENS: ENGINES,
@@ -227,7 +263,8 @@ def _kernel(device_index: int, intermediate: int, rows: int) -> jit.Kernel:
             "-default-device",
             f"-DQ35_MKM_SMEM_BYTES={engine.smem_bytes}",
         )
-        + engine.defines,
+        + engine.defines
+        + engine_options(rows, plain),
     )
     return jit.load(cubin, engine.kernel, (THREADS, 1, 1), engine.smem_bytes)
 
@@ -293,6 +330,13 @@ def build(
     for hi in ENGINE_ROWS:
         if min_rows <= hi and max_rows > lo:
             _kernel(device_index, intermediate, hi)
+            if onepass_plain(hi, max(lo + 1, min(max_rows, hi))):
+                _kernel(device_index, intermediate, hi, True)
+                logger.info(
+                    "NVIDIA megakernel: Qwen3.5 %d-token engine runs ONEPASS up to %d rows, its plain build past them",
+                    hi,
+                    ENGINE_ONEPASS_MAX_ROWS,
+                )
         lo = hi
 
 
@@ -400,7 +444,7 @@ def mkm_moe(
         out=gemm2_out.data_ptr(),
         num_tokens=m,
     )
-    kernel = _kernel(device.index, intermediate, rows)
+    kernel = _kernel(device.index, intermediate, rows, onepass_plain(rows, m))
     stream = torch.cuda.current_stream().cuda_stream
     if rows in (M32_MAX_TOKENS, M64_MAX_TOKENS, M128_MAX_TOKENS) + WIDE_ROWS:
         # min(M * 10, SMs) CTAs, one per SM, each running its share of the distinct experts

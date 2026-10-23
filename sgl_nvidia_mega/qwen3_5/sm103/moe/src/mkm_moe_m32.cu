@@ -209,8 +209,11 @@ constexpr int kARow = 260;  // FC1 accumulator row stride in floats: 16 B aligne
 #ifndef SPEC_STAGES  // ring stages issued for the speculated expert before the routing verdict (rest: after it)
 #define SPEC_STAGES 4
 #endif
-#ifndef STAGE_STAMPS  // DIAG: per-stage issue (slots 64 + st) and landing (16 + st, seen by warp 4) stamps
+#ifndef STAGE_STAMPS  // DIAG: per-stage issue (slots 64 + st), landing (16 + st, seen by warp 4) and MMA issue (40 + st) stamps
 #define STAGE_STAMPS 0
+#endif
+#ifndef STAMP_IT  // DIAG: the item whose stages STAGE_STAMPS records
+#define STAMP_IT 0
 #endif
 #ifndef DIAG_SPEC  // DIAG: warp 1's speculative ranking, stamps 16 = logits loaded, 17 = keys, 18 = top-10 (stride 32)
 #define DIAG_SPEC 0
@@ -249,11 +252,30 @@ static_assert(DRAIN_SMEM == 0, "x's shared memory holds the next item's rows whi
 #ifndef DIAG_ROUTE  // DIAG: stamps 13 = warp 0's routing rounds done, 15 = their barrier, 14 = item 0's rows gathered
 #define DIAG_ROUTE 0
 #endif
+#ifndef ONEPASS  // 1: an item of at most 8 rows runs FC2 in one pass (16 h copies of 8 rows: 16 tiles in one accumulator)
+#define ONEPASS 0
+#endif
+static_assert(!(ONEPASS && TAIL8), "ONEPASS drains its one FC2 pass on the TMEM warpgroup");
+#ifndef THR_D  // a CTA with one item, in a grid where some CTAs have two, keeps at most THR_D ring stages in flight
+#define THR_D 0  // (its HBM share goes to the CTAs on the critical path); 0 = off
+#endif
 #ifndef FC2_PF  // FC2 tiles (beyond the first kStages) prefetched to L2 ahead of the ring; 0 = off
 #define FC2_PF 0
 #endif
 #ifndef FC2_PF_LEAD  // issue the FC2 prefetch when the producer reaches FC1 stage kFc1Stages - FC2_PF_LEAD
 #define FC2_PF_LEAD 4
+#endif
+#ifndef FC2_PF_FROM  // the first FC2 stage (0 .. 7) the FC2 prefetch covers (old: kStages, the stages beyond the ring)
+#define FC2_PF_FROM 4
+#endif
+#ifndef FC2_PF_IT0  // items from this index on take the FC2 prefetch
+#define FC2_PF_IT0 0
+#endif
+#ifndef NEXT_PF  // the next item's first NEXT_PF stages prefetched to L2 when the producer reaches stage NEXT_PF_AT
+#define NEXT_PF 0
+#endif
+#ifndef NEXT_PF_AT
+#define NEXT_PF_AT 16
 #endif
 
 struct Params {
@@ -568,7 +590,14 @@ __device__ __forceinline__ uint32_t warp_top10_redux(uint32_t (&keys)[16], uint3
   return mine;
 }
 // The top-10 keys of one logits row (16 bf16 a lane in v0, v1), lane k < 10 holding the k-th largest
+#ifndef TOPK_NOINLINE  // 1: one out-of-line copy of the row top-10 shared by every routing warp (instruction cache)
+#define TOPK_NOINLINE 0
+#endif
+#if TOPK_NOINLINE
+__device__ __noinline__ uint32_t row_top10(const uint4 v0, const uint4 v1, uint32_t lane, uint32_t* s_cand) {
+#else
 __device__ __forceinline__ uint32_t row_top10(const uint4 v0, const uint4 v1, uint32_t lane, uint32_t* s_cand) {
+#endif
   uint32_t keys[16];
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
@@ -666,8 +695,9 @@ __device__ __forceinline__ void reg_fence64(uint32_t (&r)[64]) {  // keep uses o
 // r-th row of the item, row info buffer rb)
 template <int C0, int C1>
 __device__ __forceinline__ void fc2_drain16(const Params& p, Smem& s, uint32_t tm, int q, int lane, int pass, float a2,
-                                            int rb) {
-  const int row = q * 32 + lane, tile = pass * 8 + row / 16, r = row % 16;
+                                            int rb, bool one = false) {
+  // one: the item's single pass holds 16 tiles of 8 rows (accumulator row = 8 tile + item row)
+  const int row = q * 32 + lane, tile = one ? row / 8 : pass * 8 + row / 16, r = one ? row % 8 : row % 16;
   const bool valid = r < s.nrows[rb];
   __nv_bfloat16* orow = valid ? p.out + (size_t)(s.rtok[rb][r] * kTopK + s.rkslot[rb][r]) * kH + tile * 256 : nullptr;
   const uint32_t base = tm + ((uint32_t)(q * 32) << 16);
@@ -994,7 +1024,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       }
       if (lane == 0) {
         s.nitems = nall;
-        s.spec_ok = owner ? 1 : 0;
+        s.spec_ok = (owner ? 1 : 0) | (U > G ? 2 : 0);  // bit 1: some CTA runs more than one expert
         stamp(p, 1);
         mbar_arrive(&s.route_done);
       }
@@ -1013,7 +1043,8 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     return;
   }
   tc_fence_after();
-  const bool spec_ok = s.spec_ok != 0;
+  const bool spec_ok = (s.spec_ok & 1) != 0;
+  const bool thr = THR_D > 0 && nitems == 1 && (s.spec_ok & 2) != 0;
   // ring stage of item 0's stage 0: the speculative fill (stages 0 .. SPEC_STAGES - 1) is item 0's own only if spec_ok
   const int base0 = spec_ok ? 0 : SPEC_STAGES;
   float ag = 0.f, sc = 0.f, a2 = 0.f;
@@ -1043,9 +1074,9 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
   // SwiGLU + NVFP4 epilogue (h = 0: the one FC1 pass), tasks (row, 16-wide block, half) = 16 x 8 x 2 = 256,
   // task = et + k * nt.
   // Accumulator columns of each 32-block: [0, 8) up 2m, [8, 16) gate 2m, [16, 24) up 2m + 1, [24, 32) gate 2m + 1
-  auto epi_tasks = [&](int h, int et, int nt) {
+  auto epi_tasks = [&](int h, int et, int nt, bool one) {  // one: rows 0..7 only, 16 copies of 8 rows
 #pragma unroll 1
-    for (int task = et; task < 256; task += nt) {
+    for (int task = et; task < (one ? 128 : 256); task += nt) {
       const int row = task / 16, blk = (task / 2) % 8, hf = task % 2;
       const float4* ar = reinterpret_cast<const float4*>(s.acc1 + row * kARow + 32 * blk + 4 * hf);
       const float4 u_even = ar[0], g_even = ar[2], u_odd = ar[4], g_odd = ar[6];
@@ -1075,8 +1106,13 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       const int gblk = 8 * h + blk;  // 16-wide block over the 128 intermediates; k-blocks 0, 1
       const int chunk = gblk / 2, r8 = row % 8;
       const uint32_t off = (uint32_t)((row / 8) * 1024 + r8 * 128 + ((chunk ^ r8) * 16) + (gblk % 2) * 8 + hf * 4);
+      if (one) {
 #pragma unroll
-      for (int cp = 0; cp < 8; ++cp) *reinterpret_cast<uint32_t*>(s.ha + cp * 2048 + off) = packed;
+        for (int cp = 0; cp < 16; ++cp) *reinterpret_cast<uint32_t*>(s.ha + cp * 1024 + off) = packed;
+      } else {
+#pragma unroll
+        for (int cp = 0; cp < 8; ++cp) *reinterpret_cast<uint32_t*>(s.ha + cp * 2048 + off) = packed;
+      }
       if (hf == 0) reinterpret_cast<uint8_t*>(&s.hsf[row][gblk / 4])[gblk % 4] = (uint8_t)sf;
     }
   };
@@ -1103,9 +1139,13 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
         const int st0 = (it == 0 && spec_ok) ? SPEC_STAGES : 0;
         for (int st = st0; st < kTotStages; ++st) {
           const int g = base + st;
-          if (FC2_PF > 0 && st == kFc1Stages - FC2_PF_LEAD) {
-            // the FC2 tiles beyond the ring go to L2 now, while the last FC1 stages and h are in progress
-            for (int j = kStages; j < kStages + FC2_PF; ++j) prefetch_stage(kFc1Stages + j, e);
+          if (FC2_PF > 0 && st == kFc1Stages - FC2_PF_LEAD && it >= FC2_PF_IT0) {
+            // the FC2 tiles go to L2 now, while the last FC1 stages and h are in progress
+            for (int j = FC2_PF_FROM; j < FC2_PF_FROM + FC2_PF && j < kFc2Stages; ++j) prefetch_stage(kFc1Stages + j, e);
+          }
+          if (NEXT_PF > 0 && st == NEXT_PF_AT && it + 1 < nitems) {
+            // the next item's first stages go to L2 while this one finishes (their TMA loads then start from L2)
+            for (int k = 0; k < NEXT_PF; ++k) prefetch_stage(k, s.item_e[it + 1]);
           }
           if (PF_SET != 0 && ((st == st0 && (PF_SET & 1)) || (st == kFc1Stages + 4 && (PF_SET & 4)) ||
                               (st == kFc1Stages + 6 && (PF_SET & 8)))) {
@@ -1114,8 +1154,9 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
             for (int k = st; k < st + n && k < kTotStages; ++k) prefetch_stage(k, e);
           }
           if (g >= kStages) mbar_wait(&s.empty[g % kStages], ((g / kStages) - 1) & 1);
+          if (thr && g >= THR_D) mbar_wait(&s.full[(g - THR_D) % kStages], ((g - THR_D) / kStages) & 1);
           issue_stage(g, st, e, pol);
-          if (STAGE_STAMPS && it == 0) stamp(p, 64 + st);
+          if (STAGE_STAMPS && it == STAMP_IT) stamp(p, 64 + st);
         }
       }
     }
@@ -1136,6 +1177,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
         if (it > 0) mbar_wait(&s.acc_drained, (it - 1) & 1);
         mbar_wait(&s.x_full, par);
         tc_fence_after();
+        const bool one = ONEPASS && s.nrows[par] <= 8;  // FC2 in one pass of 16 tiles
         int n = 0;
         for (int st = 0; st < kFc1Stages; ++st) {
           const int g = base + st, b = g % kStages, ks = st;
@@ -1144,6 +1186,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
           tc_fence_after();
           if (st == 0 && it == 0) stamp(p, 3);
           if (st == 0 && it > 0 && it == nitems - 1) stamp(p, 11);
+          if (STAGE_STAMPS && it == STAMP_IT) stamp(p, 40 + st);
 #pragma unroll
           for (int q = 0; q < 4; ++q, ++n) {
             const int kb = ks * 4 + q;  // k-blocks in K order: one accumulator, the stock summation order
@@ -1160,13 +1203,14 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
         if (it == 0) stamp(p, 6);
         for (int st = kFc1Stages; st < kTotStages; ++st) {
           const int g = base + st, b = g % kStages, f = st - kFc1Stages;
-          if (f == 4) { mbar_wait(&s.fc2_free, par); tc_fence_after(); }
+          if (f == 4 && !one) { mbar_wait(&s.fc2_free, par); tc_fence_after(); }
           mbar_wait(&s.full[b], (g / kStages) & 1);
           mbar_wait(&s.sf_full[b], (g / kStages) & 1);
           tc_fence_after();
+          if (STAGE_STAMPS && it == STAMP_IT) stamp(p, 40 + st);
 #pragma unroll
           for (int tl = 0; tl < 2; ++tl) {
-            const int j = 2 * f + tl, jt = j % 8;
+            const int j = 2 * f + tl, jt = one ? j : j % 8;
 #pragma unroll
             for (int kb = 0; kb < 2; ++kb) {
               const int n2 = 64 + j * 2 + kb;  // scale-factor slot, numbered on from FC1's 64 k-blocks
@@ -1177,7 +1221,11 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
             }
           }
           tc_commit(&s.empty[b]);
-          if (f % 4 == 3) tc_commit(&s.fc2_pass[f / 4]);
+          if (one) {  // both pass barriers complete once per item either way
+            if (f == kFc2Stages - 1) { tc_commit(&s.fc2_pass[0]); tc_commit(&s.fc2_pass[1]); }
+          } else if (f % 4 == 3) {
+            tc_commit(&s.fc2_pass[f / 4]);
+          }
         }
       }
     }
@@ -1200,7 +1248,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
         }
       }
       mbar_wait(&s.acc_ready, par);
-      epi_tasks(0, et, 192);
+      epi_tasks(0, et, 192, ONEPASS && s.nrows[par] <= 8);
       if (warp == 3 && lane == 0 && it == 0 && !DIAG_ROUTE) stamp(p, 14);
       fence_proxy_async_smem();
       named_bar(6, 192);  // h and its scale words are complete for the TMEM warpgroup
@@ -1225,7 +1273,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       auto stage_sf2 = [&](int st) {  // FC2 tiles 2 f, 2 f + 1: k-blocks 0, 1 of their row blocks (rows 0..127 | 128..255)
         const int g = base + st, b = g % kStages;
         mbar_wait(&s.full[b], (g / kStages) & 1);
-        if (STAGE_STAMPS && threadIdx.x == 128 && it == 0) stamp(p, 16 + st);
+        if (STAGE_STAMPS && threadIdx.x == 128 && it == STAMP_IT) stamp(p, 16 + st);
         if (g >= 4) mbar_wait(&s.empty[(g - 4) % kStages], ((g - 4) / kStages) & 1);
         const uint8_t* sf = s.ring[b] + 32768;
         const int n0 = 64 + (st - kFc1Stages) * 4;
@@ -1247,7 +1295,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       for (int st = 0; st < kFc1Stages; ++st) {
         const int g = base + st, b = g % kStages, ks = st;
         mbar_wait(&s.full[b], (g / kStages) & 1);
-        if (STAGE_STAMPS && threadIdx.x == 128 && it == 0) stamp(p, 16 + st);
+        if (STAGE_STAMPS && threadIdx.x == 128 && it == STAMP_IT) stamp(p, 16 + st);
         if (g >= 4) mbar_wait(&s.empty[(g - 4) % kStages], ((g - 4) / kStages) & 1);
         const uint8_t* sf = s.ring[b] + 32768;
 #pragma unroll
@@ -1277,22 +1325,25 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
         drain_fc1(2);
         if (lane == 0) mbar_arrive(&s.acc_ready);
       }
+      const bool one = ONEPASS && nrows <= 8;  // FC2 in one pass of 16 tiles (8 rows each)
       mbar_wait(&s.acc_ready, par);
-      epi_tasks(0, 64 + (warp - 4) * 32 + lane, 192);
+      epi_tasks(0, 64 + (warp - 4) * 32 + lane, 192, one);
       fence_proxy_async_smem();
       named_bar(6, 192);  // h complete
       if (threadIdx.x == 128 && it == 0) stamp(p, 5);
       // h scale factors: 16 atoms (tile jt, k-block kb) of 4 columns; row m = 32 c + lane is nonzero only in its tile
+      // (one: 32 atoms, 16 tiles of 8 rows, columns kColSfa .. kColSfa + 127)
       {
         uint32_t r[32];
+        const int rr = one ? 8 : 16, nh = one ? 4 : 2;
 #pragma unroll 1
-        for (int half = 0; half < 2; ++half) {
+        for (int half = 0; half < nh; ++half) {
 #pragma unroll
           for (int i = 0; i < 32; ++i) {
             const int a = half * 8 + i / 4, col = i % 4;  // atom a = 2 jt + kb
             const int jt = a / 2, kb = a % 2;
             const int row = 32 * col + lane;
-            r[i] = (row / 16 == jt && row % 16 < nrows) ? s.hsf[row % 16][kb] : 0u;
+            r[i] = (row / rr == jt && row % rr < nrows) ? s.hsf[row % rr][kb] : 0u;
           }
           tmem_st_x32(tm + lane_addr + kColSfa + half * 32, r);
         }
@@ -1302,6 +1353,20 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       __syncwarp();
       if (lane == 0) mbar_arrive(&s.h_ready);
       if (q == 0 && lane == 0 && it == 0 && !DIAG_ROUTE) stamp(p, 15);
+      if (one) {  // every FC2 stage's scale factors, then the one pass's drain
+        for (int st = kFc1Stages + EARLY_SF2; st < kTotStages; ++st) stage_sf2(st);
+        mbar_wait(&s.fc2_pass[0], par);
+        tc_fence_after();
+        if (q == 0 && lane == 0 && it == 0) stamp(p, 12);
+        fc2_drain16<0, 4>(p, s, tm, q, lane, 0, a2, rb, true);
+        tc_fence_before();
+        __syncwarp();
+        if (lane == 0) {
+          mbar_arrive(&s.fc2_free);  // once per item either way (the MMA warp's parity)
+          mbar_arrive(&s.acc_drained);
+        }
+        continue;
+      }
       for (int st = kFc1Stages + EARLY_SF2; st < kTotStages; ++st) {
         if (st == kFc1Stages + 4) {
           // pass 0 is fully staged; drain it once its MMAs are done, then free the accumulator for pass 1

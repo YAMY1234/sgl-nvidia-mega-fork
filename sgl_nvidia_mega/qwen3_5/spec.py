@@ -27,6 +27,7 @@ SGLANG_READS = {
         "SPECULATIVE_DECODING",
         "MULTI_NODE_TP",
         "KV_OFFLOAD",
+        "PD_DISAGGREGATION",
         "MegakernelSpec",
         "Numerics",
         "NumericsKind",
@@ -51,6 +52,7 @@ SGLANG_READS = {
         "enable_linear_replayssm_spec",
         "mamba_ssm_dtype",
         "startup_weight_load_mode",
+        "disaggregation_mode",
     ),
     "srt/configs/qwen3_5.py": ("text_config",),
     "srt/megakernels/eagle_binding.py": ("EagleForwardView",),
@@ -178,8 +180,20 @@ def binding_reasons() -> list[str]:
     return []
 
 
+def pd_reasons(cfg) -> list[str]:
+    """A PD prefill server runs no decode or verify step: the plugin serves the decode side only."""
+    if (cfg.disaggregation_mode or "null") == "prefill":
+        return ["a PD prefill server runs no covered step; enable it on the decode side"]
+    return []
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    return text_config_reasons(hf_config) + binding_reasons() + runtime.slot_reasons()
+    return (
+        text_config_reasons(hf_config)
+        + binding_reasons()
+        + runtime.slot_reasons()
+        + pd_reasons(cfg)
+    )
 
 
 def _build(model, hf_config, ctx):
@@ -198,6 +212,8 @@ SPEC = MegakernelSpec(
             Feature.MULTI_NODE_TP,
             # HiCache: covered steps read only running requests' pages
             Feature.KV_OFFLOAD,
+            # the decode side of PD (pd_reasons refuses the prefill side)
+            Feature.PD_DISAGGREGATION,
         }
     ),
     numerics=NUMERICS,

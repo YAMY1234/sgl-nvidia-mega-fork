@@ -240,11 +240,11 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
                 else []
             )
         )
-    # 64 and 128 requests: the GDN chain and route_topk (gdn_core up to its rows; the
-    # hop and MKA stop at 32 requests)
+    # 64 and 128 requests: the GDN chain, route_topk and MKA's front path (gdn_core up to
+    # its rows; the hop stops at 32 requests)
     for rows in (448, 896):
         assert _on(plan.slots(rows, every)) == sorted(
-            ["gdn_pdl", "gdn_verify", "route_topk"]
+            ["gdn_pdl", "gdn_verify", "mka", "route_topk"]
             + (["gdn_core"] if rows <= plan.GDN_CORE_MAX_ROWS else [])
         )
     assert _on(plan.slots(56, plan.Facts(gdn_verify=True))) == ["gdn_verify"]
@@ -277,7 +277,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(14, attention)) == ["hop"]
     # with its wide entries and front path MKA covers every width
     wide_attention = plan.Facts(mka=True, mka_wide=True)
-    widths = (7, 14, 28, 56, 112, 224)
+    widths = (7, 14, 28, 56, 112, 224, 448, 896)
     assert plan.covered(widths, wide_attention, 7) == widths
     # mkm_wide: mkm's 16-token engine at two requests, not past the router front's rows
     wide = plan.Facts(route=True, mkm=True, mkm_wide=True)
@@ -324,8 +324,8 @@ def test_the_slot_plans_row_bounds_are_the_kernels():
     assert plan.MKA_MAX_ROWS == mka.MAX_ROWS
     from sgl_nvidia_mega.qwen3_5.attention import mka as mka_step
 
-    # MKA's wide entries and front path at the widths they are checked at (32 requests)
-    assert plan.MKA_WIDE_MAX_ROWS == 224 <= plan.MAX_ROWS
+    # MKA's wide entries, then its front path at every covered width
+    assert plan.MKA_WIDE_MAX_ROWS == plan.MAX_ROWS
     assert mka_step.FUSED_MAX_ROWS <= mka.WIDE_MAX_ROWS
 
 

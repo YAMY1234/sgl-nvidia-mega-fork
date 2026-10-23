@@ -77,7 +77,7 @@ GDN_PUSH_MAX_ROWS = 8
 ROUTE_SHARED_ROWS = 8
 MKA_MAX_ROWS = 8
 # with four query heads a rank: the wide entries, then the front path (attention/mka.py)
-MKA_WIDE_MAX_ROWS = 224  # the widths its wide entries / front path are checked at
+MKA_WIDE_MAX_ROWS = MAX_ROWS  # its front path is checked at every covered width (to 128 requests)
 # slots lowm / lowm_se: the rows up to which each low-M launch measured faster than SGLang's quantize +
 # cuBLAS path on GB300 (results/trt-1022/l6): the input projections (in_proj_qkvz + in_proj_ba, qkv_proj),
 # the output projections (out_proj, o_proj) and the shared expert

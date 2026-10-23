@@ -216,7 +216,10 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         and facts.lowm_push
         and hop
         and rows <= max(LOWM_OUTPROJ_MAX_ROWS, LOWM_OPROJ_MAX_ROWS),
-        hop_fp8=hop and facts.hop_fp8 and rows <= HOP_MAX_ROWS,
+        # wherever the one-shot hop runs: with hop_mid up to four requests (batch 4, TP8 static: B4 -0.027 ms a round)
+        hop_fp8=hop
+        and facts.hop_fp8
+        and rows <= (HOP_MID_MAX_ROWS if facts.hop_mid else HOP_MAX_ROWS),
     )
 
 

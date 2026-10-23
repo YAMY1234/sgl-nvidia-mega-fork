@@ -226,11 +226,13 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     )
     # four to 32 requests: the GDN chain (with its one-launch core), the two-shot hop,
     # route_topk and MKA's front path (whose flag mka_push only the wide entries act on),
-    # with the router front's tiles and mkm's 32-token engine up to their rows; no low-M launch past two requests
+    # with the router front's tiles and mkm's 32-token engine up to their rows; no low-M launch past two requests;
+    # the hop's FP8 copy wherever the one-shot hop runs (hop_mid: up to four requests)
     for rows in (28, 56, 112, 224):
         assert _on(plan.slots(rows, every)) == sorted(
             gdn
             + ["hop", "mka", "mka_push", "route_topk"]
+            + (["hop_fp8"] if rows <= plan.HOP_MID_MAX_ROWS else [])
             + (["route_gemm"] if rows <= plan.ROUTE_GEMM_MAX_ROWS else [])
             + (["mkm_m32"] if rows <= plan.MKM_M32_MAX_ROWS else [])
             + (["mkm_m64"] if plan.MKM_M32_MAX_ROWS < rows <= plan.MKM_M64_MAX_ROWS else [])
@@ -253,6 +255,8 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     # hop_mid: the one-shot hop up to four requests, not past them
     mid = plan.Facts(hop=True, hop_mid=True)
     assert _on(plan.slots(28, mid)) == ["hop"]
+    assert _on(plan.slots(28, plan.Facts(hop=True, hop_mid=True, hop_fp8=True))) == ["hop", "hop_fp8"]
+    assert _on(plan.slots(28, plan.Facts(hop=True, hop_wide=True, hop_fp8=True))) == ["hop"]
     assert _on(plan.slots(56, mid)) == []
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]
     assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]

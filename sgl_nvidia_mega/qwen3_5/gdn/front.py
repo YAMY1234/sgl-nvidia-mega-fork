@@ -207,7 +207,7 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
             x.shape[0],
             front.PIN,
             core_kernel.EARLY,
-            int(not (opts.core and core_kernel.EARLY)),
+            int(not (opts.core and (core_kernel.EARLY or front.PIN))),
         )
     attn, bound = gdn.attn, st.bound["gdn"]
     meta, pools = st.view.gdn, st.view.mamba
@@ -238,8 +238,9 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
         history_g=pools.ring_g[li],
         ring_indices=st.fb.req_pool_indices[:requests],
         pad_slot=meta.pad_slot_id,
-        # slot gdn_core with the committed history early loads the checkpoint and ring itself
-        prefetch=not (opts.core and core_kernel.EARLY),
+        # no L2 prefetch of the checkpoint / ring in front of slot gdn_core with the pinned front or the early
+        # history: the core loads them before its own wait, and the late prefetch only delays this launch's completion
+        prefetch=not (opts.core and (core_kernel.EARLY or front.PIN)),
     )
     if opts.core:
         from sgl_nvidia_mega.qwen3_5.gdn.verify import _fused

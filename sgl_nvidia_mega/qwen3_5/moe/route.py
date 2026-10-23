@@ -23,6 +23,12 @@ token's top-10 experts and renormalized weights as the trtllm-gen routing comput
 and the NVFP4 input as the runner's quantizer does; the runner then serves the
 materialized routing (FlashInfer's routed MoE), which skips its own top-k kernel. The
 logits are SGLang's, so the step's output is the stock one's.
+
+Slot ``mkm_m32`` takes route_topk's place at 17 to 32 rows: slot mkm's 32-token engine runs
+the top-10, FC1, SwiGLU, the NVFP4 requantization and FC2 in one launch on the router
+GEMM's logits and the NVFP4 input (with route_gemm the router front's tiles give both;
+otherwise route_topk's launch quantizes the input), bit for bit the runner's rows on
+those logits, so the step's output is route_topk's.
 """
 
 from __future__ import annotations
@@ -112,6 +118,7 @@ class Bound(msgspec.Struct, frozen=True):
     shared: bool = False  # slot route_shared: the shared gate/up in the router launch
     topk: bool = False  # slot route_topk: the top-10 + NVFP4 input launch built
     gemm: bool = False  # slot route_gemm: the router front's 16-row tiles stand in for the GEMM
+    m32: dict = msgspec.field(default_factory=dict)  # slot mkm_m32: layer id -> weight TMA maps
     reason: str = ""  # why a requested slot is not built
 
 
@@ -168,6 +175,39 @@ def build(
             device="cuda",
         ),
         shared=shared,
+    )
+
+
+def build_m32(model, bound: Bound) -> Bound:
+    """Slot mkm_m32 on ``bound`` (route_topk built): the 32-token engine and every MoE
+    layer's weight maps (slot mkm's when built), or why it cannot serve."""
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm as mkm_kernel
+
+    m = model.model
+    layers = [m.layers[i].mlp for i in range(m.start_layer, m.end_layer)]
+    device = torch.cuda.current_device()
+    intermediate = layers[0].experts.w2_weight.shape[-1] * 2
+    reason = mkm_kernel.m32_unsupported(device, intermediate)
+    if reason:
+        return msgspec.structs.replace(bound, reason=f"mkm_m32: {reason}")
+    mkm_kernel.build(
+        device,
+        intermediate,
+        mkm_kernel.M32_MAX_TOKENS,
+        min_rows=mkm_kernel.M16_MAX_TOKENS + 1,
+    )
+    return msgspec.structs.replace(
+        bound,
+        m32={
+            mlp.layer_id: bound.mkm.get(mlp.layer_id)
+            or mkm_kernel.weight_maps(mlp.experts.w13_weight, mlp.experts.w2_weight)
+            for mlp in layers
+        },
+        identity=torch.arange(
+            mkm_kernel.M32_MAX_TOKENS * mkm_kernel.TOP_K,
+            dtype=torch.int32,
+            device="cuda",
+        ),
     )
 
 
@@ -351,3 +391,27 @@ def routed_topk(mlp, x: torch.Tensor, gemm: bool = False):
     with flashinfer_trtllm_deferred_finalize_context():
         combine_input = experts.run_moe_core(dispatch_output=dispatch_output)
     return experts.dispatcher.combine(combine_input=combine_input)
+
+
+def routed_m32(mlp, x: torch.Tensor, bound: Bound, gemm: bool = False):
+    """``FusedMoE.forward_deferred_finalize`` of ``mlp``'s routed experts on ``x``
+    [17-32 rows, hidden] in one launch of the 32-token engine (slot mkm_m32), on SGLang's
+    router GEMM and route_topk's quantized input, or with ``gemm`` (slot route_gemm,
+    numeric) on the router front's tiles (logits and quantized input in one launch)."""
+    from sgl_nvidia_mega.qwen3_5.moe import mkm
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    if ("mkm_m32", x.shape[0]) not in _ENGAGED:
+        _ENGAGED.add(("mkm_m32", x.shape[0]))
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 slot mkm_m32 runs at %d rows", x.shape[0]
+        )
+    scale = mlp.experts.w13_input_scale_quant.reshape(1)
+    if gemm:
+        logits, x_fp4, x_sf = router.router_gemm_quant_tiled(x, mlp.gate.weight, scale)
+    else:
+        logits, _ = mlp.gate(x)
+        _, _, x_fp4, x_sf = router.route_topk_quant(logits, x, scale)
+    return mkm.routed(
+        mlp, bound.m32[mlp.layer_id], bound.identity, logits, x_fp4, x_sf
+    )

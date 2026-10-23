@@ -13,7 +13,8 @@ alternate stream), otherwise the eager order. With ``defer`` (the boundary takes
 finalize) it returns SGLang's ``MoeDeferredFinalize`` handoff, otherwise the summed
 rows. Slot ``route`` (``route.py``) runs the deferred routed experts on the router
 front, and slot ``mkm`` (``mkm.py``) runs them in one launch on its outputs; past route's
-rows, slot ``route_topk`` (``route.py``) runs them on a materialized routing. In the
+rows, slot ``route_topk`` (``route.py``) runs them on a materialized routing, or at 17 to
+32 rows slot ``mkm_m32`` in one launch of mkm's 32-token engine. In the
 dual-stream order of up to 8 rows, slot ``route_shared`` computes the shared expert's
 gate/up in the router front's launch; the alternate stream waits for that launch only and
 runs the rest of the shared expert (numeric).
@@ -70,8 +71,8 @@ SGLANG_MIRRORS = {
 
 
 def build(model, ctx) -> route.Bound:
-    """Slots ``route``, ``mkm`` and ``route_topk`` for every MoE layer; the result is
-    ``st.bound["moe"]``."""
+    """Slots ``route``, ``mkm``, ``route_topk`` and ``mkm_m32`` for every MoE layer; the
+    result is ``st.bound["moe"]``."""
     import msgspec
 
     from sgl_nvidia_mega.qwen3_5 import plan
@@ -101,6 +102,10 @@ def build(model, ctx) -> route.Bound:
         if "route_gemm" in SLOTS:
             router.build(torch.cuda.current_device(), router.MAX_TOKENS)
             bound = msgspec.structs.replace(bound, gemm=True)
+        if "mkm_m32" in SLOTS and plan.widest(ctx.widths, plan.MKM_M32_MAX_ROWS) > (
+            plan.MKM_WIDE_MAX_ROWS
+        ):
+            bound = route.build_m32(model, bound)
     return bound
 
 
@@ -194,6 +199,8 @@ def _router_experts(mlp, x, defer: bool, st):
 
     if defer and st.slots.route:
         return route.routed(mlp, x, st.bound["moe"] if st.slots.mkm else None)
+    if defer and st.slots.mkm_m32:
+        return route.routed_m32(mlp, x, st.bound["moe"], gemm=st.slots.route_gemm)
     if defer and st.slots.route_topk:
         return route.routed_topk(mlp, x, gemm=st.slots.route_gemm)
     router_logits, _ = mlp.gate(x)

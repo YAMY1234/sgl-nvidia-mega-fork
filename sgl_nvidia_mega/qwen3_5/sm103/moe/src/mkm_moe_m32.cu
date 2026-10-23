@@ -574,7 +574,14 @@ __device__ __forceinline__ uint32_t warp_top10_redux(uint32_t (&keys)[16], uint3
   return mine;
 }
 // The top-10 keys of one logits row (16 bf16 a lane in v0, v1), lane k < 10 holding the k-th largest
+#ifndef TOPK_NOINLINE  // 1: one out-of-line copy of the row top-10 shared by every routing warp (instruction cache)
+#define TOPK_NOINLINE 0
+#endif
+#if TOPK_NOINLINE
+__device__ __noinline__ uint32_t row_top10(const uint4 v0, const uint4 v1, uint32_t lane, uint32_t* s_cand) {
+#else
 __device__ __forceinline__ uint32_t row_top10(const uint4 v0, const uint4 v1, uint32_t lane, uint32_t* s_cand) {
+#endif
   uint32_t keys[16];
 #pragma unroll
   for (int i = 0; i < 8; ++i) {

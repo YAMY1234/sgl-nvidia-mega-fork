@@ -80,9 +80,17 @@ M64_ENGINES = {
         "mkm_moe_m64.cu", "q35_mkm_moe_m64", 228352, "CU_TENSOR_MAP_SWIZZLE_64B"
     ),
 }
+# the 128-token engines (the 64-token engine's units, on a given routing only)
+M128_MAX_TOKENS = 128
+M128_ENGINES = {
+    128: Engine(
+        "mkm_moe_m128.cu", "q35_mkm_moe_m128", 231424, "CU_TENSOR_MAP_SWIZZLE_64B"
+    ),
+}
 RESERVED_SMS = {
     M32_MAX_TOKENS: 32 if _RESERVED is None else int(_RESERVED),
     M64_MAX_TOKENS: 0 if _RESERVED is None else int(_RESERVED),
+    M128_MAX_TOKENS: 0 if _RESERVED is None else int(_RESERVED),
 }
 
 
@@ -114,8 +122,10 @@ class ParamsM32(Params):
     _fields_ = [("x_fp4", ctypes.c_void_p), ("ids_in", ctypes.c_void_p)]
 
 
-# the rows each engine serves: (7-row, 16-token, 32-token, 64-token) engines up to these
-ENGINE_ROWS = (MAX_TOKENS, M16_MAX_TOKENS, M32_MAX_TOKENS, M64_MAX_TOKENS)
+# the rows each engine serves: (7-row, 16-token, 32-token, 64-token, 128-token) engines up to these
+ENGINE_ROWS = (MAX_TOKENS, M16_MAX_TOKENS, M32_MAX_TOKENS, M64_MAX_TOKENS, M128_MAX_TOKENS)
+# the engines that take a given routing (route_topk's ids); the 128-token one only that way
+ROUTED_ENGINES = (M64_MAX_TOKENS, M128_MAX_TOKENS)
 
 
 def engine_rows(m: int) -> int:
@@ -131,6 +141,7 @@ def _kernel(device_index: int, intermediate: int, rows: int) -> jit.Kernel:
         M16_MAX_TOKENS: WIDE_ENGINES,
         M32_MAX_TOKENS: M32_ENGINES,
         M64_MAX_TOKENS: M64_ENGINES,
+        M128_MAX_TOKENS: M128_ENGINES,
     }[rows][intermediate]
     major, minor = torch.cuda.get_device_capability(device_index)
     cubin = jit.compile_source(
@@ -146,9 +157,13 @@ def _kernel(device_index: int, intermediate: int, rows: int) -> jit.Kernel:
     return jit.load(cubin, engine.kernel, (THREADS, 1, 1), engine.smem_bytes)
 
 
-def max_tokens(intermediate: int, m32: bool = False, m64: bool = False) -> int:
-    """The widest rows an engine serves for ``intermediate`` per rank (``m32`` / ``m64``:
-    with the 32 / 64-token engine)."""
+def max_tokens(
+    intermediate: int, m32: bool = False, m64: bool = False, m128: bool = False
+) -> int:
+    """The widest rows an engine serves for ``intermediate`` per rank (``m32`` / ``m64`` /
+    ``m128``: with the 32 / 64 / 128-token engine)."""
+    if m128 and intermediate in M128_ENGINES:
+        return M128_MAX_TOKENS
     if m64 and intermediate in M64_ENGINES:
         return M64_MAX_TOKENS
     if m32 and intermediate in M32_ENGINES:
@@ -253,19 +268,22 @@ def mkm_moe(
     routing: tuple | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(gemm2_out bf16 [M * 10, 4096], expert_weights bf16 [M, 10]) for logits [M, 512]
-    bf16 (M <= 7, at TP8 M <= 64) and the router front's x_fp4 [M, 2048] / x_sf [M, 256]
+    bf16 (M <= 7, at TP8 M <= 128) and the router front's x_fp4 [M, 2048] / x_sf [M, 256]
     (uint8, linear e4m3); w13_sf [512, 2 I, 256] / w2_sf [512, 4096, I / 16] e4m3 viewed
     as uint8 (the engine follows I); g1_alpha, g1_scale_c, g2_alpha [512] fp32. With
-    ``routing`` (route_topk's ids int32 / weights bf16 [M, 10], 33 to 64 rows) the engine
-    takes that routing instead of ranking the logits, and returns those weights."""
+    ``routing`` (route_topk's ids int32 / weights bf16 [M, 10]; 33 to 64 rows, and required
+    at 65 to 128) the engine takes that routing instead of ranking the logits, and returns
+    those weights."""
     m = logits.shape[0]
     intermediate = w2_sf.shape[2] * 16
-    widest = max_tokens(intermediate, m32=True, m64=True)
+    widest = max_tokens(intermediate, m32=True, m64=True, m128=True)
     if not 1 <= m <= widest:
         raise ValueError(f"mkm: {m} rows (1-{widest})")
     rows = engine_rows(m)
-    if routing is not None and rows != M64_MAX_TOKENS:
-        raise ValueError(f"mkm: a given routing needs the 64-token engine, not {m} rows")
+    if routing is not None and rows not in ROUTED_ENGINES:
+        raise ValueError(f"mkm: a given routing needs the 64 / 128-token engine, not {m} rows")
+    if routing is None and rows == M128_MAX_TOKENS:
+        raise ValueError(f"mkm: {m} rows need a given routing (route_topk's)")
     device = logits.device
     gemm2_out = torch.empty((m * TOP_K, HIDDEN), dtype=torch.bfloat16, device=device)
     expert_weights = torch.empty((m, TOP_K), dtype=torch.bfloat16, device=device)
@@ -285,7 +303,7 @@ def mkm_moe(
     )
     kernel = _kernel(device.index, intermediate, rows)
     stream = torch.cuda.current_stream().cuda_stream
-    if rows in (M32_MAX_TOKENS, M64_MAX_TOKENS):
+    if rows in (M32_MAX_TOKENS, M64_MAX_TOKENS, M128_MAX_TOKENS):
         # min(M * 10, SMs) CTAs, one per SM, each running its share of the distinct experts
         sms = torch.cuda.get_device_properties(device).multi_processor_count - RESERVED_SMS[rows]
         ids_in = 0 if routing is None else routing[0].data_ptr()

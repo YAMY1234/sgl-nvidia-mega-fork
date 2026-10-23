@@ -103,12 +103,15 @@ TACTICS: dict = {
     (4096, 0, 1024, 28, True): _t(8, 2, 1, 1, 1),
     (4096, 0, 1024, 14, False): _t(8, 4, 1, 1, 1),  # o_proj
     (4096, 0, 1024, 28, False): _t(4, 2, 1, 1, 1),
-    (256, 8, 4096, 14, False): _t(16, 2, 1, 1, 4),  # shared expert gate_up + SwiGLU, shared gate
+    (256, 8, 4096, 7, False): _t(8, 2, 1, 1, 4),  # shared expert gate_up + SwiGLU, shared gate
+    (256, 8, 4096, 14, False): _t(16, 2, 1, 1, 4),
     (256, 8, 4096, 28, False): _t(16, 2, 1, 1, 4),
     (256, 8, 4096, 56, False): _t(8, 2, 1, 1, 4),
-    (256, 8, 4096, 14, True): _t(8, 2, 1, 1, 4),  # shared expert gate_up on the hop's E4M3
+    (256, 8, 4096, 7, True): _t(8, 2, 1, 1, 4),  # shared expert gate_up on the hop's E4M3
+    (256, 8, 4096, 14, True): _t(8, 2, 1, 1, 4),
     (256, 8, 4096, 28, True): _t(8, 2, 1, 1, 4),
-    (4096, 0, 128, 14, True): _t(2, 1, 1, 1, 1),  # shared expert down_proj x sigmoid(gate)
+    (4096, 0, 128, 7, True): _t(2, 1, 1, 1, 1),  # shared expert down_proj x sigmoid(gate)
+    (4096, 0, 128, 14, True): _t(2, 1, 1, 1, 1),
     (4096, 0, 128, 28, True): _t(2, 1, 1, 1, 1),
     (4096, 0, 128, 56, True): _t(2, 1, 1, 1, 1),
 }

@@ -199,6 +199,8 @@ def test_the_slot_plan_covers_one_request_of_7_rows():
     shared = dict(route=True, route_shared=True)
     assert plan.plan((7,), plan.Facts(**shared)) == {7: plan.Slots(**shared)}
     assert not plan.slots(7, plan.Facts(route_shared=True)).route_shared
+    # where lowm_se runs, its two launches take the shared expert instead
+    assert _on(plan.slots(7, plan.Facts(**shared, lowm_se=True))) == ["lowm_se", "route"]
     with pytest.raises(ValueError):
         plan.slots(plan.MAX_ROWS + 1, plan.Facts())
 
@@ -212,10 +214,10 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     every = plan.Facts(
         **{**dict.fromkeys(plan.Facts.__struct_fields__, True), "mkm_wide": False}
     )
-    # route_topk (and mkm_m32 in its place) serves only where route does not
+    # route_topk (and mkm_m32 in its place) serves only where route does not; lowm_se takes route_shared's place
     assert _on(plan.slots(7, every)) == sorted(
         set(plan.Slots.__struct_fields__)
-        - {"route_topk", "route_gemm", "mkm_m32", "mkm_m64", "mkm_m128"}
+        - {"route_topk", "route_gemm", "mkm_m32", "mkm_m64", "mkm_m128", "route_shared"}
     )
     # two requests: the 16-row router front, the GDN chain, the hop's one-shot rows,
     # MKA's wide entries with their push, every low-M launch and the hop's FP8 copy

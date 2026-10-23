@@ -111,7 +111,7 @@ def test_cluster_split_is_the_same_sums(rows):
     assert float(d.max()) <= float(a.float().abs().max()) * 2.0**-7
 
 
-@pytest.mark.parametrize("rows", [14, 28, 56])
+@pytest.mark.parametrize("rows", [7, 14, 28, 56])
 def test_shared_expert_is_sglang_numerically(rows):
     from sgl_kernel import silu_and_mul
     from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul
@@ -146,6 +146,16 @@ def test_shared_expert_is_sglang_numerically(rows):
     torch.cuda.synchronize()
     # the hidden FP8 rows differ from SGLang's only where the FP32 sum order moves a BF16 rounding
     assert float((h8.float() != q2.float()).float().mean()) < 0.02
+    # gate_up on the hop's E4M3 rows (slot hop_fp8): SGLang's quantization, byte for byte, at the same tactic
+    t8 = t.get((256, 8, 4096, rows, True)) or lowm.default_tactic(rows, 256, 8, 4096, swiglu=True)
+    h8_q, h8_8 = torch.empty_like(h8), torch.empty_like(h8)
+    lg_q, lg_8 = torch.empty_like(logits), torch.empty_like(logits)
+    for x8, hh, lg in ((None, h8_q, lg_q), (q, h8_8, lg_8)):
+        lowm.gemm(x8=x8, x16=x, w8=lowm.swiglu_pairs(gu), w_scale=sgu, in_scale=s, w16=gate8, out=hh, out2=lg,
+                  swiglu_scale=s_h, tactic=t8)
+    torch.cuda.synchronize()
+    assert torch.equal(h8_q.view(torch.uint8), h8_8.view(torch.uint8))
+    assert torch.equal(lg_q, lg_8)
     rel = float((out.float() - ref.float()).norm() / ref.float().norm())
     assert rel < 2e-2, rel
     first = out.clone()

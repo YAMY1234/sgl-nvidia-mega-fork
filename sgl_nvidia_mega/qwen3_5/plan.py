@@ -23,7 +23,7 @@ routes), or with ``hop_mid`` (numeric: its one-shot protocol past FlashInfer's) 
 ``gdn_push`` (numeric: out_proj as the hop's push GEMM, on gdn_verify's FP8 norm) runs up
 to 8 rows. ``gdn_front`` (numeric: the GDN projections and conv in one launch, then
 gdn_pdl's verify) covers one or two requests of 7 rows, ``route_shared`` (numeric: the shared
-expert's gate/up in route's launch) up to 8 rows. ``skv2`` runs the full attention's core
+expert's gate/up in route's launch) up to 8 rows where ``lowm_se`` does not run. ``skv2`` runs the full attention's core
 of one request through the split-KV attention of SGLang branch
 nvidia/qwen35-agentx-gb300, ``mka`` the fused attention prologue and epilogue around it
 (up to 8 rows; with four query heads a rank, its wide entries up to 14 rows and past
@@ -174,6 +174,7 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
     mka = facts.mka and rows <= (MKA_WIDE_MAX_ROWS if facts.mka_wide else MKA_MAX_ROWS)
     gdn_verify = facts.gdn_verify and rows <= GDN_VERIFY_MAX_ROWS
     route_topk = facts.route_topk and not route and rows <= ROUTE_TOPK_MAX_ROWS
+    lowm_se = facts.lowm_se and rows <= LOWM_SE_MAX_ROWS
     return Slots(
         route=route,
         route_topk=route_topk,
@@ -203,7 +204,9 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         and facts.gdn_front
         and rows % GDN_FRONT_ROWS == 0
         and rows <= GDN_FRONT_MAX_ROWS,
-        route_shared=route and facts.route_shared and rows <= ROUTE_SHARED_ROWS,
+        # lowm_se's two launches take the shared expert where both run (one request: the router launch's
+        # shared stage and SGLang's four-launch tail are left out)
+        route_shared=route and facts.route_shared and rows <= ROUTE_SHARED_ROWS and not lowm_se,
         # SKV2 attends one sequence
         skv2=facts.skv2 and rows <= tokens_per_request,
         mka=mka,
@@ -211,7 +214,7 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         lowm_in=facts.lowm_in and rows <= LOWM_IN_MAX_ROWS,
         lowm_outproj=facts.lowm_out and rows <= LOWM_OUTPROJ_MAX_ROWS,
         lowm_oproj=facts.lowm_out and rows <= LOWM_OPROJ_MAX_ROWS,
-        lowm_se=facts.lowm_se and rows <= LOWM_SE_MAX_ROWS,
+        lowm_se=lowm_se,
         lowm_push=facts.lowm_out
         and facts.lowm_push
         and hop

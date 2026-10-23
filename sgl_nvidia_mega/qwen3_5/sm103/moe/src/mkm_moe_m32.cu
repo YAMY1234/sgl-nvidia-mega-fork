@@ -220,7 +220,8 @@ constexpr int kTraceStride = STAGE_STAMPS ? 128 : DIAG_SPEC ? 32 : 16;
 #define SMEM_SPACE 1
 #endif
 #ifndef PF_SET  // L2 prefetch of the stages that wait for a ring slot at: 1 = start, 4 = FC2, 8 = FC2 pass 1
-#define PF_SET 5
+// (none: from 17 rows the CTAs' streams already keep HBM busy, so these prefetches only compete with the ring's loads)
+#define PF_SET 0
 #endif
 #ifndef PF_N1  // stages prefetched at the start trigger
 #define PF_N1 4
@@ -229,7 +230,8 @@ constexpr int kTraceStride = STAGE_STAMPS ? 128 : DIAG_SPEC ? 32 : 16;
 #define PF_N2 4
 #endif
 #ifndef TAILV  // FC2 drains: bit 0 = last pass on all 8 warps; bit 1 = TMEM loads double-buffered; bit 2 = coalesced stores
-#define TAILV 3
+// (0: measured at 28 / 56 rows, the plain drains cost the least)
+#define TAILV 0
 #endif
 #define TAIL8 (TAILV & 1)
 #define DRAIN_PIPE ((TAILV >> 1) & 1)
@@ -242,7 +244,7 @@ static_assert(DRAIN_SMEM == 0, "x's shared memory holds the next item's rows whi
 #define GATHER_BATCH 8
 #endif
 #ifndef SPEC_PF  // stages of the speculated expert past the first ring fill prefetched to L2 while the routing runs
-#define SPEC_PF 8
+#define SPEC_PF 4
 #endif
 #ifndef DIAG_ROUTE  // DIAG: stamps 13 = warp 0's routing rounds done, 15 = their barrier, 14 = item 0's rows gathered
 #define DIAG_ROUTE 0

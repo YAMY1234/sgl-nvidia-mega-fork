@@ -261,6 +261,18 @@ static_assert(DRAIN_SMEM == 0, "x's shared memory holds the next item's rows whi
 #ifndef FC2_PF_LEAD  // issue the FC2 prefetch when the producer reaches FC1 stage kFc1Stages - FC2_PF_LEAD
 #define FC2_PF_LEAD 4
 #endif
+#ifndef FC2_PF_FROM  // the first FC2 stage (0 .. 7) the FC2 prefetch covers (old: kStages, the stages beyond the ring)
+#define FC2_PF_FROM 4
+#endif
+#ifndef FC2_PF_IT0  // items from this index on take the FC2 prefetch
+#define FC2_PF_IT0 0
+#endif
+#ifndef NEXT_PF  // the next item's first NEXT_PF stages prefetched to L2 when the producer reaches stage NEXT_PF_AT
+#define NEXT_PF 0
+#endif
+#ifndef NEXT_PF_AT
+#define NEXT_PF_AT 16
+#endif
 
 struct Params {
   const uint16_t* logits;    // [M, 512] bf16 router logits (router_gemm_quant output)
@@ -1117,9 +1129,13 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
         const int st0 = (it == 0 && spec_ok) ? SPEC_STAGES : 0;
         for (int st = st0; st < kTotStages; ++st) {
           const int g = base + st;
-          if (FC2_PF > 0 && st == kFc1Stages - FC2_PF_LEAD) {
-            // the FC2 tiles beyond the ring go to L2 now, while the last FC1 stages and h are in progress
-            for (int j = kStages; j < kStages + FC2_PF; ++j) prefetch_stage(kFc1Stages + j, e);
+          if (FC2_PF > 0 && st == kFc1Stages - FC2_PF_LEAD && it >= FC2_PF_IT0) {
+            // the FC2 tiles go to L2 now, while the last FC1 stages and h are in progress
+            for (int j = FC2_PF_FROM; j < FC2_PF_FROM + FC2_PF && j < kFc2Stages; ++j) prefetch_stage(kFc1Stages + j, e);
+          }
+          if (NEXT_PF > 0 && st == NEXT_PF_AT && it + 1 < nitems) {
+            // the next item's first stages go to L2 while this one finishes (their TMA loads then start from L2)
+            for (int k = 0; k < NEXT_PF; ++k) prefetch_stage(k, s.item_e[it + 1]);
           }
           if (PF_SET != 0 && ((st == st0 && (PF_SET & 1)) || (st == kFc1Stages + 4 && (PF_SET & 4)) ||
                               (st == kFc1Stages + 6 && (PF_SET & 8)))) {

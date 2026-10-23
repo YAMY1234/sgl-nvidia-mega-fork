@@ -272,7 +272,8 @@ def build(model, ctx) -> Bound:
             for w in ctx.widths:
                 if w <= plan.LOWM_SE_MAX_ROWS:
                     launches.add((w, k, n, 8, 1, 1, True))
-                    if want_fp8 and w <= plan.HOP_MAX_ROWS:
+                    # the hop writes the MoE input's E4M3 copy up to hop_mid's rows
+                    if want_fp8 and w <= max(plan.HOP_MAX_ROWS, plan.HOP_MID_MAX_ROWS):
                         launches.add((w, k, n, 8, 0, 1, True))
                     launches.add((w, kd, nd, 0, 0, 2, False))
     for w, k, n8, n16, act, epi8, f32 in sorted(launches):

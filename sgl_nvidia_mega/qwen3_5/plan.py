@@ -38,6 +38,8 @@ also write the next projection's static FP8 input, which it then reads without a
 
 from __future__ import annotations
 
+import os
+
 import msgspec
 
 MAX_ROWS = 896  # the widest covered step: 128 requests of 7 verify rows (TP8 bs128)
@@ -92,6 +94,9 @@ LOWM_IN_MAX_ROWS = 14
 LOWM_OUTPROJ_MAX_ROWS = 14
 LOWM_OPROJ_MAX_ROWS = 14
 LOWM_SE_MAX_ROWS = 14
+# measurement knob (TRT-L18): the shared expert's low-M bound, e.g. 28 for four requests
+if os.environ.get("SGLANG_Q35_LOWM_SE_MAX_ROWS"):
+    LOWM_SE_MAX_ROWS = int(os.environ["SGLANG_Q35_LOWM_SE_MAX_ROWS"])
 
 
 class Slots(msgspec.Struct, frozen=True):

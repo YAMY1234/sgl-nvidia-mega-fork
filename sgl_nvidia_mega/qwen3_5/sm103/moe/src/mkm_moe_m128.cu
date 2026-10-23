@@ -226,7 +226,8 @@ constexpr int kTraceStride = STAGE_STAMPS ? 128 : (DIAG_SPEC || DIAG_ROUTE) ? 32
 #define SMEM_SPACE 1
 #endif
 #ifndef PF_SET  // L2 prefetch of the stages that wait for a ring slot at: 1 = start, 4 = FC2, 8 = FC2 pass 1
-#define PF_SET 5
+// (none: from 56 rows every CTA streams and HBM is the bound, so these prefetches only compete with the ring's loads)
+#define PF_SET 0
 #endif
 #ifndef PF_N1  // stages prefetched at the start trigger
 #define PF_N1 4
@@ -247,8 +248,11 @@ static_assert(DRAIN_SMEM == 0, "x's shared memory holds the next item's rows whi
 #ifndef GATHER_BATCH  // x row granules each gathering thread loads before storing them
 #define GATHER_BATCH 8
 #endif
+#ifndef GATHER_ASYNC  // 1: the gather copies by cp.async (every granule in flight at once, no register staging)
+#define GATHER_ASYNC 1
+#endif
 #ifndef SPEC_PF  // stages of the speculated expert past the first ring fill prefetched to L2 while the routing runs
-#define SPEC_PF 8
+#define SPEC_PF 4
 #endif
 #ifndef FC2_PF  // FC2 tiles (beyond the first kStages) prefetched to L2 ahead of the ring; 0 = off
 #define FC2_PF 0
@@ -825,6 +829,25 @@ q35_mkm_moe_m128(const __grid_constant__ CUtensorMap tm13, const __grid_constant
   // their x rows and scale bytes into xa / xsf, by threads tid = 0 .. nt - 1
   auto copy_rows = [&](int rb, int tid, int nt) {
     const int n1 = s.nrows[rb] * 128, n = s.nrows[rb] * 144;  // 16-B granules: x rows, then their scale bytes
+    if (GATHER_ASYNC) {
+      for (int idx = tid; idx < n; idx += nt) {
+        const uint8_t* src;
+        uint8_t* dst;
+        if (idx < n1) {
+          const int r = idx >> 7, c = (idx >> 3) & 15, q = idx & 7;
+          src = p.x_fp4 + (size_t)s.rtok[rb][r] * (kH / 2) + c * 128 + q * 16;
+          dst = s.xa + c * 2048 + (r / 8) * 1024 + (r % 8) * 128 + ((q ^ (r % 8)) * 16);
+        } else {
+          const int r = (idx - n1) >> 4, q = (idx - n1) & 15;
+          src = p.x_sf + (size_t)s.rtok[rb][r] * (kH / 16) + q * 16;
+          dst = &s.xsf[r][q * 16];
+        }
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_u32(dst)), "l"(src) : "memory");
+      }
+      asm volatile("cp.async.wait_all;" ::: "memory");
+      fence_proxy_async_smem();
+      return;
+    }
     // GATHER_BATCH loads a thread ahead of their stores: the global latency is paid once a batch
     for (int i0 = tid; i0 < n; i0 += GATHER_BATCH * nt) {
       uint4 v[GATHER_BATCH];
@@ -1033,6 +1056,10 @@ q35_mkm_moe_m128(const __grid_constant__ CUtensorMap tm13, const __grid_constant
         s.nitems = nall;
         s.spec_ok = owner ? 1 : 0;
         stamp(p, 1);
+        if (DIAG_ROUTE && p.trace) {  // DIAG values (not times): 22 = items, 23 = speculation kept
+          p.trace[blockIdx.x * kTraceStride + 22] = nall;
+          p.trace[blockIdx.x * kTraceStride + 23] = owner ? 1 : 0;
+        }
         mbar_arrive(&s.route_done);
       }
     }
@@ -1181,6 +1208,8 @@ q35_mkm_moe_m128(const __grid_constant__ CUtensorMap tm13, const __grid_constant
           tc_fence_after();
           if (st == 0 && it == 0) stamp(p, 3);
           if (st == 0 && it > 0 && it == nitems - 1) stamp(p, 11);
+          if (DIAG_ROUTE && st == 0 && it < 4) stamp(p, 24 + it);  // DIAG: item it's first FC1 MMA
+          if (DIAG_ROUTE && st == kFc1Stages - 1 && it < 4) stamp(p, 28 + it);  // DIAG: its last FC1 stage landed
 #pragma unroll
           for (int q = 0; q < 4; ++q, ++n) {
             const int kb = ks * 4 + q;  // k-blocks in K order: one accumulator, the stock summation order

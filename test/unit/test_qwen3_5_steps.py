@@ -1115,6 +1115,7 @@ def test_the_gdn_front_slot_runs_the_front_the_verify_the_norm_and_out_proj(push
         "history_g": "ring_g2(3, 8, 16)",
         "ring_indices": "req(1,)",
         "pad_slot": -1,
+        "prefetch": True,
     }
     # q / k / v are the conv rows' views; a / b the front's b8 / a8 halves
     q, k_, v = seen["qkv"]

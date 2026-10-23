@@ -431,6 +431,33 @@ def test_core_is_gdn_verify_numerically(pad, history, bs):
     )
     assert torch.equal(y_cap.view(torch.uint8), y_got.view(torch.uint8))
     assert all(torch.equal(c, g) for c, g in zip(capped, got_ring))
+    # the committed history loaded before the PDL wait (early_hist) leaves every byte as it was
+    early = [t.clone() for t in ring]
+    y_early = torch.empty_like(y_got)
+    core(
+        qkv,
+        z,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        *early,
+        states,
+        replay,
+        write_pos,
+        cache_base,
+        is_flush,
+        weight,
+        scale,
+        1e-6,
+        y_early,
+        rows_per_request=DRAFT,
+        num_k_heads=H,
+        early_hist=True,
+    )
+    assert torch.equal(y_early.view(torch.uint8), y_got.view(torch.uint8))
+    assert all(torch.equal(e, g) for e, g in zip(early, got_ring))
     live = torch.ones(tokens, dtype=torch.bool, device="cuda")
     if pad:
         live[-DRAFT:] = False
@@ -629,6 +656,47 @@ def test_front_takes_its_weights_by_bulk_copy_with_the_same_bytes(pad):
             got.append({**outs, "state": o["state"].clone(), "phys": o["phys"].clone()})
         for n, t in got[0].items():
             assert torch.equal(t, got[1][n]), n
+
+
+@pytest.mark.parametrize("pad", [False, True])
+def test_front_holds_its_register_weights_with_the_same_bytes(pad):
+    """The pinned launch (register weight loads held ahead of the PDL wait) writes every
+    output and pool as the default bulk-copy launch, eager and from a CUDA graph."""
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front
+
+    for seed in range(3):
+        o = _front_operands(30 + seed, pad=pad)
+        packed = front.pack(o["w"])
+        start = {n: o[n].clone() for n in ("state", "phys")}
+        got = []
+        for kw in ({"pin": False}, {"pin": True}):
+            for n, t in start.items():
+                o[n].copy_(t)
+            outs = _front_outputs()
+            for t in outs.values():  # a padded request leaves the conv rows unwritten
+                t.zero_()
+            _run_front(o, packed, outs, **kw)
+            torch.cuda.synchronize()
+            assert outs["error"].item() == 0
+            got.append({**outs, "state": o["state"].clone(), "phys": o["phys"].clone()})
+        for n, t in got[0].items():
+            assert torch.equal(t, got[1][n]), n
+    # graph replay of the pinned launch
+    for n, t in start.items():
+        o[n].copy_(t)
+    outs = _front_outputs()
+    for t in outs.values():
+        t.zero_()
+    _run_front(o, packed, outs, pin=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_front(o, packed, outs, pin=True)
+    for n, t in start.items():
+        o[n].copy_(t)
+    graph.replay()
+    torch.cuda.synchronize()
+    for n, t in got[1].items():
+        assert torch.equal(outs[n] if n in outs else o[n], t), n
 
 
 @pytest.mark.parametrize("requests", [2, 3, 4])

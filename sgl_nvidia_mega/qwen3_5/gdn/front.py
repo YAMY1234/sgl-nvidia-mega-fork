@@ -196,12 +196,18 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
     from sgl_nvidia_mega.qwen3_5.gdn import replayssm
     from sgl_nvidia_mega.qwen3_5.gdn.front_norm import norm
     from sgl_nvidia_mega.qwen3_5.gdn.verify import _out_proj
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
     from sgl_nvidia_mega.qwen3_5.sm103.gdn import front
 
     if x.shape[0] not in _ENGAGED:
         _ENGAGED.add(x.shape[0])
         logger.info(
-            "NVIDIA megakernel: Qwen3.5 slot gdn_front runs at %d rows", x.shape[0]
+            "NVIDIA megakernel: Qwen3.5 slot gdn_front runs at %d rows "
+            "(SGLANG_PERFLL_GDN_PIN=%d, SGLANG_PERFLL_GDN_CORE_EARLY=%d, prefetch=%d)",
+            x.shape[0],
+            front.PIN,
+            core_kernel.EARLY,
+            int(not (opts.core and core_kernel.EARLY)),
         )
     attn, bound = gdn.attn, st.bound["gdn"]
     meta, pools = st.view.gdn, st.view.mamba
@@ -232,6 +238,8 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
         history_g=pools.ring_g[li],
         ring_indices=st.fb.req_pool_indices[:requests],
         pad_slot=meta.pad_slot_id,
+        # slot gdn_core with the committed history early loads the checkpoint and ring itself
+        prefetch=not (opts.core and core_kernel.EARLY),
     )
     if opts.core:
         from sgl_nvidia_mega.qwen3_5.gdn.verify import _fused

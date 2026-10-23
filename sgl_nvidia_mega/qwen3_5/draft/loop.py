@@ -88,6 +88,12 @@ class DraftLoop:
         steps = io.num_steps - 1
         tokens = io.draft_tokens_out
         tokens[:, :1].copy_(io.topk_index)
+        # request-major slots: every step's rows of several requests made dense in one copy,
+        # for the front and the FP8 KV write
+        n, k = io.num_requests, io.num_steps
+        self._locs = (
+            io.out_cache_loc[: n * k].view(n, k).t().contiguous() if n > 1 else None
+        )
         positions, mrope = io.positions, io.mrope_positions
         if parts.mkd is not None and io.num_requests == SERVED_BS:
             self._mkd_steps(io, steps)
@@ -118,11 +124,9 @@ class DraftLoop:
 
     def _model_step(self, io, i: int, x):
         """Draft step i's decoder layer on its fc output ``x``: the final-norm rows."""
-        # request-major slots: step i's of several requests are a strided view, which the
-        # front and the FP8 KV write read as dense rows
-        cache_loc = io.out_cache_loc[i :: io.num_steps]
-        if io.num_requests > 1:
-            cache_loc = cache_loc.contiguous()
+        cache_loc = (
+            self._locs[i] if self._locs is not None else io.out_cache_loc[i : i + 1]
+        )
         return layer.layer(
             self.parts,
             x,

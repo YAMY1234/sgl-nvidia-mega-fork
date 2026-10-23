@@ -23,6 +23,8 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "mkm_m32",
     "mkm_m64",
     "mkm_m128",
+    "mkm_m256",
+    "mkm_m512",
     "gdn_verify",
     "gdn_pdl",
     "gdn_core",
@@ -126,6 +128,14 @@ def slot_reasons() -> list[str]:
             f"{SLOTS_ENV}: slot 'mkm_m128' serves the steps of more than nine requests "
             "('multi_request')"
         )
+    for name, more in (("mkm_m256", "18"), ("mkm_m512", "36")):
+        if name in SLOTS and "route_topk" not in SLOTS:
+            reasons.append(f"{SLOTS_ENV}: slot '{name}' runs on slot 'route_topk''s routing")
+        if name in SLOTS and "multi_request" not in SLOTS:
+            reasons.append(
+                f"{SLOTS_ENV}: slot '{name}' serves the steps of more than {more} requests "
+                "('multi_request')"
+            )
     if "route_shared" in SLOTS and "route" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'route_shared' runs in slot 'route''s launch"
@@ -253,6 +263,8 @@ def build(model, ctx):
         and "mkm_m32" in SLOTS,
         mkm_m64=bound["moe"].m64,
         mkm_m128=bound["moe"].m128,
+        mkm_m256=bound["moe"].m256,
+        mkm_m512=bound["moe"].m512,
         gdn_verify=bound["gdn"].gdn_verify,
         gdn_pdl=bound["gdn"].gdn_pdl,
         gdn_core=bound["gdn"].gdn_core,
@@ -308,6 +320,17 @@ def build(model, ctx):
         <= slot_plan.MKM_M64_MAX_ROWS
     ):
         vacuous.add("mkm_m128")
+    # mkm_m256 / mkm_m512 have nothing to serve where no covered step has 129 to 256 / 257 to 512 rows
+    if (
+        slot_plan.widest(pctx.widths, slot_plan.MKM_M256_MAX_ROWS)
+        <= slot_plan.MKM_M128_MAX_ROWS
+    ):
+        vacuous.add("mkm_m256")
+    if (
+        slot_plan.widest(pctx.widths, slot_plan.MKM_M512_MAX_ROWS)
+        <= slot_plan.MKM_M256_MAX_ROWS
+    ):
+        vacuous.add("mkm_m512")
     # hop_wide has nothing to serve where no covered step is past the one-shot rows
     if max(pctx.widths) <= slot_plan.HOP_MAX_ROWS:
         vacuous.update({"hop_wide", "hop_mid"})

@@ -39,6 +39,7 @@ class Engine(NamedTuple):
     kernel: str
     smem_bytes: int  # sizeof(Smem) + 1024, checked when the source compiles
     w2_swizzle: str  # the W2 TMA map's swizzle: its box is a row of I / 2 bytes
+    defines: tuple = ()  # extra compile options
 
 
 # per intermediate size a rank holds (TP8, TP4)
@@ -87,10 +88,37 @@ M128_ENGINES = {
         "mkm_moe_m128.cu", "q35_mkm_moe_m128", 231424, "CU_TENSOR_MAP_SWIZZLE_64B"
     ),
 }
+# the wide engines (src/mkm_moe_wide.cu, the 128-token engine's units on a static work split: CTA c runs experts
+# c, c + G, ...), on a given routing only, built per token bound
+M256_MAX_TOKENS = 256
+M512_MAX_TOKENS = 512
+M256_ENGINES = {
+    128: Engine(
+        "mkm_moe_wide.cu",
+        "q35_mkm_moe_wide",
+        226304,
+        "CU_TENSOR_MAP_SWIZZLE_64B",
+        ("-DQ35_MKM_MAX_TOK=256",),
+    ),
+}
+M512_ENGINES = {
+    128: Engine(
+        "mkm_moe_wide.cu",
+        "q35_mkm_moe_wide",
+        231424,
+        "CU_TENSOR_MAP_SWIZZLE_64B",
+        ("-DQ35_MKM_MAX_TOK=512",),
+    ),
+}
+# a wide engine's CTA runs at most 4 own experts (512 / 128) and 3 further row groups (its kMaxItems)
+WIDE_MIN_SMS = 128
+WIDE_ROWS = (M256_MAX_TOKENS, M512_MAX_TOKENS)
 RESERVED_SMS = {
     M32_MAX_TOKENS: 32 if _RESERVED is None else int(_RESERVED),
     M64_MAX_TOKENS: 0 if _RESERVED is None else int(_RESERVED),
     M128_MAX_TOKENS: 0 if _RESERVED is None else int(_RESERVED),
+    M256_MAX_TOKENS: 0 if _RESERVED is None else int(_RESERVED),
+    M512_MAX_TOKENS: 0 if _RESERVED is None else int(_RESERVED),
 }
 
 
@@ -122,10 +150,19 @@ class ParamsM32(Params):
     _fields_ = [("x_fp4", ctypes.c_void_p), ("ids_in", ctypes.c_void_p)]
 
 
-# the rows each engine serves: (7-row, 16-token, 32-token, 64-token, 128-token) engines up to these
-ENGINE_ROWS = (MAX_TOKENS, M16_MAX_TOKENS, M32_MAX_TOKENS, M64_MAX_TOKENS, M128_MAX_TOKENS)
-# the engines that take a given routing (route_topk's ids); the 128-token one only that way
-ROUTED_ENGINES = (M64_MAX_TOKENS, M128_MAX_TOKENS)
+# the rows each engine serves: (7-row, 16-token, 32-token, 64-token, 128-token, 256-token, 512-token) engines up to
+# these
+ENGINE_ROWS = (
+    MAX_TOKENS,
+    M16_MAX_TOKENS,
+    M32_MAX_TOKENS,
+    M64_MAX_TOKENS,
+    M128_MAX_TOKENS,
+    M256_MAX_TOKENS,
+    M512_MAX_TOKENS,
+)
+# the engines that take a given routing (route_topk's ids); those past 64 tokens only that way
+ROUTED_ENGINES = (M64_MAX_TOKENS, M128_MAX_TOKENS, M256_MAX_TOKENS, M512_MAX_TOKENS)
 
 
 def engine_rows(m: int) -> int:
@@ -142,6 +179,8 @@ def _kernel(device_index: int, intermediate: int, rows: int) -> jit.Kernel:
         M32_MAX_TOKENS: M32_ENGINES,
         M64_MAX_TOKENS: M64_ENGINES,
         M128_MAX_TOKENS: M128_ENGINES,
+        M256_MAX_TOKENS: M256_ENGINES,
+        M512_MAX_TOKENS: M512_ENGINES,
     }[rows][intermediate]
     major, minor = torch.cuda.get_device_capability(device_index)
     cubin = jit.compile_source(
@@ -152,16 +191,26 @@ def _kernel(device_index: int, intermediate: int, rows: int) -> jit.Kernel:
             "-std=c++17",
             "-default-device",
             f"-DQ35_MKM_SMEM_BYTES={engine.smem_bytes}",
-        ),
+        )
+        + engine.defines,
     )
     return jit.load(cubin, engine.kernel, (THREADS, 1, 1), engine.smem_bytes)
 
 
 def max_tokens(
-    intermediate: int, m32: bool = False, m64: bool = False, m128: bool = False
+    intermediate: int,
+    m32: bool = False,
+    m64: bool = False,
+    m128: bool = False,
+    m256: bool = False,
+    m512: bool = False,
 ) -> int:
     """The widest rows an engine serves for ``intermediate`` per rank (``m32`` / ``m64`` /
-    ``m128``: with the 32 / 64 / 128-token engine)."""
+    ``m128`` / ``m256`` / ``m512``: with the 32 / 64 / 128 / 256 / 512-token engine)."""
+    if m512 and intermediate in M512_ENGINES:
+        return M512_MAX_TOKENS
+    if m256 and intermediate in M256_ENGINES:
+        return M256_MAX_TOKENS
     if m128 and intermediate in M128_ENGINES:
         return M128_MAX_TOKENS
     if m64 and intermediate in M64_ENGINES:
@@ -181,6 +230,19 @@ def m32_unsupported(device_index: int, intermediate: int) -> str:
     )
     if sms < M32_MIN_SMS:
         return f"{sms} SMs (the 32-token engine needs {M32_MIN_SMS})"
+    return ""
+
+
+def wide_unsupported(device_index: int, intermediate: int) -> str:
+    """Why the 256 / 512-token engines cannot serve ``intermediate`` per rank on this GPU
+    ("" when they can)."""
+    if intermediate not in M256_ENGINES:
+        return f"no 256 / 512-token engine at intermediate {intermediate} per rank"
+    sms = torch.cuda.get_device_properties(device_index).multi_processor_count - max(
+        RESERVED_SMS[r] for r in WIDE_ROWS
+    )
+    if sms < WIDE_MIN_SMS:
+        return f"{sms} SMs (the 256 / 512-token engines need {WIDE_MIN_SMS})"
     return ""
 
 
@@ -272,17 +334,19 @@ def mkm_moe(
     (uint8, linear e4m3); w13_sf [512, 2 I, 256] / w2_sf [512, 4096, I / 16] e4m3 viewed
     as uint8 (the engine follows I); g1_alpha, g1_scale_c, g2_alpha [512] fp32. With
     ``routing`` (route_topk's ids int32 / weights bf16 [M, 10]; 33 to 64 rows, and required
-    at 65 to 128) the engine takes that routing instead of ranking the logits, and returns
+    at 65 to 512) the engine takes that routing instead of ranking the logits, and returns
     those weights."""
     m = logits.shape[0]
     intermediate = w2_sf.shape[2] * 16
-    widest = max_tokens(intermediate, m32=True, m64=True, m128=True)
+    widest = max_tokens(
+        intermediate, m32=True, m64=True, m128=True, m256=True, m512=True
+    )
     if not 1 <= m <= widest:
         raise ValueError(f"mkm: {m} rows (1-{widest})")
     rows = engine_rows(m)
     if routing is not None and rows not in ROUTED_ENGINES:
         raise ValueError(f"mkm: a given routing needs the 64 / 128-token engine, not {m} rows")
-    if routing is None and rows == M128_MAX_TOKENS:
+    if routing is None and rows > M64_MAX_TOKENS:
         raise ValueError(f"mkm: {m} rows need a given routing (route_topk's)")
     device = logits.device
     gemm2_out = torch.empty((m * TOP_K, HIDDEN), dtype=torch.bfloat16, device=device)
@@ -303,12 +367,18 @@ def mkm_moe(
     )
     kernel = _kernel(device.index, intermediate, rows)
     stream = torch.cuda.current_stream().cuda_stream
-    if rows in (M32_MAX_TOKENS, M64_MAX_TOKENS, M128_MAX_TOKENS):
+    if rows in (M32_MAX_TOKENS, M64_MAX_TOKENS, M128_MAX_TOKENS) + WIDE_ROWS:
         # min(M * 10, SMs) CTAs, one per SM, each running its share of the distinct experts
+        # (the wide engines: every SM, CTA c running experts c, c + G, ...)
         sms = torch.cuda.get_device_properties(device).multi_processor_count - RESERVED_SMS[rows]
         ids_in = 0 if routing is None else routing[0].data_ptr()
+        if rows in WIDE_ROWS and not (
+            routing[0].is_contiguous() and ids_in % 16 == 0 and sms >= WIDE_MIN_SMS
+        ):
+            raise ValueError("mkm: the wide engines read contiguous 16-B aligned ids on >= 128 SMs")
         p = ParamsM32(x_fp4=x_fp4.data_ptr(), ids_in=ids_in, **fields)
-        jit.launch(kernel, (min(m * TOP_K, sms), 1, 1), [*maps, p], stream)
+        grid = sms if rows in WIDE_ROWS else min(m * TOP_K, sms)
+        jit.launch(kernel, (grid, 1, 1), [*maps, p], stream)
         return gemm2_out, (expert_weights if routing is None else routing[1])
     swizzle = jit.driver().CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
     wide = rows == M16_MAX_TOKENS

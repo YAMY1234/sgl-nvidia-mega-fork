@@ -14,7 +14,8 @@ up to 7, and with ``mkm_wide`` (its 16-token engine) up to 16; ``mkm_m32`` (its 
 engine, on route_topk's widths: the top-10 and both expert GEMMs in one launch on the
 router GEMM's logits and the NVFP4 input) runs 17 to 32 rows, and ``mkm_m64`` (its 64-token
 engine on route_topk's routing and NVFP4 input) 33 to 64, ``mkm_m128`` (its 128-token engine,
-likewise) 65 to 128. ``gdn_verify`` (the
+likewise) 65 to 128, ``mkm_m256`` / ``mkm_m512`` (its wide engines, likewise) 129 to 256 / 257 to
+512. ``gdn_verify`` (the
 GatedDeltaNet verify chain with its launch choices changed) covers every width, with
 ``gdn_core`` (numeric: its ReplaySSM verify, gated norm and FP8 output in one launch), and ``hop`` (the boundary's fused all-reduce points on the decode hop) the
 widths where FlashInfer's low-latency kernels, which it equals bit for bit, run, and with
@@ -67,6 +68,9 @@ MKM_M32_MAX_ROWS = 32
 MKM_M64_MAX_ROWS = 64
 # slot mkm_m128: the 128-token engine on route_topk's routing, past the 64-token one
 MKM_M128_MAX_ROWS = 128
+# slots mkm_m256 / mkm_m512: the wide engines on route_topk's routing, past the 128-token one
+MKM_M256_MAX_ROWS = 256
+MKM_M512_MAX_ROWS = 512
 HOP_MAX_ROWS = 15
 # with hop_wide: the two-shot hop past the one-shot rows (FlashInfer's BT routes, bit for bit)
 HOP_WIDE_MAX_ROWS = 224
@@ -104,6 +108,8 @@ class Slots(msgspec.Struct, frozen=True):
     # in route_topk's runner: the 64-token engine on route_topk's routing (moe/route.py)
     mkm_m64: bool = False
     mkm_m128: bool = False  # likewise, its 128-token engine
+    mkm_m256: bool = False  # likewise, its 256-token engine
+    mkm_m512: bool = False  # likewise, its 512-token engine
     gdn_verify: bool = False  # the GDN verify chain's launch choices (gdn/verify.py)
     gdn_pdl: bool = False  # its ReplaySSM verify launched dependent on the conv
     # its ReplaySSM verify, gated norm and FP8 output in one launch (sm103/gdn/core.py)
@@ -141,6 +147,8 @@ class Facts(msgspec.Struct, frozen=True):
     mkm_m32: bool = False  # the 32-token engine built for every MoE layer
     mkm_m64: bool = False  # the 64-token engine built for every MoE layer
     mkm_m128: bool = False  # the 128-token engine built for every MoE layer
+    mkm_m256: bool = False  # the 256-token engine built for every MoE layer
+    mkm_m512: bool = False  # the 512-token engine built for every MoE layer
     gdn_verify: bool = False  # the GDN verify slot built for every GDN layer
     gdn_pdl: bool = False  # with its dependent verify launch
     gdn_core: bool = False  # with the one-launch verify core
@@ -190,6 +198,12 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         mkm_m128=route_topk
         and facts.mkm_m128
         and MKM_M64_MAX_ROWS < rows <= MKM_M128_MAX_ROWS,
+        mkm_m256=route_topk
+        and facts.mkm_m256
+        and MKM_M128_MAX_ROWS < rows <= MKM_M256_MAX_ROWS,
+        mkm_m512=route_topk
+        and facts.mkm_m512
+        and MKM_M256_MAX_ROWS < rows <= MKM_M512_MAX_ROWS,
         gdn_verify=gdn_verify,
         gdn_pdl=gdn_verify and facts.gdn_pdl,
         gdn_core=gdn_verify and facts.gdn_core and rows <= GDN_CORE_MAX_ROWS,

@@ -10,9 +10,10 @@ replayed from a CUDA graph:
   logits, RenormalizeNaive, deferred finalize): each token's 10 expert rows and their
   weights, at 1, 4 and 7 rows (the 2-CTA engines) and at TP8 also 8, 14 and 16 rows (the
   16-token engine), 17, 21, 28 and 32 rows (the 32-token engine), 33, 56 and 64 rows
-  (the 64-token engine, also on route_topk's routing) and 65, 84, 112 and 128 rows (the
-  128-token engine, on route_topk's routing), also with every token routed to the same
-  experts; graph replay of each;
+  (the 64-token engine, also on route_topk's routing), 65, 84, 112 and 128 rows (the
+  128-token engine, on route_topk's routing) and 129, 168, 224, 256, 257, 336, 448 and 512
+  rows (the wide engines, on route_topk's routing), also with every token routed to the
+  same experts; graph replay of each;
 - the router front with the shared gate/up stage (slot route_shared, numeric): its
   logits and NVFP4 input bit for bit the plain launch's, and its gate/up rows against
   fp64 on SGLang's static FP8 quantization of the rows, at most 1.05 x the mean relative
@@ -200,12 +201,17 @@ def test_mkm_replays_from_a_cuda_graph(layer, m):
     assert all(torch.equal(a, b) for a, b in zip(eager, captured))
 
 
-@pytest.mark.parametrize("m", [33, 35, 56, 64, 65, 84, 112, 128])
+@pytest.mark.parametrize(
+    "m", [33, 35, 56, 64, 65, 84, 112, 128, 129, 168, 224, 256, 257, 336, 448, 512]
+)
 @pytest.mark.parametrize("shared_route", [False, True])
 def test_mkm_on_route_topks_routing_is_the_trtllm_routed_experts(layer, m, shared_route):
-    """Slots mkm_m64 / mkm_m128: the 64 / 128-token engine on route_topk's routing (ids and
-    weights) gives the runner's rows on the logits, bit for bit."""
-    if m > mkm.max_tokens(layer["inter"], m32=True, m64=True, m128=True):
+    """Slots mkm_m64 / mkm_m128 / mkm_m256 / mkm_m512: the 64 / 128 / 256 / 512-token engine
+    on route_topk's routing (ids and weights) gives the runner's rows on the logits, bit for
+    bit."""
+    if m > mkm.max_tokens(
+        layer["inter"], m32=True, m64=True, m128=True, m256=True, m512=True
+    ):
         pytest.skip("no engine for these rows at this intermediate")
     logits, x_fp4, x_sf = _inputs(m, 5)
     if shared_route:
@@ -232,9 +238,11 @@ def test_mkm_on_route_topks_routing_is_the_trtllm_routed_experts(layer, m, share
     assert not differ.any(), f"rows {differ.nonzero().flatten().tolist()} differ"
 
 
-@pytest.mark.parametrize("m", [56, 112])
+@pytest.mark.parametrize("m", [56, 112, 224, 448])
 def test_mkm_on_route_topks_routing_replays_from_a_cuda_graph(layer, m):
-    if m > mkm.max_tokens(layer["inter"], m32=True, m64=True, m128=True):
+    if m > mkm.max_tokens(
+        layer["inter"], m32=True, m64=True, m128=True, m256=True, m512=True
+    ):
         pytest.skip("no engine for these rows at this intermediate")
     logits, x_fp4, x_sf = _inputs(m, 6)
     x = torch.randn(m, H, device="cuda").to(torch.bfloat16)

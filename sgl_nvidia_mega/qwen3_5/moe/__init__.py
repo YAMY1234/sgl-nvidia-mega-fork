@@ -16,7 +16,8 @@ front, and slot ``mkm`` (``mkm.py``) runs them in one launch on its outputs; pas
 rows, slot ``route_topk`` (``route.py``) runs them on a materialized routing, or at 17 to
 32 rows slot ``mkm_m32`` in one launch of mkm's 32-token engine, and at 33 to 64 slot
 ``mkm_m64`` on route_topk's routing in one launch of its 64-token engine (65 to 128:
-``mkm_m128``, its 128-token engine). In the
+``mkm_m128``, its 128-token engine; 129 to 256 / 257 to 512: ``mkm_m256`` / ``mkm_m512``, its
+wide engines). In the
 dual-stream order of up to 8 rows, slot ``route_shared`` computes the shared expert's
 gate/up in the router front's launch; the alternate stream waits for that launch only and
 runs the rest of the shared expert (numeric).
@@ -113,8 +114,16 @@ def build(model, ctx) -> route.Bound:
         m128 = "mkm_m128" in SLOTS and plan.widest(
             ctx.widths, plan.MKM_M128_MAX_ROWS
         ) > (plan.MKM_M64_MAX_ROWS)
-        if m32 or m64 or m128:
-            bound = route.build_m32(model, bound, m32=m32, m64=m64, m128=m128)
+        m256 = "mkm_m256" in SLOTS and plan.widest(
+            ctx.widths, plan.MKM_M256_MAX_ROWS
+        ) > (plan.MKM_M128_MAX_ROWS)
+        m512 = "mkm_m512" in SLOTS and plan.widest(
+            ctx.widths, plan.MKM_M512_MAX_ROWS
+        ) > (plan.MKM_M256_MAX_ROWS)
+        if m32 or m64 or m128 or m256 or m512:
+            bound = route.build_m32(
+                model, bound, m32=m32, m64=m64, m128=m128, m256=m256, m512=m512
+            )
     return bound
 
 
@@ -220,6 +229,10 @@ def _router_experts(mlp, x, defer: bool, st):
         return route.routed_given(mlp, x, st.bound["moe"], "mkm_m64")
     if defer and st.slots.mkm_m128:
         return route.routed_given(mlp, x, st.bound["moe"], "mkm_m128")
+    if defer and st.slots.mkm_m256:
+        return route.routed_given(mlp, x, st.bound["moe"], "mkm_m256")
+    if defer and st.slots.mkm_m512:
+        return route.routed_given(mlp, x, st.bound["moe"], "mkm_m512")
     if defer and st.slots.route_topk:
         return route.routed_topk(mlp, x, gemm=st.slots.route_gemm)
     router_logits, _ = mlp.gate(x)

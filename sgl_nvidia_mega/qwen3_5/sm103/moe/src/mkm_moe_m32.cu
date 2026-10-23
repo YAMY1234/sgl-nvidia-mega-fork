@@ -209,8 +209,11 @@ constexpr int kARow = 260;  // FC1 accumulator row stride in floats: 16 B aligne
 #ifndef SPEC_STAGES  // ring stages issued for the speculated expert before the routing verdict (rest: after it)
 #define SPEC_STAGES 4
 #endif
-#ifndef STAGE_STAMPS  // DIAG: per-stage issue (slots 64 + st) and landing (16 + st, seen by warp 4) stamps
+#ifndef STAGE_STAMPS  // DIAG: per-stage issue (slots 64 + st), landing (16 + st, seen by warp 4) and MMA issue (40 + st) stamps
 #define STAGE_STAMPS 0
+#endif
+#ifndef STAMP_IT  // DIAG: the item whose stages STAGE_STAMPS records
+#define STAMP_IT 0
 #endif
 #ifndef DIAG_SPEC  // DIAG: warp 1's speculative ranking, stamps 16 = logits loaded, 17 = keys, 18 = top-10 (stride 32)
 #define DIAG_SPEC 0
@@ -1120,7 +1123,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
           if (g >= kStages) mbar_wait(&s.empty[g % kStages], ((g / kStages) - 1) & 1);
           if (thr && g >= THR_D) mbar_wait(&s.full[(g - THR_D) % kStages], ((g - THR_D) / kStages) & 1);
           issue_stage(g, st, e, pol);
-          if (STAGE_STAMPS && it == 0) stamp(p, 64 + st);
+          if (STAGE_STAMPS && it == STAMP_IT) stamp(p, 64 + st);
         }
       }
     }
@@ -1149,6 +1152,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
           tc_fence_after();
           if (st == 0 && it == 0) stamp(p, 3);
           if (st == 0 && it > 0 && it == nitems - 1) stamp(p, 11);
+          if (STAGE_STAMPS && it == STAMP_IT) stamp(p, 40 + st);
 #pragma unroll
           for (int q = 0; q < 4; ++q, ++n) {
             const int kb = ks * 4 + q;  // k-blocks in K order: one accumulator, the stock summation order
@@ -1169,6 +1173,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
           mbar_wait(&s.full[b], (g / kStages) & 1);
           mbar_wait(&s.sf_full[b], (g / kStages) & 1);
           tc_fence_after();
+          if (STAGE_STAMPS && it == STAMP_IT) stamp(p, 40 + st);
 #pragma unroll
           for (int tl = 0; tl < 2; ++tl) {
             const int j = 2 * f + tl, jt = j % 8;
@@ -1230,7 +1235,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       auto stage_sf2 = [&](int st) {  // FC2 tiles 2 f, 2 f + 1: k-blocks 0, 1 of their row blocks (rows 0..127 | 128..255)
         const int g = base + st, b = g % kStages;
         mbar_wait(&s.full[b], (g / kStages) & 1);
-        if (STAGE_STAMPS && threadIdx.x == 128 && it == 0) stamp(p, 16 + st);
+        if (STAGE_STAMPS && threadIdx.x == 128 && it == STAMP_IT) stamp(p, 16 + st);
         if (g >= 4) mbar_wait(&s.empty[(g - 4) % kStages], ((g - 4) / kStages) & 1);
         const uint8_t* sf = s.ring[b] + 32768;
         const int n0 = 64 + (st - kFc1Stages) * 4;
@@ -1252,7 +1257,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       for (int st = 0; st < kFc1Stages; ++st) {
         const int g = base + st, b = g % kStages, ks = st;
         mbar_wait(&s.full[b], (g / kStages) & 1);
-        if (STAGE_STAMPS && threadIdx.x == 128 && it == 0) stamp(p, 16 + st);
+        if (STAGE_STAMPS && threadIdx.x == 128 && it == STAMP_IT) stamp(p, 16 + st);
         if (g >= 4) mbar_wait(&s.empty[(g - 4) % kStages], ((g - 4) / kStages) & 1);
         const uint8_t* sf = s.ring[b] + 32768;
 #pragma unroll

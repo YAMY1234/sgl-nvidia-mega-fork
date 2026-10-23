@@ -280,7 +280,7 @@ def test_the_draft_decode_takes_cp_lite_where_it_serves(monkeypatch):
         ),
         (
             {"draft_loop", "draft_multi"},
-            "slot 'draft_multi' serves the draft steps of more than two requests "
+            "slot 'draft_multi' serves the draft steps of two or more requests "
             "('multi_request')",
         ),
     ],
@@ -390,7 +390,7 @@ def test_the_draft_loop_serves_two_requests_at_tp8_on_request(
 @pytest.mark.parametrize(
     "tp_size, slots, built, served",
     [
-        (8, {"multi_request", "draft_multi"}, True, (1, 4, 8, 16)),
+        (8, {"multi_request", "draft_multi"}, True, (1, 2, 4, 8, 16)),
         (8, {"multi_request", "draft_multi"}, False, (1,)),
         (4, {"multi_request", "draft_multi"}, True, (1,)),
         (8, {"draft_multi"}, True, (1,)),

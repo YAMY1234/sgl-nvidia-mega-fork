@@ -48,8 +48,8 @@ DRAFT_SLOTS: tuple[str, ...] = (
     "draft_hop",
     "draft_front",
     "draft_skv2",
-    # draft_loop also serves TP8's draft graphs of 4, 8 and 16 requests (with
-    # multi_request)
+    # draft_loop also serves TP8's draft graphs of 4, 8 and 16 requests, and those of
+    # two or more take the sharded top-1 (with multi_request)
     "draft_multi",
 )
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
@@ -138,7 +138,7 @@ def slot_reasons() -> list[str]:
         reasons.append(f"{SLOTS_ENV}: slot 'draft_hop' runs on slot 'hop''s mailbox")
     if "draft_multi" in SLOTS and "multi_request" not in SLOTS:
         reasons.append(
-            f"{SLOTS_ENV}: slot 'draft_multi' serves the draft steps of more than two "
+            f"{SLOTS_ENV}: slot 'draft_multi' serves the draft steps of two or more "
             "requests ('multi_request')"
         )
     if "draft_skv2" in SLOTS and "draft_extend" not in SLOTS:

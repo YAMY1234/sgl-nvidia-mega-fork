@@ -7,11 +7,16 @@ the attention's buffers, and each requested draft slot's build."""
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+# Slot draft_fc_rep: the multi-request draft steps of at least this many rows take SGLang's
+# replicated fc
+FC_REP_MIN_ROWS = int(os.environ.get("SGLANG_Q35_DRAFT_FC_REP_MIN_ROWS", "8"))
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -72,6 +77,8 @@ class Parts:
         self.top1x: Optional[Any] = None
         # sm103.draft.embed.EmbedExchange: those steps' embedding rows (slot draft_embed)
         self.embedx: Optional[Any] = None
+        # the full embedding table [vocab, hidden] on this rank (slot draft_embed_full)
+        self.embed_full: Optional[torch.Tensor] = None
         # (entry, bs) pairs whose capture logged the engagement line
         self.engaged: set = set()
 
@@ -98,13 +105,19 @@ class Parts:
             parts.top1x = parts._build_top1x()
         if "draft_embed" in slots:
             parts.embedx = parts._build_embedx()
+        if "draft_embed_full" in slots:
+            parts.embed_full = parts._build_embed_full()
         logger.info(
             "NVIDIA megakernel: Qwen3.5 MTP draft parts built (slots %s; MoE %s, hop "
-            "%s, exchange %s)",
+            "%s, exchange %s, embedding %s, multi-request fc %s)",
             sorted(slots),
             "single launch" if parts.moe is not None else "SGLang's",
             "draft hop" if parts.hop is not None else "SGLang's",
             "MKD" if parts.mkd is not None else "SGLang's",
+            "full table" if parts.embed_full is not None
+            else "exchange" if parts.embedx is not None else "SGLang's",
+            f"replicated from {FC_REP_MIN_ROWS} rows" if "draft_fc_rep" in slots
+            else "row-split up to 16 rows",
         )
         return parts
 
@@ -233,23 +246,84 @@ class Parts:
             device=self.device,
         )
 
+    def _build_embed_full(self) -> torch.Tensor:
+        """Every rank's shard of the embedding gathered into one table, -0.0 written as
+        +0.0 (what the vocabulary-parallel embedding's all-reduce of zero rows returns)."""
+        import torch.distributed as dist
+
+        b = self.binding
+        embed = self.model.embed_tokens
+        shard = embed.shard_indices
+        start = int(shard.org_vocab_start_index)
+        local = int(shard.org_vocab_end_index - shard.org_vocab_start_index)
+        weight = embed.weight.data
+        layout = torch.tensor([start, local], dtype=torch.int64, device=self.device)
+        layouts = torch.empty(b.tp_size, 2, dtype=torch.int64, device=self.device)
+        dist.all_gather_into_tensor(layouts, layout, group=b.tp_device_group)
+        want = [[r * local, local] for r in range(b.tp_size)]
+        if (
+            shard.added_vocab_end_index != shard.added_vocab_start_index
+            or weight.dtype != torch.bfloat16
+            or layouts.tolist() != want
+        ):
+            raise RuntimeError(
+                "NVIDIA megakernel: slot draft_embed_full cannot run: the embedding "
+                f"shards {layouts.tolist()} ({weight.dtype}) are not equal rank-major "
+                "slices without added vocabulary"
+            )
+        rows = weight[:local].clone()
+        bits = rows.view(torch.int16)
+        bits.masked_fill_(bits == -32768, 0)
+        full = torch.empty(
+            b.tp_size * local, rows.shape[1], dtype=rows.dtype, device=self.device
+        )
+        dist.all_gather_into_tensor(full, rows, group=b.tp_device_group)
+        del rows, bits
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 MTP draft embedding: the full table "
+            "[%d, %d] on every rank (%.2f GB)",
+            full.shape[0],
+            full.shape[1],
+            full.numel() * full.element_size() / 2**30,
+        )
+        return full
+
+    def fc_replicated(self, rows: int) -> bool:
+        """Whether a multi-request draft step of ``rows`` rows takes SGLang's replicated
+        fc (slot draft_fc_rep)."""
+        return "draft_fc_rep" in self.slots and rows >= FC_REP_MIN_ROWS
+
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """The embedding rows of ``token_ids``: slot draft_embed's exchange where it is
-        built and the rows fit it, else SGLang's vocabulary-parallel embedding."""
+        """The embedding rows of ``token_ids``: slot draft_embed_full's table, else slot
+        draft_embed's exchange where it is built and the rows fit it, else SGLang's
+        vocabulary-parallel embedding."""
         from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import MAX_ROWS
 
+        if self.embed_full is not None:
+            return self.embed_full.index_select(0, token_ids)
         if self.embedx is not None and token_ids.shape[0] <= MAX_ROWS:
             return self.embedx(token_ids)
         return self.model.embed_tokens(token_ids)
 
-    def note_engaged(self, entry: str, bs: int) -> None:
+    def note_engaged(self, entry: str, bs: int, paths: str = "") -> None:
         """Log once per (entry, bs) captured: the engagement line every rank prints."""
         if torch.cuda.is_current_stream_capturing() and (entry, bs) not in self.engaged:
             self.engaged.add((entry, bs))
             logger.info(
                 "NVIDIA megakernel: Qwen3.5 MTP draft %s captured for batch size %d "
-                "(slots %s)",
+                "(slots %s)%s",
                 entry,
                 bs,
                 sorted(self.slots),
+                f": {paths}" if paths else "",
             )
+
+    def embed_path(self, rows: int) -> str:
+        """Which lookup ``embed`` takes for ``rows`` rows (for the engagement line)."""
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import MAX_ROWS
+
+        if self.embed_full is not None:
+            return "embedding full table"
+        if self.embedx is not None and rows <= MAX_ROWS:
+            return "embedding exchange"
+        return "embedding SGLang's"

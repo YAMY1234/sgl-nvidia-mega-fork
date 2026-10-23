@@ -157,12 +157,21 @@ SGL_DEVICE void draft_top1_xchg_kernel(const DraftTop1Params& p) {
     mc_store(dst + 1, static_cast<uint32_t>(k >> 32), tag);
   }
   if (t < p.m) {
+    // every rank's two words of this row in flight together, then each re-polled only while its tag
+    // is stale: the keys that already landed cost one round trip, not one each
+    uint64_t v[2 * kWorld];
+#pragma unroll
+    for (int k = 0; k < 2 * kWorld; ++k) {
+      const uint64_t* w = p.uc + ((slot * kWorld + k / 2) * kMaxRows + t) * 2 + k % 2;
+      asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(v[k]) : "l"(w) : "memory");
+    }
     uint64_t win = 0;
 #pragma unroll
     for (int r = 0; r < kWorld; ++r) {
       const uint64_t* w = p.uc + ((slot * kWorld + r) * kMaxRows + t) * 2;
-      const uint32_t lo = poll(w, tag);
-      const uint32_t hi = poll(w + 1, tag);
+      const uint32_t lo = static_cast<uint32_t>(v[2 * r] >> 32) == tag ? static_cast<uint32_t>(v[2 * r]) : poll(w, tag);
+      const uint32_t hi =
+          static_cast<uint32_t>(v[2 * r + 1] >> 32) == tag ? static_cast<uint32_t>(v[2 * r + 1]) : poll(w + 1, tag);
       win = max64(win, (static_cast<uint64_t>(hi) << 32) | lo);
     }
     const int64_t id = static_cast<int64_t>(0xFFFFFFFFu - static_cast<uint32_t>(win));

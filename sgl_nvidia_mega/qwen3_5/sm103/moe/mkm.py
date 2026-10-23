@@ -16,6 +16,7 @@ turn and gathering each one's token rows).
 from __future__ import annotations
 
 import ctypes
+import os
 from functools import cache
 from pathlib import Path
 from typing import NamedTuple
@@ -64,9 +65,19 @@ M32_ENGINES = {
         "mkm_moe_m32.cu", "q35_mkm_moe_m32", 224256, "CU_TENSOR_MAP_SWIZZLE_64B"
     ),
 }
+# SMs the 32 / 64-token engines leave to the alternate stream's shared expert (whose GEMMs do not fit beside an
+# engine CTA on an SM); experiment knob while its value is measured in serving
+RESERVED_SMS = int(os.environ.get("SGLANG_Q35_MKM_RESERVED_SMS", "0"))
 # each CTA of the 32-token engine runs at most 3 distinct experts (src/mkm_moe_m32.cu
-# kMaxItems): it needs 32 * 10 / 3 SMs
+# kMaxItems): it needs 32 * 10 / 3 SMs; the 64-token engine's 8 items fit as well
 M32_MIN_SMS = 107
+# the 64-token engines (the 32-token engine's work in (expert, row group) units)
+M64_MAX_TOKENS = 64
+M64_ENGINES = {
+    128: Engine(
+        "mkm_moe_m64.cu", "q35_mkm_moe_m64", 228352, "CU_TENSOR_MAP_SWIZZLE_64B"
+    ),
+}
 
 
 class Params(ctypes.Structure):
@@ -91,13 +102,14 @@ class Params(ctypes.Structure):
 
 
 class ParamsM32(Params):
-    """qwen_mkm_moe_m32::Params: each item gathers its token rows from x_fp4."""
+    """qwen_mkm_moe_m32::Params / qwen_mkm_moe_m64::Params: each item gathers its token rows
+    from x_fp4; the 64-token engine also takes a given routing (ids_in, null: its own)."""
 
-    _fields_ = [("x_fp4", ctypes.c_void_p)]
+    _fields_ = [("x_fp4", ctypes.c_void_p), ("ids_in", ctypes.c_void_p)]
 
 
-# the rows each engine serves: (7-row, 16-token, 32-token) engines up to these
-ENGINE_ROWS = (MAX_TOKENS, M16_MAX_TOKENS, M32_MAX_TOKENS)
+# the rows each engine serves: (7-row, 16-token, 32-token, 64-token) engines up to these
+ENGINE_ROWS = (MAX_TOKENS, M16_MAX_TOKENS, M32_MAX_TOKENS, M64_MAX_TOKENS)
 
 
 def engine_rows(m: int) -> int:
@@ -108,9 +120,12 @@ def engine_rows(m: int) -> int:
 @cache
 def _kernel(device_index: int, intermediate: int, rows: int) -> jit.Kernel:
     """The engine of ``engine_rows`` bound ``rows`` at ``intermediate`` per rank."""
-    engine = {MAX_TOKENS: ENGINES, M16_MAX_TOKENS: WIDE_ENGINES}.get(rows, M32_ENGINES)[
-        intermediate
-    ]
+    engine = {
+        MAX_TOKENS: ENGINES,
+        M16_MAX_TOKENS: WIDE_ENGINES,
+        M32_MAX_TOKENS: M32_ENGINES,
+        M64_MAX_TOKENS: M64_ENGINES,
+    }[rows][intermediate]
     major, minor = torch.cuda.get_device_capability(device_index)
     cubin = jit.compile_source(
         (Path(__file__).parent / "src" / engine.source).read_text(),
@@ -125,9 +140,11 @@ def _kernel(device_index: int, intermediate: int, rows: int) -> jit.Kernel:
     return jit.load(cubin, engine.kernel, (THREADS, 1, 1), engine.smem_bytes)
 
 
-def max_tokens(intermediate: int, m32: bool = False) -> int:
-    """The widest rows an engine serves for ``intermediate`` per rank (``m32``: with the
-    32-token engine)."""
+def max_tokens(intermediate: int, m32: bool = False, m64: bool = False) -> int:
+    """The widest rows an engine serves for ``intermediate`` per rank (``m32`` / ``m64``:
+    with the 32 / 64-token engine)."""
+    if m64 and intermediate in M64_ENGINES:
+        return M64_MAX_TOKENS
     if m32 and intermediate in M32_ENGINES:
         return M32_MAX_TOKENS
     return M16_MAX_TOKENS if intermediate in WIDE_ENGINES else MAX_TOKENS
@@ -138,7 +155,7 @@ def m32_unsupported(device_index: int, intermediate: int) -> str:
     it can)."""
     if intermediate not in M32_ENGINES:
         return f"no 32-token engine at intermediate {intermediate} per rank"
-    sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    sms = torch.cuda.get_device_properties(device_index).multi_processor_count - RESERVED_SMS
     if sms < M32_MIN_SMS:
         return f"{sms} SMs (the 32-token engine needs {M32_MIN_SMS})"
     return ""
@@ -225,18 +242,22 @@ def mkm_moe(
     g1_alpha: torch.Tensor,
     g1_scale_c: torch.Tensor,
     g2_alpha: torch.Tensor,
+    routing: tuple | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(gemm2_out bf16 [M * 10, 4096], expert_weights bf16 [M, 10]) for logits [M, 512]
-    bf16 (M <= 7, at TP8 M <= 32) and the router front's x_fp4 [M, 2048] / x_sf [M, 256]
+    bf16 (M <= 7, at TP8 M <= 64) and the router front's x_fp4 [M, 2048] / x_sf [M, 256]
     (uint8, linear e4m3); w13_sf [512, 2 I, 256] / w2_sf [512, 4096, I / 16] e4m3 viewed
-    as uint8 (the engine follows I); g1_alpha, g1_scale_c, g2_alpha [512] fp32."""
+    as uint8 (the engine follows I); g1_alpha, g1_scale_c, g2_alpha [512] fp32. With
+    ``routing`` (route_topk's ids int32 / weights bf16 [M, 10], 33 to 64 rows) the engine
+    takes that routing instead of ranking the logits, and returns those weights."""
     m = logits.shape[0]
     intermediate = w2_sf.shape[2] * 16
-    if not 1 <= m <= max_tokens(intermediate, m32=True):
-        raise ValueError(
-            f"mkm: {m} rows (1-{max_tokens(intermediate, m32=True)})"
-        )
+    widest = max_tokens(intermediate, m32=True, m64=True)
+    if not 1 <= m <= widest:
+        raise ValueError(f"mkm: {m} rows (1-{widest})")
     rows = engine_rows(m)
+    if routing is not None and rows != M64_MAX_TOKENS:
+        raise ValueError(f"mkm: a given routing needs the 64-token engine, not {m} rows")
     device = logits.device
     gemm2_out = torch.empty((m * TOP_K, HIDDEN), dtype=torch.bfloat16, device=device)
     expert_weights = torch.empty((m, TOP_K), dtype=torch.bfloat16, device=device)
@@ -256,12 +277,13 @@ def mkm_moe(
     )
     kernel = _kernel(device.index, intermediate, rows)
     stream = torch.cuda.current_stream().cuda_stream
-    if rows == M32_MAX_TOKENS:
+    if rows in (M32_MAX_TOKENS, M64_MAX_TOKENS):
         # min(M * 10, SMs) CTAs, one per SM, each running its share of the distinct experts
-        sms = torch.cuda.get_device_properties(device).multi_processor_count
-        p = ParamsM32(x_fp4=x_fp4.data_ptr(), **fields)
+        sms = torch.cuda.get_device_properties(device).multi_processor_count - RESERVED_SMS
+        ids_in = 0 if routing is None else routing[0].data_ptr()
+        p = ParamsM32(x_fp4=x_fp4.data_ptr(), ids_in=ids_in, **fields)
         jit.launch(kernel, (min(m * TOP_K, sms), 1, 1), [*maps, p], stream)
-        return gemm2_out, expert_weights
+        return gemm2_out, (expert_weights if routing is None else routing[1])
     swizzle = jit.driver().CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
     wide = rows == M16_MAX_TOKENS
     # the x rows past m read as zeros: 8 rows a box, 16 for the 16-token engine

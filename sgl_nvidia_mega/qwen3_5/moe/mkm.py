@@ -131,10 +131,10 @@ def unsupported(mlp) -> str:
     return ""
 
 
-def routed(mlp, maps: tuple, identity: torch.Tensor, logits, x_fp4, x_sf):
+def routed(mlp, maps: tuple, identity: torch.Tensor, logits, x_fp4, x_sf, routing=None):
     """The deferred-finalize output of ``mlp``'s routed experts from the router front's
     logits and quantized input (``maps``: the layer's weight TMA maps; ``identity``:
-    0, 1, ... int32)."""
+    0, 1, ... int32; ``routing``: route_topk's ids and weights, for the 64-token engine)."""
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         FlashInferTrtllmDeferredFinalizeOutput,
     )
@@ -153,6 +153,7 @@ def routed(mlp, maps: tuple, identity: torch.Tensor, logits, x_fp4, x_sf):
         experts.g1_alphas,
         experts.g1_scale_c,
         experts.g2_alphas,
+        routing=routing,
     )
     deferred = FlashInferTrtllmDeferredFinalizeOutput(
         gemm2_out=gemm2_out,

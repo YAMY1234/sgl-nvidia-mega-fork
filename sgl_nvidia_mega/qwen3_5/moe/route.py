@@ -28,7 +28,10 @@ Slot ``mkm_m32`` takes route_topk's place at 17 to 32 rows: slot mkm's 32-token 
 the top-10, FC1, SwiGLU, the NVFP4 requantization and FC2 in one launch on the router
 GEMM's logits and the NVFP4 input (with route_gemm the router front's tiles give both;
 otherwise route_topk's launch quantizes the input), bit for bit the runner's rows on
-those logits, so the step's output is route_topk's.
+those logits, so the step's output is route_topk's. Slot ``mkm_m64`` takes the runner's
+place at 33 to 64 rows: after route_topk's launch (the routing and the NVFP4 input) the
+64-token engine runs FC1, SwiGLU, the requantization and FC2 on that routing in one launch,
+bit for bit the runner's rows.
 """
 
 from __future__ import annotations
@@ -119,6 +122,7 @@ class Bound(msgspec.Struct, frozen=True):
     topk: bool = False  # slot route_topk: the top-10 + NVFP4 input launch built
     gemm: bool = False  # slot route_gemm: the router front's 16-row tiles stand in for the GEMM
     m32: dict = msgspec.field(default_factory=dict)  # slot mkm_m32: layer id -> weight TMA maps
+    m64: bool = False  # slot mkm_m64: the 64-token engine built (on m32's maps)
     reason: str = ""  # why a requested slot is not built
 
 
@@ -178,9 +182,9 @@ def build(
     )
 
 
-def build_m32(model, bound: Bound) -> Bound:
-    """Slot mkm_m32 on ``bound`` (route_topk built): the 32-token engine and every MoE
-    layer's weight maps (slot mkm's when built), or why it cannot serve."""
+def build_m32(model, bound: Bound, m32: bool = True, m64: bool = False) -> Bound:
+    """Slots mkm_m32 / mkm_m64 on ``bound`` (route_topk built): the 32 / 64-token engines
+    and every MoE layer's weight maps (slot mkm's when built), or why they cannot serve."""
     from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm as mkm_kernel
 
     m = model.model
@@ -193,18 +197,19 @@ def build_m32(model, bound: Bound) -> Bound:
     mkm_kernel.build(
         device,
         intermediate,
-        mkm_kernel.M32_MAX_TOKENS,
-        min_rows=mkm_kernel.M16_MAX_TOKENS + 1,
+        mkm_kernel.M64_MAX_TOKENS if m64 else mkm_kernel.M32_MAX_TOKENS,
+        min_rows=(mkm_kernel.M16_MAX_TOKENS if m32 else mkm_kernel.M32_MAX_TOKENS) + 1,
     )
     return msgspec.structs.replace(
         bound,
+        m64=m64,
         m32={
             mlp.layer_id: bound.mkm.get(mlp.layer_id)
             or mkm_kernel.weight_maps(mlp.experts.w13_weight, mlp.experts.w2_weight)
             for mlp in layers
         },
         identity=torch.arange(
-            mkm_kernel.M32_MAX_TOKENS * mkm_kernel.TOP_K,
+            mkm_kernel.M64_MAX_TOKENS * mkm_kernel.TOP_K,
             dtype=torch.int32,
             device="cuda",
         ),
@@ -414,4 +419,32 @@ def routed_m32(mlp, x: torch.Tensor, bound: Bound, gemm: bool = False):
         _, _, x_fp4, x_sf = router.route_topk_quant(logits, x, scale)
     return mkm.routed(
         mlp, bound.m32[mlp.layer_id], bound.identity, logits, x_fp4, x_sf
+    )
+
+
+def routed_m64(mlp, x: torch.Tensor, bound: Bound):
+    """``FusedMoE.forward_deferred_finalize`` of ``mlp``'s routed experts on ``x``
+    [33-64 rows, hidden]: SGLang's router GEMM, route_topk's launch (the routing and the
+    NVFP4 input, as slot route_topk runs them), then the 64-token engine on that routing in
+    place of the runner (slot mkm_m64)."""
+    from sgl_nvidia_mega.qwen3_5.moe import mkm
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    if ("mkm_m64", x.shape[0]) not in _ENGAGED:
+        _ENGAGED.add(("mkm_m64", x.shape[0]))
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 slot mkm_m64 runs at %d rows", x.shape[0]
+        )
+    logits, _ = mlp.gate(x)
+    ids, weights, x_fp4, x_sf = router.route_topk_quant(
+        logits, x, mlp.experts.w13_input_scale_quant.reshape(1)
+    )
+    return mkm.routed(
+        mlp,
+        bound.m32[mlp.layer_id],
+        bound.identity,
+        logits,
+        x_fp4,
+        x_sf,
+        routing=(ids, weights),
     )

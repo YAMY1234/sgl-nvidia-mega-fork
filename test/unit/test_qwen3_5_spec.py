@@ -231,7 +231,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     )
     # two requests: the 16-row router front, the GDN chain, the hop's one-shot rows,
     # MKA's wide entries with their push, every low-M launch and the hop's FP8 copy
-    gdn = ["gdn_core", "gdn_pdl", "gdn_verify"]
+    gdn = ["gdn_conv", "gdn_core", "gdn_pdl", "gdn_verify"]
     lowm = ["lowm_in", "lowm_oproj", "lowm_outproj", "lowm_push", "lowm_se"]
     assert _on(plan.slots(14, every)) == sorted(
         gdn + lowm + ["gdn_front", "hop", "hop_fp8", "mka", "mka_push", "route"]
@@ -263,7 +263,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     # its rows; the hop stops at 32 requests)
     for rows in (448, 896):
         assert _on(plan.slots(rows, every)) == sorted(
-            ["gdn_pdl", "gdn_verify", "mka", "route_topk"]
+            ["gdn_conv", "gdn_pdl", "gdn_verify", "mka", "route_topk"]
             + (["gdn_core"] if rows <= plan.GDN_CORE_MAX_ROWS else [])
             + (["mkm_m512"] if rows <= plan.MKM_M512_MAX_ROWS else [])
         )

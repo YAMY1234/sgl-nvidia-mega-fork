@@ -161,6 +161,7 @@ class Options(msgspec.Struct, frozen=True):
     push: bool = False  # out_proj pushes its partial into the hop (slot gdn_push)
     core: bool = False  # verify, gated norm and FP8 in one launch (slot gdn_core)
     lowm_push: bool = False  # out_proj's low-M launch pushes into the hop (slot lowm_push)
+    conv_rows: bool = False  # the hoisted conv writing each channel's window row once (slot gdn_conv)
 
 
 STOCK = Options(views=False, block_n=256, block_v=64, num_warps=1, norm_fp8=False)
@@ -216,6 +217,21 @@ def pool_reasons(pools, tokens_per_request: int) -> list[str]:
     if pools.temporal.dtype != torch.bfloat16:
         reasons.append(f"{pools.temporal.dtype} checkpoints")
     if tokens_per_request > MAX_DRAFT:
+        reasons.append(f"{tokens_per_request} rows a request")
+    return reasons
+
+
+def conv_pool_reasons(pools, tokens_per_request: int) -> list[str]:
+    """Why slot gdn_conv cannot run on the pools ([] when it can): width-4 conv states and the
+    deduplicated windows (window[t][w] = row[t + w]) of 4 to 8 rows a request."""
+    reasons = []
+    conv, windows = pools.conv[0], pools.intermediate_conv_window[0]
+    if conv.shape[-1] != 3:
+        reasons.append(f"conv states {tuple(conv.shape)} are not width 4")
+    st = windows.stride()
+    if not (st[2] == 1 and st[4] == 1 and st[3] >= tokens_per_request + 2):
+        reasons.append(f"conv windows {tuple(windows.shape)} {st} are not deduplicated")
+    if not 3 < tokens_per_request <= 8:
         reasons.append(f"{tokens_per_request} rows a request")
     return reasons
 
@@ -354,6 +370,7 @@ def _conv(attn, mixed_qkv, st, opts) -> torch.Tensor:
         meta.intermediate_indices[:bs],
         block_n=opts.block_n,
         token_major_out=opts.views,
+        **({"hoist": True, "window_mode": 1} if opts.conv_rows else {}),
     )
     return y.transpose(1, 2).view(seq_len, -1)
 
@@ -433,6 +450,7 @@ def _core(attn, mixed_qkv, a, b, st, opts):
         meta.intermediate_indices[:bs],
         block_n=opts.block_n,
         token_major_out=opts.views,
+        **({"hoist": True, "window_mode": 1} if opts.conv_rows else {}),
     )
     mixed_qkv = y.transpose(1, 2).view(seq_len, -1)
     query, key, value = torch.split(

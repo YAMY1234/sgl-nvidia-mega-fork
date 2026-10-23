@@ -28,6 +28,8 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "gdn_verify",
     "gdn_pdl",
     "gdn_core",
+    # the verify conv with every x row loaded first and the windows in one store a channel (bitwise)
+    "gdn_conv",
     "hop",
     "hop_wide",
     "hop_mid",
@@ -161,6 +163,8 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_core' runs slot 'gdn_verify''s step in one launch"
         )
+    if "gdn_conv" in SLOTS and "gdn_verify" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'gdn_conv' runs slot 'gdn_verify''s conv")
     if "gdn_pdl" in SLOTS and "gdn_verify" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_pdl' launches slot 'gdn_verify''s verify"
@@ -268,6 +272,7 @@ def build(model, ctx):
         gdn_verify=bound["gdn"].gdn_verify,
         gdn_pdl=bound["gdn"].gdn_pdl,
         gdn_core=bound["gdn"].gdn_core,
+        gdn_conv=bound["gdn"].gdn_conv,
         hop=bound["boundary"].hop is not None,
         hop_wide=bound["boundary"].wide,
         hop_mid=bound["boundary"].mid,

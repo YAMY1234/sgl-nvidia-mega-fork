@@ -63,6 +63,7 @@ class Bound(msgspec.Struct, frozen=True):
     gdn_verify: bool = False  # slot gdn_verify serves every GDN layer
     gdn_pdl: bool = False  # and launches its verify dependent on the conv
     gdn_core: bool = False  # and runs its verify, gated norm and FP8 in one launch
+    gdn_conv: bool = False  # and its conv with the x rows loaded first and one window store
     # slot gdn_push: layer id -> out_proj's weights packed for the hop's push GEMM
     packed: dict = msgspec.field(default_factory=dict)
     # slot gdn_front: layer id -> in_proj_qkvz's weights packed for the front
@@ -132,6 +133,7 @@ def build(model, ctx) -> Bound:
         gdn_verify=True,
         gdn_pdl="gdn_pdl" in SLOTS,
         gdn_core=core,
+        gdn_conv="gdn_conv" in SLOTS,
         packed=packed,
         front=front_packed,
         error=error,
@@ -149,6 +151,9 @@ def step(layer, x, st):
         if st.slots.gdn_core:
             opts = msgspec.structs.replace(opts, core=True)
             verify.engaged("gdn_core", x.shape[0])
+        if st.slots.gdn_conv:
+            opts = msgspec.structs.replace(opts, conv_rows=True)
+            verify.engaged("gdn_conv", x.shape[0])
         # push only where the MoE input's all-reduce will consume on the hop
         if st.slots.gdn_push and hop.takes_moe_input(
             st.bound["boundary"].hop, layer, st, x.shape[0]

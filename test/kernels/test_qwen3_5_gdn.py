@@ -114,6 +114,45 @@ def test_conv_update_is_sglangs(views, block_n, bs):
 
 
 @pytest.mark.parametrize("bs", REQUESTS)
+@pytest.mark.parametrize("tile", [(128, 4), (64, 2)])
+@pytest.mark.parametrize("window_mode", [0, 1])
+def test_hoisted_conv_is_sglangs(window_mode, tile, bs):
+    """Slot gdn_conv: x rows loaded first (and with window_mode 1 one window row a channel) writes the
+    output, the conv states and the deduplicated windows bit for bit as SGLang's kernel."""
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
+
+    from sgl_nvidia_mega.qwen3_5.gdn.conv import conv_update
+
+    g = torch.Generator(device="cuda").manual_seed(window_mode + tile[0] + 10 * bs)
+    rows = _projection(bs, True, g)
+    weight = torch.randn(D, WIDTH, device="cuda", generator=g).to(torch.bfloat16)
+    state = torch.randn(SLOTS, D, WIDTH - 1, device="cuda", generator=g).to(torch.bfloat16)
+    shared = torch.randn(SLOTS, D, DRAFT + WIDTH - 2, device="cuda", generator=g).to(torch.bfloat16)
+    slots = torch.tensor(STATE_SLOTS[:bs], dtype=torch.int32, device="cuda")
+    if bs > 2:
+        slots[1] = -1  # a padded request
+    inter = torch.arange(bs, dtype=torch.int32, device="cuda")
+    x = rows.view(bs, DRAFT, D).transpose(1, 2)
+
+    def windows(t):
+        st = t.stride()
+        return t.as_strided((SLOTS, DRAFT, D, WIDTH - 1), (st[0], 1, st[1], 1))
+
+    want_state, want_shared = state.clone(), shared.clone()
+    want = causal_conv1d_update(
+        x, want_state, weight, None, "silu", conv_state_indices=slots,
+        intermediate_conv_window=windows(want_shared), intermediate_state_indices=inter,
+    )
+    got = conv_update(
+        x, state, weight, None, "silu", slots, windows(shared), inter, block_n=tile[0],
+        token_major_out=True, hoist=True, num_warps=tile[1], window_mode=window_mode,
+    )
+    live = (slots >= 0)[:, None, None]
+    assert torch.equal(torch.where(live, got, 0), torch.where(live, want.contiguous(), 0))
+    assert torch.equal(state, want_state) and torch.equal(shared, want_shared)
+
+
+@pytest.mark.parametrize("bs", REQUESTS)
 @pytest.mark.parametrize("views", [False, True])
 def test_norm_fp8_is_sglangs_norm_then_static_quant(views, bs):
     from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm

@@ -178,6 +178,12 @@ class Qwen35Verify:
                     "NVIDIA megakernel: slot gdn_verify cannot run: "
                     + "; ".join(reasons)
                 )
+        if any(s.gdn_conv for s in self.slots.values()):
+            reasons = gdn.verify.conv_pool_reasons(view.mamba, self.binding.tokens_per_request)
+            if reasons:
+                raise RuntimeError(
+                    "NVIDIA megakernel: slot gdn_conv cannot run: " + "; ".join(reasons)
+                )
         if any(s.gdn_core for s in self.slots.values()):
             reasons = gdn.verify.core_pool_reasons(view.mamba)
             if reasons:

@@ -114,6 +114,8 @@ class Slots(msgspec.Struct, frozen=True):
     gdn_pdl: bool = False  # its ReplaySSM verify launched dependent on the conv
     # its ReplaySSM verify, gated norm and FP8 output in one launch (sm103/gdn/core.py)
     gdn_core: bool = False
+    # its conv with every x row loaded first and each window row in one store (gdn/conv.py; bitwise)
+    gdn_conv: bool = False
     hop: bool = False  # the boundary's fused all-reduce points (boundary/hop.py)
     # out_proj pushes its partial into the hop from its GEMM (gdn/verify.py; numeric)
     gdn_push: bool = False
@@ -152,6 +154,7 @@ class Facts(msgspec.Struct, frozen=True):
     gdn_verify: bool = False  # the GDN verify slot built for every GDN layer
     gdn_pdl: bool = False  # with its dependent verify launch
     gdn_core: bool = False  # with the one-launch verify core
+    gdn_conv: bool = False  # with the hoisted conv writing each window row once
     hop: bool = False  # the decode hop, built for the widest step it covers
     hop_wide: bool = False  # with its two-shot protocol past the one-shot rows
     hop_mid: bool = False  # with its one-shot protocol up to HOP_MID_MAX_ROWS
@@ -208,6 +211,7 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         gdn_verify=gdn_verify,
         gdn_pdl=gdn_verify and facts.gdn_pdl,
         gdn_core=gdn_verify and facts.gdn_core and rows <= GDN_CORE_MAX_ROWS,
+        gdn_conv=gdn_verify and facts.gdn_conv,
         hop=hop,
         gdn_push=gdn_verify
         and hop

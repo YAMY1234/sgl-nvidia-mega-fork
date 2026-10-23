@@ -213,6 +213,9 @@ constexpr int kARow = 132;  // FC1 accumulator row stride in floats: 16 B aligne
 #ifndef DIAG_NO_MMA  // timing diagnostic only: no MMAs, stages are released as soon as they land
 #define DIAG_NO_MMA 0
 #endif
+#ifndef DRAIN2  // 1: the FC1 accumulator drain split across the two lane-quarter-0 warps (warp 4: columns 0..63, warp 0:
+#define DRAIN2 0  // 64..127) instead of warp 4 alone
+#endif
 #ifndef SPEC_STAGES  // ring stages warp 1 issues for its token's expert before the routing verdict (the rest after it)
 #define SPEC_STAGES 5
 #endif
@@ -907,7 +910,7 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
     if (q == 0) {
       if (lane == 0) stamp(p, 4);
 #pragma unroll 1
-      for (int c = 0; c < 2; ++c) {
+      for (int c = 0; c < (DRAIN2 ? 1 : 2); ++c) {
         uint32_t r[64];
         tmem_ld_x64(tm + (uint32_t)(c * 64), r);
         tmem_ld_wait();
@@ -926,7 +929,7 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
     }
     if (threadIdx.x == 128) stamp(p, 15);
     tc_fence_before();
-    named_bar(2, 128);  // quarter 0's accumulator rows are visible to the whole warpgroup
+    named_bar(2, DRAIN2 ? 160 : 128);  // quarter 0's accumulator rows (DRAIN2: warp 0's half too) are visible
 
     if (threadIdx.x == 128) stamp(p, 5);
     if (!HOIST_SCALES) { ag = p.g1_alpha[e]; sc = p.g1_scale_c[e]; }
@@ -1008,6 +1011,21 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
       stage_sf(st, 32 + (st - kFc1Stages) * 4, 4, 1, 1024);
 
     if (q < 2) fc2_drain(p, s, tm, q, lane, 0, a2, rank, e);
+  }
+  if (DRAIN2 && warp == 0) {  // accumulator columns 64..127 of the token rows, beside warp 4's 0..63
+    mbar_wait(&s.fc1_done, 0);
+    tc_fence_after();
+    uint32_t r[64];
+    tmem_ld_x64(tm + 64u, r);
+    tmem_ld_wait();
+    if (lane < 8) {
+#pragma unroll
+      for (int i = 0; i < 16; ++i)
+        *reinterpret_cast<uint4*>(s.acc1 + lane * kARow + 64 + 4 * i) =
+            make_uint4(r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]);
+    }
+    tc_fence_before();
+    named_bar(2, 160);
   }
   if (warp < 2) fc2_drain(p, s, tm, warp, lane, 1, a2, rank, e);
   tc_fence_before();

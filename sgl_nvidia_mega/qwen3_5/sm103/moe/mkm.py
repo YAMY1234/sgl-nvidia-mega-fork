@@ -143,10 +143,12 @@ M64_RESERVE_BY_ROWS = tuple(
 _LOGGED: set = set()
 
 
-# PERF-SM: build options of the 32-token engine, bit for bit either way. THR_D: a CTA with one expert, while some CTA
-# runs two, keeps at most this many ring stages in flight (0 = off); TOPK_NOINLINE: the row top-10 out of line.
+# PERF-SM: build options of the 32 / 64-token engines, bit for bit either way. THR_D (32-token): a CTA with one expert,
+# while some CTA runs two, keeps at most this many ring stages in flight (0 = off); TOPK_NOINLINE (32-token): the row
+# top-10 out of line; ONEPASS (32 / 64-token): an item of at most 8 rows runs FC2 in one pass of 16 tiles.
 ENGINE_THR_D = int(os.environ.get("SGLANG_Q35_MKM_THR_D", "0"))
 ENGINE_TOPK_NOINLINE = os.environ.get("SGLANG_Q35_MKM_TOPK_NOINLINE", "0") == "1"
+ENGINE_ONEPASS = os.environ.get("SGLANG_Q35_MKM_ONEPASS", "0") == "1"
 
 
 def engine_options(rows: int) -> tuple:
@@ -156,6 +158,8 @@ def engine_options(rows: int) -> tuple:
         opts += (f"-DTHR_D={ENGINE_THR_D}",)
     if ENGINE_TOPK_NOINLINE and rows == M32_MAX_TOKENS:
         opts += ("-DTOPK_NOINLINE=1",)
+    if ENGINE_ONEPASS and rows in (M32_MAX_TOKENS, M64_MAX_TOKENS):
+        opts += ("-DONEPASS=1",)
     if opts:
         logger.info("NVIDIA megakernel: Qwen3.5 %d-token engine built with %s", rows, " ".join(opts))
     return opts

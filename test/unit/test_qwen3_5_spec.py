@@ -210,15 +210,12 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     )
     # four to 32 requests: the GDN chain (with its one-launch core), the two-shot hop,
     # route_topk and MKA's front path (whose flag mka_push only the wide entries act on),
-    # with the router front's tiles up to its rows; the low-M output projections (with their
-    # push) up to four requests, the low-M shared expert up to two
+    # with the router front's tiles up to its rows; no low-M launch past two requests
     for rows in (28, 56, 112, 224):
         assert _on(plan.slots(rows, every)) == sorted(
             gdn
-            + ["hop", "hop_fp8", "mka", "mka_push", "route_topk"]
+            + ["hop", "mka", "mka_push", "route_topk"]
             + (["route_gemm"] if rows <= plan.ROUTE_GEMM_MAX_ROWS else [])
-            + (["lowm_oproj", "lowm_outproj", "lowm_push"] if rows <= 28 else [])
-            + (["lowm_se"] if rows <= plan.LOWM_SE_MAX_ROWS else [])
         )
     assert _on(plan.slots(56, plan.Facts(gdn_verify=True))) == ["gdn_verify"]
     no_wide = plan.Facts(hop=True)

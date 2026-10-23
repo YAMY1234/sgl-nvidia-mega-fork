@@ -72,10 +72,10 @@ MKA_WIDE_MAX_ROWS = MAX_ROWS
 # cuBLAS path on GB300 (results/trt-1022/l6): the input projections (in_proj_qkvz + in_proj_ba, qkv_proj),
 # the output projections (out_proj, o_proj) and the shared expert
 LOWM_IN_MAX_ROWS = 14
-LOWM_OUTPROJ_MAX_ROWS = 28
-LOWM_OPROJ_MAX_ROWS = 28
-# the shared expert only up to two requests: at four (TP8 static, batch 3: hop_mid and route_gemm on the main
-# stream) its launches on the alternate stream cost the step 0.21 ms a round; at eight they gain nothing
+# Up to two requests: on batch 3 (TP8 static) the launches at four requests (out_proj / o_proj with their push,
+# the hop's FP8 copy) cost the step 0.14 ms a round, the shared expert's 0.21 ms more
+LOWM_OUTPROJ_MAX_ROWS = 14
+LOWM_OPROJ_MAX_ROWS = 14
 LOWM_SE_MAX_ROWS = 14
 
 
@@ -189,7 +189,7 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         and facts.lowm_push
         and hop
         and rows <= max(LOWM_OUTPROJ_MAX_ROWS, LOWM_OPROJ_MAX_ROWS),
-        hop_fp8=hop and facts.hop_fp8,
+        hop_fp8=hop and facts.hop_fp8 and rows <= HOP_MAX_ROWS,
     )
 
 

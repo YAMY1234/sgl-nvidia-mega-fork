@@ -122,6 +122,21 @@ def test_the_runtime_gives_the_executor_the_build_contexts_binding(monkeypatch):
     assert built.binding == "EagleBinding" and built.summary() == "slots none (stock)"
 
 
+def test_slot_skv2_cp_builds_as_a_graph_variant_of_slot_skv2(monkeypatch):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2", "skv2_cp"}))
+    monkeypatch.setenv("SGLANG_TRTL1_ATTN_CP", "1")
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    ctx = SimpleNamespace(
+        widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
+    )
+    assert runtime.slot_reasons() == []
+    built = runtime.build(model, ctx)
+    variants = built.graph_variants["target_verify"]
+    assert variants.capture_labels == ("split_kv_stock", "split_kv_long", "split_kv_cp")
+
+
 def _draft_ctx():
     return SimpleNamespace(
         widths=(), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"

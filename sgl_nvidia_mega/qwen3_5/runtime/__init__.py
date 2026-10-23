@@ -37,9 +37,6 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "gdn_front",
     "route_shared",
     "skv2",
-    # one request from SGLANG_PERFLL_CP_B1_MIN_KV's "verify" length: CP-lite in place of
-    # SKV2, in a graph variant of its own (attention/route.py)
-    "skv2_cp",
     "mka",
     "mka_push",
     "lowm_in",
@@ -52,6 +49,10 @@ OPT_IN_SLOTS: tuple[str, ...] = (
 # when requested in the same variable: covering them costs the one-request step about
 # 0.3% at TP8
 OPT_IN_COVERAGE: tuple[str, ...] = ("multi_request",)
+# Graph variants of a built slot, requested in the same variable: no width of their own.
+# skv2_cp: one request from SGLANG_PERFLL_CP_B1_MIN_KV's "verify" length runs CP-lite in
+# place of SKV2, in a graph variant of its own (attention/route.py)
+OPT_IN_VARIANTS: tuple[str, ...] = ("skv2_cp",)
 # The MTP draft's EAGLE entries and kernel groups (qwen3_5/draft), requested in the same
 # variable; the draft spec's build reads them, the target's ignores them
 DRAFT_ENTRIES: tuple[str, ...] = ("draft_loop", "draft_extend")
@@ -107,6 +108,7 @@ def slot_reasons() -> list[str]:
         *SHIPPED_SLOTS,
         *OPT_IN_SLOTS,
         *OPT_IN_COVERAGE,
+        *OPT_IN_VARIANTS,
         *DRAFT_ENTRIES,
         *DRAFT_SLOTS,
     )
@@ -341,7 +343,13 @@ def build(model, ctx):
     )
     built = msgspec.structs.asdict(facts)
     # every package's build agrees across ranks, so this raises on every rank alike
-    target_slots = SLOTS - set(DRAFT_ENTRIES) - set(DRAFT_SLOTS) - set(OPT_IN_COVERAGE)
+    target_slots = (
+        SLOTS
+        - set(DRAFT_ENTRIES)
+        - set(DRAFT_SLOTS)
+        - set(OPT_IN_COVERAGE)
+        - set(OPT_IN_VARIANTS)
+    )
     # mkm's 16-token engine has nothing to serve where no covered step is wider than 7 rows
     vacuous = (
         {"mkm_wide"}

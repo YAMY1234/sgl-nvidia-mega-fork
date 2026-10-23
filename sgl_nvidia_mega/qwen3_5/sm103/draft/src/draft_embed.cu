@@ -96,10 +96,19 @@ extern "C" __global__ void __launch_bounds__(256) draft_embed_xchg(const DraftEm
       }
     }
   }
+  // the thread's words in flight together, then each re-polled only while its tag is stale
+  uint64_t v[kWords];
 #pragma unroll
   for (int j = 0; j < kWords; ++j) {
     const int w = w0 + j * kThreads;
-    if (w < words) p.out[static_cast<int64_t>(row) * words + w] = poll(p.uc + base + w, tag);
+    if (w < words) asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(v[j]) : "l"(p.uc + base + w) : "memory");
+  }
+#pragma unroll
+  for (int j = 0; j < kWords; ++j) {
+    const int w = w0 + j * kThreads;
+    if (w < words)
+      p.out[static_cast<int64_t>(row) * words + w] =
+          static_cast<uint32_t>(v[j] >> 32) == tag ? static_cast<uint32_t>(v[j]) : poll(p.uc + base + w, tag);
   }
   if (barrier && static_cast<int>(threadIdx.x) < p.world) {
     // every rank has entered this call (tags only grow: a rank one call ahead also passes)

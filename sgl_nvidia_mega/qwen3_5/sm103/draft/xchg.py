@@ -52,7 +52,7 @@ MAX_TOKENS = 2
 _MAX_SMEM_BYTES = 216 * 1024
 # fc_gather: the split fc's widest batch (2.2 _FC_SPLIT_MAX_TOKENS) and its grid
 GATHER_MAX_TOKENS = 16
-GATHER_CTAS, GATHER_THREADS = 32, 512
+GATHER_THREADS = 512
 
 
 def _order_key(value: float) -> int:
@@ -714,6 +714,7 @@ class FcGather:
         # [epoch, CTA arrivals]: the epoch tags the call's words, from 1
         self.epoch_done = torch.tensor([1, 0], dtype=torch.int32, device=device)
         sms = _sm_count(device.index)
+        self._ctas = sms
         self._kernels = _draft_fc_kernels(
             device.index, world, draft_fc_partial_rows(HIDDEN, 2 * HIDDEN // world, sms)
         )
@@ -738,5 +739,6 @@ class FcGather:
             rank=self.rank,
             m=m,
         )
-        _launch(self._kernels["fc_gather"], GATHER_CTAS, p, self.device, pdl=False)
+        # one CTA an SM: with the batched polls every thread waits about one round trip
+        _launch(self._kernels["fc_gather"], self._ctas, p, self.device, pdl=False)
         return out

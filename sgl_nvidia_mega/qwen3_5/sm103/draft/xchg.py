@@ -24,6 +24,7 @@ add unused shared memory, ``smem_pad``, and run beside a narrower hidden partial
 from __future__ import annotations
 
 import ctypes
+import os
 import struct
 from functools import cache
 from pathlib import Path
@@ -70,6 +71,9 @@ def _order_key(value: float) -> int:
 # -1e30; torch.argmax ranks NaN above every value (2.2 draft_vocab_argmax.py)
 NAN_KEY_SPLIT_ARGMAX = _order_key(-1e30)
 NAN_KEY_TORCH_ARGMAX = 0xFFFFFFFF
+# SGLANG_PERFDRAFT_MKD_PARTIAL_ROWS4=1 (PERF-DRAFT, default off): the side-stream hidden partial issues four rows'
+# weight loads per warp at once (mkd_hidden_partial_r4, same values), so it ends before the draft head beside it
+PARTIAL_ROWS4 = os.environ.get("SGLANG_PERFDRAFT_MKD_PARTIAL_ROWS4", "0") == "1"
 
 
 class MkdXchgParams(ctypes.Structure):
@@ -220,6 +224,7 @@ def _fc_kernels(device_index: int, world: int) -> dict[str, jit.Kernel]:
             cubin, "mkd_fc_memo", (256, 1, 1), MEMO_BLOCK_ROWS * HIDDEN * 2
         ),
         "mkd_hidden_partial": jit.load(cubin, "mkd_hidden_partial", (256, 1, 1), 0),
+        "mkd_hidden_partial_r4": jit.load(cubin, "mkd_hidden_partial_r4", (256, 1, 1), 0),
     }
 
 
@@ -600,7 +605,8 @@ def mkd_hidden_partial(
     )
     kernels = _fc_kernels(device.index, world)
     grid = ctas if ctas > 0 else _sm_count(device.index)
-    _launch(kernels["mkd_hidden_partial"], grid, p, device, pdl=False)
+    name = "mkd_hidden_partial_r4" if PARTIAL_ROWS4 else "mkd_hidden_partial"
+    _launch(kernels[name], grid, p, device, pdl=False)
 
 
 # ---------------------------------------------------------------- draft lm_head

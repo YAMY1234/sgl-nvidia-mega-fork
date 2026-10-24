@@ -53,8 +53,10 @@ _HEAD_CTAS_PER_SM = 1
 HEAD_SMEM_PAD = 120 * 1024
 # SMs a hidden rank leaves to the side-stream hidden partial: the early-released head
 # would fill every SM, and the partial (which the exchange waits for) would start only as
-# head CTAs retire; the head then runs on the other SMs
-PARTIAL_SMS = 24
+# head CTAs retire; the head then runs on the other SMs. SGLANG_PERFDRAFT_MKD_PARTIAL_SMS
+# (PERF-DRAFT) sets it: with the four-row partial (SGLANG_PERFDRAFT_MKD_PARTIAL_ROWS4) fewer
+# SMs still end it before the head, and the hidden ranks' head gets the rest back
+PARTIAL_SMS = int(os.environ.get("SGLANG_PERFDRAFT_MKD_PARTIAL_SMS", "24"))
 # Draft and draft-extend widths that take the row-split fc (2.2 _FC_SPLIT_MAX_TOKENS)
 FC_SPLIT_MAX_TOKENS = kernels.GATHER_MAX_TOKENS
 # Rows of a draft step the vocabulary exchange serves (2.2 DraftVocabExchange.MAX_ROWS)

@@ -359,6 +359,38 @@ def test_fc_partial_ext_rows_are_the_one_row_partials(ranks, boundary):
             assert torch.equal(got[i].view(torch.int32), one[0].view(torch.int32)), i
 
 
+@pytest.mark.parametrize("ctas", [8, 24, 0])
+def test_hidden_partial_rows4_is_the_one_row_kernel(ranks, boundary, ctas, monkeypatch):
+    """SGLANG_PERFDRAFT_MKD_PARTIAL_ROWS4: the side-stream hidden partial with four rows'
+    loads in flight per warp writes the one-row kernel's fp32 partial bit for bit, at every
+    hidden slice and CTA count, and sets the exchange flag to the epoch."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, _, _ = ranks
+    mkd, weights = boundary
+    width = mkd.width
+    with torch.inference_mode():
+        h = _randn(1, H, g=_gen(7100 + rank + ctas))
+        shard = _randn(H, width, g=_gen(7200 + rank), scale=0.02)
+        got = {}
+        for rows4 in (False, True):
+            monkeypatch.setattr(kernels, "PARTIAL_ROWS4", rows4)
+            for col in range(0, H, width):
+                out = torch.full((1, H), float("nan"), dtype=torch.float32, device="cuda")
+                epoch_done = torch.tensor([11, 0], dtype=torch.int32, device="cuda")
+                sync = torch.zeros(2, dtype=torch.int32, device="cuda")
+                kernels.mkd_hidden_partial(
+                    h, shard, weights["norm_hid"], EPS, col, out, epoch_done, sync, world, ctas=ctas
+                )
+                torch.cuda.synchronize()
+                assert sync.tolist() == [0, 11], (rows4, col)
+                got[(rows4, col)] = out
+        for col in range(0, H, width):
+            assert torch.equal(
+                got[(True, col)].view(torch.int32), got[(False, col)].view(torch.int32)
+            ), col
+
+
 def test_split_fc_opt_in_paths(ranks, boundary, allsum):
     """The extend's split fc with the one-launch all-sum equals the default path bit for bit;
     with the fused partial too it stays the fp32 fc up to rounding."""

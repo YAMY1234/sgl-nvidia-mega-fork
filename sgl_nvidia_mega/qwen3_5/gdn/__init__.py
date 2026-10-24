@@ -68,6 +68,8 @@ class Bound(msgspec.Struct, frozen=True):
     packed: dict = msgspec.field(default_factory=dict)
     # slot gdn_front: layer id -> in_proj_qkvz's weights packed for the front
     front: dict = msgspec.field(default_factory=dict)
+    # SGLANG_PERFLL_ROUTE_LIN (numeric): layer id -> the router-before-all-reduce weights (sm103/hop pack_router_lin)
+    rlin: dict = msgspec.field(default_factory=dict)
     error: object = None  # the front's sticky error word, int32, zero
     reason: str = ""  # why a requested slot is not built
 
@@ -101,6 +103,7 @@ def build(model, ctx) -> Bound:
                 packed[gdn.attn.layer_id] = pack_out_proj(gdn.out_proj.weight.t())
             except ValueError as e:
                 return Bound(reason=f"layer {i}: {e}")
+    rlin = _route_lin(m, gdns) if packed else {}
     front_packed, error = {}, None
     if "gdn_front" in SLOTS:
         import torch
@@ -136,6 +139,7 @@ def build(model, ctx) -> Bound:
         gdn_conv="gdn_conv" in SLOTS,
         packed=packed,
         front=front_packed,
+        rlin=rlin,
         error=error,
     )
 
@@ -199,4 +203,52 @@ def step(layer, x, st):
     core = core.reshape(z_shape)
     core = core.reshape(*core.shape[:-2], core.shape[-2] * core.shape[-1])
     out, _ = gdn.out_proj(core)
+    return out
+
+
+def _route_lin(m, gdns) -> dict:
+    """SGLANG_PERFLL_ROUTE_LIN=1 (numeric): each GDN layer's router-before-all-reduce weights on this TP8 rank, by
+    layer id (sm103/hop pack_router_lin); {} when off or when a layer does not take it."""
+    import logging
+    import os
+
+    if os.environ.get("SGLANG_PERFLL_ROUTE_LIN") != "1":
+        return {}
+    import torch
+    import torch.distributed as dist
+    from sglang.srt.layers.layer_boundary.fusions.cutedsl import _fused_norm_gamma
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.qwen3_5.sm103.hop import RL_WORLD, pack_router_lin
+
+    log = logging.getLogger(__name__)
+    group = get_parallel().tp_group
+    if group.world_size != RL_WORLD:
+        log.info("NVIDIA megakernel: route-lin off: TP %d (serves TP %d)", group.world_size, RL_WORLD)
+        return {}
+    rank = dist.get_rank(group.device_group)
+    out = {}
+    for i, gdn in gdns:
+        layer = m.layers[i]
+        mlp = getattr(layer, "mlp", None)
+        gamma = _fused_norm_gamma(layer.ffn_boundary.plan.norm)
+        if (
+            mlp is None
+            or getattr(mlp, "gate", None) is None
+            or gamma is None
+            or layer.layer_id != gdn.attn.layer_id
+            or getattr(mlp, "layer_id", layer.layer_id) != layer.layer_id
+        ):
+            log.info("NVIDIA megakernel: route-lin off: layer %d does not take it", i)
+            return {}
+        with torch.no_grad():
+            out[gdn.attn.layer_id] = pack_router_lin(
+                mlp.gate.weight,
+                gamma,
+                gdn.out_proj.weight.t(),
+                gdn.out_proj.input_scale,
+                gdn.out_proj.weight_scale,
+                rank,
+            )
+    log.info("NVIDIA megakernel: route-lin weights built for %d GDN layers (rank %d)", len(out), rank)
     return out

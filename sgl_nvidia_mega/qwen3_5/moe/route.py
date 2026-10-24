@@ -381,6 +381,15 @@ def routed(mlp, x: torch.Tensor, fused: Bound | None = None, shared: bool = Fals
     return _routed_experts(mlp, x, fused, logits, x_fp4, x_sf)
 
 
+def routed_lin(mlp, x: torch.Tensor, fused: Bound, logits, x_fp4, x_sf):
+    """``routed`` with the router front's outputs taken from the MoE input's hop (SGLANG_PERFLL_ROUTE_LIN, numeric:
+    the logits from the mixer's router partials, the NVFP4 input bit for bit the front's): slot mkm on them."""
+    if ("route_lin", x.shape[0]) not in _ENGAGED:
+        _ENGAGED.add(("route_lin", x.shape[0]))
+        logger.info("NVIDIA megakernel: Qwen3.5 route-lin (router before the all-reduce) runs at %d rows", x.shape[0])
+    return _routed_experts(mlp, x, fused, logits, x_fp4, x_sf)
+
+
 def _routed_experts(mlp, x, fused, logits, x_fp4, x_sf):
     """The routed experts on the router front's outputs (``fused``: slot mkm's kernel),
     deferred."""
@@ -393,8 +402,14 @@ def _routed_experts(mlp, x, fused, logits, x_fp4, x_sf):
 
     experts = mlp.experts
     if fused is not None:
+        from sgl_nvidia_mega.qwen3_5 import uhist
+        from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm as mkm_kernel
+
         maps = fused.mkm[mlp.layer_id]
-        return mkm.routed(mlp, maps, fused.identity, logits, x_fp4, x_sf)
+        # measurement knobs (default off): pinned logits, the U histogram
+        out = mkm.routed(mlp, maps, fused.identity, uhist.pinned_logits(mlp.layer_id, logits), x_fp4, x_sf)
+        uhist.record(mlp.layer_id, mkm_kernel.LAST_TOPK_IDS)
+        return out
     topk_output = mlp.topk(x, logits)
     if not TopKOutputChecker.format_is_bypassed(topk_output):
         raise RuntimeError("the router front requires logits-based bypassed TopK")

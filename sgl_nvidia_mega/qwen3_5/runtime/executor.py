@@ -245,6 +245,9 @@ class Qwen35Verify:
             capture = aux if getattr(layer, "_is_layer_to_capture", False) else None
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden = self._layer(i, layer, hidden, st, capture)
+        from sgl_nvidia_mega.qwen3_5 import uhist
+
+        uhist.join()  # SGLANG_PERFLL_UHIST: the side stream's counters rejoin after the last layer
         hidden = boundary.close_stream(st, hidden)
         return hidden, (aux if len(aux) else None)
 

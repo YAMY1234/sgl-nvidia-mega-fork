@@ -419,13 +419,40 @@ def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
         early_dependents=opts.push,
     )
     if opts.push:
-        return st.bound["boundary"].hop.out_proj_push(
+        hop = st.bound["boundary"].hop
+        h0 = _route_lin_h0(hop, attn.layer_id, rows, st)
+        if h0 is not None:
+            # SGLANG_PERFLL_ROUTE_LIN (numeric): the router partial rides the out_proj push
+            return hop.out_proj_push_rl(
+                x_fp8=x,
+                packed_w=st.bound["gdn"].packed[attn.layer_id],
+                input_scale=gdn.out_proj.input_scale,
+                weight_scale=gdn.out_proj.weight_scale,
+                rl_w=st.bound["gdn"].rlin[attn.layer_id],
+                h0=h0,
+            )
+        return hop.out_proj_push(
             x_fp8=x,
             packed_w=st.bound["gdn"].packed[attn.layer_id],
             input_scale=gdn.out_proj.input_scale,
             weight_scale=gdn.out_proj.weight_scale,
         )
     return _out_proj(gdn.out_proj, x, qkv.dtype, st, opts.lowm_push)
+
+
+def _route_lin_h0(hop, layer_id: int, rows: int, st):
+    """The layer's residual input when its router partial can ride the out_proj push (SGLANG_PERFLL_ROUTE_LIN: the
+    router mailbox built, the layer's weights packed, a 7-row step whose MoE runs the router front + slot mkm without
+    route_shared, and the layer input's hop recorded the residual); else None."""
+    if hop.rl is None or layer_id not in st.bound["gdn"].rlin:
+        return None
+    s = st.slots
+    if not (s.route and s.mkm and not s.route_shared and rows <= 7):
+        return None
+    lid, h0 = st.scratch.get("rlin.h0", (None, None))
+    if lid != layer_id or h0 is None or tuple(h0.shape) != (rows, 4096):
+        return None
+    return h0
 
 
 def _core(attn, mixed_qkv, a, b, st, opts):

@@ -81,6 +81,9 @@ def build(model, ctx) -> route.Bound:
     from sgl_nvidia_mega.qwen3_5 import plan
     from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
 
+    from sgl_nvidia_mega.qwen3_5 import uhist
+
+    uhist.build()  # measurement knobs, default off (no compile inside a capture)
     bound = route.Bound(reason="stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
     if "route" in SLOTS:
         rows = plan.widest(ctx.widths, plan.ROUTE_MAX_ROWS)
@@ -223,6 +226,10 @@ def _router_experts(mlp, x, defer: bool, st):
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
     if defer and st.slots.route:
+        rl = st.scratch.pop("rlin.moe", None)
+        if rl is not None and rl[0] == mlp.layer_id and st.slots.mkm:
+            # SGLANG_PERFLL_ROUTE_LIN: the logits and NVFP4 input came out of the MoE input's hop
+            return route.routed_lin(mlp, x, st.bound["moe"], *rl[1:])
         return route.routed(mlp, x, st.bound["moe"] if st.slots.mkm else None)
     if defer and st.slots.mkm_m32:
         return route.routed_m32(mlp, x, st.bound["moe"], gemm=st.slots.route_gemm)

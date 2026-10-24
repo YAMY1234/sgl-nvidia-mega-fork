@@ -176,6 +176,8 @@ def build(model, ctx) -> Bound:
     megakernel_agree(reasons, what="hop refusals")
     if reasons:
         return Bound(reason="; ".join(reasons))
+    import os
+
     hop = Hop(
         max_m=rows,
         eps=m.flashinfer_mnnvl_cutedsl_fusion.rms_epsilon,
@@ -183,6 +185,7 @@ def build(model, ctx) -> Bound:
         device=torch.device("cuda", torch.cuda.current_device()),
         deadline_s=ctx.deadline_s,
         wide_max_m=wide_rows,
+        route_lin=os.environ.get("SGLANG_PERFLL_ROUTE_LIN") == "1",
     )
     global _ACTIVE
     _ACTIVE = hop
@@ -329,6 +332,9 @@ def layer_input(hop, layer, hidden, st):
     norm, residual, *fp8 = _finalize(
         hop, "layer input", owed, residual, _fused_norm_gamma(plan.norm), scale
     )
+    if hop.rl is not None:
+        # SGLANG_PERFLL_ROUTE_LIN: the layer's residual input, which its router partials read
+        st.scratch["rlin.h0"] = (layer.layer_id, residual)
     stream.write(residual)
     if fp8:
         lowm.stash_fp8(st, norm, fp8[0])
@@ -380,12 +386,30 @@ def moe_input(hop, layer, hidden, st):
 
     _engage("MoE input", rows)
     scale = lowm.moe_input_fp8_scale(layer, st)
-    norm, residual, *fp8 = hop.all_reduce_residual_rms_norm(
-        local_contribution=part,
-        residual=residual,
-        gamma=_fused_norm_gamma(plan.norm),
-        **({} if scale is None else {"fp8_scale": scale}),
-    )
+    if hop._pushed_rl:
+        # SGLANG_PERFLL_ROUTE_LIN: the mixer pushed its router partial too; this hop also gives the MoE its logits
+        # and NVFP4 input (moe/route.py routed_lin)
+        lid, h0 = st.scratch.get("rlin.h0", (None, None))
+        if lid != layer.layer_id or h0 is None or h0.data_ptr() != residual.data_ptr():
+            raise RuntimeError(
+                f"route-lin: layer {layer.layer_id}'s residual is not the one its router partials read"
+            )
+        _engage("MoE input + router (route-lin)", rows)
+        (norm, residual, *fp8), rl = hop.all_reduce_residual_rms_norm_rl(
+            local_contribution=part,
+            residual=residual,
+            gamma=_fused_norm_gamma(plan.norm),
+            global_scale=layer.mlp.experts.w13_input_scale_quant.reshape(1),
+            **({} if scale is None else {"fp8_scale": scale}),
+        )
+        st.scratch["rlin.moe"] = (layer.layer_id, *rl)
+    else:
+        norm, residual, *fp8 = hop.all_reduce_residual_rms_norm(
+            local_contribution=part,
+            residual=residual,
+            gamma=_fused_norm_gamma(plan.norm),
+            **({} if scale is None else {"fp8_scale": scale}),
+        )
     stream.write(residual)
     if fp8:
         lowm.stash_fp8(st, norm, fp8[0])

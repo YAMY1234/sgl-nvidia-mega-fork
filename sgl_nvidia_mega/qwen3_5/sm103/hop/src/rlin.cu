@@ -74,6 +74,12 @@ static_assert(kRlCtas == 16, "the launcher's grid is 128 + 16 CTAs");
 constexpr int kCoreK = 1024;              // core_r columns at TP8
 constexpr int kSliceK = kHidden / 8;      // h0 columns a rank: 512
 constexpr int kRlSteps = (kCoreK + kSliceK) / 16 / 8;  // k16 steps a warp: 12
+#ifndef RL_FIRST  // 1: the router CTAs take blockIdx 0..15 (they run the longer path, so they go first), the out_proj
+#define RL_FIRST 0  // CTAs 16..143 (row block blockIdx - 16, the same arithmetic); 0: out_proj CTAs first
+#endif
+__device__ __forceinline__ bool is_router_cta() { return RL_FIRST ? blockIdx.x < 16 : blockIdx.x >= kHidCtas; }
+__device__ __forceinline__ int hid_cta() { return RL_FIRST ? (int)blockIdx.x - 16 : (int)blockIdx.x; }
+__device__ __forceinline__ int rl_cta() { return RL_FIRST ? (int)blockIdx.x : (int)blockIdx.x - kHidCtas; }
 constexpr uint32_t kSentF32 = 0x80000000u;  // f32 -0.0: an empty router slot
 
 __device__ __forceinline__ size_t rslot(const Site& s, uint32_t stage, int src, int token, int e) {
@@ -130,7 +136,7 @@ __device__ __forceinline__ float sanitize_f32(float x) { return __float_as_uint(
 __device__ __forceinline__ void oproj_rows(const OprojArgs& o, const RlArgs& r, float (&red)[8][32][8]) {
   constexpr int S = 4;
   constexpr int kK = 8 * S * 32;
-  const int cta = blockIdx.x;
+  const int cta = hid_cta();
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int g = lane >> 2, t = lane & 3;
   uint4 a[S][2];
@@ -192,7 +198,7 @@ struct RlSmem {
   uint32_t xb[8][(kCoreK + kSliceK) / 2 + 4];  // [token][k pair] bf16x2, row padded against bank conflicts
 };
 __device__ __forceinline__ void router_rows(const OprojArgs& o, const RlArgs& r, float (&red)[8][32][8], RlSmem& sm) {
-  const int c = blockIdx.x - kHidCtas;
+  const int c = rl_cta();
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int g = lane >> 2, t = lane & 3;
   uint4 a[kRlSteps][2];
@@ -493,7 +499,7 @@ __device__ __forceinline__ void consume_rl_kernel(const Args& a, const RlArgs& r
 extern "C" __global__ void __launch_bounds__(256, 1) q35hop_oproj_push_rl_s4(q35rl::OprojArgs o, q35rl::RlArgs r) {
   __shared__ __align__(16) float red[8][32][8];
   __shared__ __align__(16) q35rl::RlSmem sm;
-  if (blockIdx.x < q35rl::kHidCtas) {
+  if (!q35rl::is_router_cta()) {
     q35rl::oproj_rows(o, r, red);
   } else {
     q35rl::router_rows(o, r, red, sm);

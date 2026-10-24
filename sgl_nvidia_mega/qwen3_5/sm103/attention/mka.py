@@ -19,6 +19,7 @@ GEMM to bf16, optionally pushed into the decode hop's mailbox. Each launches clu
 from __future__ import annotations
 
 import ctypes
+import os
 from functools import cache
 from pathlib import Path
 from typing import Optional
@@ -39,6 +40,8 @@ ENTRIES = {
     "q35mka_prologue_late": 0,
     "q35mka_gate": 0,
     "q35mka_epilogue_q4": 0,
+    "q35mka_epilogue_q4_rl": 0,
+    "q35mka_rl_router": 0,
     "q35mka_epilogue_q4_late": 0,
     "q35mka_epilogue_q8": 0,
     "q35mka_epilogue_q8_late": 0,
@@ -275,3 +278,39 @@ def epilogue(
     )
     name = f"q35mka_epilogue{'_wide' if wide else ''}_q{nq}" + ("" if early_trigger else "_late")
     _launch(name, 16 * CLUSTER, p, attn.device)
+
+
+# SGLANG_PERFLL_ROUTE_LIN_ATTN (with SGLANG_PERFLL_ROUTE_LIN=1; default "off": the attention layers keep the router
+# launch): "sep" launches the router partial on its own right after the epilogue (W=8 micro: -0.78 us a hop against
+# today's epilogue -> consume -> router); "in" adds its 16 CTAs to the epilogue launch (two clusters past the 16 that
+# co-reside on GB300, so they wait for a second wave: +0.3 us a hop)
+RL_ATTN_FORM = os.environ.get("SGLANG_PERFLL_ROUTE_LIN_ATTN", "off")
+
+
+def epilogue_rl(attn, gate, w_packed, sx, sw, out, site: Site, rl_args) -> None:
+    """``epilogue`` of a TP8 B1 step (4 q heads a rank, early trigger, pushing into the hop) plus the router partial
+    (SGLANG_PERFLL_ROUTE_LIN): 16 more CTAs that push this rank's router partial into the hop's router mailbox
+    (``rl_args``: sm103/hop RlArgs, from ``Hop.rl_push_args``)."""
+    m = int(attn.shape[0])
+    if not (attn.is_contiguous() and gate.is_contiguous() and out.is_contiguous()):
+        raise ValueError("MKA epilogue: attn, gate and out must be contiguous")
+    if m > MAX_ROWS or attn.shape[1] != 4 * HEAD_DIM or m > site.m_cap:
+        raise ValueError(f"MKA router-lin epilogue: attn {tuple(attn.shape)}")
+    p = EpiParams(
+        attn=attn.data_ptr(),
+        gate=gate.data_ptr(),
+        w=w_packed.data_ptr(),
+        sx=sx.data_ptr(),
+        sw=sw.data_ptr(),
+        out=out.data_ptr(),
+        m=m,
+        push=1,
+        site=site,
+    )
+    stream = torch.cuda.current_stream(attn.device).cuda_stream
+    kernels = _kernels(attn.device.index)
+    if RL_ATTN_FORM == "in":
+        jit.launch(kernels["q35mka_epilogue_q4_rl"], (16 * CLUSTER + 16, 1, 1), [p, rl_args], stream, (CLUSTER, 1, 1))
+        return
+    jit.launch(kernels["q35mka_epilogue_q4"], (16 * CLUSTER, 1, 1), [p], stream, (CLUSTER, 1, 1))
+    jit.launch(kernels["q35mka_rl_router"], (16, 1, 1), [p, rl_args], stream)

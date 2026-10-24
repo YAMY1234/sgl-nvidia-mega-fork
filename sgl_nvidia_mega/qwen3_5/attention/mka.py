@@ -134,6 +134,40 @@ def pack(layer) -> None:
         kernels.pack_qkv(layer.qkv_proj.weight.t(), layer.num_heads),
         kernels.pack_o(layer.o_proj.weight.t()),
     )
+    _pack_route_lin(layer)
+
+
+# SGLANG_PERFLL_ROUTE_LIN (numeric): layer id -> the router-before-all-reduce weights on this TP8 rank
+RL_WEIGHTS: dict = {}
+
+
+def _pack_route_lin(layer) -> None:
+    import os
+
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import mka as kernels
+
+    if os.environ.get("SGLANG_PERFLL_ROUTE_LIN") != "1" or kernels.RL_ATTN_FORM == "off" or layer.num_heads != 4:
+        return
+    import torch.distributed as dist
+    from sglang.srt.layers.layer_boundary.fusions.cutedsl import _fused_norm_gamma
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.qwen3_5.sm103.hop import RL_WORLD, pack_router_lin
+
+    group = get_parallel().tp_group
+    mlp = getattr(layer, "mlp", None)
+    gamma = _fused_norm_gamma(layer.ffn_boundary.plan.norm)
+    if group.world_size != RL_WORLD or mlp is None or getattr(mlp, "gate", None) is None or gamma is None:
+        return
+    with torch.no_grad():
+        RL_WEIGHTS[layer.attn.layer_id] = pack_router_lin(
+            mlp.gate.weight,
+            gamma,
+            layer.o_proj.weight.t(),
+            layer.o_proj.input_scale,
+            layer.o_proj.weight_scale,
+            dist.get_rank(group.device_group),
+        )
 
 
 def step(layer, x, st):
@@ -196,6 +230,23 @@ def step(layer, x, st):
     ):
         out = torch.empty((m, layer.hidden_size), dtype=torch.bfloat16, device=x.device)
     hop = _push_hop(layer, st, m) if st.slots.mka_push else None
+    h0 = _route_lin_h0(hop, layer, m, st)
+    if h0 is not None:
+        # SGLANG_PERFLL_ROUTE_LIN (numeric): the router partial rides the o_proj push
+        kernels.epilogue_rl(
+            attn=o,
+            gate=gate,
+            w_packed=w_o,
+            sx=layer.o_proj.input_scale,
+            sw=layer.o_proj.weight_scale,
+            out=out,
+            site=hop.site,
+            rl_args=hop.rl_push_args(RL_WEIGHTS[attn.layer_id], h0),
+        )
+        hop.mark_pushed_rl(out)
+        # the router launch does not wait on the epilogue: keep its output's memory out of reuse for the whole step
+        st.scratch.setdefault("rlin.keep", []).append(out)
+        return out
     kernels.epilogue(
         attn=o,
         gate=gate,
@@ -209,6 +260,19 @@ def step(layer, x, st):
     if hop is not None:
         hop.mark_pushed(out)
     return out
+
+
+def _route_lin_h0(hop, layer, rows: int, st):
+    """The layer's residual input when its router partial can ride the o_proj push (as gdn/verify.py's); else None."""
+    if hop is None or hop.rl is None or layer.attn.layer_id not in RL_WEIGHTS:
+        return None
+    s = st.slots
+    if not (s.route and s.mkm and not s.route_shared and rows <= 7):
+        return None
+    lid, h0 = st.scratch.get("rlin.h0", (None, None))
+    if lid != layer.layer_id or h0 is None or tuple(h0.shape) != (rows, 4096):
+        return None
+    return h0
 
 
 def _front_step(layer, x, st):

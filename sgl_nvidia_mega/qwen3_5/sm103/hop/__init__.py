@@ -432,6 +432,25 @@ class Hop:
         self._pushed_rl = True
         return out
 
+    def rl_push_args(self, rl_w, h0) -> RlArgs:
+        """The router-partial launch arguments of another producer (the attention epilogue) that pushes this rank's
+        router partial; it then calls ``mark_pushed_rl`` on its hidden partial."""
+        if self.rl is None or self.world != RL_WORLD:
+            raise ValueError("no router mailbox")
+        return RlArgs(
+            rmc=self.rl[0],
+            ruc=self.rl[1],
+            rw=rl_w.data_ptr(),
+            h0=h0.data_ptr(),
+            k0=(HIDDEN // RL_WORLD) * self.rank,
+            trace=0 if self.rl_trace is None else self.rl_trace.data_ptr(),
+        )
+
+    def mark_pushed_rl(self, partial: torch.Tensor) -> None:
+        """``mark_pushed`` of a producer that also pushed its router partial."""
+        self.mark_pushed(partial)
+        self._pushed_rl = True
+
     def all_reduce_residual_rms_norm_rl(
         self, *, local_contribution, residual, gamma, global_scale, fp8_scale=None
     ):

@@ -240,32 +240,28 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
   if constexpr (kMkd) PDLTriggerSecondary<true>();
 
   // ---- this warp's activation slice as f16 B fragments ----
-  // act[t][b][j]: row 8t + g, K elements 32 (warp * kSliceBlocks + b) + 8q + 2j, + 1; loaded as
-  // bf16 pairs (zeros past kM) and converted in place
+  // act[t][b][j]: row 8t + g, K elements 32 (warp * kSliceBlocks + b) + 8q + 2j, + 1, as bf16
+  // pairs (zeros past kM) until the rows' maxima are known, then converted in place. Two token
+  // tiles first take the maxima and reload the slice (from L1) after the barrier: holding both
+  // tiles' bf16 rows across it spilled.
   uint32_t act[kTokenTiles][kSliceBlocks][4];
-#pragma unroll
-  for (int t = 0; t < kTokenTiles; ++t) {
+  auto load_x = [&](int t, int b) {
     const int row = kTokens * t + g;
-#pragma unroll
-    for (int b = 0; b < kSliceBlocks; ++b) {
-      const uint4 v = row < kM ? reinterpret_cast<const uint4*>(
-                                     p.x + static_cast<int64_t>(row) * kK)[(warp * kSliceBlocks + b) * 4 + q]
-                               : make_uint4(0u, 0u, 0u, 0u);
-      act[t][b][0] = v.x;
-      act[t][b][1] = v.y;
-      act[t][b][2] = v.z;
-      act[t][b][3] = v.w;
-    }
-  }
+    return row < kM ? reinterpret_cast<const uint4*>(p.x + static_cast<int64_t>(row) * kK)[(warp * kSliceBlocks + b) * 4 + q]
+                    : make_uint4(0u, 0u, 0u, 0u);
+  };
 #pragma unroll
   for (int t = 0; t < kTokenTiles; ++t) {
     float amax = 0.0f;
 #pragma unroll
     for (int b = 0; b < kSliceBlocks; ++b) {
+      const uint4 v = load_x(t, b);
+      const uint32_t w4[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        amax = fmaxf(amax, fabsf(bf16_lo(act[t][b][j])));
-        amax = fmaxf(amax, fabsf(bf16_hi(act[t][b][j])));
+        if constexpr (kTokenTiles == 1) act[t][b][j] = w4[j];
+        amax = fmaxf(amax, fabsf(bf16_lo(w4[j])));
+        amax = fmaxf(amax, fabsf(bf16_hi(w4[j])));
       }
     }
     amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
@@ -279,6 +275,13 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
     const float factor = exp2i(shift);
 #pragma unroll
     for (int b = 0; b < kSliceBlocks; ++b) {
+      if constexpr (kTokenTiles > 1) {
+        const uint4 v = load_x(t, b);
+        act[t][b][0] = v.x;
+        act[t][b][1] = v.y;
+        act[t][b][2] = v.z;
+        act[t][b][3] = v.w;
+      }
 #pragma unroll
       for (int j = 0; j < 4; ++j) act[t][b][j] = f16x2_rn(bf16_lo(act[t][b][j]) * factor, bf16_hi(act[t][b][j]) * factor);
     }

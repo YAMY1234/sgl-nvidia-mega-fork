@@ -226,9 +226,9 @@ def nvrtc_gemv(
     ctas: int,
 ) -> torch.Tensor:
     """``out`` [m, N] bf16 = x [m, 4096] bf16 @ dequant(values, scales).T, m <= 16, on
-    ``ctas`` <= ceil(N / 8) CTAs (head_mx8_t1 / head_mx8_t2)."""
-    tiles = 1 if x.shape[0] <= 8 else 2
-    kernel = _kernel(x.device.index, f"head_mx8_t{tiles}", smem_bytes(tiles))
+    ``ctas`` <= ceil(N / 8) CTAs (head_mx8_m<m>)."""
+    m = int(x.shape[0])
+    kernel = _kernel(x.device.index, f"head_mx8_m{m}", smem_bytes(1 if m <= 8 else 2))
     _launch(kernel, ctas, x, values, scales, out, None, False)
     return out
 

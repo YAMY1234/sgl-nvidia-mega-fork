@@ -3,8 +3,8 @@
 // Adapted from TensorRT-LLM (Apache-2.0): tensorrt_llm/_torch/cute_dsl_kernels/blackwell/
 // q35_draft_head_gemv.py (release 4d09932ca7, Q35DraftHeadGemvKernel with MXFP8 weights and
 // argmax off), translated from CuTe DSL to CUDA C++ with the same tiles, MMA fragments, rounding
-// points and fp32 summation order; mkd_head.cu's per-CTA packed maxima and row walk for the
-// one-row head of the MKD draft step boundary.
+// points and fp32 summation order (its logits bit for bit); mkd_head.cu's per-CTA packed maxima
+// and row walk for the one-row head of the MKD draft step boundary.
 //
 // PERF-LP draft lm_head from a draft-only MXFP8 copy of this rank's vocabulary shard (E4M3
 // values, one UE8M0 scale per 32 K-elements; TRT-LLM's TRTLLM_Q35_DRAFT_FP8_HEAD format):
@@ -21,9 +21,15 @@
 // back by 2^-e_t: only the fp32 summation order differs from a dequantized reference.
 //
 // Built with NVRTC for hidden 4096: mkd_head_mx8 (one row; bf16 logits and per CTA the packed
-// maximum of its rows, as mkd_head), head_mx8_t1 / head_mx8_t2 (1-8 / 9-16 rows; bf16 logits).
+// maximum of its rows, as mkd_head) and head_mx8_m<M> for M = 1..16 rows (bf16 logits).
+// HEAD_MX8_TMA_WARPS 1: every warp issues one weight row and its scale row of a tile (one copy
+// pair per warp) instead of 16 lanes of warp 0 (TRT-LLM's; the copies of a warp serialize).
 
 #include "mkd_common.cuh"
+
+#ifndef HEAD_MX8_TMA_WARPS
+#define HEAD_MX8_TMA_WARPS 1
+#endif
 
 namespace sglang {
 
@@ -59,6 +65,17 @@ struct Layout {
 
 SGL_DEVICE void fence_mbarrier_init() {
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+
+// The tile's phase, with CuTe DSL's 10 ms suspend hint (the warp sleeps until the phase flips
+// instead of spinning) and a memory clobber: the tile's shared-memory reads stay after it.
+SGL_DEVICE void mbar_wait(uint64_t* bar, uint32_t parity) {
+  asm volatile(
+      "{\n\t.reg .pred p;\n\t"
+      "WAIT_%=: mbarrier.try_wait.parity.shared.b64 p, [%0], %1, 10000000;\n\t"
+      "@!p bra WAIT_%=;\n\t}\n" ::"r"(device::ptx::to_shared(bar)),
+      "r"(parity)
+      : "memory");
 }
 
 SGL_DEVICE void fence_proxy_async_shared() {
@@ -138,23 +155,24 @@ struct HeadMx8Params {
   bf16_t* logits;                 // [m, n]
   uint32_t* part;                 // kMkd: [gridDim.x] packed (key16 << 16) | (0xffff - row), or kNanPart
   int32_t n;
-  int32_t m;        // rows of x: 1..8 per token tile
+  int32_t m;        // rows of x (the kernel's kM)
   int32_t reverse;  // 1: walk the groups from the end (alternate draft steps, as mkd_head)
 };
 
 /**
- * \brief kTokenTiles * 8 rows of x against the n weight rows on gridDim.x persistent CTAs of
- * kK / (32 * kSliceBlocks) warps (gridDim.x <= ceil(n / 8)). kMkd (one token tile, m == 1):
- * mkd_head's PDL points and per-CTA packed maxima; else TRT-LLM's (trigger once the activation
- * is staged).
+ * \brief kM (<= 16) rows of x against the n weight rows on gridDim.x persistent CTAs of
+ * kK / (32 * kSliceBlocks) warps (gridDim.x <= ceil(n / 8)). kMkd (kM == 1): mkd_head's PDL
+ * points and per-CTA packed maxima; else TRT-LLM's (trigger once the activation is staged).
  */
-template <int kK, int kSliceBlocks, int kTokenTiles, bool kMkd>
+template <int kK, int kSliceBlocks, int kM, bool kMkd>
 SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
   using namespace device;
   using namespace head_mx8;
+  constexpr int kTokenTiles = (kM + kTokens - 1) / kTokens;
   using L = Layout<kK, kSliceBlocks, kTokenTiles>;
-  static_assert(!kMkd || kTokenTiles == 1);
+  static_assert(kM >= 1 && kM <= 2 * kTokens && (!kMkd || kM == 1));
   static_assert(kSliceBlocks == 8, "one 8-byte scale load per weight row and warp");
+  static_assert(!HEAD_MX8_TMA_WARPS || L::kWarps >= kRows, "a warp per tile row");
   extern __shared__ __align__(128) uint8_t smem[];
   uint8_t* s_w = smem + L::kW;
   uint8_t* s_s = smem + L::kS;
@@ -169,7 +187,6 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
   const int g = lane / 4;
   const int q = lane % 4;
   const int n = p.n;
-  const int m = p.m;
   const int ctas = static_cast<int>(gridDim.x);
   const int bidx = static_cast<int>(blockIdx.x);
   const int num_groups = (n + kGroupRows - 1) / kGroupRows;
@@ -180,21 +197,25 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
     const int gg = bidx + j * ctas;
     return p.reverse ? num_groups - 1 - gg : gg;
   };
-  // tile `tile` (local groups 2 tile, 2 tile + 1) into `slot`: lanes 0..15 of warp 0, one weight
-  // row and its scale row each; rows past n re-read row n - 1 (their outputs are not stored)
+  // the issuing threads: lanes 0..15 of warp 0 (TRT-LLM's), or lane 0 of warps 0..15
+  const bool issuer = HEAD_MX8_TMA_WARPS ? (lane == 0 && warp < kRows) : warp == 0;
+  // tile `tile` (local groups 2 tile, 2 tile + 1) into `slot`: one weight row (row r of the
+  // tile: the issuing lane or warp) and its scale row each; rows past n re-read row n - 1
+  // (their outputs are not stored)
   auto issue_tile = [&](int slot, int tile) {
     constexpr uint32_t kRowBytes = kK + L::kScaleRow;
-    if (lane == 0) {
+    const int r = HEAD_MX8_TMA_WARPS ? warp : lane;
+    if (r == 0 && (HEAD_MX8_TMA_WARPS || lane == 0)) {
       const int groups = min(my_groups - 2 * tile, 2);
       ptx::mbar_arrive_expect_tx(&mbar[slot], static_cast<uint32_t>(groups * kGroupRows) * kRowBytes);
     }
-    if (lane < kRows) {
-      const int local = 2 * tile + lane / kGroupRows;
+    if (r < kRows) {
+      const int local = 2 * tile + r / kGroupRows;
       if (local < my_groups) {
-        const int row = min(group_of(local) * kGroupRows + lane % kGroupRows, n - 1);
-        bulk_g2s(s_w + (slot * kRows + lane) * L::kRowStride, p.w + static_cast<int64_t>(row) * kK, kK, &mbar[slot]);
+        const int row = min(group_of(local) * kGroupRows + r % kGroupRows, n - 1);
+        bulk_g2s(s_w + (slot * kRows + r) * L::kRowStride, p.w + static_cast<int64_t>(row) * kK, kK, &mbar[slot]);
         bulk_g2s(
-            s_s + (slot * kRows + lane) * L::kScaleRow,
+            s_s + (slot * kRows + r) * L::kScaleRow,
             p.s + static_cast<int64_t>(row) * L::kScaleRow,
             L::kScaleRow,
             &mbar[slot]);
@@ -211,7 +232,7 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
   __syncthreads();
 
   // ---- the first two tiles (static weights: before the PDL wait) ----
-  if (warp == 0 && my_tiles > 0) {
+  if (issuer && my_tiles > 0) {
     issue_tile(0, 0);
     if (my_tiles > 1) issue_tile(1, 1);
   }
@@ -220,16 +241,16 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
 
   // ---- this warp's activation slice as f16 B fragments ----
   // act[t][b][j]: row 8t + g, K elements 32 (warp * kSliceBlocks + b) + 8q + 2j, + 1; loaded as
-  // bf16 pairs (zeros past m) and converted in place
+  // bf16 pairs (zeros past kM) and converted in place
   uint32_t act[kTokenTiles][kSliceBlocks][4];
 #pragma unroll
   for (int t = 0; t < kTokenTiles; ++t) {
     const int row = kTokens * t + g;
 #pragma unroll
     for (int b = 0; b < kSliceBlocks; ++b) {
-      const uint4 v = row < m ? reinterpret_cast<const uint4*>(
-                                    p.x + static_cast<int64_t>(row) * kK)[(warp * kSliceBlocks + b) * 4 + q]
-                              : make_uint4(0u, 0u, 0u, 0u);
+      const uint4 v = row < kM ? reinterpret_cast<const uint4*>(
+                                     p.x + static_cast<int64_t>(row) * kK)[(warp * kSliceBlocks + b) * 4 + q]
+                               : make_uint4(0u, 0u, 0u, 0u);
       act[t][b][0] = v.x;
       act[t][b][1] = v.y;
       act[t][b][2] = v.z;
@@ -249,7 +270,7 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
     }
     amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
     amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
-    if (q == 0 && kTokens * t + g < m) red_max_shared(&s_amax[kTokens * t + g], __float_as_uint(amax));
+    if (q == 0 && kTokens * t + g < kM) red_max_shared(&s_amax[kTokens * t + g], __float_as_uint(amax));
   }
   __syncthreads();
 #pragma unroll
@@ -262,13 +283,16 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
       for (int j = 0; j < 4; ++j) act[t][b][j] = f16x2_rn(bf16_lo(act[t][b][j]) * factor, bf16_hi(act[t][b][j]) * factor);
     }
   }
-  // 2^-e of the output row this thread reduces (unused by the threads that reduce none)
+  // the output (token, MMA row half) this thread reduces when tidx < 128 * kTokenTiles, and 2^-e
+  // of its token
+  const int out_e = (tidx / 32) % 4;
+  const int out_token = kTokens * (tidx / 128) + 2 * q + out_e % 2;
   float inv;
   {
-    const int out_row = (kTokens * (tidx / 128) + 2 * q + (tidx / 32) % 2) % L::kTokensPad;
-    const int shift = max(min(kHeadroomExp + 127 - static_cast<int>(s_amax[out_row] >> 23), 126), -126);
+    const int shift = max(min(kHeadroomExp + 127 - static_cast<int>(s_amax[out_token % L::kTokensPad] >> 23), 126), -126);
     inv = exp2i(-shift);
   }
+  const bool reducer = tidx < 128 * kTokenTiles && out_token < kM;
   if constexpr (!kMkd) PDLTriggerSecondary<true>();
 
   // ---- stream the tiles ----
@@ -277,7 +301,7 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
   bool nan = false;
   for (int i = 0; i < my_tiles; ++i) {
     const int slot = i % 2;
-    ptx::mbar_wait_parity(&mbar[slot], static_cast<uint32_t>((i / 2) % 2));
+    mbar_wait(&mbar[slot], static_cast<uint32_t>((i / 2) % 2));
     // weight rows g and g + 8 of the tile, this warp's slice: 8 bytes of block b at 32 b + 8q
     const uint8_t* w_lo = s_w + (slot * kRows + g) * L::kRowStride + warp * kSliceBlocks * kBlock + 8 * q;
     const uint8_t* w_hi = w_lo + kGroupRows * L::kRowStride;
@@ -324,27 +348,23 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
     }
     // every warp is done with this slot's weights and has written its partial tile
     __syncthreads();
-    if (warp == 0 && i + 2 < my_tiles) {
+    if (issuer && i + 2 < my_tiles) {
       fence_proxy_async_shared();
       issue_tile(slot, i + 2);
     }
-    if (tidx < 128 * kTokenTiles) {
-      // thread (t, e, lane) sums element e of the lane's MMA tile t over the warps
-      float total = 0.0f;
+    const int local = 2 * i + out_e / 2;  // MMA rows 0..7: the tile's first group, 8..15: its second
+    if (reducer && local < my_groups) {
+      const int row = group_of(local) * kGroupRows + g;
+      if (row < n) {
+        // element out_e of the lane's MMA tile, summed over the warps in warp order
+        float total = 0.0f;
 #pragma unroll
-      for (int w = 0; w < L::kWarps; ++w) total = total + s_part[((slot * L::kWarps + w) * 4 * kTokenTiles + tidx / 32) * 32 + lane];
-      const int e = (tidx / 32) % 4;
-      const int token = kTokens * (tidx / 128) + 2 * q + e % 2;
-      const int local = 2 * i + e / 2;  // MMA rows 0..7: the tile's first group, 8..15: its second
-      if (token < m && local < my_groups) {
-        const int row = group_of(local) * kGroupRows + g;
-        if (row < n) {
-          const bf16_t v = __float2bfloat16_rn(total * inv);
-          p.logits[static_cast<int64_t>(token) * n + row] = v;
-          if constexpr (kMkd) {
-            const uint32_t k = key16(v, nan);
-            best = max(best, (k << 16) | (0xffffu - static_cast<uint32_t>(row)));
-          }
+        for (int w = 0; w < L::kWarps; ++w) total = total + s_part[((slot * L::kWarps + w) * 4 * kTokenTiles + tidx / 32) * 32 + lane];
+        const bf16_t v = __float2bfloat16_rn(total * inv);
+        p.logits[static_cast<int64_t>(out_token) * n + row] = v;
+        if constexpr (kMkd) {
+          const uint32_t k = key16(v, nan);
+          best = max(best, (k << 16) | (0xffffu - static_cast<uint32_t>(row)));
         }
       }
     }
@@ -368,11 +388,28 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
 
 using sglang::HeadMx8Params;
 
-#define HEAD_MX8_ENTRY(name, tiles, mkd)                                                          \
-  extern "C" __global__ void __launch_bounds__(16 * 32, 1) name(const HeadMx8Params __grid_constant__ p) { \
-    sglang::head_mx8_kernel<4096, 8, tiles, mkd>(p);                                            \
+extern "C" __global__ void __launch_bounds__(16 * 32, 1) mkd_head_mx8(const HeadMx8Params __grid_constant__ p) {
+  sglang::head_mx8_kernel<4096, 8, 1, true>(p);
+}
+
+#define HEAD_MX8_GEMV(rows)                                                                       \
+  extern "C" __global__ void __launch_bounds__(16 * 32, 1) head_mx8_m##rows(const HeadMx8Params __grid_constant__ p) { \
+    sglang::head_mx8_kernel<4096, 8, rows, false>(p);                                           \
   }
 
-HEAD_MX8_ENTRY(mkd_head_mx8, 1, true)
-HEAD_MX8_ENTRY(head_mx8_t1, 1, false)
-HEAD_MX8_ENTRY(head_mx8_t2, 2, false)
+HEAD_MX8_GEMV(1)
+HEAD_MX8_GEMV(2)
+HEAD_MX8_GEMV(3)
+HEAD_MX8_GEMV(4)
+HEAD_MX8_GEMV(5)
+HEAD_MX8_GEMV(6)
+HEAD_MX8_GEMV(7)
+HEAD_MX8_GEMV(8)
+HEAD_MX8_GEMV(9)
+HEAD_MX8_GEMV(10)
+HEAD_MX8_GEMV(11)
+HEAD_MX8_GEMV(12)
+HEAD_MX8_GEMV(13)
+HEAD_MX8_GEMV(14)
+HEAD_MX8_GEMV(15)
+HEAD_MX8_GEMV(16)

@@ -121,7 +121,13 @@ class DraftMkm:
         return SimpleNamespace(slots=SimpleNamespace(**on), bound={"moe": self.bound}, scratch={})
 
     def __call__(self, layer, x: torch.Tensor):
-        """The draft layer's MoE on ``x`` [rows, hidden]: SGLang's deferred-finalize handoff (MoeDeferredFinalize)."""
+        """The draft layer's MoE on ``x`` [rows, hidden]: SGLang's deferred-finalize handoff (MoeDeferredFinalize),
+        whose ``complete()`` is this rank's finalized rows, unreduced: the draft layer runs the all-reduce itself (the
+        hop's finalize, or the all-reduce before its final norm), as after SGLang's own draft MoE."""
         from sgl_nvidia_mega.qwen3_5 import moe
 
-        return moe.step(layer, x, self.state(int(x.shape[0])), defer=True)
+        return moe.step(layer, x, self.state(int(x.shape[0])), defer=True, reduce=_unreduced)
+
+
+def _unreduced(rows: torch.Tensor) -> torch.Tensor:
+    return rows

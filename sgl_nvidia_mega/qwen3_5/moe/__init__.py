@@ -136,9 +136,11 @@ def build(model, ctx) -> route.Bound:
     return bound
 
 
-def step(layer, x: torch.Tensor, st, defer: bool):
+def step(layer, x: torch.Tensor, st, defer: bool, reduce=None):
     """``layer``'s MoE on the normed input ``x`` [rows, hidden]: the deferred-finalize
-    handoff with ``defer``, else the unreduced rows [rows, hidden]."""
+    handoff with ``defer``, else the unreduced rows [rows, hidden]. ``reduce``: the
+    handoff's ``complete`` sum (default SGLang's post-experts all-reduce; the MTP draft
+    layer, which runs its own all-reduce after the MoE, passes the identity)."""
     from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
     from sglang.srt.layers.layer_boundary.fusions.cutedsl import MoeDeferredFinalize
     from sglang.srt.layers.moe.utils import sum_post_experts_output
@@ -169,7 +171,7 @@ def step(layer, x: torch.Tensor, st, defer: bool):
             routed,
             gated_shared_output=shared,
             m=rows,
-            reduce=sum_post_experts_output,
+            reduce=sum_post_experts_output if reduce is None else reduce,
         )
     if shared is not None:
         if use_fused_gate:

@@ -264,7 +264,7 @@ def step(layer, x, st):
 
 def _route_lin_h0(hop, layer, rows: int, st):
     """The layer's residual input when its router partial can ride the o_proj push (as gdn/verify.py's); else None."""
-    if hop is None or hop.rl is None or layer.attn.layer_id not in RL_WEIGHTS:
+    if hop is None or layer.attn.layer_id not in RL_WEIGHTS or hop.rl is None:
         return None
     s = st.slots
     if not (s.route and s.mkm and not s.route_shared and rows <= 7):

@@ -951,10 +951,10 @@ def test_trt_front_reads_its_rows_and_state_index_after_its_pdl_wait():
     from sgl_nvidia_mega.qwen3_5.sm103 import trt_lowm
     from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
 
+    o = _trt_operands(66)  # first: the CUDA context the driver-API load below needs
     major, minor = torch.cuda.get_device_capability()
     cubin = jit.compile_source(_LATE_PRODUCER, "late_producer", f"sm_{major}{minor}a", ("-std=c++17",))
     producer = jit.load(cubin, "late_producer", (256, 1, 1), 0)
-    o = _trt_operands(66)
     xq = static_quant_fp8(o["x"], o["sx"], repeat_scale=False)[0]
     # the inputs as one buffer: BF16 rows, E4M3 rows, and the state index
     nx = o["x"].numel() * 2

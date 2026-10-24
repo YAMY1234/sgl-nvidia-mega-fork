@@ -158,6 +158,8 @@ _LOGGED: set = set()
 ENGINE_THR_D = int(os.environ.get("SGLANG_Q35_MKM_THR_D", "0"))
 ENGINE_TOPK_NOINLINE = os.environ.get("SGLANG_Q35_MKM_TOPK_NOINLINE", "0") == "1"
 ENGINE_ONEPASS = os.environ.get("SGLANG_Q35_MKM_ONEPASS", "0") == "1"
+# MMA_SFONLY (32 / 64-token): the MMA warp waits only on a stage's sf_full (its arrivers waited on the stage's full)
+ENGINE_MMA_SFONLY = os.environ.get("SGLANG_Q35_MKM_MMA_SFONLY", "0") == "1"
 # ONEPASS in the 64-token engine only up to this many rows (past it, the plain build: B8's 56 rows lost 0.04 ms a round)
 ENGINE_ONEPASS_MAX_ROWS = int(os.environ.get("SGLANG_Q35_MKM_ONEPASS_MAX_ROWS", "64"))
 
@@ -171,6 +173,8 @@ def engine_options(rows: int, plain: bool = False) -> tuple:
         opts += ("-DTOPK_NOINLINE=1",)
     if ENGINE_ONEPASS and not plain and rows in (M32_MAX_TOKENS, M64_MAX_TOKENS):
         opts += ("-DONEPASS=1",)
+    if ENGINE_MMA_SFONLY and rows in (M32_MAX_TOKENS, M64_MAX_TOKENS):
+        opts += ("-DMMA_SFONLY=1",)
     if opts:
         logger.info("NVIDIA megakernel: Qwen3.5 %d-token engine built with %s", rows, " ".join(opts))
     return opts

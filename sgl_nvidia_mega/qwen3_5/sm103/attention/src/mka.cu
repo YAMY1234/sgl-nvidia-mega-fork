@@ -36,6 +36,9 @@ __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.lau
 #ifndef Q35_PIN_MKA_EPI
 #define Q35_PIN_MKA_EPI 0  // SGLANG_PERFLL_PIN_MKA_EPI: o_proj weights held ahead of the PDL wait (narrow and wide)
 #endif
+#ifndef Q35_PIN_RL
+#define Q35_PIN_RL 0  // SGLANG_PERFLL_PIN_RL: the route-lin router CTAs' weights held ahead of the PDL wait
+#endif
 #ifndef Q35_PIN_MKA_PRO
 #define Q35_PIN_MKA_PRO 0  // SGLANG_PERFLL_PIN_MKA_PRO: the late prologue's weights held ahead of it
 #endif
@@ -936,6 +939,12 @@ __device__ __forceinline__ void mka_epilogue_rl_router(const EpiParams& p, const
       for (int mt = 0; mt < 2; ++mt) a[st][mt] = ldg_nc_v4(wb + (st * 2 + mt) * 32);
   }
   const float sx = __ldg(p.sx);
+  if (!SEP && Q35_PIN_RL) {  // SEP 1 has no wait to sink below
+    uint32_t dep = __float_as_uint(sx);
+#pragma unroll
+    for (int st = 0; st < kRlSteps; ++st) dep ^= a[st][0].x ^ a[st][1].x;
+    q35hop::pin_before_wait(dep, reinterpret_cast<uint64_t>(r.rw));
+  }
   if (!SEP) pdl_wait();
   pdl_trigger();  // as the epilogue's early-trigger CTAs
   const float inv_sx = div_full(1.0f, sx);

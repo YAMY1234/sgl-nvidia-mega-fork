@@ -313,7 +313,7 @@ def test_mka_with_its_weights_pinned_ahead_of_the_wait_is_bit_for_bit(early, m, 
     step = _MkaStep(m, g)
     step.run(ops, early_trigger=early)
     want = step.bits()
-    monkeypatch.setattr(mka, "_kernels", functools.partial(mka._kernels, pins=(True, True)))
+    monkeypatch.setattr(mka, "_kernels", functools.partial(mka._kernels, pins=(True, True, True)))
     step.run(ops, early_trigger=early)
     assert _same(want, step.bits())
 

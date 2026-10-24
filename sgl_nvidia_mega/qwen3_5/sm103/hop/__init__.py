@@ -56,6 +56,8 @@ FIN_PREWAIT = os.environ.get("SGLANG_PERFLL_HOP_FIN_PREWAIT", "0") == "1"
 PIN_OPROJ = os.environ.get("SGLANG_PERFLL_PIN_OPROJ", "0") == "1"
 OPROJ_EARLY = os.environ.get("SGLANG_PERFLL_OPROJ_EARLY", "0") == "1"
 FIN_EARLY = os.environ.get("SGLANG_PERFLL_FIN_EARLY", "0") == "1"
+# A/Bs: ROUTE-LIN's out_proj W_o fragments and router weights held ahead of the PDL wait (rlin.cu)
+PIN_RL = os.environ.get("SGLANG_PERFLL_PIN_RL", "0") == "1"
 logger = logging.getLogger(__name__)
 # int32 0, 1, 2, ... buffers (data_ptr -> length) whose prefixes are identity row maps of a finalize
 _IDENTITY_ROWS: dict = {}
@@ -227,8 +229,10 @@ def _kernels(
 
 
 @cache
-def _rl_kernels(device_index: int, deadline_ns: int) -> dict[str, jit.Kernel]:
+def _rl_kernels(device_index: int, deadline_ns: int, pin: bool = PIN_RL) -> dict[str, jit.Kernel]:
     major, minor = torch.cuda.get_device_capability(device_index)
+    if pin:
+        logger.info("NVIDIA megakernel: Qwen3.5 route-lin kernels built with SGLANG_PERFLL_PIN_RL")
     import os
 
     # SGLANG_PERFLL_MKM_EARLY=1: the consume writes the logits' sentinel first (with mkm's EARLY_PF in MKM7_DEFS)
@@ -237,7 +241,13 @@ def _rl_kernels(device_index: int, deadline_ns: int) -> dict[str, jit.Kernel]:
         RL_SOURCE.read_text(),
         "q35_hop_rl",
         f"sm_{major}{minor}a",
-        ("-std=c++17", "-default-device", f"-DQ35_HOP_DEADLINE_NS={deadline_ns}ull", f"-DRL_SENTINEL={sentinel}"),
+        (
+            "-std=c++17",
+            "-default-device",
+            f"-DQ35_HOP_DEADLINE_NS={deadline_ns}ull",
+            f"-DRL_SENTINEL={sentinel}",
+            f"-DQ35_PIN_RL={int(pin)}",
+        ),
         headers(),
     )
     return {

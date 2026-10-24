@@ -130,6 +130,10 @@ __device__ __forceinline__ void mc_st_v4f(float* mc, float a, float b, float c, 
 }
 __device__ __forceinline__ float sanitize_f32(float x) { return __float_as_uint(x) == kSentF32 ? 0.f : x; }
 
+#ifndef Q35_PIN_RL
+#define Q35_PIN_RL 0  // SGLANG_PERFLL_PIN_RL: W_o and router weights held ahead of the PDL wait
+#endif
+
 // ---------------------------------------------------------------- out_proj + router partials
 
 // = hop.cu's oproj_push_kernel<4>: CTA c owns output rows [32c, 32c + 32) over the full K
@@ -148,6 +152,12 @@ __device__ __forceinline__ void oproj_rows(const OprojArgs& o, const RlArgs& r, 
       for (int b = 0; b < 2; ++b) a[st][b] = ldg_nc_v4(wb + (st * 2 + b) * 32);
   }
   const float alpha = __fmul_rn(*o.sx, *o.sw);
+  if (Q35_PIN_RL) {
+    uint32_t dep = __float_as_uint(alpha);
+#pragma unroll
+    for (int st = 0; st < S; ++st) dep ^= a[st][0].x ^ a[st][1].x;
+    pin_before_wait(dep, reinterpret_cast<uint64_t>(o.w));
+  }
   pdl_wait();
   if (r.trace != nullptr && cta == 0 && tid == 0) rl_stamp(r, ld_volatile_u32(&o.site.ctrl->seq), 0);
   const int m = o.m;
@@ -208,6 +218,12 @@ __device__ __forceinline__ void router_rows(const OprojArgs& o, const RlArgs& r,
     for (int st = 0; st < kRlSteps; ++st)
 #pragma unroll
       for (int mt = 0; mt < 2; ++mt) a[st][mt] = ldg_nc_v4(wb + (st * 2 + mt) * 32);
+  }
+  if (Q35_PIN_RL) {
+    uint32_t dep = 0;
+#pragma unroll
+    for (int st = 0; st < kRlSteps; ++st) dep ^= a[st][0].x ^ a[st][1].x;
+    pin_before_wait(dep, reinterpret_cast<uint64_t>(r.rw));
   }
   pdl_wait();
   const uint32_t seq0 = r.trace != nullptr ? ld_volatile_u32(&o.site.ctrl->seq) : 0u;

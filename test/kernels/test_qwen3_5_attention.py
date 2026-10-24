@@ -299,17 +299,18 @@ def test_mka_replays_in_a_cuda_graph_bit_for_bit():
         assert torch.isfinite(step.out.float()).all()
 
 
+@pytest.mark.parametrize("m", [7, 14])
 @pytest.mark.parametrize("early", [True, False])
-def test_mka_with_its_weights_pinned_ahead_of_the_wait_is_bit_for_bit(early, monkeypatch):
+def test_mka_with_its_weights_pinned_ahead_of_the_wait_is_bit_for_bit(early, m, monkeypatch):
     """SGLANG_PERFLL_PIN_MKA_EPI / _PRO only hold the weight loads ahead of griddepcontrol.wait: the same bytes,
-    for the early and the late PDL releases."""
+    for the early and the late PDL releases, the narrow and the wide entries."""
     import functools
 
     from sgl_nvidia_mega.qwen3_5.sm103.attention import mka
 
     g = torch.Generator(device="cuda").manual_seed(9)
     ops = _mka_operands(g)
-    step = _MkaStep(7, g)
+    step = _MkaStep(m, g)
     step.run(ops, early_trigger=early)
     want = step.bits()
     monkeypatch.setattr(mka, "_kernels", functools.partial(mka._kernels, pins=(True, True)))

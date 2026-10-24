@@ -78,6 +78,14 @@ def _router_reason(mlp) -> Optional[str]:
     return None
 
 
+def perflp_bf16_twin(experts) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """The BF16 experts (checkpoint order, this rank's slice) SGLang keeps beside NVFP4 draft experts under
+    SGLANG_PERFLP_DRAFT_MOE_KEEP_BF16 (PERF-LP), or None: the single launch serves the steps of <= 2 tokens in BF16."""
+    w13 = getattr(experts, "perflp_bf16_w13", None)
+    w2 = getattr(experts, "perflp_bf16_w2", None)
+    return (w13, w2) if w13 is not None and w2 is not None else None
+
+
 def unsupported_reason(mlp) -> Optional[str]:
     """Why the single launch cannot serve this block (None when it can): the checks of
     SingleTokenDraftMoe._unsupported_reason and _router_unsupported_reason."""
@@ -90,15 +98,18 @@ def unsupported_reason(mlp) -> Optional[str]:
     # The kernel reads W13 as [gate rows | up rows] in checkpoint order (flashinfer_trtllm's
     # layout is put back in that order, in a copy).
     method = experts.quant_method
-    if not isinstance(method, UnquantizedFusedMoEMethod):
+    twin = perflp_bf16_twin(experts)
+    if twin is None and not isinstance(method, UnquantizedFusedMoEMethod):
         return f"expert weights handled by {type(method).__name__}"
-    if method.w13_swiglu_interleaved:
+    if twin is None and method.w13_swiglu_interleaved:
         return "expert weights in a kernel-specific layout"
     if get_parallel().moe_ep_size != 1:
         return "expert parallelism"
-    w13, w2 = experts.w13_weight, experts.w2_weight
+    w13, w2 = twin or (experts.w13_weight, experts.w2_weight)
     ws13, ws2 = shared.gate_up_proj.weight, shared.down_proj.weight
-    s13, s2 = _checkpoint_shapes(experts)
+    s13, s2 = (
+        (tuple(w13.shape), tuple(w2.shape)) if twin else _checkpoint_shapes(experts)
+    )
     hidden, inter = s13[-1], s2[-1]
     tensors = (w13, w2, ws13, ws2, mlp.shared_expert_gate.weight)
     if any(t.dtype != torch.bfloat16 for t in tensors):
@@ -200,9 +211,9 @@ class DraftMoe:
         """The block's single-launch MoE, compiled and checked to fit this device, or
         None (logged) when it cannot serve the block."""
         reason = unsupported_reason(mlp)
-        weights = None
+        weights = perflp_bf16_twin(mlp.experts)
         if reason is None:
-            if mlp.experts.quant_method.use_flashinfer_trtllm_moe:
+            if weights is None and mlp.experts.quant_method.use_flashinfer_trtllm_moe:
                 weights = checkpoint_weights(mlp.experts)
             w13, w2 = weights or (mlp.experts.w13_weight, mlp.experts.w2_weight)
             reason = "; ".join(
@@ -224,7 +235,9 @@ class DraftMoe:
         logger.info(
             "Single-launch draft MoE active for layer %d%s.",
             mlp.layer_id,
-            " (checkpoint-order copy of flashinfer_trtllm's experts)"
+            " (PERF-LP BF16 twin of the NVFP4 experts)"
+            if perflp_bf16_twin(mlp.experts) is not None
+            else " (checkpoint-order copy of flashinfer_trtllm's experts)"
             if weights
             else "",
         )

@@ -24,6 +24,7 @@ build on every rank alike.
 from __future__ import annotations
 
 import logging
+import os
 
 from typing import Optional
 
@@ -46,6 +47,9 @@ MAX_M = 1
 # branch's TP4 setup also pushes the single-launch MoE into the final norm's hop,
 # SGLANG_Q35MF_MKD_HOP_PUSH, which changes no bits and is not ported).
 GEMV_O_PROJ = {8: True, 4: False}
+# PERF-DRAFT: the widest multi-request step whose o_proj pushes its rows (slot draft_push_rows; TRT-L15's A/B: a gain
+# at 2-4 rows, a loss from 8); default the rows GEMV's own cap
+PUSH_ROWS_MAX = int(os.environ.get("SGLANG_PERFDRAFT_PUSH_ROWS_MAX", "0"))
 
 
 class DraftHop:
@@ -123,6 +127,7 @@ class DraftHop:
             self.gemv
             and self.o_proj_k is not None
             and 2 <= m <= kernels.rows_max_m(self.o_proj_k)
+            and (PUSH_ROWS_MAX <= 0 or m <= PUSH_ROWS_MAX)
             and self.hop.supports(m)
         )
 

@@ -26,6 +26,7 @@ equal to them bit for bit.
 from __future__ import annotations
 
 import ctypes
+import os
 from functools import cache
 from pathlib import Path
 
@@ -47,6 +48,16 @@ WORLDS = (2, 4, 8)
 # the rows up to which FlashInfer's MNNVL CuTe DSL fusion runs its one-shot (LL) routes at
 # TP8 (all-reduce, finalize); past them its BT routes, which the two-shot hop equals
 ONE_SHOT_ROWS, ONE_SHOT_FINALIZE_ROWS = 15, 23
+# A/Bs only: the one-shot finalize as before its fix (routing slots read before griddepcontrol.wait)
+FIN_PREWAIT = os.environ.get("SGLANG_PERFLL_HOP_FIN_PREWAIT", "0") == "1"
+# int32 0, 1, 2, ... buffers (data_ptr -> length) whose prefixes are identity row maps of a finalize
+_IDENTITY_ROWS: dict = {}
+
+
+def register_identity_rows(rows: torch.Tensor) -> None:
+    """Record ``rows`` (int32 0, 1, 2, ...): a finalize whose ``permuted_indices`` is a contiguous prefix of it
+    passes no row map, so its routed rows need not wait for the map's load."""
+    _IDENTITY_ROWS[rows.data_ptr()] = rows.numel()
 
 
 class Site2(ctypes.Structure):
@@ -182,6 +193,7 @@ def _kernels(device_index: int, deadline_ns: int) -> dict[str, jit.Kernel]:
         headers(),
     )
     names = ["q35hop_publish", "q35hop_publish_fin_top10", "q35hop_publish_fin"]
+    names += ["q35hop_publish_fin_prewait_top10", "q35hop_publish_fin_prewait"]
     names += [f"q35hop_consume_w{w}" for w in WORLDS]
     kernels = {n: jit.load(cubin, n, (ROW_THREADS, 1, 1), 0) for n in names}
     for w in WORLDS:
@@ -486,13 +498,19 @@ class Hop:
         two = self._two_shot_rows(m, finalize=True)
         args, outs = (self._args2 if two else self._args)(m, residual, gamma, fp8_scale)
         args.routed, args.expert_w = routed_output.data_ptr(), expert_weights.data_ptr()
-        args.permuted, args.top_k = permuted_indices.data_ptr(), top_k
+        identity = (
+            not FIN_PREWAIT
+            and permuted_indices.is_contiguous()
+            and _IDENTITY_ROWS.get(permuted_indices.data_ptr(), 0) >= permuted_indices.numel()
+        )
+        args.permuted = None if identity else permuted_indices.data_ptr()
+        args.top_k = top_k
         args.shared = jit.null_or_pointer(gated_shared_output).value
         if two:
             kind = "fin_top10" if top_k == 10 else "fin"
             self._launch2(f"q35hop2_{kind}_w{self.world}", args)
             return outs
-        name = "q35hop_publish_fin_top10" if top_k == 10 else "q35hop_publish_fin"
+        name = "q35hop_publish_fin" + ("_prewait" if FIN_PREWAIT else "") + ("_top10" if top_k == 10 else "")
         self._launch(name, args, QUAD_CTAS)
         self._consume(args)
         return outs

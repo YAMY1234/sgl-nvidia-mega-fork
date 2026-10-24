@@ -795,9 +795,9 @@ def test_front_norm_is_slot_gdn_verifys():
 TRT_HEADS = {8: (2, 8), 16: (1, 4)}  # (H, HV) per rank at TP8 / TP16
 
 
-def _trt_operands(seed, tp=8, pad=False):
-    """One request of 7 rows at TP ``tp``: the operands of ``trt_front.front`` (the pools as
-    in ``_front_operands``; ``pad`` gives the request the pad state index -1)."""
+def _trt_operands(seed, tp=8, pad=False, requests=1):
+    """``requests`` requests of 7 rows at TP ``tp``: the operands of ``trt_front.front`` (the
+    pools as in ``_front_operands``; ``pad`` gives the last request the pad state index -1)."""
     h, hv = TRT_HEADS[tp]
     d = 2 * h * K + hv * V
     g = torch.Generator(device="cuda").manual_seed(seed)
@@ -808,7 +808,7 @@ def _trt_operands(seed, tp=8, pad=False):
     phys = rand(FRONT_SLOTS, d, 9).to(torch.bfloat16)
     return dict(
         d=d,
-        x=rand(DRAFT, 4096).to(torch.bfloat16),
+        x=rand(requests * DRAFT, 4096).to(torch.bfloat16),
         w=rand(d + hv * V, 4096, scale=0.05).clamp(-440, 440).to(torch.float8_e4m3fn),
         sx=torch.tensor([0.01], device="cuda"),
         sw=torch.tensor([0.002], device="cuda"),
@@ -817,20 +817,27 @@ def _trt_operands(seed, tp=8, pad=False):
         state=rand(FRONT_SLOTS, d, WIDTH - 1).to(torch.bfloat16),
         phys=phys,
         windows=phys.as_strided((FRONT_SLOTS, DRAFT, d, WIDTH - 1), (d * 9, 1, 9, 1)),
-        states=torch.tensor([-1 if pad else FRONT_STATES[0]], dtype=torch.int32, device="cuda"),
+        states=torch.tensor(
+            list(FRONT_STATES[: requests - 1]) + [-1 if pad else FRONT_STATES[requests - 1]],
+            dtype=torch.int32,
+            device="cuda",
+        ),
     )
 
 
 def _trt_outputs(o):
+    rows = o["x"].shape[0]
     return dict(
-        out=torch.empty(DRAFT, o["w"].shape[0], dtype=torch.bfloat16, device="cuda"),
-        ba=torch.empty(DRAFT, o["ba_w"].shape[0], dtype=torch.bfloat16, device="cuda"),
+        out=torch.empty(rows, o["w"].shape[0], dtype=torch.bfloat16, device="cuda"),
+        ba=torch.empty(rows, o["ba_w"].shape[0], dtype=torch.bfloat16, device="cuda"),
     )
 
 
 def _run_trt_front(o, x8, outs, x=None):
     from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
 
+    # every request count a test runs (SGLANG_PERFLL_GDN_TRTFRONT_MAX_REQ in serving)
+    trt_front.MAX_REQUESTS = max(trt_front.MAX_REQUESTS, 2)
     trt_front.prepare(o["w"].shape[0], o["ba_w"].shape[0], o["conv_w"], o["state"], o["windows"])
     trt_front.front(
         o["x"] if x is None else x,
@@ -848,24 +855,25 @@ def _run_trt_front(o, x8, outs, x=None):
     )
 
 
+@pytest.mark.parametrize("requests", [1, 2])
 @pytest.mark.parametrize("act", ["fp8", "quant"])
 @pytest.mark.parametrize("tp", [8, 16])
-def test_trt_front_holds_its_projections_to_fp64_and_its_conv_is_sglangs(tp, act):
+def test_trt_front_holds_its_projections_to_fp64_and_its_conv_is_sglangs(tp, act, requests):
     from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
     from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
     from sglang.srt.layers.quantization.fp8_utils import flashinfer_bmm_fp8
 
     errors = {n: [] for n in ("qkvz", "qkvz_stock", "ba", "ba_stock")}
     for seed in range(3):
-        o = _trt_operands(60 + seed, tp)
-        d = o["d"]
+        o = _trt_operands(60 + seed, tp, requests=requests)
+        d, rows = o["d"], o["x"].shape[0]
         state0, phys0 = o["state"].clone(), o["phys"].clone()
         xq, _ = static_quant_fp8(o["x"], o["sx"], repeat_scale=False)
         outs = _trt_outputs(o)
         _run_trt_front(o, xq if act == "fp8" else None, outs)
         torch.cuda.synchronize()
-        # the BF16 q / k / v rows the conv took: window row 0 holds 2 state columns, then the 7 rows
-        qkv = o["phys"][0, :, 2:].t()
+        # the BF16 q / k / v rows the conv took: window row r holds 2 state columns, then request r's 7 rows
+        qkv = torch.cat([o["phys"][r, :, 2:].t() for r in range(requests)])
         projected = torch.cat([qkv, outs["out"][:, d:]], dim=1)
         ref = (xq.double() @ o["w"].double().t()) * (o["sx"].double() * o["sw"].double())
         stock = flashinfer_bmm_fp8(xq, o["w"].t(), o["sx"], o["sw"], torch.bfloat16)
@@ -874,24 +882,24 @@ def test_trt_front_holds_its_projections_to_fp64_and_its_conv_is_sglangs(tp, act
         ref = o["x"].double() @ o["ba_w"].double().t()
         errors["ba"].append(_errors(outs["ba"], ref))
         errors["ba_stock"].append(_errors(o["x"] @ o["ba_w"].t(), ref))
-        # the conv on those rows, as SGLang's update (windows at intermediate row 0)
+        # the conv on those rows, as SGLang's update (request r's windows at intermediate row r)
         state, phys = state0.clone(), phys0.clone()
         windows = phys.as_strided(o["windows"].shape, o["windows"].stride())
         want = causal_conv1d_update(
-            qkv.contiguous().view(1, DRAFT, d).transpose(1, 2),
+            qkv.contiguous().view(requests, DRAFT, d).transpose(1, 2),
             state,
             o["conv_w"],
             None,
             "silu",
             conv_state_indices=o["states"],
             intermediate_conv_window=windows,
-            intermediate_state_indices=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            intermediate_state_indices=torch.arange(requests, dtype=torch.int32, device="cuda"),
         )
-        assert torch.equal(outs["out"][:, :d], want.transpose(1, 2).reshape(DRAFT, d))
+        assert torch.equal(outs["out"][:, :d], want.transpose(1, 2).reshape(rows, d))
         assert torch.equal(o["state"], state) and torch.equal(o["phys"], phys)
     e = {n: torch.tensor(v, dtype=torch.float64) for n, v in errors.items()}
     print(
-        f"T0 trt_front tp{tp} {act} qkvz mean rel-L2 {e['qkvz'][:, 0].mean():.4g} vs stock "
+        f"T0 trt_front tp{tp} {act} requests={requests} qkvz mean rel-L2 {e['qkvz'][:, 0].mean():.4g} vs stock "
         f"{e['qkvz_stock'][:, 0].mean():.4g}, max abs {e['qkvz'][:, 1].max():.4g} vs "
         f"{e['qkvz_stock'][:, 1].max():.4g}; ba {e['ba'][:, 0].mean():.4g} vs "
         f"{e['ba_stock'][:, 0].mean():.4g}, {e['ba'][:, 1].max():.4g} vs "

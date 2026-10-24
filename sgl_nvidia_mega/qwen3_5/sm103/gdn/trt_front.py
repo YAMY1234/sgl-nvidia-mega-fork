@@ -28,30 +28,39 @@ import os
 import torch
 
 ENABLED = os.environ.get("SGLANG_PERFLL_GDN_TRTFRONT", "0") == "1"
+# the most requests of 7 rows a step takes it for (1: B1 only; 2: also B2, within TensorRT-LLM's own M <= 16 at TP8)
+MAX_REQUESTS = int(os.environ.get("SGLANG_PERFLL_GDN_TRTFRONT_MAX_REQ", "1"))
 ROWS, HIDDEN = 7, 4096
 # TensorRT-LLM's _TACTICS mode of each activation form (lowm_linear.default_tactic)
 MODES = {"fp8": "mixed8", "quant": "mixed"}
 
-_SPECS: dict = {}  # (activation form, qkvz rows) -> the prepared trt_lowm.Spec
+_SPECS: dict = {}  # (activation form, qkvz rows, requests) -> the prepared trt_lowm.Spec
 
 
-def spec(act: str, qkvz: int, ba: int, conv_weight, conv_state, windows):
-    """The ``trt_lowm`` launch of one request's front with the ``act`` activations (``fp8`` / ``quant``) over a
-    [qkvz, 4096] FP8 and a [ba, 4096] BF16 weight, on these conv tensors' layouts: TensorRT-LLM's tactic of the
-    shape (BF16 segment: its k_warps and ksplit, one tile a CTA), as its GDN mixer passes it."""
+def takes(requests: int) -> bool:
+    """Whether a step of ``requests`` requests of 7 rows takes this front (SGLANG_PERFLL_GDN_TRTFRONT[_MAX_REQ])."""
+    return ENABLED and 1 <= requests <= MAX_REQUESTS
+
+
+def spec(act: str, qkvz: int, ba: int, conv_weight, conv_state, windows, requests: int = 1):
+    """The ``trt_lowm`` launch of the front of ``requests`` requests of 7 rows with the ``act`` activations (``fp8`` /
+    ``quant``) over a [qkvz, 4096] FP8 and a [ba, 4096] BF16 weight, on these conv tensors' layouts: TensorRT-LLM's
+    tactic of the shape at M = 7 requests (BF16 segment: its k_warps and ksplit, one tile a CTA), as its GDN mixer
+    passes it; request r's windows at row r."""
     from sgl_nvidia_mega.qwen3_5.sm103 import trt_lowm
     from sgl_nvidia_mega.qwen3_5.sm103.trt_lowm.lowm_linear import (
         default_tactic,
         lowm_conv_supported,
     )
 
-    tactic = default_tactic(ROWS, qkvz, HIDDEN, mode=MODES[act])
-    if not lowm_conv_supported(ROWS, tactic, conv_weight.shape[0], ROWS):
+    m = ROWS * requests
+    tactic = default_tactic(m, qkvz, HIDDEN, mode=MODES[act])
+    if not lowm_conv_supported(m, tactic, conv_weight.shape[0], ROWS):
         raise ValueError(
-            f"TensorRT-LLM's {MODES[act]} tactic {tactic} has no conv epilogue for {qkvz} rows"
+            f"TensorRT-LLM's {MODES[act]} tactic {tactic} has no conv epilogue for {m} x {qkvz}"
         )
     return trt_lowm.spec(
-        m=ROWS,
+        m=m,
         k=HIDDEN,
         n_fp8=qkvz,
         n_bf16=ba,
@@ -61,19 +70,20 @@ def spec(act: str, qkvz: int, ba: int, conv_weight, conv_state, windows):
         split_out=qkvz,
         out_dtype=torch.bfloat16,
         conv=trt_lowm.conv_spec(
-            conv_weight, conv_state, windows, requests=1, tokens=ROWS
+            conv_weight, conv_state, windows, requests=requests, tokens=ROWS
         ),
     )
 
 
 def prepare(qkvz: int, ba: int, conv_weight, conv_state, windows) -> None:
-    """Compile both activation forms on these layouts (not inside a graph capture)."""
+    """Compile both activation forms for 1..MAX_REQUESTS requests on these layouts (not inside a graph capture)."""
     from sgl_nvidia_mega.qwen3_5.sm103 import trt_lowm
 
-    for act in MODES:
-        s = spec(act, qkvz, ba, conv_weight, conv_state, windows)
-        trt_lowm.prepare(s)
-        _SPECS[act, qkvz] = s
+    for requests in range(1, MAX_REQUESTS + 1):
+        for act in MODES:
+            s = spec(act, qkvz, ba, conv_weight, conv_state, windows, requests)
+            trt_lowm.prepare(s)
+            _SPECS[act, qkvz, requests] = s
 
 
 def front(
@@ -90,17 +100,18 @@ def front(
     out: torch.Tensor,
     ba: torch.Tensor,
 ) -> None:
-    """One request's front of the BF16 rows ``x`` [7, 4096] (and their E4M3 copy ``x_fp8``, quantized with
+    """The front of R requests' BF16 rows ``x`` [7 R, 4096] (and their E4M3 copy ``x_fp8``, quantized with
     ``input_scale``, or None) over ``weight`` [QKVZ, 4096] E4M3 (row-major [N, K]) and ``ba_weight`` [2 HV, 4096]
-    BF16 into ``out`` [7, QKVZ] and ``ba`` [7, 2 HV]; ``conv_state`` [slots, C, 3] / ``windows`` [rows, 7, C, 3]
-    updated at ``state_indices`` [1] int32 and intermediate row 0."""
+    BF16 into ``out`` [7 R, QKVZ] and ``ba`` [7 R, 2 HV]; ``conv_state`` [slots, C, 3] / ``windows`` [rows, 7, C, 3]
+    updated at ``state_indices`` [R] int32 and intermediate rows 0..R-1."""
     from sgl_nvidia_mega.qwen3_5.sm103 import trt_lowm
 
     act = "fp8" if x_fp8 is not None else "quant"
-    s = _SPECS.get((act, weight.shape[0]))
+    requests = x.shape[0] // ROWS
+    s = _SPECS.get((act, weight.shape[0], requests))
     if s is None:
         raise RuntimeError(
-            f"the TensorRT-LLM GDN front ({act}, {weight.shape[0]} rows) was not prepared"
+            f"the TensorRT-LLM GDN front ({act}, {weight.shape[0]} rows, {requests} requests) was not prepared"
         )
     trt_lowm.run(
         s,

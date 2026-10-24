@@ -227,9 +227,9 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
 
     rows = x.shape[0]
     requests = rows // ROWS
-    # TensorRT-LLM's own in_proj kernel for one request in front of slot gdn_core (SGLANG_PERFLL_GDN_TRTFRONT), on the
-    # hop's E4M3 copy of x where the hop wrote one (slot hop_fp8)
-    trt = trt_front.ENABLED and requests == 1 and opts.core
+    # TensorRT-LLM's own in_proj kernel for up to SGLANG_PERFLL_GDN_TRTFRONT_MAX_REQ requests in front of slot gdn_core
+    # (SGLANG_PERFLL_GDN_TRTFRONT), on the hop's E4M3 copy of x where the hop wrote one (slot hop_fp8)
+    trt = trt_front.takes(requests) and opts.core
     x8 = lowm.take_fp8(st, x) if trt and st.slots.hop_fp8 else None
     # the L2 prefetch of the checkpoint / ring in front of slot gdn_core is left out with the early history (the core
     # holds those loads ahead of its wait) and for the pinned one-request front (which completes later with it)

@@ -1190,8 +1190,11 @@ def test_the_gdn_front_leaves_out_its_l2_prefetch_ahead_of_a_pinned_or_early_cor
         assert front.step(gdn, torch.zeros(rows, 4096, dtype=torch.bfloat16), st, opts) == "fused"
     assert seen["prefetch"] is prefetch
 
-@pytest.mark.parametrize("trt, rows, wants", [(False, 7, False), (True, 7, True), (True, 14, False)])
-def test_the_hop_quantizes_a_gdn_layers_input_for_the_trt_front_only(trt, rows, wants):
+@pytest.mark.parametrize(
+    "trt, max_req, rows, wants",
+    [(False, 1, 7, False), (True, 1, 7, True), (True, 1, 14, False), (True, 2, 14, True), (True, 2, 21, False)],
+)
+def test_the_hop_quantizes_a_gdn_layers_input_for_the_trt_front_only(trt, max_req, rows, wants):
     """Slot hop_fp8 writes a GDN layer's E4M3 input under slot gdn_front only for the TensorRT-LLM
     one-request front (SGLANG_PERFLL_GDN_TRTFRONT), with in_proj_qkvz's static input scale."""
     from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
@@ -1203,16 +1206,24 @@ def test_the_hop_quantizes_a_gdn_layers_input_for_the_trt_front_only(trt, rows, 
     layer = Qwen3_5LinearDecoderLayer.__new__(Qwen3_5LinearDecoderLayer)
     object.__setattr__(layer, "linear_attn", SimpleNamespace(in_proj_qkvz=SimpleNamespace(input_scale=scale)))
     st = SimpleNamespace(slots=SimpleNamespace(hop_fp8=True, gdn_verify=True, gdn_front=True))
-    with patch.object(trt_front, "ENABLED", trt):
+    with patch.object(trt_front, "ENABLED", trt), patch.object(trt_front, "MAX_REQUESTS", max_req):
         got = lowm_mod.layer_input_fp8_scale(layer, st, rows)
     assert (got is scale) if wants else got is None
 
 
 @pytest.mark.parametrize(
-    "trt, hop_fp8, rows, core",
-    [(True, True, 7, True), (True, False, 7, True), (True, True, 14, True), (True, True, 7, False), (False, True, 7, True)],
+    "trt, max_req, hop_fp8, rows, core",
+    [
+        (True, 1, True, 7, True),
+        (True, 1, False, 7, True),
+        (True, 1, True, 14, True),
+        (True, 2, True, 14, True),
+        (True, 2, True, 21, True),
+        (True, 1, True, 7, False),
+        (False, 2, True, 7, True),
+    ],
 )
-def test_the_trt_gdn_front_runs_one_request_ahead_of_slot_gdn_core(trt, hop_fp8, rows, core):
+def test_the_trt_gdn_front_runs_one_request_ahead_of_slot_gdn_core(trt, max_req, hop_fp8, rows, core):
     """With SGLANG_PERFLL_GDN_TRTFRONT one request in front of slot gdn_core takes TensorRT-LLM's
     in_proj launch, on the hop's E4M3 rows where it wrote them (BF16 rows otherwise): the raw
     [N, K] in_proj_qkvz weight, the layer's conv pools and the step's state index; the core
@@ -1236,6 +1247,7 @@ def test_the_trt_gdn_front_runs_one_request_ahead_of_slot_gdn_core(trt, hop_fp8,
     opts = msgspec.structs.replace(verify.SLOT_PDL, core=core)
     with (
         patch.object(trt_front, "ENABLED", trt),
+        patch.object(trt_front, "MAX_REQUESTS", max_req),
         patch.object(trt_front, "front", lambda *args: seen.update(trt=args)),
         patch.object(kernel, "front", lambda *args, **kw: seen.update(front=kw)),
         patch.object(lowm_mod, "take_fp8", lambda st_, x_: x8 if x_ is x else None),
@@ -1245,7 +1257,7 @@ def test_the_trt_gdn_front_runs_one_request_ahead_of_slot_gdn_core(trt, hop_fp8,
             front.step(gdn, x, st, opts)
         except Exception:
             assert not core  # the stock tail of the mock layer
-    if not (trt and rows == 7 and core):
+    if not (trt and rows <= 7 * max_req and core):
         assert "trt" not in seen and "front" in seen
         return
     assert "front" not in seen
@@ -1263,11 +1275,11 @@ def test_the_trt_gdn_front_runs_one_request_ahead_of_slot_gdn_core(trt, hop_fp8,
         "states(1,)",
     )
     out, ba = args[10], args[11]
-    assert out.shape == (7, 2560) and ba.shape == (7, 16)
+    assert out.shape == (rows, 2560) and ba.shape == (rows, 16)
     _, qkv, z, a, b, *_ = seen["fused"]
-    assert qkv.data_ptr() == out.data_ptr() and qkv.shape == (7, 1536) and qkv.stride() == (2560, 1)
-    assert z.data_ptr() == out[:, 1536:].data_ptr() and z.shape == (7, 8, 128) and z.stride() == (2560, 128, 1)
-    assert a.data_ptr() == ba[:, 8:].data_ptr() and b.data_ptr() == ba.data_ptr() and a.shape == b.shape == (7, 8)
+    assert qkv.data_ptr() == out.data_ptr() and qkv.shape == (rows, 1536) and qkv.stride() == (2560, 1)
+    assert z.data_ptr() == out[:, 1536:].data_ptr() and z.shape == (rows, 8, 128) and z.stride() == (2560, 128, 1)
+    assert a.data_ptr() == ba[:, 8:].data_ptr() and b.data_ptr() == ba.data_ptr() and a.shape == b.shape == (rows, 8)
 
 
 def test_the_trt_gdn_front_prepares_on_the_first_gdn_layers_pools():
@@ -1295,11 +1307,14 @@ def test_the_trt_gdn_front_prepares_on_the_first_gdn_layers_pools():
     assert tuple(map(log.tag, seen[0][2:])) == ("conv_w(1536, 4)", "conv2(3, 1536, 3)", "window2(3, 7, 1536, 3)")
 
 
-@pytest.mark.parametrize("qkvz, ba, d, tactic_fp8, tactic_quant", [
-    (2560, 16, 1536, (16, 2, 1, True, 2), (16, 4, 1, True, 1)),
-    (1280, 8, 768, (16, 2, 1, True, 1), (16, 2, 1, True, 1)),
+@pytest.mark.parametrize("qkvz, ba, d, requests, tactic_fp8, tactic_quant", [
+    (2560, 16, 1536, 1, (16, 2, 1, True, 2), (16, 4, 1, True, 1)),
+    (1280, 8, 768, 1, (16, 2, 1, True, 1), (16, 2, 1, True, 1)),
+    (2560, 16, 1536, 2, (8, 4, 1, False, 1), (16, 4, 1, False, 1)),
+    (1280, 8, 768, 2, (16, 2, 1, False, 1), (16, 2, 1, False, 1)),
 ])
-def test_trt_lowm_takes_trts_gdn_tactics_and_refuses_an_unprepared_launch(qkvz, ba, d, tactic_fp8, tactic_quant):
+def test_trt_lowm_takes_trts_gdn_tactics_and_refuses_an_unprepared_launch(qkvz, ba, d, requests, tactic_fp8,
+                                                                          tactic_quant):
     """The TensorRT-LLM front's launches at TP8 / TP16 are those of TensorRT-LLM's GDN mixer
     (mixed8 on E4M3 rows, mixed on BF16 rows: k_warps, n_tiles, ksplit, swap_ab, min_blocks;
     the BF16 segment one tile a CTA), PDL with the early trigger; ``trt_lowm`` refuses to compile
@@ -1311,7 +1326,8 @@ def test_trt_lowm_takes_trts_gdn_tactics_and_refuses_an_unprepared_launch(qkvz, 
     state = torch.zeros(3, d, 3, dtype=torch.bfloat16)
     windows = torch.zeros(3, d, 9, dtype=torch.bfloat16).as_strided((3, 7, d, 3), (d * 9, 1, 9, 1))
     for act, tactic in (("fp8", tactic_fp8), ("quant", tactic_quant)):
-        s = trt_front.spec(act, qkvz, ba, conv_w, state, windows)
+        s = trt_front.spec(act, qkvz, ba, conv_w, state, windows, requests)
+        assert s.m == 7 * requests and s.conv_shapes[2] == requests
         assert (s.k_warps, s.n_tiles, s.ksplit, s.swap_ab, s.min_blocks) == tactic
         assert (s.n_fp8, s.n_bf16, s.n_tiles_bf16, s.fp8_act) == (qkvz, ba, 1, act)
         assert (s.n_out, s.n_out2, s.conv_channels, s.conv_tokens, s.conv_write_state) == (qkvz, ba, d, 7, True)
@@ -1319,7 +1335,7 @@ def test_trt_lowm_takes_trts_gdn_tactics_and_refuses_an_unprepared_launch(qkvz, 
         assert s.use_pdl and s.early_trigger and not s.release_after_wait and not s.unsafe_skip_wait
         assert s.conv_shapes[3] == ((3, 7, d, 3), (d * 9, 1, 9, 1))
     with pytest.raises(RuntimeError, match="not prepared"):
-        trt_lowm.run(s, out=torch.zeros(7, qkvz, dtype=torch.bfloat16))
+        trt_lowm.run(s, out=torch.zeros(7 * requests, qkvz, dtype=torch.bfloat16))
     with patch.object(torch.cuda, "is_current_stream_capturing", lambda: True):
         with pytest.raises(RuntimeError, match="before graph capture"):
             trt_lowm.prepare(s)

@@ -35,6 +35,8 @@ EARLY = os.environ.get("SGLANG_PERFLL_GDN_CORE_EARLY", "0") == "1"
 # FlashInfer's out_proj BMM (cuBLASLt launches its nvjet kernel as a programmatic dependent, which waits before reading
 # its input); 1: every width, 0: off
 RELEASE_MIN_ROWS = int(os.environ.get("SGLANG_PERFLL_GDN_CORE_RELEASE", "0") or 0)
+# SGLANG_PERFLL_GDN_CORE_RELEASE_MAX=<rows>: and up to that many rows (0: no cap), so only A/B-measured widths release
+RELEASE_MAX_ROWS = int(os.environ.get("SGLANG_PERFLL_GDN_CORE_RELEASE_MAX", "0") or 0)
 
 
 class Params(ctypes.Structure):

@@ -655,6 +655,87 @@ def test_the_draft_moe_takes_the_target_path_within_its_rows(
     assert moe_mkm.DraftMkm(None, wide=True).takes(rows, rows_per_request) is want
 
 
+@pytest.mark.parametrize(
+    "extend_fin, path, taken, want",
+    [
+        # the extend's final norm after SGLang's MoE: one all-reduce (x8 stands in for it)
+        (False, "sglang", True, ["mlp", "all_reduce", "norm"]),
+        (False, "mkm", True, ["mkm", "complete", "all_reduce", "norm"]),
+        # SGLANG_PERFDRAFT_EXTEND_FIN: the finalize, all-reduce, residual add and norm in the extend's hop
+        (True, "sglang", True, ["mlp deferred", "fin"]),
+        (True, "mkm", True, ["mkm", "fin"]),
+        # a deferred output the hop does not read: still one all-reduce (SGLang's finish runs its own)
+        (True, "sglang", False, ["mlp deferred", "complete", "norm"]),
+        (True, "mkm", False, ["mkm", "complete", "all_reduce", "norm"]),
+    ],
+)
+def test_the_draft_extends_moe_output_is_reduced_once(monkeypatch, extend_fin, path, taken, want):
+    from sgl_nvidia_mega.qwen3_5.draft import layer
+
+    rows, log = 14, []
+    x = torch.ones(rows, 4)
+    routed = torch.bfloat16 if taken else torch.float32
+
+    def owed(reduced):
+        def complete():
+            log.append("complete")
+            return 8 * x if reduced else x
+
+        return SimpleNamespace(
+            m=rows,
+            routed_output=torch.zeros(1, dtype=routed),
+            expert_weights=torch.zeros(1, dtype=torch.bfloat16),
+            permuted_indices=torch.zeros(1, dtype=torch.int32),
+            gated_shared_output=torch.zeros(1, dtype=torch.bfloat16),
+            complete=complete,
+        )
+
+    def mlp(h, defer_finalize=False):
+        log.append("mlp deferred" if defer_finalize else "mlp")
+        return owed(reduced=True) if defer_finalize else h
+
+    def fin(*, residual, gamma, **_):
+        log.append("fin")
+        return residual + gamma, residual
+
+    def norm(h, residual):
+        log.append("norm")
+        return h + residual, residual
+
+    def mkm(lay, h):
+        log.append("mkm")
+        return owed(reduced=False)  # the draft's target-path handoff completes unreduced
+
+    mlp.supports_deferred_finalize = True
+    mkm.takes = lambda r, rows_per_request: True
+    norm.gemma_weight = 100.0
+    extend_hop = SimpleNamespace(
+        hop=SimpleNamespace(supports=lambda m: m <= rows, moe_finalize_all_reduce_rms_norm=fin),
+        ffn_input=lambda h, residual, norm, moe_single_launch: (h, residual),
+    )
+    parts = SimpleNamespace(
+        layer=SimpleNamespace(input_layernorm=lambda h: h, post_attention_layernorm=None, mlp=mlp),
+        attention=lambda h, *args, rows_per_request, o_proj: h,
+        hop=extend_hop,
+        moe=None,
+        moe_mkm=mkm if path == "mkm" else None,
+        slots=frozenset({"draft_hop", "draft_fin"}),
+        model=SimpleNamespace(norm=norm),
+    )
+
+    def all_reduce(h):
+        log.append("all_reduce")
+        return 8 * h
+
+    monkeypatch.setattr(layer, "EXTEND_FIN", extend_fin)
+    monkeypatch.setattr("sglang.srt.distributed.tensor_model_parallel_all_reduce", all_reduce)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    out = layer.layer(parts, x, None, None, None, None, rows_per_request=7)
+    assert log == want
+    # the hop's launch, or the one all-reduce plus the residual
+    assert torch.equal(out, x + 100.0 if "fin" in log else 8 * x + x)
+
+
 def test_the_draft_embeds_through_the_exchange_where_it_fits():
     from sgl_nvidia_mega.qwen3_5.draft.parts import Parts
     from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import MAX_ROWS

@@ -85,6 +85,9 @@ TOP1_KEYS = os.environ.get("SGLANG_PERFDRAFT_TOP1_KEYS", "0") == "1"
 # norm in the hop's MNNVL rounding, which equals what 2.2 runs there (FlashInfer's MNNVL
 # fusion under DRAFT_MNNVL_AR) bit for bit at 1-7 rows
 EXTEND_MNNVL = True
+# SGLANG_PERFDRAFT_EXTEND_FIN (PERF-DRAFT, default off; numeric): with slot draft_fin, the draft extend's MoE finalize,
+# all-reduce, residual add and final norm in one launch of that hop too, as TensorRT-LLM's step 0 runs Q35Ar2Kernel
+EXTEND_FIN = os.environ.get("SGLANG_PERFDRAFT_EXTEND_FIN", "0") == "1"
 
 
 def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
@@ -167,15 +170,16 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         moe_in, residual = lay.post_attention_layernorm(
             tensor_model_parallel_all_reduce(attn_out), residual
         )
-    fin = hop is not None and moe is None and "draft_fin" in parts.slots
+    fin_hop = hop if hop is not None else extend_hop if EXTEND_FIN else None
+    fin = fin_hop is not None and moe is None and "draft_fin" in parts.slots
     if fin and not lay.mlp.supports_deferred_finalize:
-        _note_fin(rows, "SGLang's: the experts do not defer their finalize")
+        _note_fin(rows, "SGLang's: the experts do not defer their finalize", hop is None)
         fin = False
     if fin:
         owed = mkm(lay, moe_in) if mkm is not None else lay.mlp(moe_in, defer_finalize=True)
-        if _hop_takes(hop.hop, owed):
-            _note_fin(rows, "in the final norm's hop (slot draft_fin)")
-            out, _ = hop.hop.moe_finalize_all_reduce_rms_norm(
+        if _hop_takes(fin_hop.hop, owed):
+            _note_fin(rows, "in the final norm's hop (slot draft_fin)", hop is None)
+            out, _ = fin_hop.hop.moe_finalize_all_reduce_rms_norm(
                 routed_output=owed.routed_output,
                 expert_weights=owed.expert_weights,
                 permuted_indices=owed.permuted_indices,
@@ -184,8 +188,12 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
                 gamma=parts.model.norm.gemma_weight,
             )
             return out
-        _note_fin(rows, "SGLang's: the hop does not read this deferred output")
+        _note_fin(rows, "SGLang's: the hop does not read this deferred output", hop is None)
         moe_out = owed.complete()
+        if hop is None and mkm is None:
+            # SGLang's own finish already ran its post-experts all-reduce
+            out, _ = parts.model.norm(moe_out, residual)
+            return out
     elif mkm is not None:
         moe_out = mkm(lay, moe_in).complete()
     else:
@@ -207,12 +215,13 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
 _FIN_NOTED: set = set()
 
 
-def _note_fin(rows: int, where: str) -> None:
+def _note_fin(rows: int, where: str, extend: bool = False) -> None:
     """Log once per captured row count where slot draft_fin's MoE finalize ran."""
-    if torch.cuda.is_current_stream_capturing() and rows not in _FIN_NOTED:
-        _FIN_NOTED.add(rows)
+    if torch.cuda.is_current_stream_capturing() and (extend, rows) not in _FIN_NOTED:
+        _FIN_NOTED.add((extend, rows))
         logger.info(
-            "NVIDIA megakernel: Qwen3.5 MTP draft step of %d rows: MoE finalize %s",
+            "NVIDIA megakernel: Qwen3.5 MTP draft %s of %d rows: MoE finalize %s",
+            "extend" if extend else "step",
             rows,
             where,
         )

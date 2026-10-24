@@ -280,7 +280,6 @@ class DraftHeadMx8:
         sms = torch.cuda.get_device_properties(dev).multi_processor_count
         self.ctas = min(sms, -(-self.n // 8))
         self.gemv = gemv
-        self.mkd_smem = None
         self._noted: set = set()
         # every row count's GEMV compiled and run once on zeros
         x = torch.zeros(self.max_rows, self.k, dtype=torch.bfloat16, device=dev)
@@ -356,7 +355,6 @@ class DraftHeadMx8:
     def prepare_mkd(self, smem_pad: int) -> None:
         """Load and run once the MKD head kernel for ``smem_pad`` (before capture)."""
         dev = self.values.device
-        self.mkd_smem = smem_pad
         x = torch.zeros(1, self.k, dtype=torch.bfloat16, device=dev)
         logits = torch.empty(1, self.n, dtype=torch.bfloat16, device=dev)
         part = torch.empty(self.ctas, dtype=torch.int32, device=dev)

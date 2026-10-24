@@ -62,6 +62,12 @@ struct Site {
 
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+// Holds the loads named in `dep` (one word of each) ahead of griddepcontrol.wait: ptxas otherwise sinks static
+// ld.global.nc loads below it (ACQBULK). The thread waits for those loads here; `never` is never 0 (a pointer).
+__device__ __forceinline__ void pin_before_wait(uint32_t dep, uint64_t never) {
+  asm volatile("{ .reg .pred a, b; setp.eq.u64 a, %1, 0; setp.eq.u32 b, %0, 1; and.pred a, a, b; @a trap; }"
+               :: "r"(dep), "l"(never) : "memory");
+}
 __device__ __forceinline__ unsigned long long gtimer() {
   unsigned long long t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));

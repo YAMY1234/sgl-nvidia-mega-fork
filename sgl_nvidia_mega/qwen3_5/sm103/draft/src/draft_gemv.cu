@@ -62,6 +62,12 @@ struct Site {
 
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+// Holds the loads named in `dep` (one word of each) ahead of griddepcontrol.wait: ptxas otherwise sinks static
+// ld.global.nc loads below it (ACQBULK). The thread waits for those loads here; `never` is never 0 (a pointer).
+__device__ __forceinline__ void pin_before_wait(uint32_t dep, uint64_t never) {
+  asm volatile("{ .reg .pred a, b; setp.eq.u64 a, %1, 0; setp.eq.u32 b, %0, 1; and.pred a, a, b; @a trap; }"
+               :: "r"(dep), "l"(never) : "memory");
+}
 __device__ __forceinline__ unsigned long long gtimer() {
   unsigned long long t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -364,13 +370,6 @@ typedef long long int64_t;
 
 namespace q35draft_gemv {
 
-// Holds the loads named in `dep` (one word of each) ahead of griddepcontrol.wait: ptxas otherwise sinks static
-// ld.global.nc loads below it (ACQBULK). `never` is never 0 (a pointer).
-__device__ __forceinline__ void pin_before_wait(uint32_t dep, uint64_t never) {
-  asm volatile("{ .reg .pred a, b; setp.eq.u64 a, %1, 0; setp.eq.u32 b, %0, 1; and.pred a, a, b; @a trap; }"
-               :: "r"(dep), "l"(never) : "memory");
-}
-
 struct Params {
   const __nv_bfloat16* x;               // [K], written by the previous grid
   const __nv_bfloat16* gate;            // kGate: [K], applied to x as it is staged
@@ -504,7 +503,7 @@ __device__ __forceinline__ void mkd_gemv_rows_push_kernel(const Params& p) {
     uint32_t dep = 0;
 #pragma unroll
     for (int j = 0; j < kVecs; ++j) dep ^= wv[j].x;
-    pin_before_wait(dep, reinterpret_cast<uint64_t>(p.w));
+    q35hop::pin_before_wait(dep, reinterpret_cast<uint64_t>(p.w));
   }
   q35hop::pdl_wait();
   for (int i = static_cast<int>(threadIdx.x); i < m * (kK / 8); i += kRows * 32) {

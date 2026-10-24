@@ -252,6 +252,9 @@ static_assert(DRAIN_SMEM == 0, "x's shared memory holds the next item's rows whi
 #ifndef DIAG_ROUTE  // DIAG: stamps 13 = warp 0's routing rounds done, 15 = their barrier, 14 = item 0's rows gathered
 #define DIAG_ROUTE 0
 #endif
+#ifndef MMA_SFONLY  // 1: the MMA warp waits only on a stage's sf_full: its arrivers (the TMEM warpgroup) waited on the
+#define MMA_SFONLY 0  // stage's full barrier before staging the scale factors, so the data has landed (one wait less per stage)
+#endif
 #ifndef ONEPASS  // 1: an item of at most 8 rows runs FC2 in one pass (16 h copies of 8 rows: 16 tiles in one accumulator)
 #define ONEPASS 0
 #endif
@@ -1181,7 +1184,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
         int n = 0;
         for (int st = 0; st < kFc1Stages; ++st) {
           const int g = base + st, b = g % kStages, ks = st;
-          mbar_wait(&s.full[b], (g / kStages) & 1);
+          if (!MMA_SFONLY) mbar_wait(&s.full[b], (g / kStages) & 1);
           mbar_wait(&s.sf_full[b], (g / kStages) & 1);
           tc_fence_after();
           if (st == 0 && it == 0) stamp(p, 3);
@@ -1204,7 +1207,7 @@ q35_mkm_moe_m32(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
         for (int st = kFc1Stages; st < kTotStages; ++st) {
           const int g = base + st, b = g % kStages, f = st - kFc1Stages;
           if (f == 4 && !one) { mbar_wait(&s.fc2_free, par); tc_fence_after(); }
-          mbar_wait(&s.full[b], (g / kStages) & 1);
+          if (!MMA_SFONLY) mbar_wait(&s.full[b], (g / kStages) & 1);
           mbar_wait(&s.sf_full[b], (g / kStages) & 1);
           tc_fence_after();
           if (STAGE_STAMPS && it == STAMP_IT) stamp(p, 40 + st);

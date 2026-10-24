@@ -26,6 +26,7 @@ and the output gate with o_proj's static FP8 input quantization in one launch.
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 
@@ -73,6 +74,9 @@ SGLANG_READS = {
 # the widest step the fused kernels serve; wider steps take the front path, which measured
 # faster from four requests on (TP8, results/trt-1022/l2a micro e58d29c)
 FUSED_MAX_ROWS = 14
+# PERF-SM: the front path offers the output gate and o_proj's FP8 input quantization to the CP-lite
+# merge of an ungated call (needs an SGLang with CpLite.offer_gate_epilogue); off by default
+_CP_GATE_EPILOGUE = os.environ.get("SGLANG_PSM_CP_GATE_EPILOGUE", "0") == "1"
 
 # the packed (qkv, o_proj) weights per full-attention layer id, filled at build
 WEIGHTS: dict = {}
@@ -342,8 +346,18 @@ def _front_step(layer, x, st):
         k_scale=k_scale,
         v_scale=v_scale,
     )
+    gate = gate.reshape(m, width)
+    cp, oq = None, None
+    if _CP_GATE_EPILOGUE:
+        from sglang.srt.layers.attention.q35_cp_lite import CpLite
+
+        cp = CpLite._instance
+        if cp is not None:
+            oq = torch.empty((m, width), dtype=torch.float8_e4m3fn, device=x.device)
+            cp.offer_gate_epilogue(gate, layer.o_proj.input_scale, oq)
     o = attn(q.reshape(m, width), None, None, st.fb).reshape(m, width)
-    oq = gate_quant(o.contiguous(), gate.reshape(m, width), layer.o_proj.input_scale)
+    if cp is None or not cp.take_gate_epilogue():
+        oq = gate_quant(o.contiguous(), gate, layer.o_proj.input_scale)
     if st.slots.lowm_oproj:
         # slot lowm_out: o_proj on the low-M launch, pushing into the hop with lowm_push
         hop = None

@@ -189,6 +189,31 @@ def build(model, gdns) -> dict:
     }
 
 
+def prepare(lm, pools) -> None:
+    """Compile the TensorRT-LLM front (SGLANG_PERFLL_GDN_TRTFRONT) on the mamba pools' layouts where they first
+    exist: the first covered step, before any graph capture (every GDN layer has the same layouts)."""
+    from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
+
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    if not trt_front.ENABLED:
+        return
+    m = lm.model
+    gdn = next(
+        m.layers[i].linear_attn
+        for i in range(m.start_layer, m.end_layer)
+        if isinstance(m.layers[i], Qwen3_5LinearDecoderLayer)
+    )
+    li = pools.layer_ids.index(gdn.attn.layer_id)
+    trt_front.prepare(
+        gdn.in_proj_qkvz.weight.shape[1],
+        gdn.in_proj_ba.weight.shape[0],
+        gdn.attn.conv_weights,
+        pools.conv[0][li],
+        pools.intermediate_conv_window[0][li],
+    )
+
+
 def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
     """``Qwen3_5GatedDeltaNet.forward`` of a target-verify step of requests of 7 rows on
     the front: the TP-partial output [rows, hidden] of the normed BF16 rows x; ``opts``
@@ -196,27 +221,65 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
     from sgl_nvidia_mega.qwen3_5.gdn import replayssm
     from sgl_nvidia_mega.qwen3_5.gdn.front_norm import norm
     from sgl_nvidia_mega.qwen3_5.gdn.verify import _out_proj
+    from sgl_nvidia_mega.qwen3_5 import lowm
     from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
-    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front, trt_front
 
     rows = x.shape[0]
     requests = rows // ROWS
+    # TensorRT-LLM's own in_proj kernel for one request in front of slot gdn_core (SGLANG_PERFLL_GDN_TRTFRONT), on the
+    # hop's E4M3 copy of x where the hop wrote one (slot hop_fp8)
+    trt = trt_front.ENABLED and requests == 1 and opts.core
+    x8 = lowm.take_fp8(st, x) if trt and st.slots.hop_fp8 else None
     # the L2 prefetch of the checkpoint / ring in front of slot gdn_core is left out with the early history (the core
     # holds those loads ahead of its wait) and for the pinned one-request front (which completes later with it)
     prefetch = not (opts.core and (core_kernel.EARLY or (front.PIN and requests == 1)))
-    if rows not in _ENGAGED:
-        _ENGAGED.add(rows)
+    if (rows, x8 is not None) not in _ENGAGED:
+        _ENGAGED.add((rows, x8 is not None))
         logger.info(
             "NVIDIA megakernel: Qwen3.5 slot gdn_front runs at %d rows "
-            "(SGLANG_PERFLL_GDN_PIN=%d, SGLANG_PERFLL_GDN_CORE_EARLY=%d, prefetch=%d)",
+            "(SGLANG_PERFLL_GDN_PIN=%d, SGLANG_PERFLL_GDN_CORE_EARLY=%d, SGLANG_PERFLL_GDN_TRTFRONT=%d, fp8_x=%d, "
+            "prefetch=%d)",
             rows,
             front.PIN,
             core_kernel.EARLY,
-            int(prefetch),
+            trt,
+            x8 is not None,
+            int(prefetch and not trt),
         )
     attn, bound = gdn.attn, st.bound["gdn"]
     meta, pools = st.view.gdn, st.view.mamba
     li = pools.layer_ids.index(attn.layer_id)
+    if trt:
+        from sgl_nvidia_mega.qwen3_5.gdn.verify import _fused
+
+        out = x.new_empty((rows, gdn.in_proj_qkvz.weight.shape[1]))
+        ba = x.new_empty((rows, gdn.in_proj_ba.weight.shape[0]))
+        trt_front.front(
+            x,
+            x8,
+            # the method keeps the weight as the [K, N] transpose of a row-major [N, K]
+            gdn.in_proj_qkvz.weight.t(),
+            gdn.in_proj_qkvz.input_scale,
+            gdn.in_proj_qkvz.weight_scale,
+            gdn.in_proj_ba.weight,
+            attn.conv_weights,
+            pools.conv[0][li],
+            pools.intermediate_conv_window[0][li],
+            meta.state_indices[:requests],
+            out,
+            ba,
+        )
+        # convolved q | k | v, the raw z, and b / a in the front's b8 / a8 order
+        return _fused(
+            gdn,
+            out[:, :CONV_CHANNELS],
+            out[:, CONV_CHANNELS:].view(rows, attn.num_v_heads, attn.head_v_dim),
+            ba[:, attn.num_v_heads :],
+            ba[:, : attn.num_v_heads],
+            st,
+            opts,
+        )
     projected = x.new_empty((rows, 2560))
     conv = x.new_empty((rows, CONV_CHANNELS))
     ba = x.new_empty((rows, 16))

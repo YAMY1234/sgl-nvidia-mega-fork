@@ -199,6 +199,7 @@ class Qwen35Verify:
                     "NVIDIA megakernel: slot gdn_front cannot run: "
                     + "; ".join(reasons)
                 )
+            front.prepare(self.lm, view.mamba)
         skv2 = any(s.skv2 for s in self.slots.values())
         mka = any(s.mka for s in self.slots.values())
         if skv2 or mka:

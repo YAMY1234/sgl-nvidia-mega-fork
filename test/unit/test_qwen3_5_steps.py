@@ -1190,6 +1190,151 @@ def test_the_gdn_front_leaves_out_its_l2_prefetch_ahead_of_a_pinned_or_early_cor
         assert front.step(gdn, torch.zeros(rows, 4096, dtype=torch.bfloat16), st, opts) == "fused"
     assert seen["prefetch"] is prefetch
 
+@pytest.mark.parametrize("trt, rows, wants", [(False, 7, False), (True, 7, True), (True, 14, False)])
+def test_the_hop_quantizes_a_gdn_layers_input_for_the_trt_front_only(trt, rows, wants):
+    """Slot hop_fp8 writes a GDN layer's E4M3 input under slot gdn_front only for the TensorRT-LLM
+    one-request front (SGLANG_PERFLL_GDN_TRTFRONT), with in_proj_qkvz's static input scale."""
+    from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
+
+    from sgl_nvidia_mega.qwen3_5 import lowm as lowm_mod
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    scale = torch.ones(1)
+    layer = Qwen3_5LinearDecoderLayer.__new__(Qwen3_5LinearDecoderLayer)
+    object.__setattr__(layer, "linear_attn", SimpleNamespace(in_proj_qkvz=SimpleNamespace(input_scale=scale)))
+    st = SimpleNamespace(slots=SimpleNamespace(hop_fp8=True, gdn_verify=True, gdn_front=True))
+    with patch.object(trt_front, "ENABLED", trt):
+        got = lowm_mod.layer_input_fp8_scale(layer, st, rows)
+    assert (got is scale) if wants else got is None
+
+
+@pytest.mark.parametrize(
+    "trt, hop_fp8, rows, core",
+    [(True, True, 7, True), (True, False, 7, True), (True, True, 14, True), (True, True, 7, False), (False, True, 7, True)],
+)
+def test_the_trt_gdn_front_runs_one_request_ahead_of_slot_gdn_core(trt, hop_fp8, rows, core):
+    """With SGLANG_PERFLL_GDN_TRTFRONT one request in front of slot gdn_core takes TensorRT-LLM's
+    in_proj launch, on the hop's E4M3 rows where it wrote them (BF16 rows otherwise): the raw
+    [N, K] in_proj_qkvz weight, the layer's conv pools and the step's state index; the core
+    reads the convolved q / k / v and the raw z of its one output, and b / a from the other.
+    Past one request, or without the core, the front runs."""
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5 import lowm as lowm_mod
+    from sgl_nvidia_mega.qwen3_5.gdn import front, verify
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front as kernel
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    log = _log()
+    gdn, st = _gdn_front_setup(log)
+    k = log.known
+    gdn.in_proj_qkvz.weight = torch.zeros(2560, 4096, dtype=torch.float8_e4m3fn).t()
+    st.slots = SimpleNamespace(hop_fp8=hop_fp8)
+    x = k["x"] if rows == 7 else torch.zeros(rows, 4096, dtype=torch.bfloat16)
+    x8 = torch.zeros(7, 4096, dtype=torch.float8_e4m3fn)
+    seen = {}
+    opts = msgspec.structs.replace(verify.SLOT_PDL, core=core)
+    with (
+        patch.object(trt_front, "ENABLED", trt),
+        patch.object(trt_front, "front", lambda *args: seen.update(trt=args)),
+        patch.object(kernel, "front", lambda *args, **kw: seen.update(front=kw)),
+        patch.object(lowm_mod, "take_fp8", lambda st_, x_: x8 if x_ is x else None),
+        patch.object(verify, "_fused", lambda *args: seen.update(fused=args) or "fused"),
+    ):
+        try:
+            front.step(gdn, x, st, opts)
+        except Exception:
+            assert not core  # the stock tail of the mock layer
+    if not (trt and rows == 7 and core):
+        assert "trt" not in seen and "front" in seen
+        return
+    assert "front" not in seen
+    args = seen["trt"]
+    assert args[0] is x and args[1] is (x8 if hop_fp8 else None)
+    w = args[2]
+    assert w.shape == (2560, 4096) and w.stride() == (4096, 1)
+    assert tuple(map(log.tag, args[3:10])) == (
+        "in_s(1,)",
+        "in_ws(1,)",
+        "ba_w(16, 4096)",
+        "conv_w(1536, 4)",
+        "conv2(3, 1536, 3)",
+        "window2(3, 7, 1536, 3)",
+        "states(1,)",
+    )
+    out, ba = args[10], args[11]
+    assert out.shape == (7, 2560) and ba.shape == (7, 16)
+    _, qkv, z, a, b, *_ = seen["fused"]
+    assert qkv.data_ptr() == out.data_ptr() and qkv.shape == (7, 1536) and qkv.stride() == (2560, 1)
+    assert z.data_ptr() == out[:, 1536:].data_ptr() and z.shape == (7, 8, 128) and z.stride() == (2560, 128, 1)
+    assert a.data_ptr() == ba[:, 8:].data_ptr() and b.data_ptr() == ba.data_ptr() and a.shape == b.shape == (7, 8)
+
+
+def test_the_trt_gdn_front_prepares_on_the_first_gdn_layers_pools():
+    """``front.prepare`` (the executor's first covered step, before any capture) compiles the
+    TensorRT-LLM front on a GDN layer's weights and its pools' layouts; nothing without the switch."""
+    from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
+
+    from sgl_nvidia_mega.qwen3_5.gdn import front
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    log = _log()
+    gdn, st = _gdn_front_setup(log)
+    gdn.in_proj_qkvz.weight = torch.zeros(2560, 4096, dtype=torch.float8_e4m3fn).t()
+    layer = Qwen3_5LinearDecoderLayer.__new__(Qwen3_5LinearDecoderLayer)
+    object.__setattr__(layer, "linear_attn", gdn)
+    lm = SimpleNamespace(model=SimpleNamespace(start_layer=1, end_layer=3, layers=[None, SimpleNamespace(), layer]))
+    seen = []
+    for enabled in (False, True):
+        with (
+            patch.object(trt_front, "ENABLED", enabled),
+            patch.object(trt_front, "prepare", lambda *args: seen.append(args)),
+        ):
+            front.prepare(lm, st.view.mamba)
+    assert len(seen) == 1 and seen[0][:2] == (2560, 16)
+    assert tuple(map(log.tag, seen[0][2:])) == ("conv_w(1536, 4)", "conv2(3, 1536, 3)", "window2(3, 7, 1536, 3)")
+
+
+@pytest.mark.parametrize("qkvz, ba, d, tactic_fp8, tactic_quant", [
+    (2560, 16, 1536, (16, 2, 1, True, 2), (16, 4, 1, True, 1)),
+    (1280, 8, 768, (16, 2, 1, True, 1), (16, 2, 1, True, 1)),
+])
+def test_trt_lowm_takes_trts_gdn_tactics_and_refuses_an_unprepared_launch(qkvz, ba, d, tactic_fp8, tactic_quant):
+    """The TensorRT-LLM front's launches at TP8 / TP16 are those of TensorRT-LLM's GDN mixer
+    (mixed8 on E4M3 rows, mixed on BF16 rows: k_warps, n_tiles, ksplit, swap_ab, min_blocks;
+    the BF16 segment one tile a CTA), PDL with the early trigger; ``trt_lowm`` refuses to compile
+    inside a capture and to launch what was not prepared."""
+    from sgl_nvidia_mega.qwen3_5.sm103 import trt_lowm
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    conv_w = torch.zeros(d, 4, dtype=torch.bfloat16)
+    state = torch.zeros(3, d, 3, dtype=torch.bfloat16)
+    windows = torch.zeros(3, d, 9, dtype=torch.bfloat16).as_strided((3, 7, d, 3), (d * 9, 1, 9, 1))
+    for act, tactic in (("fp8", tactic_fp8), ("quant", tactic_quant)):
+        s = trt_front.spec(act, qkvz, ba, conv_w, state, windows)
+        assert (s.k_warps, s.n_tiles, s.ksplit, s.swap_ab, s.min_blocks) == tactic
+        assert (s.n_fp8, s.n_bf16, s.n_tiles_bf16, s.fp8_act) == (qkvz, ba, 1, act)
+        assert (s.n_out, s.n_out2, s.conv_channels, s.conv_tokens, s.conv_write_state) == (qkvz, ba, d, 7, True)
+        assert (s.a16_stride, s.a8_stride) == (4096, 4096 if act == "fp8" else 0)
+        assert s.use_pdl and s.early_trigger and not s.release_after_wait and not s.unsafe_skip_wait
+        assert s.conv_shapes[3] == ((3, 7, d, 3), (d * 9, 1, 9, 1))
+    with pytest.raises(RuntimeError, match="not prepared"):
+        trt_lowm.run(s, out=torch.zeros(7, qkvz, dtype=torch.bfloat16))
+    with patch.object(torch.cuda, "is_current_stream_capturing", lambda: True):
+        with pytest.raises(RuntimeError, match="before graph capture"):
+            trt_lowm.prepare(s)
+
+
+def test_sglangs_verify_intermediate_rows_are_the_batch_rows(monkeypatch):
+    """The TensorRT-LLM front writes a request's conv windows at its batch row, as SGLang's
+    target verify indexes them (verify_intermediate_state_indices: request r, row r)."""
+    from sglang.srt.layers.attention.linear import utils
+    from sglang.srt.utils import common
+
+    monkeypatch.setattr(common, "get_eager_max_batch_size", lambda n: n)
+    assert utils.build_verify_intermediate_state_indices(8, "cpu").tolist() == list(range(8))
+
+
 @pytest.mark.parametrize("front_slot", [False, True])
 def test_the_gdn_step_runs_the_front_where_the_plan_gives_it(monkeypatch, front_slot):
     from sgl_nvidia_mega.qwen3_5 import gdn

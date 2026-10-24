@@ -24,6 +24,14 @@ checked bit for bit against that branch on the same inputs, not here):
   on its own projected rows; a padded request leaves the state and windows alone; graph
   replays equal eager launches;
 - its gated norm writing static FP8, bit for bit slot gdn_verify's.
+
+And TensorRT-LLM r3's own in_proj front (SGLANG_PERFLL_GDN_TRTFRONT, ``sm103/gdn/trt_front.py``; numeric) at the
+TP8 and TP16 shapes, on the hop's E4M3 rows and on BF16 rows: its q / k / v rows (read back from the windows it
+writes) and z against fp64 on the same operands, at most 1.05 x the mean relative L2 and 2 x the max abs error of
+SGLang's ops, b / a likewise; its conv output, rolling state and windows bit for bit ``causal_conv1d_update``'s on
+those rows; a padded request leaves the pools alone; it reads its rows and state index only after its PDL wait (a
+producer that releases it at entry and writes them late; the wait-less build as the positive control); graph
+replays equal eager launches, and a launch that was not prepared is refused inside a capture.
 """
 
 import pytest
@@ -780,3 +788,251 @@ def test_front_norm_is_slot_gdn_verifys():
     norm(core, z, weight, scale, quant, rstd, 1e-6)
     want = rms_norm_gated_fp8(core, weight, 1e-6, z, scale, activation="silu")
     assert torch.equal(quant.view(torch.uint8), want.view(torch.uint8).view(-1, V))
+
+
+# --------------------------------------------- TensorRT-LLM's in_proj front (TRTFRONT)
+
+TRT_HEADS = {8: (2, 8), 16: (1, 4)}  # (H, HV) per rank at TP8 / TP16
+
+
+def _trt_operands(seed, tp=8, pad=False):
+    """One request of 7 rows at TP ``tp``: the operands of ``trt_front.front`` (the pools as
+    in ``_front_operands``; ``pad`` gives the request the pad state index -1)."""
+    h, hv = TRT_HEADS[tp]
+    d = 2 * h * K + hv * V
+    g = torch.Generator(device="cuda").manual_seed(seed)
+
+    def rand(*shape, scale=1.0):
+        return torch.randn(*shape, device="cuda", generator=g) * scale
+
+    phys = rand(FRONT_SLOTS, d, 9).to(torch.bfloat16)
+    return dict(
+        d=d,
+        x=rand(DRAFT, 4096).to(torch.bfloat16),
+        w=rand(d + hv * V, 4096, scale=0.05).clamp(-440, 440).to(torch.float8_e4m3fn),
+        sx=torch.tensor([0.01], device="cuda"),
+        sw=torch.tensor([0.002], device="cuda"),
+        ba_w=rand(2 * hv, 4096, scale=0.02).to(torch.bfloat16),
+        conv_w=rand(d, WIDTH, scale=0.5).to(torch.bfloat16),
+        state=rand(FRONT_SLOTS, d, WIDTH - 1).to(torch.bfloat16),
+        phys=phys,
+        windows=phys.as_strided((FRONT_SLOTS, DRAFT, d, WIDTH - 1), (d * 9, 1, 9, 1)),
+        states=torch.tensor([-1 if pad else FRONT_STATES[0]], dtype=torch.int32, device="cuda"),
+    )
+
+
+def _trt_outputs(o):
+    return dict(
+        out=torch.empty(DRAFT, o["w"].shape[0], dtype=torch.bfloat16, device="cuda"),
+        ba=torch.empty(DRAFT, o["ba_w"].shape[0], dtype=torch.bfloat16, device="cuda"),
+    )
+
+
+def _run_trt_front(o, x8, outs, x=None):
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    trt_front.prepare(o["w"].shape[0], o["ba_w"].shape[0], o["conv_w"], o["state"], o["windows"])
+    trt_front.front(
+        o["x"] if x is None else x,
+        x8,
+        o["w"],
+        o["sx"],
+        o["sw"],
+        o["ba_w"],
+        o["conv_w"],
+        o["state"],
+        o["windows"],
+        o["states"],
+        outs["out"],
+        outs["ba"],
+    )
+
+
+@pytest.mark.parametrize("act", ["fp8", "quant"])
+@pytest.mark.parametrize("tp", [8, 16])
+def test_trt_front_holds_its_projections_to_fp64_and_its_conv_is_sglangs(tp, act):
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
+    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+    from sglang.srt.layers.quantization.fp8_utils import flashinfer_bmm_fp8
+
+    errors = {n: [] for n in ("qkvz", "qkvz_stock", "ba", "ba_stock")}
+    for seed in range(3):
+        o = _trt_operands(60 + seed, tp)
+        d = o["d"]
+        state0, phys0 = o["state"].clone(), o["phys"].clone()
+        xq, _ = static_quant_fp8(o["x"], o["sx"], repeat_scale=False)
+        outs = _trt_outputs(o)
+        _run_trt_front(o, xq if act == "fp8" else None, outs)
+        torch.cuda.synchronize()
+        # the BF16 q / k / v rows the conv took: window row 0 holds 2 state columns, then the 7 rows
+        qkv = o["phys"][0, :, 2:].t()
+        projected = torch.cat([qkv, outs["out"][:, d:]], dim=1)
+        ref = (xq.double() @ o["w"].double().t()) * (o["sx"].double() * o["sw"].double())
+        stock = flashinfer_bmm_fp8(xq, o["w"].t(), o["sx"], o["sw"], torch.bfloat16)
+        errors["qkvz"].append(_errors(projected, ref))
+        errors["qkvz_stock"].append(_errors(stock, ref))
+        ref = o["x"].double() @ o["ba_w"].double().t()
+        errors["ba"].append(_errors(outs["ba"], ref))
+        errors["ba_stock"].append(_errors(o["x"] @ o["ba_w"].t(), ref))
+        # the conv on those rows, as SGLang's update (windows at intermediate row 0)
+        state, phys = state0.clone(), phys0.clone()
+        windows = phys.as_strided(o["windows"].shape, o["windows"].stride())
+        want = causal_conv1d_update(
+            qkv.contiguous().view(1, DRAFT, d).transpose(1, 2),
+            state,
+            o["conv_w"],
+            None,
+            "silu",
+            conv_state_indices=o["states"],
+            intermediate_conv_window=windows,
+            intermediate_state_indices=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        )
+        assert torch.equal(outs["out"][:, :d], want.transpose(1, 2).reshape(DRAFT, d))
+        assert torch.equal(o["state"], state) and torch.equal(o["phys"], phys)
+    e = {n: torch.tensor(v, dtype=torch.float64) for n, v in errors.items()}
+    print(
+        f"T0 trt_front tp{tp} {act} qkvz mean rel-L2 {e['qkvz'][:, 0].mean():.4g} vs stock "
+        f"{e['qkvz_stock'][:, 0].mean():.4g}, max abs {e['qkvz'][:, 1].max():.4g} vs "
+        f"{e['qkvz_stock'][:, 1].max():.4g}; ba {e['ba'][:, 0].mean():.4g} vs "
+        f"{e['ba_stock'][:, 0].mean():.4g}, {e['ba'][:, 1].max():.4g} vs "
+        f"{e['ba_stock'][:, 1].max():.4g}",
+        flush=True,
+    )
+    for name in ("qkvz", "ba"):
+        got, stock = e[name], e[f"{name}_stock"]
+        assert got[:, 0].mean() <= 1.05 * stock[:, 0].mean(), name
+        assert got[:, 1].max() <= 2 * stock[:, 1].max(), name
+
+
+@pytest.mark.parametrize("tp", [8, 16])
+def test_trt_front_leaves_a_padded_requests_pools_alone(tp):
+    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+
+    o = _trt_operands(65, tp, pad=True)
+    state0, phys0 = o["state"].clone(), o["phys"].clone()
+    _run_trt_front(o, static_quant_fp8(o["x"], o["sx"], repeat_scale=False)[0], _trt_outputs(o))
+    torch.cuda.synchronize()
+    assert torch.equal(o["state"], state0) and torch.equal(o["phys"], phys0)
+
+
+_LATE_PRODUCER = r"""
+extern "C" __global__ void late_producer(const uint4* src, uint4* dst, int n16, const int* slot_src,
+                                         int* slot_dst, unsigned long long delay_ns) {
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  unsigned long long t0, t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  do {
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  } while (t - t0 < delay_ns);
+  for (int i = threadIdx.x; i < n16; i += blockDim.x) dst[i] = src[i];
+  if (threadIdx.x == 0) *slot_dst = *slot_src;
+}
+"""
+
+
+def test_trt_front_reads_its_rows_and_state_index_after_its_pdl_wait():
+    """A producer that releases its dependents at entry and writes the front's BF16 / E4M3
+    rows and its state index 20 ms later (well past the host's launch of the front): the
+    front's outputs and pools are those of the written inputs. The build without the wait
+    (TensorRT-LLM's positive control) reads the stale ones."""
+    import ctypes
+
+    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+
+    from sgl_nvidia_mega.common import jit
+    from sgl_nvidia_mega.qwen3_5.sm103 import trt_lowm
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    major, minor = torch.cuda.get_device_capability()
+    cubin = jit.compile_source(_LATE_PRODUCER, "late_producer", f"sm_{major}{minor}a", ("-std=c++17",))
+    producer = jit.load(cubin, "late_producer", (256, 1, 1), 0)
+    o = _trt_operands(66)
+    xq = static_quant_fp8(o["x"], o["sx"], repeat_scale=False)[0]
+    # the inputs as one buffer: BF16 rows, E4M3 rows, and the state index
+    nx = o["x"].numel() * 2
+    src = torch.cat([o["x"].view(torch.uint8).flatten(), xq.view(torch.uint8).flatten()])
+    dst = torch.zeros_like(src)
+    x, x8 = dst[:nx].view(torch.bfloat16).view(DRAFT, 4096), dst[nx:].view(torch.float8_e4m3fn).view(DRAFT, 4096)
+    slot_src, slot = o["states"].clone(), torch.tensor([FRONT_STATES[1]], dtype=torch.int32, device="cuda")
+    o["states"] = slot
+    start = {n: o[n].clone() for n in ("state", "phys")}
+    # both builds launched once first (a first launch loads the module: slower than the producer's delay)
+    _run_trt_front(o, x8, _trt_outputs(o), x=x)
+    skip = trt_front._SPECS["fp8", o["w"].shape[0]]._replace(unsafe_skip_wait=True)
+    trt_lowm.prepare(skip)
+
+    def run_skip(outs):
+        trt_lowm.run(skip, out=outs["out"], out2=outs["ba"], x16=x, x8=x8, w_fp8=o["w"], weight_scale=o["sw"],
+                     input_scale=o["sx"], w_bf16=o["ba_w"], conv=(o["conv_w"], o["state"], slot, o["windows"]))
+
+    run_skip(_trt_outputs(o))
+    torch.cuda.synchronize()
+    want = None
+    for late, skip_wait in ((False, False), (True, False), (True, True)):
+        for n, t in start.items():
+            o[n].copy_(t)
+        dst.zero_()
+        slot.fill_(FRONT_STATES[1])
+        outs = _trt_outputs(o)
+        torch.cuda.synchronize()
+        args = [ctypes.c_void_p(src.data_ptr()), ctypes.c_void_p(dst.data_ptr()), ctypes.c_int(src.numel() // 16),
+                ctypes.c_void_p(slot_src.data_ptr()), ctypes.c_void_p(slot.data_ptr()),
+                ctypes.c_ulonglong(20_000_000 if late else 0)]
+        jit.launch(producer, (1, 1, 1), args, torch.cuda.current_stream().cuda_stream)
+        if not late:
+            torch.cuda.synchronize()
+        if skip_wait:
+            run_skip(outs)
+        else:
+            _run_trt_front(o, x8, outs, x=x)
+        torch.cuda.synchronize()
+        got = {**outs, "state": o["state"].clone(), "phys": o["phys"].clone()}
+        if want is None:
+            want = got
+        elif skip_wait:
+            assert not all(torch.equal(t, want[n]) for n, t in got.items())
+        else:
+            for n, t in got.items():
+                assert torch.equal(t, want[n]), n
+
+
+def test_trt_front_replays_from_a_cuda_graph_and_never_compiles_in_one():
+    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+
+    from sgl_nvidia_mega.qwen3_5.sm103 import trt_lowm
+
+    o = _trt_operands(67)
+    x8 = static_quant_fp8(o["x"], o["sx"], repeat_scale=False)[0]
+    pools = ("state", "phys")
+    start = {n: o[n].clone() for n in pools}
+    outs = _trt_outputs(o)
+    _run_trt_front(o, x8, outs)  # prepare (compile) and run outside capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_trt_front(o, x8, outs)
+    for seed in (68, 69):
+        fresh = _trt_operands(seed)
+        o["x"].copy_(fresh["x"])
+        x8.copy_(static_quant_fp8(o["x"], o["sx"], repeat_scale=False)[0])
+        for n in pools:
+            o[n].copy_(start[n])
+        graph.replay()
+        torch.cuda.synchronize()
+        got = {n: t.clone() for n, t in outs.items()}
+        got.update({n: o[n].clone() for n in pools})
+        for n in pools:
+            o[n].copy_(start[n])
+        _run_trt_front(o, x8, outs)
+        torch.cuda.synchronize()
+        for n, t in outs.items():
+            assert torch.equal(got[n], t), n
+        for n in pools:
+            assert torch.equal(got[n], o[n]), n
+    # a launch that was not prepared is refused inside a capture, not compiled there
+    unprepared = trt_lowm.spec(m=DRAFT, k=4096, n_bf16=16, tactic_bf16=(8, 1))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        with pytest.raises(RuntimeError, match="before graph capture"):
+            trt_lowm.prepare(unprepared)
+        with pytest.raises(RuntimeError, match="not prepared"):
+            trt_lowm.run(unprepared, out=outs["ba"], x16=o["x"], w_bf16=o["ba_w"])

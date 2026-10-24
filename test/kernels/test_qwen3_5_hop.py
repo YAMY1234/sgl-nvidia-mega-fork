@@ -236,6 +236,38 @@ def test_pins_and_early_releases_keep_the_bits(rank, pair):
         torch.cuda.synchronize()
 
 
+def test_identity_rows_registry_keeps_its_buffers(rank):
+    """route.build registers an identity row map and route.build_m32 replaces it: the dropped buffer must stay
+    allocated, or a later tensor at its address (an EP routing table) has its rows read as the identity map (the
+    finalize's own test: a contiguous tensor whose address is registered with at least its length)."""
+    import gc
+
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop as H
+
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    n = MAX_M * TOP_K
+    perm = torch.arange(n, dtype=torch.int32, device=device).flip(0).contiguous()
+    rows = torch.arange(n, dtype=torch.int32, device=device)
+    H.register_identity_rows(rows)
+    ptr = rows.data_ptr()
+    del rows
+    gc.collect()
+    later = [torch.empty_like(perm) for _ in range(8)]
+    reused = any(t.data_ptr() == ptr for t in later)
+    alive = any(
+        b.get("address") == ptr and b["state"] == "active_allocated"
+        for seg in torch.cuda.memory_snapshot()
+        for b in seg["blocks"]
+    )
+    if not reused and not alive:
+        pytest.skip(f"the allocator gave the dropped buffer's address {ptr:#x} to none of 8 new tensors")
+    for t in later:
+        t.copy_(perm)
+        identity = t.is_contiguous() and H._IDENTITY_ROWS.get(t.data_ptr(), 0) >= t.numel()
+        assert not identity, f"a tensor at {t.data_ptr():#x}, a dropped identity buffer's address, reads as the identity map"
+    torch.cuda.synchronize()
+
+
 def test_two_shot_hop_matches_flashinfer_fusion(rank, pair):
     """Past the one-shot rows the hop runs FlashInfer's BT protocol in one launch: the
     all-reduce past 15 rows and the finalize past 23, bit for bit (the finalize's 16-23 rows

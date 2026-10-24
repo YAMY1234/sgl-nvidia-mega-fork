@@ -215,6 +215,68 @@ def test_extend_exchange_nan_rules(ranks, boundary, nan_key):
         assert int(topk_index) == want
 
 
+def test_extend_mkd_head_is_the_scan_path(ranks, boundary, monkeypatch):
+    """SGLANG_PERFDRAFT_EXTEND_MKD_HEAD: the one-request extend's head as a draft step's (the
+    MKD head, the next draft's hidden partial on the side stream, the exchange on the head's
+    per-CTA maxima) gives the shard logits, the token and the next draft's fc of the shard
+    GEMV + logits scan + serial partial bit for bit, eager and replayed from a CUDA graph."""
+    from sgl_nvidia_mega.qwen3_5.draft import xchg as boundary_mod
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, cpu_group = ranks
+    mkd, _ = boundary
+    monkeypatch.setattr(boundary_mod, "EXTEND_MKD_HEAD", True)
+
+    def scan_path(x):
+        logits = torch.empty(1, VOCAB, dtype=torch.bfloat16, device="cuda")
+        part = torch.zeros(mkd.head_part.numel(), dtype=torch.int32, device="cuda")
+        kernels.mkd_draft_head(x, mkd.lm_head_weight, logits, part)
+        mkd.note_draft_input()
+        _, ti = mkd.exchange_extend(logits, x)
+        return [logits, ti.clone(), mkd.fc_buf.clone()]
+
+    def head_path(x):
+        logits = mkd.extend_head(x)
+        assert logits is not None
+        mkd.note_draft_input()
+        _, ti = mkd.exchange_extend(logits, x, mkd_head=True)
+        return [logits, ti.clone(), mkd.fc_buf.clone()]
+
+    def same(got, want):
+        assert torch.equal(got[0].view(torch.int16), want[0].view(torch.int16))
+        assert int(got[1]) == int(want[1]) == _want_token(want[0], group, -1e30)
+        assert torch.equal(got[2].view(torch.int16), want[2].view(torch.int16))
+
+    with torch.inference_mode():
+        rows = [_randn(1, H, g=_gen(7300 + s)) for s in range(4)]
+        for x in rows:
+            want = scan_path(x)
+            got = head_path(x)
+            torch.cuda.synchronize()
+            same(got, want)
+        dist.barrier(group=cpu_group)
+        static = rows[0].clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            head_path(static)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = head_path(static)
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        for x in rows:
+            want = scan_path(x)
+            static.copy_(x)
+            graph.replay()
+            torch.cuda.synchronize()
+            same(captured, want)
+            dist.barrier(group=cpu_group)
+
+
 @pytest.mark.parametrize("m", [1, 2, 7])
 def test_split_fc_gathers_and_sums_in_rank_order(ranks, boundary, m):
     from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels

@@ -103,6 +103,13 @@ class DraftExtend:
         # copies at the end of the graph
         selected = torch.index_select(hidden, 0, io.select_index, out=io.hidden_out)
         if mkd is not None:
+            # SGLANG_PERFDRAFT_EXTEND_MKD_HEAD: the head as a draft step's (MKD head + side-stream partial)
+            local = mkd.extend_head(selected)
+            if local is not None:
+                mkd.exchange_extend(
+                    local, selected, io.topk_index_out, io.topk_p_out, mkd_head=True
+                )
+                return
             local = layer.lm_head(parts, selected, "draft_extend")
             mkd.exchange_extend(local, selected, io.topk_index_out, io.topk_p_out)
         else:

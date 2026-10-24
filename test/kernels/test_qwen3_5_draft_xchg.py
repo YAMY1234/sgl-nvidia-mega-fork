@@ -273,7 +273,7 @@ def _gather_ordered_sum(mkd, partial, world):
     return kernels.ordered_partial_sum(mkd._fc_gather(partial), world, out)
 
 
-@pytest.mark.parametrize("m", [1, 2, 7, 16])
+@pytest.mark.parametrize("m", [1, 2, 4, 7, 8, 14, 16])
 def test_fc_allsum_is_the_gather_and_ordered_sum(ranks, boundary, allsum, m):
     """SGLANG_PERFLL_DRAFT_FC_SUM: one launch gives FcGather + ordered_partial_sum's rows bit
     for bit, -0.0 sums included, over calls that visit every stage twice."""

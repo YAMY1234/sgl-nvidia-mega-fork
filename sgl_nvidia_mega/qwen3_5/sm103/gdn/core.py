@@ -31,9 +31,10 @@ SOURCE = Path(__file__).parent / "src" / "core.cu"
 THREADS, K, V, RING, MAX_ROWS_PER_REQUEST = 128, 128, 128, 16, 8
 # the committed history before the PDL wait (EARLY_HIST), for grids of one CTA an SM
 EARLY = os.environ.get("SGLANG_PERFLL_GDN_CORE_EARLY", "0") == "1"
-# A/Bs: the core releases its dependents at entry also before FlashInfer's out_proj BMM (cuBLASLt launches its
-# nvjet kernel as a programmatic dependent, which waits before reading its input)
-RELEASE_BMM = os.environ.get("SGLANG_PERFLL_GDN_CORE_RELEASE", "0") == "1"
+# SGLANG_PERFLL_GDN_CORE_RELEASE=<rows>: from that many rows up the core releases its dependents at entry also before
+# FlashInfer's out_proj BMM (cuBLASLt launches its nvjet kernel as a programmatic dependent, which waits before reading
+# its input); 1: every width, 0: off
+RELEASE_MIN_ROWS = int(os.environ.get("SGLANG_PERFLL_GDN_CORE_RELEASE", "0") or 0)
 
 
 class Params(ctypes.Structure):

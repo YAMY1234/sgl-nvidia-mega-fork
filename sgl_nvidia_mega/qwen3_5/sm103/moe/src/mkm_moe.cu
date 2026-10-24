@@ -228,6 +228,12 @@ constexpr int kARow = 132;  // FC1 accumulator row stride in floats: 16 B aligne
 #ifndef EARLY_PF_NS
 #define EARLY_PF_NS 5000
 #endif
+#ifndef EARLY_PF_STATS  // 1 (measurement): count, in q35_mkm_early_stats, the early polls that read a full row [0], the
+#define EARLY_PF_STATS 0  // timeouts [1], and the pairs whose early expert differs from the routed one [2] (of [3] routed)
+#endif
+#if EARLY_PF_STATS
+__device__ unsigned long long q35_mkm_early_stats[4];
+#endif
 #ifndef PACE_D  // > 0: the producer issues stage st only once stage st - PACE_D has landed (bounded bytes in flight)
 #define PACE_D 0
 #endif  // partial row stride in floats: 16 B aligned, rows land on distinct banks
@@ -712,6 +718,7 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
   // and starts this pair's weight stream at once (a duplicate pair only wastes its first ring fill, mostly L2 hits)
   const int rtok = warp == 1 ? my_t : (warp == 0 ? 0 : warp - 1);
   uint32_t key = 0;
+  int early_e = -1;
   if (EARLY_PF && warp == 1) {
     // the logits may still be in flight: poll this token's row for the sentinel, then prefetch (a hint only)
     const uint4* src = reinterpret_cast<const uint4*>(p.logits + (size_t)my_t * kE + lane * 16);
@@ -742,6 +749,7 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
       const uint32_t k = TOPK_RANK ? warp_top10(keys, (uint32_t)lane, s.cand[warp]) : warp_top10_redux(keys, (uint32_t)lane, s.cand[warp]);
       uint32_t bits, e;
       topk_unkey(__shfl_sync(0xffffffffu, k, my_k), bits, e);
+      early_e = (int)e;
       if (lane == 0) {
         for (int st = 0; st < SPEC_STAGES && st < kFc1Stages; ++st) {
           asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" ::"l"(&tm13),
@@ -754,6 +762,9 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
       }
       __syncwarp();
     }
+#if EARLY_PF_STATS
+    if (lane == 0 && rank == 0) atomicAdd(&q35_mkm_early_stats[ready ? 0 : 1], 1ull);
+#endif
   }
   asm volatile("griddepcontrol.wait;" ::: "memory");
   if (threadIdx.x == 32) stamp(p, 10);
@@ -789,6 +800,12 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
     }
     mbar_wait(&s.route_done, 0);
     e = s.expert;
+#if EARLY_PF_STATS
+    if (lane == 0 && rank == 0 && e >= 0) {
+      atomicAdd(&q35_mkm_early_stats[3], 1ull);
+      if (early_e >= 0 && early_e != e) atomicAdd(&q35_mkm_early_stats[2], 1ull);
+    }
+#endif
   } else {
     if (rtok < p.num_tokens) {
       uint32_t bits, expert;

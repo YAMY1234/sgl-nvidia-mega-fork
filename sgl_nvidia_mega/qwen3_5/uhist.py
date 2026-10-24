@@ -111,6 +111,25 @@ def join() -> None:
         _STATE["pending"] = False
 
 
+def _early_stats(dev: int):
+    """The 7-row mkm engine's EARLY_PF_STATS counters [ready, timeout, mismatch, routed], or None."""
+    try:
+        from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm as mk
+
+        cu = jit.driver()
+        fn = mk._kernel(dev, 128, mk.MAX_TOKENS).function
+        (module,) = jit.check(cu.cuFuncGetModule(fn), "cuFuncGetModule")
+        res = cu.cuModuleGetGlobal(module, b"q35_mkm_early_stats")
+        if int(res[0]) != 0:
+            return None
+        ptr = int(res[1])
+        buf = (ctypes.c_ulonglong * 4)()
+        jit.check(cu.cuMemcpyDtoH(ctypes.addressof(buf), ptr, 32), "cuMemcpyDtoH")
+        return dict(zip(("ready", "timeout", "mismatch", "routed"), [int(x) for x in buf]))
+    except Exception:
+        return None
+
+
 def _dumper(dev: int) -> None:
     flag, last = os.path.join(DIR, "dump-now"), None
     while True:
@@ -132,6 +151,9 @@ def _dumper(dev: int) -> None:
             s.synchronize()
             h = host.view(_MAX_LAYERS, _ROW).tolist()
             out = {str(i): {str(u): c for u, c in enumerate(row) if c} for i, row in enumerate(h) if any(row)}
+            early = _early_stats(dev)
+            if early is not None:
+                out["mkm_early_stats"] = early
             path = os.path.join(DIR, f"uhist-r{rank}-{os.getpid()}.json")
             with open(path + ".tmp", "w") as f:
                 json.dump(out, f)

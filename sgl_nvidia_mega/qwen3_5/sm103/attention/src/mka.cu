@@ -244,6 +244,7 @@ __device__ __forceinline__ void mka_prologue_kernel(const ProParams p) {
   if (!needs_norm && !is_gate) kvs = __ldg(p.v_scale);
 
   pdl_wait();
+  // Keep this release after the wait: q35mka_gate reads x (the hop's output) before its own wait.
   if (kEarlyTrigger) pdl_trigger();
   const float inv_sx = div_full(1.0f, sx);
   const float alpha = __fmul_rn(sx, sw);

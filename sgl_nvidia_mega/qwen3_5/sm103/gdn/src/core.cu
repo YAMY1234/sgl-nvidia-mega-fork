@@ -15,7 +15,8 @@
 //
 // PDL: before griddepcontrol.wait the kernel reads only data of earlier steps or static data (indices,
 // ring cursors, the checkpoint rows, A_log / dt_bias / norm weight / FP8 scale); every global store
-// and every read of the step's activations (q / k / v, z, a, b) follows the wait.
+// and every read of the step's activations (q / k / v, z, a, b) follows the wait. The commit that writes the
+// ring cursors and checkpoint rows must stay out of this launch's PDL window (it runs in the previous round).
 //
 // Defines: TT (rows a request), HK / HV (key / value heads), NORM_F32 (FP32 norm weight), TRIGGER (2: release dependents at entry, 0: at exit),
 // STORE_O (also store the BF16 replay output, checks only).

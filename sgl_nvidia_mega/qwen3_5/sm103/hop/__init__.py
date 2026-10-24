@@ -50,6 +50,11 @@ WORLDS = (2, 4, 8)
 ONE_SHOT_ROWS, ONE_SHOT_FINALIZE_ROWS = 15, 23
 # A/Bs only: the one-shot finalize as before its fix (routing slots read before griddepcontrol.wait)
 FIN_PREWAIT = os.environ.get("SGLANG_PERFLL_HOP_FIN_PREWAIT", "0") == "1"
+# A/Bs: out_proj's weights held ahead of its PDL wait (ptxas sinks them below it otherwise); out_proj / the
+# finalize releasing their consume early (it reads only static data before its wait)
+PIN_OPROJ = os.environ.get("SGLANG_PERFLL_PIN_OPROJ", "0") == "1"
+OPROJ_EARLY = os.environ.get("SGLANG_PERFLL_OPROJ_EARLY", "0") == "1"
+FIN_EARLY = os.environ.get("SGLANG_PERFLL_FIN_EARLY", "0") == "1"
 # int32 0, 1, 2, ... buffers (data_ptr -> length) whose prefixes are identity row maps of a finalize
 _IDENTITY_ROWS: dict = {}
 
@@ -183,13 +188,23 @@ def headers() -> dict[str, str]:
 
 
 @cache
-def _kernels(device_index: int, deadline_ns: int) -> dict[str, jit.Kernel]:
+def _kernels(
+    device_index: int, deadline_ns: int, switches: tuple = (PIN_OPROJ, OPROJ_EARLY, FIN_EARLY)
+) -> dict[str, jit.Kernel]:
     major, minor = torch.cuda.get_device_capability(device_index)
+    pin_oproj, oproj_early, fin_early = (int(v) for v in switches)
     cubin = jit.compile_source(
         SOURCE.read_text(),
         "q35_hop",
         f"sm_{major}{minor}a",
-        ("-std=c++17", "-default-device", f"-DQ35_HOP_DEADLINE_NS={deadline_ns}ull"),
+        (
+            "-std=c++17",
+            "-default-device",
+            f"-DQ35_HOP_DEADLINE_NS={deadline_ns}ull",
+            f"-DQ35_PIN_OPROJ={pin_oproj}",
+            f"-DQ35_OPROJ_EARLY={oproj_early}",
+            f"-DQ35_FIN_EARLY={fin_early}",
+        ),
         headers(),
     )
     names = ["q35hop_publish", "q35hop_publish_fin_top10", "q35hop_publish_fin"]
@@ -254,7 +269,8 @@ class Hop:
             raise ValueError(f"the hop serves TP {WORLDS}, not {self.world}")
         self.rank = dist.get_rank(group)
         self.max_m, self.eps, self.device = int(max_m), float(eps), torch.device(device)
-        self.kernels = _kernels(self.device.index, int(deadline_s * 1e9))
+        self.deadline_ns = int(deadline_s * 1e9)
+        self.kernels = _kernels(self.device.index, self.deadline_ns)
         if symm_mem.get_backend(self.device) is None:
             # the backend FlashInfer's fusion workspace would select later in this process
             symm_mem.set_backend("NCCL")

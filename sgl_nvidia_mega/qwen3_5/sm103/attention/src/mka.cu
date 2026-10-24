@@ -33,6 +33,12 @@ constexpr int kHalfRot = 32;  // rotary_dim 64
 
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+#ifndef Q35_PIN_MKA_EPI
+#define Q35_PIN_MKA_EPI 0  // SGLANG_PERFLL_PIN_MKA_EPI: o_proj weights held ahead of the PDL wait
+#endif
+#ifndef Q35_PIN_MKA_PRO
+#define Q35_PIN_MKA_PRO 0  // SGLANG_PERFLL_PIN_MKA_PRO: the late prologue's weights held ahead of it
+#endif
 __device__ __forceinline__ void cluster_arrive_relaxed() {
   asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
 }
@@ -243,6 +249,12 @@ __device__ __forceinline__ void mka_prologue_kernel(const ProParams p) {
   if (is_k) kvs = __ldg(p.k_scale);
   if (!needs_norm && !is_gate) kvs = __ldg(p.v_scale);
 
+  if (!kEarlyTrigger && Q35_PIN_MKA_PRO) {
+    uint32_t dep = __float_as_uint(sx) ^ __float_as_uint(sw);
+#pragma unroll
+    for (int s = 0; s < 16; ++s) dep ^= a[s][0].x ^ a[s][1].x;
+    q35hop::pin_before_wait(dep, reinterpret_cast<uint64_t>(p.w));
+  }
   pdl_wait();
   // Keep this release after the wait: q35mka_gate reads x (the hop's output) before its own wait.
   if (kEarlyTrigger) pdl_trigger();
@@ -459,6 +471,12 @@ __device__ __forceinline__ void mka_epilogue_kernel(const EpiParams p) {
       for (int b = 0; b < 2; ++b) a[s][b] = ldg_nc_v4(wb + (s * 2 + b) * 32);
   }
   const float sx = __ldg(p.sx), sw = __ldg(p.sw);
+  if (Q35_PIN_MKA_EPI) {
+    uint32_t dep = __float_as_uint(sx) ^ __float_as_uint(sw);
+#pragma unroll
+    for (int s = 0; s < kSteps; ++s) dep ^= a[s][0].x ^ a[s][1].x;
+    q35hop::pin_before_wait(dep, reinterpret_cast<uint64_t>(p.w));
+  }
 
   pdl_wait();
   if (kEarlyTrigger) pdl_trigger();

@@ -358,8 +358,18 @@ typedef long long int64_t;
 #ifndef Q35_DRAFT_GEMV_K
 #define Q35_DRAFT_GEMV_K 1024
 #endif
+#ifndef Q35_PIN_DRAFT_GEMV
+#define Q35_PIN_DRAFT_GEMV 0  // SGLANG_PERFLL_PIN_DRAFT_GEMV: the row-push weights held ahead of the PDL wait
+#endif
 
 namespace q35draft_gemv {
+
+// Holds the loads named in `dep` (one word of each) ahead of griddepcontrol.wait: ptxas otherwise sinks static
+// ld.global.nc loads below it (ACQBULK). `never` is never 0 (a pointer).
+__device__ __forceinline__ void pin_before_wait(uint32_t dep, uint64_t never) {
+  asm volatile("{ .reg .pred a, b; setp.eq.u64 a, %1, 0; setp.eq.u32 b, %0, 1; and.pred a, a, b; @a trap; }"
+               :: "r"(dep), "l"(never) : "memory");
+}
 
 struct Params {
   const __nv_bfloat16* x;               // [K], written by the previous grid
@@ -490,6 +500,12 @@ __device__ __forceinline__ void mkd_gemv_rows_push_kernel(const Params& p) {
   const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(row) * kK);
 #pragma unroll
   for (int j = 0; j < kVecs; ++j) wv[j] = __ldg(wr + j * 32 + lane);
+  if (Q35_PIN_DRAFT_GEMV) {
+    uint32_t dep = 0;
+#pragma unroll
+    for (int j = 0; j < kVecs; ++j) dep ^= wv[j].x;
+    pin_before_wait(dep, reinterpret_cast<uint64_t>(p.w));
+  }
   q35hop::pdl_wait();
   for (int i = static_cast<int>(threadIdx.x); i < m * (kK / 8); i += kRows * 32) {
     uint4 xv = reinterpret_cast<const uint4*>(p.x)[i];

@@ -201,6 +201,41 @@ def test_finalize_reads_routing_after_the_wait_and_identity_rows(rank, pair):
         torch.cuda.synchronize()
 
 
+def test_pins_and_early_releases_keep_the_bits(rank, pair):
+    """SGLANG_PERFLL_PIN_OPROJ / _OPROJ_EARLY / _FIN_EARLY move only where out_proj's weight loads and the PDL
+    releases sit: out_proj's partial, its all-reduce and the one-shot finalize are the default build's bytes."""
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop as H
+    from sgl_nvidia_mega.qwen3_5.sm103.hop import pack_out_proj
+
+    _, hop = pair
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    base = hop.kernels
+    switched = H._kernels(hop.device.index, hop.deadline_ns, (True, True, True))
+    k = 1024  # out_proj's input per rank at TP8
+    scale = torch.tensor([0.05], device=device)
+    sx, sw = (torch.tensor([v], device=device) for v in (0.02, 0.01))
+    with torch.inference_mode():
+        gen = torch.Generator(device=device).manual_seed(77 + rank)
+        packed = pack_out_proj(_fp8(HIDDEN, k, device, gen, scale=0.5))
+        for i, m in enumerate((1, 2, 7)):
+            x = _fp8(m, k, device, gen)
+            ops = _operands(m, device, rank, seed=500 + i)
+            outs = []
+            for kernels in (base, switched):
+                hop.kernels = kernels
+                try:
+                    partial = hop.out_proj_push(x_fp8=x, packed_w=packed, input_scale=sx, weight_scale=sw)
+                    got = [partial.clone()]
+                    got += [t.clone() for t in hop.all_reduce_residual_rms_norm(
+                        local_contribution=partial, residual=ops["residual"], gamma=ops["gamma"])]
+                    got += [t.clone() for t in _run(hop, "finalize", ops, fp8_scale=scale)]
+                finally:
+                    hop.kernels = base
+                outs.append(got)
+            _same(outs[1], outs[0])
+        torch.cuda.synchronize()
+
+
 def test_two_shot_hop_matches_flashinfer_fusion(rank, pair):
     """Past the one-shot rows the hop runs FlashInfer's BT protocol in one launch: the
     all-reduce past 15 rows and the finalize past 23, bit for bit (the finalize's 16-23 rows

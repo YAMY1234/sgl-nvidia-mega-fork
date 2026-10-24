@@ -112,6 +112,9 @@ __device__ __forceinline__ void publish_fin_quad_prewait_kernel(const Args& a) {
 // The routing slots are read after griddepcontrol.wait: the MoE that runs right before (mkm's expert weights, the
 // router's tables) writes them, and PDL makes a predecessor's writes visible only after the wait. A null `permuted`
 // is the identity (row token * top_k + k): then the routed rows are requested at once, with the weights.
+#ifndef Q35_FIN_EARLY
+#define Q35_FIN_EARLY 0  // SGLANG_PERFLL_FIN_EARLY: the consume released at entry
+#endif
 template <int TOPK>
 __device__ __forceinline__ void publish_fin_quad_kernel(const Args& a) {
   constexpr int kSlots = TOPK > 0 ? TOPK : kMaxTopK;
@@ -119,6 +122,7 @@ __device__ __forceinline__ void publish_fin_quad_kernel(const Args& a) {
   const int token = blockIdx.x;
   const int quad = blockIdx.y * kRowThreads + threadIdx.x;
   const size_t col = static_cast<size_t>(quad) * 4;
+  if (Q35_FIN_EARLY) pdl_trigger();  // the consume reads only static data before its wait
   pdl_wait();
   const uint32_t stage = stage_peek(a.site);
   // Read after the wait: the side-stream join that produces it may be captured as a programmatic
@@ -156,7 +160,7 @@ __device__ __forceinline__ void publish_fin_quad_kernel(const Args& a) {
     for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], f[e]);
   }
   push_quad(a.site, stage, token, quad, make_uint2(pack_bf16x2(acc[0], acc[1]), pack_bf16x2(acc[2], acc[3])));
-  pdl_trigger();
+  if (!Q35_FIN_EARLY) pdl_trigger();
 }
 
 __device__ __forceinline__ void publish_kernel(const Args& a) {
@@ -225,6 +229,12 @@ __device__ __forceinline__ uint4 ldg_nc_v4(const uint4* q) {
   return r;
 }
 
+#ifndef Q35_PIN_OPROJ
+#define Q35_PIN_OPROJ 0  // SGLANG_PERFLL_PIN_OPROJ: weights held ahead of the PDL wait
+#endif
+#ifndef Q35_OPROJ_EARLY
+#define Q35_OPROJ_EARLY 0  // SGLANG_PERFLL_OPROJ_EARLY: the consume released once the weights are requested
+#endif
 template <int S>
 __device__ __forceinline__ void oproj_push_kernel(const OprojArgs& o) {
   constexpr int kK = 8 * S * 32;
@@ -241,6 +251,13 @@ __device__ __forceinline__ void oproj_push_kernel(const OprojArgs& o) {
       for (int b = 0; b < 2; ++b) a[st][b] = ldg_nc_v4(wb + (st * 2 + b) * 32);
   }
   const float alpha = __fmul_rn(*o.sx, *o.sw);
+  if (Q35_OPROJ_EARLY) pdl_trigger();  // the consume reads only static data before its wait
+  if (Q35_PIN_OPROJ) {
+    uint32_t dep = __float_as_uint(alpha);
+#pragma unroll
+    for (int st = 0; st < S; ++st) dep ^= a[st][0].x ^ a[st][1].x;
+    pin_before_wait(dep, reinterpret_cast<uint64_t>(o.w));
+  }
   pdl_wait();
   const int m = o.m;
   const bool tok_ok = g < m;
@@ -281,7 +298,7 @@ __device__ __forceinline__ void oproj_push_kernel(const OprojArgs& o) {
     push_frag(o.site, stage_peek(o.site), tok, fr, frag);
     *reinterpret_cast<uint4*>(o.out + row_elem(tok, fr)) = frag;
   }
-  pdl_trigger();
+  if (!Q35_OPROJ_EARLY) pdl_trigger();
 }
 
 

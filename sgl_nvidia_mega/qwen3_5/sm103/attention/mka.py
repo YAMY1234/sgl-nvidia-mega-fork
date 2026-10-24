@@ -31,6 +31,9 @@ from sgl_nvidia_mega.qwen3_5.sm103 import hop
 from sgl_nvidia_mega.qwen3_5.sm103.hop import Site
 
 SOURCE = Path(__file__).parent / "src" / "mka.cu"
+# A/Bs: weights held ahead of the PDL wait (ptxas sinks them below it otherwise): the epilogue, the late prologue
+PIN_EPI = os.environ.get("SGLANG_PERFLL_PIN_MKA_EPI", "0") == "1"
+PIN_PRO = os.environ.get("SGLANG_PERFLL_PIN_MKA_PRO", "0") == "1"
 THREADS, CLUSTER, HEAD_DIM, HIDDEN, MAX_ROWS = 256, 8, 256, 4096, 8
 WIDE_MAX_ROWS = 112  # src/mka.cu kWideTiles 8-row tiles
 _INBOX = WIDE_MAX_ROWS // 8 * CLUSTER * 256 * 4
@@ -92,13 +95,13 @@ class EpiParams(ctypes.Structure):
 
 
 @cache
-def _kernels(device_index: int) -> dict[str, jit.Kernel]:
+def _kernels(device_index: int, pins: tuple = (PIN_EPI, PIN_PRO)) -> dict[str, jit.Kernel]:
     major, minor = torch.cuda.get_device_capability(device_index)
     cubin = jit.compile_source(
         SOURCE.read_text(),
         "q35_mka",
         f"sm_{major}{minor}a",
-        ("-std=c++17", "-default-device"),
+        ("-std=c++17", "-default-device", f"-DQ35_PIN_MKA_EPI={int(pins[0])}", f"-DQ35_PIN_MKA_PRO={int(pins[1])}"),
         headers=hop.headers(),
     )
     return {n: jit.load(cubin, n, (THREADS, 1, 1), b) for n, b in ENTRIES.items()}

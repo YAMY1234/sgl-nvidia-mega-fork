@@ -23,6 +23,7 @@ deadline is compiled in, as the decode hop's.
 from __future__ import annotations
 
 import ctypes
+import os
 from functools import cache
 from pathlib import Path
 from typing import Optional
@@ -34,6 +35,8 @@ from sgl_nvidia_mega.qwen3_5.sm103 import hop as decode_hop
 
 SOURCE = Path(__file__).parent / "src" / "draft_hop.cu"
 GEMV_SOURCE = Path(__file__).parent / "src" / "draft_gemv.cu"
+# A/Bs: the row-push GEMV's weights held ahead of its PDL wait (ptxas sinks them below it otherwise)
+PIN_GEMV = os.environ.get("SGLANG_PERFLL_PIN_DRAFT_GEMV", "0") == "1"
 HIDDEN = decode_hop.HIDDEN
 GEMV_ROWS, GEMV_PUSH_ROWS = 4, 8  # warps (rows in flight) per CTA
 
@@ -86,7 +89,7 @@ def _consume_kernels(device_index: int, deadline_ns: int) -> dict[str, jit.Kerne
 
 
 @cache
-def _gemv_cubin(device_index: int, k: int):
+def _gemv_cubin(device_index: int, k: int, pin: bool = PIN_GEMV):
     if k % 256:
         raise ValueError(f"draft GEMV: K {k} is not a multiple of 256")
     major, minor = torch.cuda.get_device_capability(device_index)
@@ -94,7 +97,7 @@ def _gemv_cubin(device_index: int, k: int):
         GEMV_SOURCE.read_text(),
         f"q35_draft_gemv_k{k}",
         f"sm_{major}{minor}a",
-        ("-std=c++17", "-default-device", f"-DQ35_DRAFT_GEMV_K={k}"),
+        ("-std=c++17", "-default-device", f"-DQ35_DRAFT_GEMV_K={k}", f"-DQ35_PIN_DRAFT_GEMV={int(pin)}"),
     )
 
 

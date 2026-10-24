@@ -232,7 +232,7 @@ class _MkaStep:
         self.loc.copy_(torch.randperm(POOL_SLOTS, device="cuda", generator=g)[:m])
         self.attn.copy_(torch.randn(self.attn.shape, device="cuda", generator=g))
 
-    def run(self, ops):
+    def run(self, ops, early_trigger=True):
         from sgl_nvidia_mega.qwen3_5.sm103.attention import mka
 
         mka.prologue(
@@ -254,6 +254,7 @@ class _MkaStep:
             gate_out=self.gate,
             nq=HEADS,
             eps=1e-6,
+            early_trigger=early_trigger,
         )
         mka.epilogue(
             attn=self.attn,
@@ -263,6 +264,7 @@ class _MkaStep:
             sw=ops["o_sw"],
             out=self.out,
             nq=HEADS,
+            early_trigger=early_trigger,
         )
 
     def bits(self):
@@ -295,6 +297,24 @@ def test_mka_replays_in_a_cuda_graph_bit_for_bit():
         step.run(ops)
         assert _same(replayed, step.bits())
         assert torch.isfinite(step.out.float()).all()
+
+
+@pytest.mark.parametrize("early", [True, False])
+def test_mka_with_its_weights_pinned_ahead_of_the_wait_is_bit_for_bit(early, monkeypatch):
+    """SGLANG_PERFLL_PIN_MKA_EPI / _PRO only hold the weight loads ahead of griddepcontrol.wait: the same bytes,
+    for the early and the late PDL releases."""
+    import functools
+
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import mka
+
+    g = torch.Generator(device="cuda").manual_seed(9)
+    ops = _mka_operands(g)
+    step = _MkaStep(7, g)
+    step.run(ops, early_trigger=early)
+    want = step.bits()
+    monkeypatch.setattr(mka, "_kernels", functools.partial(mka._kernels, pins=(True, True)))
+    step.run(ops, early_trigger=early)
+    assert _same(want, step.bits())
 
 
 @pytest.mark.parametrize("m", [9, 14, 28, 56, 112])

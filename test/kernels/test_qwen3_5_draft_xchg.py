@@ -10,6 +10,9 @@ SM100-family GPUs (GB300) with NVLink multicast, against torch on the same input
   rounded once to bf16, bit for bit;
 - the memo rows equal the split fc's partials summed in rank order (checked at
   construction), and the split fc's gather and rank-order sum are exact;
+- opt-in: the one-launch all-sum (SGLANG_PERFLL_DRAFT_FC_SUM) equals the gather and
+  rank-order sum bit for bit, also from a CUDA graph, and the extend-width fused partial
+  (SGLANG_PERFLL_DRAFT_FC_GEMV) equals the one-row partial row by row;
 - a whole draft round (five steps, the extend exchange with extend fc) replays from a CUDA
   graph with fresh inputs, equal to its eager run;
 - the sharded top-1 of slot draft_multi (``sm103/draft/top1``) picks, for 1-16 rows, the
@@ -239,6 +242,153 @@ def test_split_fc_gathers_and_sums_in_rank_order(ranks, boundary, m):
         )
         ref = (x.float() @ weights["fc"].float().T).bfloat16()
         torch.testing.assert_close(got.float(), ref.float(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.fixture(scope="module")
+def allsum(ranks):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, cpu_group = ranks
+    return kernels.FcAllsum(
+        world=world,
+        rank=rank,
+        group=group,
+        cpu_group=cpu_group,
+        device=torch.device("cuda", torch.cuda.current_device()),
+        ext_rows=NUM_STEPS + 1,
+    )
+
+
+def _fp32_partials(m, rank, seed):
+    """Rank ``rank``'s fp32 partials, with signed zeros in the first columns of every rank."""
+    p = torch.randn(m, H, device="cuda", generator=_gen(seed + 31 * rank)) * 4.0
+    p[:, :8] = -0.0
+    return p
+
+
+def _gather_ordered_sum(mkd, partial, world):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    out = torch.empty(partial.shape, dtype=torch.bfloat16, device="cuda")
+    return kernels.ordered_partial_sum(mkd._fc_gather(partial), world, out)
+
+
+@pytest.mark.parametrize("m", [1, 2, 7, 16])
+def test_fc_allsum_is_the_gather_and_ordered_sum(ranks, boundary, allsum, m):
+    """SGLANG_PERFLL_DRAFT_FC_SUM: one launch gives FcGather + ordered_partial_sum's rows bit
+    for bit, -0.0 sums included, over calls that visit every stage twice."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, _ = ranks
+    mkd, _ = boundary
+    with torch.inference_mode():
+        for call in range(2 * kernels.ALLSUM_STAGES):
+            partial = _fp32_partials(m, rank, 1000 * m + call)
+            got = allsum(
+                partial, torch.empty(m, H, dtype=torch.bfloat16, device="cuda")
+            )
+            want = _gather_ordered_sum(mkd, partial, world)
+            torch.cuda.synchronize()
+            assert torch.equal(got.view(torch.int16), want.view(torch.int16)), call
+
+
+def test_fc_allsum_replays_from_a_cuda_graph(ranks, boundary, allsum):
+    rank, world, group, cpu_group = ranks
+    mkd, _ = boundary
+    m = NUM_STEPS + 1
+    with torch.inference_mode():
+        partial = _fp32_partials(m, rank, 5000)
+        out = torch.empty(m, H, dtype=torch.bfloat16, device="cuda")
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            allsum(partial, out)
+        torch.cuda.current_stream().wait_stream(stream)
+        dist.barrier(group=cpu_group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            allsum(partial, out)
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        for call in range(4):
+            partial.copy_(_fp32_partials(m, rank, 5100 + call))
+            graph.replay()
+            want = _gather_ordered_sum(mkd, partial, world)
+            torch.cuda.synchronize()
+            assert torch.equal(out.view(torch.int16), want.view(torch.int16)), call
+            dist.barrier(group=cpu_group)
+
+
+def test_fc_partial_ext_rows_are_the_one_row_partials(ranks, boundary):
+    """SGLANG_PERFLL_DRAFT_FC_GEMV: the extend-width fused partial gives every row the
+    one-row kernel's fp32 value bit for bit (the draft steps' and memo rows' arithmetic)."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, _ = ranks
+    mkd, weights = boundary
+    m = NUM_STEPS + 1
+    sms = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    rows = kernels.draft_fc_partial_ext_rows(m, H, mkd.width, sms)
+    assert rows is not None
+    norm_w = weights["norm_hid" if mkd.is_hidden_rank else "norm_emb"]
+    with torch.inference_mode():
+        x = _randn(m, H, g=_gen(7000 + rank))
+        got = kernels.draft_fc_partial_ext(
+            x,
+            norm_w,
+            EPS,
+            mkd._fc_shard,
+            mkd.slice_start,
+            torch.empty(m, H, dtype=torch.float32, device="cuda"),
+            rows,
+        )
+        one = torch.empty(1, H, dtype=torch.float32, device="cuda")
+        for i in range(m):
+            kernels.draft_fc_partial(
+                x[i : i + 1],
+                norm_w,
+                EPS,
+                mkd._fc_shard,
+                mkd.slice_start,
+                one,
+                mkd._fc_gemv_rows,
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(got[i].view(torch.int32), one[0].view(torch.int32)), i
+
+
+def test_split_fc_opt_in_paths(ranks, boundary, allsum):
+    """The extend's split fc with the one-launch all-sum equals the default path bit for bit;
+    with the fused partial too it stays the fp32 fc up to rounding."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, _ = ranks
+    mkd, weights = boundary
+    m = mkd.ext_rows
+    sms = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    saved = mkd._fc_allsum, mkd._fc_ext_rows
+    try:
+        with torch.inference_mode():
+            g = _gen(8000)
+            embeds, hidden = _randn(m, H, g=g), _randn(m, H, g=g)
+            base = mkd.split_fc(embeds, hidden)
+            mkd._fc_allsum = allsum
+            summed = mkd.split_fc(embeds, hidden)
+            mkd._fc_ext_rows = kernels.draft_fc_partial_ext_rows(m, H, mkd.width, sms)
+            fused = mkd.split_fc(embeds, hidden)
+            torch.cuda.synchronize()
+        assert torch.equal(summed.view(torch.int16), base.view(torch.int16))
+        x = torch.cat(
+            [_Norm(weights["norm_emb"])(embeds), _Norm(weights["norm_hid"])(hidden)], -1
+        )
+        ref = (x.float() @ weights["fc"].float().T).bfloat16()
+        torch.testing.assert_close(fused.float(), ref.float(), atol=3e-2, rtol=3e-2)
+    finally:
+        mkd._fc_allsum, mkd._fc_ext_rows = saved
 
 
 def test_round_replays_from_a_cuda_graph(ranks, boundary):

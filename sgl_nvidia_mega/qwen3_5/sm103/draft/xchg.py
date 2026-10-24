@@ -53,6 +53,12 @@ _MAX_SMEM_BYTES = 216 * 1024
 # fc_gather: the split fc's widest batch (2.2 _FC_SPLIT_MAX_TOKENS) and its grid
 GATHER_MAX_TOKENS = 16
 GATHER_THREADS = 512
+# fc_allsum (draft_fc_sum.cu): 128 threads a CTA, 4 fp32 columns a thread, so 8 CTAs a row
+ALLSUM_THREADS = 128
+ALLSUM_CTAS_PER_ROW = HIDDEN // (4 * ALLSUM_THREADS)
+ALLSUM_STAGES = 3
+# Static shared memory a CTA may declare (draft_fc_partial's normalized rows)
+_MAX_STATIC_SMEM_BYTES = 48 * 1024
 
 
 def _order_key(value: float) -> int:
@@ -160,18 +166,34 @@ class FcGatherParams(ctypes.Structure):
     ] + [("rank", ctypes.c_int32), ("m", ctypes.c_int32)]
 
 
+class FcAllsumParams(ctypes.Structure):
+    """sglang::FcAllsumParams."""
+
+    _fields_ = [
+        (name, ctypes.c_void_p) for name in ("partial", "out", "mc", "uc", "ctrl")
+    ] + [("rank", ctypes.c_int32), ("m", ctypes.c_int32)]
+
+
 def _sm_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _compile(device_index: int, name: str, defines: tuple[str, ...]) -> bytes:
+def _compile(
+    device_index: int,
+    name: str,
+    defines: tuple[str, ...],
+    includes: tuple[str, ...] = (),
+) -> bytes:
+    """``includes``: other sources of SRC the source includes as ``<stem>.cuh``."""
     major, minor = torch.cuda.get_device_capability(device_index)
+    headers = {"mkd_common.cuh": (SRC / "mkd_common.cuh").read_text()}
+    headers.update({f"{s}.cuh": (SRC / f"{s}.cu").read_text() for s in includes})
     return jit.compile_source(
         (SRC / f"{name}.cu").read_text(),
         "q35_" + "_".join([name, *(d.split("=")[-1] for d in defines)]),
         f"sm_{major}{minor}a",
         ("-std=c++17", "-default-device", *(f"-D{d}" for d in defines)),
-        headers={"mkd_common.cuh": (SRC / "mkd_common.cuh").read_text()},
+        headers=headers,
     )
 
 
@@ -224,6 +246,35 @@ def _draft_fc_kernels(device_index: int, world: int, max_rows: int) -> dict:
     }
     kernels["fc_gather"] = jit.load(cubin, "fc_gather", (GATHER_THREADS, 1, 1), 0)
     return kernels
+
+
+@cache
+def _fc_sum_kernels(
+    device_index: int, world: int, max_rows: int, ext_rows: int
+) -> dict:
+    """draft_fc_sum.cu: fc_allsum and the fused partial of ``ext_rows`` rows."""
+    cubin = _compile(
+        device_index,
+        "draft_fc_sum",
+        (
+            f"MKD_WORLD={world}",
+            f"DRAFT_FC_MAX_ROWS={max_rows}",
+            f"DRAFT_FC_EXT_ROWS={ext_rows}",
+        ),
+        includes=("draft_fc",),
+    )
+    width = 2 * HIDDEN // world
+    return {
+        "fc_allsum": jit.load(cubin, "fc_allsum", (ALLSUM_THREADS, 1, 1), 0),
+        "draft_fc_partial_ext": jit.load(
+            cubin, "draft_fc_partial_ext", (256, 1, 1), max_rows * width * 2
+        ),
+    }
+
+
+def build_fc_ext(device_index: int, world: int, max_rows: int, ext_rows: int) -> None:
+    """Compile draft_fc_sum.cu for ``ext_rows`` extend rows (no compile inside a capture)."""
+    _fc_sum_kernels(device_index, world, max_rows, ext_rows)
 
 
 def build(device_index: int, world: int) -> None:
@@ -647,6 +698,60 @@ def draft_fc_partial(
     return out
 
 
+def draft_fc_partial_ext_rows(
+    tokens: int, out_rows: int, width: int, num_sms: int
+) -> Optional[int]:
+    """draft_fc_partial_rows for ``tokens`` rows of x (draft_fc_partial_ext), or None if
+    they do not fit in shared memory."""
+    rows = -(-out_rows // num_sms)
+    static = tokens * width * 2
+    if static > _MAX_STATIC_SMEM_BYTES or not 1 <= tokens <= GATHER_MAX_TOKENS:
+        return None
+    return rows if rows * width * 2 + static <= _MAX_SMEM_BYTES else None
+
+
+def draft_fc_partial_ext(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    weight_slice: torch.Tensor,
+    col_start: int,
+    out: torch.Tensor,
+    max_rows: int,
+) -> torch.Tensor:
+    """``draft_fc_partial`` for the rows of a draft extend (any count up to
+    GATHER_MAX_TOKENS that ``draft_fc_partial_ext_rows`` admits; one build per count)."""
+    device = out.device
+    m, width = int(x.shape[0]), int(weight_slice.shape[-1])
+    world = 2 * HIDDEN // width
+    if world not in WORLDS or weight_slice.shape[0] != HIDDEN:
+        raise ValueError(
+            f"draft_fc_partial_ext: a {tuple(weight_slice.shape)} slice "
+            f"(built for hidden {HIDDEN} at TP {WORLDS})"
+        )
+    _check(x, "x", (m, HIDDEN), torch.bfloat16, aligned=True)
+    _check(norm_weight, "norm_weight", (HIDDEN,), torch.bfloat16, aligned=True)
+    _check(weight_slice, "weight_slice", (HIDDEN, width), torch.bfloat16, aligned=True)
+    _check(out, "out", (m, HIDDEN), torch.float32)
+    if not (col_start >= 0 and col_start + width <= HIDDEN and col_start % 8 == 0):
+        raise ValueError("draft_fc_partial_ext: slice out of range")
+    grid = _sm_count(device.index)
+    if (HIDDEN + grid - 1) // grid > max_rows:
+        raise ValueError("draft_fc_partial_ext: more weight rows per CTA than kMaxRows")
+    p = DraftFcPartialParams(
+        x=x.data_ptr(),
+        norm_w=norm_weight.data_ptr(),
+        w=weight_slice.data_ptr(),
+        out=out.data_ptr(),
+        eps=eps,
+        col_start=col_start,
+        rows=m,
+    )
+    kernels = _fc_sum_kernels(device.index, world, max_rows, m)
+    _launch(kernels["draft_fc_partial_ext"], grid, p, device, pdl=True)
+    return out
+
+
 @triton.jit
 def _ordered_partial_sum_kernel(
     src_ptr,  # [M, world * N] fp32: rank r's partial at columns [r * N, (r + 1) * N)
@@ -741,4 +846,64 @@ class FcGather:
         )
         # one CTA an SM: with the batched polls every thread waits about one round trip
         _launch(self._kernels["fc_gather"], self._ctas, p, self.device, pdl=False)
+        return out
+
+
+class FcAllsum:
+    """The split fc's gather and rank-order sum in one launch (draft_fc_sum.cu fc_allsum):
+    [m, H] fp32 partials on every rank -> [m, H] bf16, summed in rank order from rank 0 and
+    rounded once, as ``FcGather`` + ``ordered_partial_sum``; m <= GATHER_MAX_TOKENS;
+    graph-capturable. Its own mailbox and control block (not FcGather's epochs). Build on
+    every rank of ``group`` (a collective); ``ext_rows`` names the build it shares with
+    ``draft_fc_partial_ext``."""
+
+    def __init__(
+        self,
+        *,
+        world: int,
+        rank: int,
+        group,
+        cpu_group,
+        device: torch.device,
+        ext_rows: int,
+    ):
+        import torch.distributed as dist
+
+        if world not in WORLDS:
+            raise ValueError(f"the fc all-sum serves TP {WORLDS}, not {world}")
+        self.world, self.rank, self.device = world, rank, device
+        words = ALLSUM_STAGES * world * GATHER_MAX_TOKENS * HIDDEN // 2
+        self._buf, self._handle, self.mc = symmetric_words(words, group, device)
+        # every fp32 word "not arrived" (all ones)
+        self._buf.fill_(-1)
+        self.uc = self._buf.data_ptr()
+        # [stage, arrive] (fc_allsum::Ctrl)
+        self.ctrl = torch.zeros(2, dtype=torch.int32, device=device)
+        sms = _sm_count(device.index)
+        width = 2 * HIDDEN // world
+        rows = draft_fc_partial_ext_rows(ext_rows, HIDDEN, width, sms)
+        if rows is None:
+            raise ValueError(
+                f"fc all-sum: no build for {ext_rows} extend rows at TP {world}"
+            )
+        self._kernel = _fc_sum_kernels(device.index, world, rows, ext_rows)["fc_allsum"]
+        torch.cuda.synchronize(device)
+        dist.barrier(group=cpu_group)
+
+    def __call__(self, partial: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        m = int(partial.shape[0])
+        if not 1 <= m <= GATHER_MAX_TOKENS:
+            raise ValueError(f"fc all-sum: {m} rows (1-{GATHER_MAX_TOKENS})")
+        _check(partial, "partial", (m, HIDDEN), torch.float32, aligned=True)
+        _check(out, "out", (m, HIDDEN), torch.bfloat16, aligned=True)
+        p = FcAllsumParams(
+            partial=partial.data_ptr(),
+            out=out.data_ptr(),
+            mc=self.mc,
+            uc=self.uc,
+            ctrl=self.ctrl.data_ptr(),
+            rank=self.rank,
+            m=m,
+        )
+        _launch(self._kernel, m * ALLSUM_CTAS_PER_ROW, p, self.device, pdl=True)
         return out

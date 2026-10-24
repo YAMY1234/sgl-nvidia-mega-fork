@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from typing import Callable, Optional
 
 import torch
@@ -33,6 +34,14 @@ import torch
 from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
 
 logger = logging.getLogger(__name__)
+
+# SGLANG_PERFLL_DRAFT_FC_SUM=1: the split fc's gather and rank-order sum in one launch
+# (kernels.FcAllsum; the same values as FcGather + ordered_partial_sum)
+FC_SUM = os.environ.get("SGLANG_PERFLL_DRAFT_FC_SUM", "0") == "1"
+# SGLANG_PERFLL_DRAFT_FC_GEMV=1: the draft extend's partial as the fused norm + slice GEMV
+# (draft_fc_partial_ext) in place of the norm module and cuBLAS: the GEMV's dot order, as the
+# draft steps' partials and the memo rows have, not cuBLAS's (tokens may differ)
+FC_GEMV = os.environ.get("SGLANG_PERFLL_DRAFT_FC_GEMV", "0") == "1"
 
 # Memo rows built per launch at construction
 _MEMO_BLOCK = 4096
@@ -171,6 +180,29 @@ class MkdBoundary:
         self._fc_gather = kernels.FcGather(
             world=world, rank=rank, group=device_group, cpu_group=cpu_group, device=dev
         )
+        # the draft extend's rows (the verify's: num_steps draft tokens + 1), which the
+        # opt-in builds serve
+        self.ext_rows = num_steps + 1
+        self._fc_ext_rows = (
+            kernels.draft_fc_partial_ext_rows(self.ext_rows, hidden, width, sms)
+            if FC_GEMV
+            else None
+        )
+        if self._fc_ext_rows is not None:
+            kernels.build_fc_ext(dev.index, world, self._fc_ext_rows, self.ext_rows)
+        self._fc_allsum = (
+            kernels.FcAllsum(
+                world=world,
+                rank=rank,
+                group=device_group,
+                cpu_group=cpu_group,
+                device=dev,
+                ext_rows=self.ext_rows,
+            )
+            if FC_SUM
+            else None
+        )
+        self._fc_noted: set = set()
         self.is_hidden_rank = use_hidden
         self.slice_start, self.width = start, width
         self.n_embed = hidden // width
@@ -245,11 +277,16 @@ class MkdBoundary:
             for _ in range(num_steps)
         ]
         logger.info(
-            "MKD draft boundary active (tp=%d, %s candidates, %.1f MB exchange buffer); "
-            "sources %s.",
+            "MKD draft boundary active (tp=%d, %s candidates, %.1f MB exchange buffer; "
+            "split fc of %d extend rows: %s partial, %s); sources %s.",
             world,
             "memo" if memo else "embedding",
             words * 8 / 2**20,
+            self.ext_rows,
+            "fused GEMV" if self._fc_ext_rows is not None else "cuBLAS",
+            "one-launch all-sum"
+            if self._fc_allsum is not None
+            else "gather + ordered sum",
             _source_digests(),
         )
 
@@ -688,6 +725,22 @@ class MkdBoundary:
                 self._fc_gemv_rows,
             )
             return self._gather_partials(partial)
+        if (
+            self._fc_ext_rows is not None
+            and x.shape[0] == self.ext_rows
+            and x.shape[0] == input_embeds.shape[0]
+        ):
+            self._note_fc(x.shape[0], "fused norm + GEMV partial")
+            partial = kernels.draft_fc_partial_ext(
+                x.contiguous(),
+                norm.weight.data,
+                norm.variance_epsilon,
+                self._fc_shard,
+                start,
+                x.new_empty((x.shape[0], self.hidden), dtype=torch.float32),
+                self._fc_ext_rows,
+            )
+            return self._gather_partials(partial)
         x = norm(x)
         if use_hidden and x.shape[0] != input_embeds.shape[0]:
             rows = min(x.shape[0], input_embeds.shape[0])
@@ -700,6 +753,18 @@ class MkdBoundary:
         return self._gather_partials(partial)
 
     def _gather_partials(self, partial: torch.Tensor) -> torch.Tensor:
-        gathered = self._fc_gather(partial)
         out = partial.new_empty(partial.shape, dtype=torch.bfloat16)
+        if self._fc_allsum is not None:
+            self._note_fc(partial.shape[0], "one-launch all-sum")
+            return self._fc_allsum(partial, out)
+        gathered = self._fc_gather(partial)
         return kernels.ordered_partial_sum(gathered, self.world, out)
+
+    def _note_fc(self, rows: int, path: str) -> None:
+        """Log once per captured (rows, path) which opt-in split fc path a capture took."""
+        if (
+            torch.cuda.is_current_stream_capturing()
+            and (rows, path) not in self._fc_noted
+        ):
+            self._fc_noted.add((rows, path))
+            logger.info("MKD split fc of %d rows: %s", rows, path)

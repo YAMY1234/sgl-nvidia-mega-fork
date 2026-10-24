@@ -229,6 +229,22 @@ def _on(slots):
     return sorted(name for name in plan.Slots.__struct_fields__ if getattr(slots, name))
 
 
+def test_the_trt_gdn_front_widens_slot_gdn_front_to_its_requests(monkeypatch):
+    """Slot gdn_front serves up to two requests, and with SGLANG_PERFLL_GDN_TRTFRONT up to
+    SGLANG_PERFLL_GDN_TRTFRONT_MAX_REQ requests (the TensorRT-LLM front takes those steps)."""
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    front = plan.Facts(gdn_verify=True, gdn_pdl=True, gdn_front=True)
+    monkeypatch.setattr(trt_front, "ENABLED", False)
+    assert plan.slots(14, front).gdn_front and not plan.slots(21, front).gdn_front
+    monkeypatch.setattr(trt_front, "ENABLED", True)
+    monkeypatch.setattr(trt_front, "MAX_REQUESTS", 4)
+    assert plan.slots(21, front).gdn_front and plan.slots(28, front).gdn_front
+    assert not plan.slots(35, front).gdn_front
+    monkeypatch.setattr(trt_front, "MAX_REQUESTS", 2)
+    assert plan.slots(14, front).gdn_front and not plan.slots(21, front).gdn_front
+
+
 def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     # every slot built except mkm's 16-token engine (mkm_wide, below)
     every = plan.Facts(

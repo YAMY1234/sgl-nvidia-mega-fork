@@ -1219,6 +1219,7 @@ def test_the_hop_quantizes_a_gdn_layers_input_for_the_trt_front_only(trt, max_re
         (True, 1, True, 14, True),
         (True, 2, True, 14, True),
         (True, 2, True, 21, True),
+        (True, 4, True, 28, True),
         (True, 1, True, 7, False),
         (False, 2, True, 7, True),
     ],

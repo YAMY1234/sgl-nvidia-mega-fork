@@ -837,7 +837,7 @@ def _run_trt_front(o, x8, outs, x=None):
     from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
 
     # every request count a test runs (SGLANG_PERFLL_GDN_TRTFRONT_MAX_REQ in serving)
-    trt_front.MAX_REQUESTS = max(trt_front.MAX_REQUESTS, 2)
+    trt_front.MAX_REQUESTS = max(trt_front.MAX_REQUESTS, 4)
     trt_front.prepare(o["w"].shape[0], o["ba_w"].shape[0], o["conv_w"], o["state"], o["windows"])
     trt_front.front(
         o["x"] if x is None else x,
@@ -855,7 +855,7 @@ def _run_trt_front(o, x8, outs, x=None):
     )
 
 
-@pytest.mark.parametrize("requests", [1, 2])
+@pytest.mark.parametrize("requests", [1, 2, 3, 4])
 @pytest.mark.parametrize("act", ["fp8", "quant"])
 @pytest.mark.parametrize("tp", [8, 16])
 def test_trt_front_holds_its_projections_to_fp64_and_its_conv_is_sglangs(tp, act, requests):

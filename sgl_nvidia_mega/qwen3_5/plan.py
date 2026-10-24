@@ -53,6 +53,14 @@ MULTI_REQUEST_TP = (8,)
 MULTI_REQUEST = "multi_request"
 GDN_FRONT_ROWS = 7  # the rows of one request slot gdn_front's front is built for
 GDN_FRONT_MAX_ROWS = 14  # its widest step: two requests (a cluster set a request pays past two)
+
+
+def _trt_front_max_rows() -> int:
+    """The widest step TensorRT-LLM's GDN front takes (SGLANG_PERFLL_GDN_TRTFRONT[_MAX_REQ]; 0 without it)."""
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    return GDN_FRONT_ROWS * trt_front.MAX_REQUESTS if trt_front.ENABLED else 0
+
 # Each slot's widest step: its launcher's bound (sm103/moe/router.py MAX_TOKENS,
 # sm103/moe/mkm.py MAX_TOKENS, sm103/hop OPROJ_MAX_M, sm103/attention/mka.py), and for
 # hop the rows up to which FlashInfer's MNNVL CuTe DSL fusion runs the one-shot
@@ -227,7 +235,7 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         and facts.gdn_pdl
         and facts.gdn_front
         and rows % GDN_FRONT_ROWS == 0
-        and rows <= GDN_FRONT_MAX_ROWS,
+        and rows <= max(GDN_FRONT_MAX_ROWS, _trt_front_max_rows()),
         # lowm_se's two launches take the shared expert where both run (one request: the router launch's
         # shared stage and SGLang's four-launch tail are left out)
         route_shared=route and facts.route_shared and rows <= ROUTE_SHARED_ROWS and not lowm_se,

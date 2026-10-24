@@ -163,8 +163,10 @@ ENGINE_ONEPASS = os.environ.get("SGLANG_Q35_MKM_ONEPASS", "0") == "1"
 ENGINE_MMA_SFONLY = os.environ.get("SGLANG_Q35_MKM_MMA_SFONLY", "0") == "1"
 # ONEPASS in the 64-token engine only up to this many rows (past it, the plain build: B8's 56 rows lost 0.04 ms a round)
 ENGINE_ONEPASS_MAX_ROWS = int(os.environ.get("SGLANG_Q35_MKM_ONEPASS_MAX_ROWS", "64"))
-# PERF-LL: the wide engines deal the units past each CTA's own first expert to balance the CTAs (BAL_SPLIT), bit for bit
+# PERF-LL: the wide engines deal the units past each CTA's own first expert to balance the CTAs (BAL_SPLIT), bit for bit;
+# up to SGLANG_PERFLL_MKM_WIDE_BAL_MAX_ROWS rows (0: every row count), the static split's build past them
 ENGINE_WIDE_BAL = os.environ.get("SGLANG_PERFLL_MKM_WIDE_BAL", "0") == "1"
+ENGINE_WIDE_BAL_MAX_ROWS = int(os.environ.get("SGLANG_PERFLL_MKM_WIDE_BAL_MAX_ROWS", "0"))
 
 
 def engine_options(rows: int, plain: bool = False) -> tuple:
@@ -178,7 +180,7 @@ def engine_options(rows: int, plain: bool = False) -> tuple:
         opts += ("-DONEPASS=1",)
     if ENGINE_MMA_SFONLY and rows in (M32_MAX_TOKENS, M64_MAX_TOKENS):
         opts += ("-DMMA_SFONLY=1",)
-    if ENGINE_WIDE_BAL and rows in WIDE_ROWS:
+    if ENGINE_WIDE_BAL and not plain and rows in WIDE_ROWS:
         opts += ("-DBAL_SPLIT=1",)
     if opts:
         logger.info("NVIDIA megakernel: Qwen3.5 %d-token engine built with %s", rows, " ".join(opts))
@@ -276,7 +278,10 @@ def engine_rows(m: int) -> int:
 
 
 def onepass_plain(rows: int, m: int) -> bool:
-    """Whether ``m`` rows of the ``rows``-token engine run its build without ONEPASS (SGLANG_Q35_MKM_ONEPASS_MAX_ROWS)."""
+    """Whether ``m`` rows of the ``rows``-token engine run its plain build: without ONEPASS
+    (SGLANG_Q35_MKM_ONEPASS_MAX_ROWS) or, for the wide engines, without BAL_SPLIT (SGLANG_PERFLL_MKM_WIDE_BAL_MAX_ROWS)."""
+    if rows in WIDE_ROWS:
+        return ENGINE_WIDE_BAL and 0 < ENGINE_WIDE_BAL_MAX_ROWS < m
     return ENGINE_ONEPASS and rows == M64_MAX_TOKENS and m > ENGINE_ONEPASS_MAX_ROWS
 
 
@@ -372,9 +377,10 @@ def build(
             if onepass_plain(hi, max(lo + 1, min(max_rows, hi))):
                 _kernel(device_index, intermediate, hi, True)
                 logger.info(
-                    "NVIDIA megakernel: Qwen3.5 %d-token engine runs ONEPASS up to %d rows, its plain build past them",
+                    "NVIDIA megakernel: Qwen3.5 %d-token engine runs %s up to %d rows, its plain build past them",
                     hi,
-                    ENGINE_ONEPASS_MAX_ROWS,
+                    "BAL_SPLIT" if hi in WIDE_ROWS else "ONEPASS",
+                    ENGINE_WIDE_BAL_MAX_ROWS if hi in WIDE_ROWS else ENGINE_ONEPASS_MAX_ROWS,
                 )
         lo = hi
 

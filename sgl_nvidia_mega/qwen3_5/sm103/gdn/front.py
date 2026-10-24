@@ -12,12 +12,17 @@ It launches as a programmatic dependent and releases its own dependents at entry
 next launch must wait (``griddepcontrol.wait``) before it reads any output, b / a
 included. By default (``tma``) each projection CTA's packed weights arrive by one bulk
 copy into shared memory issued before that wait, instead of register loads; same MMAs,
-same bits.
+same bits. With ``SGLANG_PERFLL_GDN_PIN=1`` (``pin``) a request's launch takes them by
+register loads held ahead of that wait (``q35_gdn_front_pin``; without the hold ptxas
+sinks the loads below it), no shared-memory reload after it; same bits. ``prefetch``
+False leaves out the L2 prefetch of the verify's checkpoint and ring (when the core loads
+them before its own wait, the prefetch only delays this launch's completion).
 """
 
 from __future__ import annotations
 
 import ctypes
+import os
 from functools import cache
 from pathlib import Path
 
@@ -34,6 +39,8 @@ THREADS, CLUSTER, CTAS = (
     8,
     88,
 )  # 10 projection clusters + 1 side-projection cluster
+# a request's launch with its register weight loads held ahead of the PDL wait (q35_gdn_front_pin)
+PIN = os.environ.get("SGLANG_PERFLL_GDN_PIN", "0") == "1"
 TIMEOUT = (
     500_000_000  # clock cycles a CTA waits for its cluster's partials before trapping
 )
@@ -115,7 +122,7 @@ def pack(weight_nk: torch.Tensor) -> torch.Tensor:
 
 
 @cache
-def _kernel(device_index: int, tma: bool = True) -> jit.Kernel:
+def _kernel(device_index: int, tma: bool = True, pin: bool = False) -> jit.Kernel:
     major, minor = torch.cuda.get_device_capability(device_index)
     cubin = jit.compile_source(
         SOURCE.read_text(),
@@ -123,6 +130,8 @@ def _kernel(device_index: int, tma: bool = True) -> jit.Kernel:
         f"sm_{major}{minor}a",
         ("-std=c++17", "-default-device"),
     )
+    if pin:
+        return jit.load(cubin, "q35_gdn_front_pin", (THREADS, 1, 1), 0)
     if tma:
         return jit.load(cubin, "q35_gdn_front_tma", (THREADS, 1, 1), WEIGHT_BYTES)
     return jit.load(cubin, "q35_gdn_front", (THREADS, 1, 1), 0)
@@ -148,6 +157,8 @@ def _multi_kernel(device_index: int) -> jit.Kernel:
 def build(device_index: int) -> None:
     """Compile the front (no compile inside a step)."""
     _kernel(device_index, True)
+    if PIN:
+        _kernel(device_index, True, True)
     _multi_kernel(device_index)
 
 
@@ -189,6 +200,8 @@ def front(
     ring_indices: torch.Tensor,
     pad_slot: int = -1,
     tma: bool = True,
+    pin: bool | None = None,
+    prefetch: bool = True,
 ) -> None:
     """The front of the BF16 rows ``x`` [R * 7, 4096] (contiguous; R requests of 7 rows,
     R <= MAX_REQUESTS) into the caller's buffers: ``projected`` [R * 7, 2560] BF16
@@ -203,7 +216,8 @@ def front(
     trapping. The ReplaySSM verify's ``checkpoint`` (by state index) and ``history_*``
     rings (by ``ring_indices[r]``) are prefetched into L2: a hint, nothing is written.
     ``tma`` False takes the weights by register loads instead of the bulk copy (same
-    values)."""
+    values); ``pin`` (default ``PIN``) takes a request's by register loads held ahead of the
+    PDL wait (same values); ``prefetch`` False skips the L2 prefetch."""
     requests = x.shape[0] // ROWS
     if (
         x.dtype != torch.bfloat16
@@ -225,7 +239,7 @@ def front(
             _prefetch(history_k, 1),
             _prefetch(history_g, 1),
         )
-        if r is not None
+        if r is not None and prefetch
     ]
     ba = BaParams(
         input=x.data_ptr(),
@@ -265,7 +279,8 @@ def front(
     p.state_stride[:] = list(conv_state.stride())
     p.window_stride[:] = [windows.stride(0), 9]
     if requests == 1:
-        kernel, grid, args = _kernel(x.device.index, tma), (CTAS, 1, 1), [p]
+        pin = PIN if pin is None else pin
+        kernel, grid, args = _kernel(x.device.index, tma, pin), (CTAS, 1, 1), [p]
     else:
         kernel = _multi_kernel(x.device.index)
         grid = (CTAS - CLUSTER + CLUSTER * requests, 1, 1)

@@ -1115,6 +1115,7 @@ def test_the_gdn_front_slot_runs_the_front_the_verify_the_norm_and_out_proj(push
         "history_g": "ring_g2(3, 8, 16)",
         "ring_indices": "req(1,)",
         "pad_slot": -1,
+        "prefetch": True,
     }
     # q / k / v are the conv rows' views; a / b the front's b8 / a8 halves
     q, k_, v = seen["qkv"]
@@ -1163,6 +1164,31 @@ def test_the_gdn_front_slot_runs_the_front_the_verify_the_norm_and_out_proj(push
         assert linear is gdn.out_proj and dtype == torch.bfloat16
         assert fp8.data_ptr() == quant.data_ptr() and fp8.shape == (7, 1024)
 
+
+@pytest.mark.parametrize(
+    "pin, early, rows, prefetch",
+    [(False, False, 7, True), (True, False, 7, False), (True, False, 14, True), (False, True, 14, False)],
+)
+def test_the_gdn_front_leaves_out_its_l2_prefetch_ahead_of_a_pinned_or_early_core(pin, early, rows, prefetch):
+    """In front of slot gdn_core the front's L2 prefetch of the checkpoint / ring is left out
+    with the core's early history (any request count) and with the pinned one-request front."""
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5.gdn import front, verify
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front as kernel
+
+    gdn, st = _gdn_front_setup(_log())
+    seen = {}
+    opts = msgspec.structs.replace(verify.SLOT_PDL, core=True)
+    with (
+        patch.object(kernel, "front", lambda *args, **kw: seen.update(kw)),
+        patch.object(kernel, "PIN", pin),
+        patch.object(core_kernel, "EARLY", early),
+        patch.object(verify, "_fused", lambda *args: "fused"),
+    ):
+        assert front.step(gdn, torch.zeros(rows, 4096, dtype=torch.bfloat16), st, opts) == "fused"
+    assert seen["prefetch"] is prefetch
 
 @pytest.mark.parametrize("front_slot", [False, True])
 def test_the_gdn_step_runs_the_front_where_the_plan_gives_it(monkeypatch, front_slot):

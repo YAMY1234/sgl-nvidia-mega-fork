@@ -18,7 +18,8 @@
 // and every read of the step's activations (q / k / v, z, a, b) follows the wait.
 //
 // Defines: TT (rows a request), HK / HV (key / value heads), NORM_F32 (FP32 norm weight), TRIGGER (2: release dependents at entry, 0: at exit),
-// STORE_O (also store the BF16 replay output, checks only).
+// STORE_O (also store the BF16 replay output, checks only), EARLY_HIST (1: the committed history -- keys, log-decays,
+// update vectors and their decays -- before the wait, held there; the same arithmetic, the same bits).
 
 typedef unsigned char u8;
 typedef unsigned short u16;
@@ -29,6 +30,9 @@ typedef unsigned int u32;
 #define RING 16
 #ifndef MINB
 #define MINB 1  // resident CTAs an SM the registers are capped for
+#endif
+#ifndef EARLY_HIST
+#define EARLY_HIST 0
 #endif
 #ifndef NW
 #define NW 4  // warps; each owns VD / NW value columns as MT m16 tiles
@@ -130,6 +134,14 @@ __device__ __forceinline__ void kred(float (&acc)[4], const U4 (&A)[4], const U4
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void pdl_launch() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
 
+// Holds the loads that `dep` reads (one word of each) ahead of griddepcontrol.wait, which ptxas may otherwise sink
+// them below; `never` is a launch constant that is never 0.
+__device__ __forceinline__ void pin_before_wait(u32 dep, unsigned long long never) {
+  asm volatile("{ .reg .pred a, b; setp.eq.u64 a, %1, 0; setp.eq.u32 b, %0, 1; and.pred a, a, b; @a trap; }"
+               :: "r"(dep), "l"(never) : "memory");
+}
+
+
 __device__ __forceinline__ long long load_index(const void* p, int i, bool i64) {
   return i64 ? reinterpret_cast<const long long*>(p)[i] : (long long)reinterpret_cast<const int*>(p)[i];
 }
@@ -138,7 +150,28 @@ __device__ __forceinline__ long long load_index(const void* p, int i, bool i64) 
 #define PROF 0
 #endif
 #if PROF
-#define STAMP(i, dep) do { if (lane == 0) { asm volatile("" ::"f"((float)(dep))); st_[i] = clock64(); } } while (0)
+// PROF_GT (micro builds): %globaltimer (ns, comparable across SMs) instead of clock64
+__device__ __forceinline__ long long prof_time() {
+#ifdef PROF_GT
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return (long long)t;
+#else
+  return clock64();
+#endif
+}
+#ifdef PROF_GT
+// the timer read predicated on a test of `dep`: stamped once dep is available
+__device__ __forceinline__ long long prof_time_after(float dep) {
+  unsigned long long t;
+  asm volatile("{ .reg .pred p; setp.ne.f32 p, %1, 0f7F7FFFFF; @p mov.u64 %0, %%globaltimer; "
+               "@!p mov.u64 %0, %%globaltimer; }" : "=l"(t) : "f"(dep));
+  return (long long)t;
+}
+#define STAMP(i, dep) do { if (lane == 0) st_[i] = prof_time_after((float)(dep)); } while (0)
+#else
+#define STAMP(i, dep) do { if (lane == 0) { asm volatile("" ::"f"((float)(dep))); st_[i] = prof_time(); } } while (0)
+#endif
 #else
 #define STAMP(i, dep) do { } while (0)
 #endif
@@ -167,7 +200,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
 
 #if PROF
   long long st_[8];
-  st_[0] = clock64();
+  st_[0] = prof_time();
 #endif
 #if TRIGGER == 2
   pdl_launch();
@@ -219,6 +252,77 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
 #endif
     }
   const float rscale = rcp_rn(p.scale[0]);
+#if EARLY_HIST
+  // the committed history (ring entries j < wp, written by earlier steps; this step writes j >= wp): the history keys
+  // of warps 2 / 3, and every lane's update-vector A fragments with their decays (the post-sync block's arithmetic)
+  U4 KHe[2][4];
+  u32 hist_a[MT][4];
+  float hist_td = 0.f;
+  {
+    u32 dep = 0;
+#pragma unroll
+    for (int jt = 0; jt < 2; ++jt)
+#pragma unroll
+      for (int c = 0; c < 4; ++c) KHe[jt][c] = zero4();
+    if ((warp == 2 || warp == 3) && wp > 0) {
+#pragma unroll
+      for (int jt = 0; jt < 2; ++jt) {
+        const int j = 8 * jt + r;
+        const u16* kh = p.ring_k + rid * p.k_slot + ((long long)hk * RING + ((base + j) & (RING - 1))) * KD;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) KHe[jt][c] = j < wp ? ld16(kh + 32 * c + 8 * q) : zero4();
+      }
+    }
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) hist_a[m][i] = 0u;
+    if (wp > 0) {
+      float gj = 0.f;
+      if (lane < RING && lane < wp) gj = p.ring_g[rid * p.g_slot + hv * RING + ((base + lane) & (RING - 1))];
+#pragma unroll
+      for (int d = 1; d < 32; d <<= 1) {
+        const float o = __shfl_up_sync(FULL, gj, d);
+        if (lane >= d) gj += o;
+      }
+      const float gtot = __shfl_sync(FULL, gj, 31);
+      const int jj[4] = {2 * q, 2 * q + 1, 2 * q + 8, 2 * q + 9};
+      float dec[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float pj = __shfl_sync(FULL, gj, jj[i]);
+        dec[i] = jj[i] < wp ? __expf(gtot - pj) : 0.f;
+      }
+      hist_td = __expf(gtot);
+      const u16* dp = p.ring_d + rid * p.d_slot + (long long)hv * RING * VD;
+#pragma unroll
+      for (int m = 0; m < MT; ++m) {
+        float e[2][4];  // [half][j index i]
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+          for (int i = 0; i < 4; ++i)
+            e[h][i] = jj[i] < wp
+                          ? bf2f(dp[((base + jj[i]) & (RING - 1)) * VD + vb + 16 * m + 8 * h + r]) * dec[i]
+                          : 0.f;
+        hist_a[m][0] = pack2(e[0][0], e[0][1]);
+        hist_a[m][1] = pack2(e[1][0], e[1][1]);
+        hist_a[m][2] = pack2(e[0][2], e[0][3]);
+        hist_a[m][3] = pack2(e[1][2], e[1][3]);
+        dep ^= hist_a[m][0] ^ hist_a[m][3];
+      }
+    }
+#pragma unroll
+    for (int jt = 0; jt < 2; ++jt)
+#pragma unroll
+      for (int c = 0; c < 4; ++c) dep ^= KHe[jt][c].x;
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) dep ^= H[m][h][0].x;
+    pin_before_wait(dep, (unsigned long long)p.write_pos);
+  }
+#endif
 
   STAMP(1, bflo(H[1][1][3].w) + bflo(H[0][0][0].x) + rscale);
   // ---------------- the wait: the step's activations from here on ----------------
@@ -374,10 +478,15 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
     U4 KHh[4];
 #pragma unroll
     for (int jt = 0; jt < 2; ++jt) {
+#if EARLY_HIST
+#pragma unroll
+      for (int c = 0; c < 4; ++c) KHh[c] = KHe[jt][c];
+#else
       const int j = 8 * jt + r;
       const u16* kh = p.ring_k + rid * p.k_slot + ((long long)hk * RING + ((base + j) & (RING - 1))) * KD;
 #pragma unroll
       for (int c = 0; c < 4; ++c) KHh[c] = j < wp ? ld16(kh + 32 * c + 8 * q) : zero4();
+#endif
       float acc[4] = {0.f, 0.f, 0.f, 0.f};
       if (warp == 2) {
         kred(acc, QN, KHh);
@@ -400,6 +509,20 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
   STAMP(5, 0.f);
 
   if (wp > 0) {
+#if EARLY_HIST
+    const u32 bq0 = s_sc[0][0][lane], bq1 = s_sc[0][1][lane];
+    const u32 bk0 = s_sc[1][0][lane], bk1 = s_sc[1][1][lane];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        HQ[m][i] *= hist_td;
+        HKs[m][i] *= hist_td;
+      }
+      mma16816(HQ[m], hist_a[m][0], hist_a[m][1], hist_a[m][2], hist_a[m][3], bq0, bq1);
+      mma16816(HKs[m], hist_a[m][0], hist_a[m][1], hist_a[m][2], hist_a[m][3], bk0, bk1);
+    }
+#else
     // committed history: hw = e^{g_total} hw + bf16(d_j e^{g_total - G_j}) . bf16(scores)
     float gj = 0.f;
     if (lane < RING && lane < wp) gj = p.ring_g[rid * p.g_slot + hv * RING + ((base + lane) & (RING - 1))];
@@ -440,6 +563,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
       mma16816(HQ[m], a0, a1, a2, a3, bq0, bq1);
       mma16816(HKs[m], a0, a1, a2, a3, bk0, bk1);
     }
+#endif
   }
 
   // rhs = beta (v - e^G hw_k); forward substitution (I + A) U = rhs per value column, every lane of a quad
@@ -588,7 +712,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
     }
 #if PROF
   if (lane == 0) {
-    const long long end = clock64();
+    const long long end = prof_time();
     long long* pw = p.prof + ((long long)cta * NW + warp) * 9;
 #pragma unroll
     for (int i = 0; i < 8; ++i) pw[i] = st_[i];

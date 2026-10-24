@@ -215,21 +215,32 @@ def _hop_takes(hop, owed) -> bool:
     )
 
 
+def lm_head(parts, hidden, site: str):
+    """The LM head's logits [rows, V_local] on this rank's vocabulary shard: SGLang's, or
+    PERF-LP's draft-only MXFP8 copy for the rows it takes (``parts.head_mx8``)."""
+    head = parts.head_mx8
+    if head is not None and head.supports(hidden.shape[0]):
+        return head.logits(hidden, site)
+    lm = parts.lm
+    return lm.logits_processor._compute_lm_head(hidden, lm.lm_head, None)
+
+
 def top1(parts, hidden):
     """SGLang's draft top-1 [rows] int64 of the final-norm rows ``hidden``."""
     from sglang.srt.distributed import tensor_model_parallel_all_gather
 
     lm = parts.lm
-    logits = lm.logits_processor._compute_lm_head(hidden, lm.lm_head, None)
+    logits = lm_head(parts, hidden, "top1")
     logits = tensor_model_parallel_all_gather(logits)
     logits = logits[:, : lm.logits_processor.vocab_size]
     return torch.argmax(logits, dim=-1)
 
 
-def top1_into(parts, hidden, tokens, column: int, *, nan_key: int, **outputs) -> None:
+def top1_into(
+    parts, hidden, tokens, column: int, *, nan_key: int, site="draft_loop", **outputs
+) -> None:
     """Slot draft_multi's top-1 of the final-norm rows ``hidden``: the LM head on this
     rank's vocabulary shard, then the sharded argmax exchange, which writes the tokens
     into ``tokens[:, column]`` (and ``outputs``: topk_p, positions, mrope_positions)."""
-    lm = parts.lm
-    logits = lm.logits_processor._compute_lm_head(hidden, lm.lm_head, None)
+    logits = lm_head(parts, hidden, f"{site} top1_into")
     parts.top1x(logits, tokens, column, nan_key=nan_key, **outputs)

@@ -17,6 +17,14 @@ logger = logging.getLogger(__name__)
 # Slot draft_fc_rep: the multi-request draft steps of at least this many rows take SGLang's
 # replicated fc
 FC_REP_MIN_ROWS = int(os.environ.get("SGLANG_Q35_DRAFT_FC_REP_MIN_ROWS", "8"))
+# PERF-LP (default off): the draft lm_head of passes of at most HEAD_MXFP8_MAX_ROWS rows from
+# a draft-only MXFP8 copy of the shard (TRT-LLM's TRTLLM_Q35_DRAFT_FP8_HEAD format); its GEMV
+# is TRT-LLM's CuTe DSL kernel ("cute") or the NVRTC translation ("nvrtc")
+HEAD_MXFP8 = os.environ.get("SGLANG_PERFLP_DRAFT_HEAD_MXFP8", "0") == "1"
+HEAD_MXFP8_MAX_ROWS = int(
+    os.environ.get("SGLANG_PERFLP_DRAFT_HEAD_MXFP8_MAX_ROWS", "16")
+)
+HEAD_MXFP8_GEMV = os.environ.get("SGLANG_PERFLP_DRAFT_HEAD_MXFP8_GEMV", "cute")
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -81,6 +89,8 @@ class Parts:
         self.embed_full: Optional[torch.Tensor] = None
         # (entry, bs) pairs whose capture logged the engagement line
         self.engaged: set = set()
+        # sm103.draft.head_mx8.DraftHeadMx8 (SGLANG_PERFLP_DRAFT_HEAD_MXFP8)
+        self.head_mx8: Optional[Any] = None
 
     @classmethod
     def build(cls, draft) -> Parts:
@@ -107,6 +117,8 @@ class Parts:
             parts.embedx = parts._build_embedx()
         if "draft_embed_full" in slots:
             parts.embed_full = parts._build_embed_full()
+        if HEAD_MXFP8:
+            parts.head_mx8 = parts._build_head_mx8()
         logger.info(
             "NVIDIA megakernel: Qwen3.5 MTP draft parts built (slots %s; MoE %s, hop "
             "%s, exchange %s, embedding %s, multi-request fc %s)",
@@ -287,6 +299,27 @@ class Parts:
             full.numel() * full.element_size() / 2**30,
         )
         return full
+
+    def _build_head_mx8(self):
+        """PERF-LP: the draft-only MXFP8 copy of this rank's lm_head shard (the target's
+        bf16 shard is only read), its GEMV for 1..HEAD_MXFP8_MAX_ROWS rows and, with slot
+        draft_xchg, the MKD one-row head on it."""
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.head_mx8 import DraftHeadMx8
+
+        head = DraftHeadMx8(
+            self.lm.lm_head.weight.data,
+            max_rows=HEAD_MXFP8_MAX_ROWS,
+            gemv=HEAD_MXFP8_GEMV,
+        )
+        if self.mkd is not None:
+            self.mkd.set_head_mx8(head)
+        logger.info(
+            "PERF-LP MXFP8 draft head active on TP rank %d: %s; MKD one-row head %s",
+            self.binding.tp_rank,
+            head.describe(),
+            "MXFP8" if self.mkd is not None and self.mkd.head_mx8 is head else "none",
+        )
+        return head
 
     def fc_replicated(self, rows: int) -> bool:
         """Whether a multi-request draft step of ``rows`` rows takes SGLang's replicated

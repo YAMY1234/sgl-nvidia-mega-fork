@@ -343,6 +343,8 @@ class MkdBoundary:
         self.head_part = None
         self.head_part_cur = None
         self.head_used = False
+        # PERF-LP: the head reads the draft-only MXFP8 copy (set_head_mx8)
+        self.head_mx8 = None
         if not enabled:
             return
         head = self.lm_head_weight
@@ -392,16 +394,33 @@ class MkdBoundary:
         self.head_part_cur = self.head_part[:ctas]
         # Alternate the row walk per draft step: the next step re-reads first what is still in L2
         # (T1: -1.9 to -2.4 us per call on the TP8 shard).
-        kernels.mkd_draft_head(
-            x,
-            self.lm_head_weight,
-            logits,
-            self.head_part_cur,
-            reverse=self.step % 2 == 1,
-            smem_pad=self.head_pad,
-        )
+        if self.head_mx8 is not None:
+            self.head_mx8.mkd_head(
+                x,
+                logits,
+                self.head_part_cur,
+                reverse=self.step % 2 == 1,
+                smem_pad=self.head_pad,
+            )
+        else:
+            kernels.mkd_draft_head(
+                x,
+                self.lm_head_weight,
+                logits,
+                self.head_part_cur,
+                reverse=self.step % 2 == 1,
+                smem_pad=self.head_pad,
+            )
         self.head_used = True
         return logits
+
+    def set_head_mx8(self, head_mx8) -> None:
+        """PERF-LP: the one-row head reads ``head_mx8``'s draft-only MXFP8 copy of the
+        lm_head shard (``mkd_head_mx8``: the same logits rounding and per-CTA maxima)."""
+        if self.head_part is None:
+            return
+        head_mx8.prepare_mkd(self.head_pad)
+        self.head_mx8 = head_mx8
 
     def head_follows(self) -> bool:
         """Whether the draft head is the next launch after this step's final norm (an

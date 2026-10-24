@@ -81,6 +81,9 @@ def build(model, ctx) -> route.Bound:
     from sgl_nvidia_mega.qwen3_5 import plan
     from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
 
+    from sgl_nvidia_mega.qwen3_5 import uhist
+
+    uhist.build()  # measurement knobs, default off (no compile inside a capture)
     bound = route.Bound(reason="stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
     if "route" in SLOTS:
         rows = plan.widest(ctx.widths, plan.ROUTE_MAX_ROWS)

@@ -352,6 +352,9 @@ def weight_maps(w13: torch.Tensor, w2: torch.Tensor) -> tuple:
     )
 
 
+LAST_TOPK_IDS = None
+
+
 def mkm_moe(
     maps: tuple,
     logits: torch.Tensor,
@@ -415,6 +418,8 @@ def mkm_moe(
         grid = sms if rows in WIDE_ROWS else min(m * TOP_K, sms)
         jit.launch(kernel, (grid, 1, 1), [*maps, p], stream)
         return gemm2_out, (expert_weights if routing is None else routing[1])
+    global LAST_TOPK_IDS
+    LAST_TOPK_IDS = topk_ids  # the 7 / 16-row engines' routing (qwen3_5/uhist.py reads it)
     swizzle = jit.driver().CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
     wide = rows == M16_MAX_TOKENS
     # the x rows past m read as zeros: 8 rows a box, 16 for the 16-token engine

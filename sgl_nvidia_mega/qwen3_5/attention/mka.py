@@ -233,6 +233,12 @@ def step(layer, x, st):
     h0 = _route_lin_h0(hop, layer, m, st)
     if h0 is not None:
         # SGLANG_PERFLL_ROUTE_LIN (numeric): the router partial rides the o_proj push
+        if ("route_lin", m) not in _ENGAGED:
+            _ENGAGED.add(("route_lin", m))
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 slot mka pushes its router partial (route-lin, %s) at %d rows",
+                kernels.RL_ATTN_FORM, m,
+            )
         kernels.epilogue_rl(
             attn=o,
             gate=gate,

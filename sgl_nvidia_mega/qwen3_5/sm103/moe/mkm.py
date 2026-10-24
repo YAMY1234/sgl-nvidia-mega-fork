@@ -183,18 +183,23 @@ def engine_options(rows: int, plain: bool = False) -> tuple:
 
 # PERF-DRAFT: a caller's own "<rows>:<sms>" tables for the 32 / 64-token engines while it launches (reserve_tables)
 _TABLES: tuple | None = None
+# PERF-DRAFT: a caller's own 16-token engine bound while it launches (reserve_tables): past it, up to 16 rows, the 32-token
+# engine serves (the same logits and NVFP4 input, bit for bit the runner's rows as the 16-token engine's)
+_M16_ROWS = M16_MAX_TOKENS
 
 
 @contextlib.contextmanager
-def reserve_tables(m32: tuple, m64: tuple):
+def reserve_tables(m32: tuple, m64: tuple, m16_rows: int = M16_MAX_TOKENS):
     """The 32 / 64-token engines launched inside take these reserve tables in place of SGLANG_Q35_MKM_M32_RESERVE /
-    SGLANG_Q35_MKM_M64_RESERVE (past every bound, RESERVED_SMS as before)."""
-    global _TABLES
+    SGLANG_Q35_MKM_M64_RESERVE (past every bound, RESERVED_SMS as before); past ``m16_rows`` rows the 32-token engine
+    takes the 16-token one's (a CTA per (token, top-k) slot, it leaves the alternate stream no SMs)."""
+    global _TABLES, _M16_ROWS
     prev, _TABLES = _TABLES, (m32, m64)
+    prev16, _M16_ROWS = _M16_ROWS, m16_rows
     try:
         yield
     finally:
-        _TABLES = prev
+        _TABLES, _M16_ROWS = prev, prev16
 
 
 def reserved_sms(rows: int, m: int) -> int:
@@ -261,6 +266,8 @@ ROUTED_ENGINES = (M64_MAX_TOKENS, M128_MAX_TOKENS, M256_MAX_TOKENS, M512_MAX_TOK
 
 def engine_rows(m: int) -> int:
     """The bound of the engine that serves ``m`` rows."""
+    if _M16_ROWS < m <= M16_MAX_TOKENS:
+        return M32_MAX_TOKENS
     return next(r for r in ENGINE_ROWS if m <= r)
 
 

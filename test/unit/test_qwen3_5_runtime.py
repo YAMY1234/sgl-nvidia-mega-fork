@@ -676,20 +676,35 @@ def test_a_callers_reserve_tables_stand_in_for_the_engines_own_while_it_launches
     assert (kernel.reserved_sms(m32, 21), kernel.reserved_sms(m64, 35)) == (0, 32)
 
 
+def test_a_callers_16_token_bound_hands_the_rows_past_it_to_the_32_token_engine():
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm as kernel
+
+    m16, m32 = kernel.M16_MAX_TOKENS, kernel.M32_MAX_TOKENS
+    assert [kernel.engine_rows(m) for m in (7, 12, 13, 16, 17)] == [kernel.MAX_TOKENS, m16, m16, m16, m32]
+    with kernel.reserve_tables((), (), m16_rows=12):
+        assert [kernel.engine_rows(m) for m in (7, 12, 13, 16, 17)] == [kernel.MAX_TOKENS, m16, m32, m32, m32]
+    assert kernel.engine_rows(13) == m16
+
+
 def test_the_draft_moe_launches_the_engines_with_its_own_reserves(monkeypatch):
     from sgl_nvidia_mega.qwen3_5 import moe
     from sgl_nvidia_mega.qwen3_5.draft import moe_mkm
     from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm as kernel
 
     seen = []
-    monkeypatch.setattr(moe, "step", lambda layer, x, st, defer, reduce: seen.append(kernel._TABLES))
+    monkeypatch.setattr(
+        moe, "step", lambda layer, x, st, defer, reduce: seen.append((kernel._TABLES, kernel._M16_ROWS))
+    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     draft, x = moe_mkm.DraftMkm(None, wide=True), torch.zeros(21, 4)
     draft(None, x)  # default: the target's tables
     monkeypatch.setattr(moe_mkm, "M32_RESERVE", ((21, 32),))
     draft(None, x)
-    assert seen == [None, (((21, 32),), kernel.M64_RESERVE_BY_ROWS)]
-    assert kernel._TABLES is None
+    monkeypatch.setattr(moe_mkm, "M16_MAX_ROWS", 12)
+    draft(None, x)
+    m16, tables = kernel.M16_MAX_TOKENS, (((21, 32),), kernel.M64_RESERVE_BY_ROWS)
+    assert seen == [(None, m16), (tables, m16), (tables, 12)]
+    assert (kernel._TABLES, kernel._M16_ROWS) == (None, m16)
 
 
 @pytest.mark.parametrize(

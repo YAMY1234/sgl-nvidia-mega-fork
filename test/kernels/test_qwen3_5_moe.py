@@ -187,6 +187,22 @@ def test_mkm_is_the_trtllm_routed_experts(layer, m, seed, shared_route):
     assert not differ.any(), f"rows {differ.nonzero().flatten().tolist()} differ"
 
 
+@pytest.mark.parametrize("m", [13, 14, 16])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_the_32_token_engine_past_a_callers_16_token_bound_is_the_trtllm_routed_experts(layer, m, seed):
+    # PERF-DRAFT (SGLANG_PERFDRAFT_MKM_M16_MAX_ROWS): 13-16 rows on the 32-token engine, 32 SMs reserved
+    if m > mkm.max_tokens(layer["inter"], m32=True, m64=True) or layer["inter"] not in mkm.M32_ENGINES:
+        pytest.skip("no 32-token engine at this intermediate")
+    logits, x_fp4, x_sf = _inputs(m, seed)
+    with mkm.reserve_tables(((21, 32),), (), m16_rows=12):
+        assert mkm.engine_rows(m) == mkm.M32_MAX_TOKENS
+        rows, weights = _fused(layer, logits, x_fp4, x_sf)
+    want_rows, want_weights = _stock(layer, logits, x_fp4, x_sf)
+    assert torch.equal(weights.view(torch.int16), want_weights.view(torch.int16))
+    differ = (rows.view(torch.int16) != want_rows.view(torch.int16)).any(dim=1)
+    assert not differ.any(), f"rows {differ.nonzero().flatten().tolist()} differ"
+
+
 @pytest.mark.parametrize("m", [7, 14, 28, 56])
 def test_mkm_replays_from_a_cuda_graph(layer, m):
     if m > mkm.max_tokens(layer["inter"], m32=True, m64=True):

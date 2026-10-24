@@ -49,6 +49,9 @@ def _reserve_table(name: str) -> tuple:
 # target's): its shared expert is SGLang's BF16 one on the alternate stream, whose GEMMs need SMs beside the engine
 M32_RESERVE = _reserve_table("SGLANG_PERFDRAFT_MKM_M32_RESERVE")
 M64_RESERVE = _reserve_table("SGLANG_PERFDRAFT_MKM_M64_RESERVE")
+# the draft passes of more rows than this, up to 16, run the 32-token engine (with the reserve above) in the 16-token
+# one's place, bit for bit (default 16: none): the 16-token engine's CTA per (token, top-k) slot takes every SM past ~12 rows
+M16_MAX_ROWS = int(os.environ.get("SGLANG_PERFDRAFT_MKM_M16_MAX_ROWS", "16"))
 
 # the MoE slots moe.step reads, all off but the ones a width takes
 _SLOT_NAMES = (
@@ -146,10 +149,12 @@ class DraftMkm:
         from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm as mkm_kernel
 
         st = self.state(int(x.shape[0]))
-        if not (M32_RESERVE or M64_RESERVE):
+        if not (M32_RESERVE or M64_RESERVE or M16_MAX_ROWS < mkm_kernel.M16_MAX_TOKENS):
             return moe.step(layer, x, st, defer=True, reduce=_unreduced)
         with mkm_kernel.reserve_tables(
-            M32_RESERVE or mkm_kernel.M32_RESERVE_BY_ROWS, M64_RESERVE or mkm_kernel.M64_RESERVE_BY_ROWS
+            M32_RESERVE or mkm_kernel.M32_RESERVE_BY_ROWS,
+            M64_RESERVE or mkm_kernel.M64_RESERVE_BY_ROWS,
+            M16_MAX_ROWS,
         ):
             return moe.step(layer, x, st, defer=True, reduce=_unreduced)
 

@@ -2758,3 +2758,39 @@ def test_with_slot_hop_each_point_falls_back_to_sglang_where_the_hop_declines(
     assert log == [(p, "the hop") for p in ("layer_input", "moe_input", "final_norm")]
     # an auxiliary capture reads SGLang's own prepare
     assert boundary.pre(layer, "h", st, capture=[]) == "sglang layer input"
+
+
+def test_the_draft_moe_target_path_hands_off_unreduced():
+    """PERF-DRAFT's draft MoE on the target path (draft/moe_mkm.py): its handoff's complete() is this rank's finalized
+    rows, unreduced (the draft layer all-reduces after the MoE itself); moe.step's default keeps SGLang's post-experts
+    all-reduce. The all-reduce is stood in for by x8 (eight ranks of equal partials): a double reduction reads 8x."""
+    from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
+
+    from sgl_nvidia_mega.qwen3_5.draft.moe_mkm import DraftMkm
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    rows, hidden, top_k = 14, 4, 10
+    x = torch.ones(rows, hidden)
+    finalized = torch.arange(rows * hidden, dtype=torch.float32).view(rows, hidden)
+    deferred = SimpleNamespace(
+        gemm2_out=torch.zeros(rows * top_k, hidden),
+        expert_weights=torch.zeros(rows, top_k),
+        expanded_idx_to_permuted_idx=torch.arange(rows * top_k, dtype=torch.int32),
+        top_k=top_k,
+    )
+    mlp = SimpleNamespace(
+        alt_stream=None,
+        shared_expert_gate=SimpleNamespace(weight=torch.zeros(1, hidden)),
+        _forward_shared_experts=lambda x, apply_gate: torch.zeros_like(x),
+        _gate_shared_output_out_of_place=lambda x, s: s,
+    )
+    layer = SimpleNamespace(mlp=mlp)
+    with (
+        patch.object(moe, "_router_experts", lambda mlp, x, defer, st: deferred),
+        patch.object(flashinfer_trtllm, "finalize_flashinfer_trtllm_deferred_output", lambda d, s: finalized),
+        patch("sglang.srt.layers.moe.utils.sum_post_experts_output", lambda t: 8 * t),
+    ):
+        draft = DraftMkm(route.Bound(route=True), wide=True)(layer, x).complete()
+        target = moe.step(layer, x, SimpleNamespace(slots=plan.Slots(), bound={}, scratch={}), defer=True)
+    assert torch.equal(draft, finalized)
+    assert torch.equal(target.complete(), 8 * finalized)

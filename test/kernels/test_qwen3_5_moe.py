@@ -254,6 +254,23 @@ def test_mkm_on_route_topks_routing_is_the_trtllm_routed_experts(layer, m, share
     assert not differ.any(), f"rows {differ.nonzero().flatten().tolist()} differ"
 
 
+@pytest.mark.parametrize("m", [129, 168, 224, 256, 257, 336, 448, 512])
+@pytest.mark.parametrize("shared_route", [False, True])
+def test_wide_engines_balanced_split_is_the_trtllm_routed_experts(
+    layer, m, shared_route, monkeypatch
+):
+    """SGLANG_PERFLL_MKM_WIDE_BAL: the wide engines with the balanced work split give the
+    runner's rows, bit for bit."""
+    monkeypatch.setattr(mkm, "ENGINE_WIDE_BAL", True)
+    mkm._kernel.cache_clear()
+    try:
+        test_mkm_on_route_topks_routing_is_the_trtllm_routed_experts(
+            layer, m, shared_route
+        )
+    finally:
+        mkm._kernel.cache_clear()
+
+
 @pytest.mark.parametrize("m", [56, 112, 224, 448])
 def test_mkm_on_route_topks_routing_replays_from_a_cuda_graph(layer, m):
     if m > mkm.max_tokens(

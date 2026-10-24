@@ -569,10 +569,15 @@ class StockSplitDecode:
                     denom[split, column] = total
 
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 from cutlass.cute.runtime import from_dlpack
+
+# SGLANG_PERFLL_SKV2_MERGE_RELEASE=1: the merge releases its own dependent at entry (StockSplitPlan.release)
+MERGE_RELEASE = os.environ.get("SGLANG_PERFLL_SKV2_MERGE_RELEASE", "0") == "1"
 
 
 @triton.jit
@@ -636,7 +641,10 @@ def _merge_attention(
     SKIP_EMPTY: tl.constexpr,
     SHORT_MERGE: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    RELEASE: tl.constexpr = False,
 ):
+    if RELEASE:  # the consumer's own dependency wait still covers this grid's stores
+        tl.extra.cuda.gdc_launch_dependents()
     if USE_GDC:  # launched as a programmatic dependent of the split producer
         tl.extra.cuda.gdc_wait()
     if SHORT_MERGE and not BALANCED:
@@ -708,6 +716,7 @@ class StockSplitPlan:
         prefetch=True,
         merge_pdl=None,
         trigger=False,
+        release=None,
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("SKV2 storage must be prepared before graph capture")
@@ -723,6 +732,9 @@ class StockSplitPlan:
         self.denom = torch.empty_like(self.maximum)
         # merge_pdl: the merge is a programmatic dependent of the producer (waits before reading the partials).
         self.merge_pdl = pdl if merge_pdl is None else merge_pdl
+        # release: the merge releases its own dependent at entry, so that consumer's work before its dependency wait
+        # (the MKA epilogue's o_proj weight loads) overlaps the merge
+        self.release = MERGE_RELEASE if release is None else release
         kernel = StockSplitDecode(
             self.heads,
             self.qlen,
@@ -779,6 +791,7 @@ class StockSplitPlan:
             True,
             True,
             USE_GDC=self.merge_pdl,
+            RELEASE=self.release,
             num_warps=4,
             enable_fp_fusion=False,
             **({"launch_pdl": True} if self.merge_pdl else {}),

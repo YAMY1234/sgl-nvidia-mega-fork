@@ -119,23 +119,24 @@ def load_keys_ef(
     tile: cutlass.Constexpr[int],
     length: cutlass.Int32,
 ):
-    """load_keys through a TMA atom with an L2 evict-first policy: two 64 x 128 B boxes per page (wide_box layout)."""
+    """load_keys through a TMA atom with an L2 evict-first policy: two 64 x 128 B boxes per page (wide_box layout).
+    The whole warp calls it, as load_keys (the TMA copy elects its issuing lane)."""
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(barrier, tile * 256)
-        for half in cutlass.range_constexpr(tile // 64):
-            page_index = first_page + half
-            page = cutlass.Int32(0)
-            if page_index < cute.ceil_div(length, 64):
-                page = table[0, page_index]
-            for cb in cutlass.range_constexpr(2):
-                tks, tkg = cpasync.tma_partition(
-                    tma_k,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(cute.local_tile(sk[None, None, stage], (64, 128), (half, cb)), 0, 2),
-                    cute.group_modes(cute.local_tile(gk, (64, 128), (page, cb)), 0, 2),
-                )
-                cute.copy(tma_k, tkg, tks, tma_bar_ptr=barrier, cache_policy=cutlass.Int64(EVICT_FIRST))
+    for half in cutlass.range_constexpr(tile // 64):
+        page_index = first_page + half
+        page = cutlass.Int32(0)
+        if page_index < cute.ceil_div(length, 64):
+            page = table[0, page_index]
+        for cb in cutlass.range_constexpr(2):
+            tks, tkg = cpasync.tma_partition(
+                tma_k,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(cute.local_tile(sk[None, None, stage], (64, 128), (half, cb)), 0, 2),
+                cute.group_modes(cute.local_tile(gk, (64, 128), (page, cb)), 0, 2),
+            )
+            cute.copy(tma_k, tkg, tks, tma_bar_ptr=barrier, cache_policy=cutlass.Int64(EVICT_FIRST))
 
 
 @cute.experimental.jit
@@ -150,23 +151,24 @@ def load_values_ef(
     tile: cutlass.Constexpr[int],
     length: cutlass.Int32,
 ):
-    """load_values through a TMA atom with an L2 evict-first policy: two 128 B x 64 boxes per page (wide_box layout)."""
+    """load_values through a TMA atom with an L2 evict-first policy: two 128 B x 64 boxes per page (wide_box layout).
+    The whole warp calls it, as load_values (the TMA copy elects its issuing lane)."""
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(barrier, tile * 256)
-        for half in cutlass.range_constexpr(tile // 64):
-            page_index = first_page + half
-            page = cutlass.Int32(0)
-            if page_index < cute.ceil_div(length, 64):
-                page = table[0, page_index]
-            for cb in cutlass.range_constexpr(2):
-                tvs, tvg = cpasync.tma_partition(
-                    tma_v,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(cute.local_tile(sv[None, None, stage], (128, 64), (cb, half)), 0, 2),
-                    cute.group_modes(cute.local_tile(gv, (128, 64), (cb, page)), 0, 2),
-                )
-                cute.copy(tma_v, tvg, tvs, tma_bar_ptr=barrier, cache_policy=cutlass.Int64(EVICT_FIRST))
+    for half in cutlass.range_constexpr(tile // 64):
+        page_index = first_page + half
+        page = cutlass.Int32(0)
+        if page_index < cute.ceil_div(length, 64):
+            page = table[0, page_index]
+        for cb in cutlass.range_constexpr(2):
+            tvs, tvg = cpasync.tma_partition(
+                tma_v,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(cute.local_tile(sv[None, None, stage], (128, 64), (cb, half)), 0, 2),
+                cute.group_modes(cute.local_tile(gv, (128, 64), (cb, page)), 0, 2),
+            )
+            cute.copy(tma_v, tvg, tvs, tma_bar_ptr=barrier, cache_policy=cutlass.Int64(EVICT_FIRST))
 
 
 class StockSplitDecode:

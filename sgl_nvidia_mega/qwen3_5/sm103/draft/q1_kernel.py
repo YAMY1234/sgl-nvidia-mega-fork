@@ -55,6 +55,7 @@ raw scores; P x 448 = ex2(fma(s, c, -fma(m, c, -log2 448))) is rounded once to e
 with fp32 maxima and denominators, and a small kernel merges the CTAs in fp32. Only fp32 association differs.
 """
 
+import logging
 import math
 
 import cuda.bindings.driver as cuda
@@ -772,7 +773,7 @@ class Q1SplitPlan:
         self.denom = torch.empty_like(self.maximum)
         self.pdl = pdl
         self.release = pdl and release
-        from sgl_nvidia_mega.qwen3_5.sm103.attention.skv2 import KV_EVICT_FIRST
+        from sgl_nvidia_mega.qwen3_5.sm103.attention.skv2 import KV_EVICT_FIRST, _EF_LOGGED
 
         kernel = Q1SplitDecode(
             self.heads,
@@ -782,6 +783,11 @@ class Q1SplitPlan:
             pdl=pdl,
             evict_first=KV_EVICT_FIRST if evict_first is None else evict_first,
         )
+        if kernel.evict_first and "SKV2-Q1" not in _EF_LOGGED:
+            _EF_LOGGED.add("SKV2-Q1")
+            logging.getLogger(__name__).info(
+                "NVIDIA megakernel: SKV2-Q1 K / V loads use an L2 evict-first policy (SGLANG_PERFLL_KV_EVICT_FIRST)"
+            )
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self.compiled = cute.compile(

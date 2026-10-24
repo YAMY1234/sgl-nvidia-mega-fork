@@ -731,6 +731,7 @@ class StockSplitDecode:
                     denom[split, column] = total
 
 
+import logging
 import os
 
 import torch
@@ -742,6 +743,8 @@ from cutlass.cute.runtime import from_dlpack
 MERGE_RELEASE = os.environ.get("SGLANG_PERFLL_SKV2_MERGE_RELEASE", "0") == "1"
 # SGLANG_PERFLL_KV_EVICT_FIRST=1: K / V tiles in page-high boxes loaded with an L2 evict-first policy (same arithmetic)
 KV_EVICT_FIRST = os.environ.get("SGLANG_PERFLL_KV_EVICT_FIRST", "0") == "1"
+# kernels whose evict-first engage line was logged (once per process)
+_EF_LOGGED = set()
 
 
 @triton.jit
@@ -912,6 +915,11 @@ class StockSplitPlan:
             wide_box=KV_EVICT_FIRST if evict_first is None else evict_first,
             evict_first=KV_EVICT_FIRST if evict_first is None else evict_first,
         )
+        if kernel.evict_first and "SKV2" not in _EF_LOGGED:
+            _EF_LOGGED.add("SKV2")
+            logging.getLogger(__name__).info(
+                "NVIDIA megakernel: SKV2 K / V loads use an L2 evict-first policy (SGLANG_PERFLL_KV_EVICT_FIRST)"
+            )
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self.compiled = cute.compile(

@@ -61,11 +61,15 @@ PIN_RL = os.environ.get("SGLANG_PERFLL_PIN_RL", "0") == "1"
 logger = logging.getLogger(__name__)
 # int32 0, 1, 2, ... buffers (data_ptr -> length) whose prefixes are identity row maps of a finalize
 _IDENTITY_ROWS: dict = {}
+# the registered buffers, held for the process: a freed one (route.build_m32 replaces route.build's) would give its
+# address to another tensor, whose rows a finalize then reads as the identity map
+_IDENTITY_KEEP: list = []
 
 
 def register_identity_rows(rows: torch.Tensor) -> None:
     """Record ``rows`` (int32 0, 1, 2, ...): a finalize whose ``permuted_indices`` is a contiguous prefix of it
-    passes no row map, so its routed rows need not wait for the map's load."""
+    passes no row map, so its routed rows need not wait for the map's load. The registry holds ``rows``."""
+    _IDENTITY_KEEP.append(rows)
     _IDENTITY_ROWS[rows.data_ptr()] = rows.numel()
 
 

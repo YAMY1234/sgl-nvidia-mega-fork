@@ -121,7 +121,12 @@ def _want_token(local_logits, group, nan_as):
     return int(torch.argmax(full))  # the first maximum: the lowest id
 
 
-def test_step_exchange_picks_the_global_argmax(ranks, boundary):
+@pytest.mark.parametrize("split_send", [False, True])
+def test_step_exchange_picks_the_global_argmax(ranks, boundary, split_send, monkeypatch):
+    """(split_send: SGLANG_PERFDRAFT_MKD_XCHG_SPLIT_SEND, the hidden partial sent by its own threads.)"""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    monkeypatch.setattr(kernels, "XCHG_SPLIT_SEND", split_send)
     rank, world, group, _ = ranks
     mkd, _ = boundary
     n_embed = world // 2

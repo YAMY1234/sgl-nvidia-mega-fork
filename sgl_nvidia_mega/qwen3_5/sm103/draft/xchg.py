@@ -74,6 +74,9 @@ NAN_KEY_TORCH_ARGMAX = 0xFFFFFFFF
 # SGLANG_PERFDRAFT_MKD_PARTIAL_ROWS4=1 (PERF-DRAFT, default off): the side-stream hidden partial issues four rows'
 # weight loads per warp at once (mkd_hidden_partial_r4, same values), so it ends before the draft head beside it
 PARTIAL_ROWS4 = os.environ.get("SGLANG_PERFDRAFT_MKD_PARTIAL_ROWS4", "0") == "1"
+# SGLANG_PERFDRAFT_MKD_XCHG_SPLIT_SEND=1 (PERF-DRAFT, default off): a hidden rank's exchange sends its partial from other
+# threads than the candidate memo row (mkd_xchg_memo_split, the same words)
+XCHG_SPLIT_SEND = os.environ.get("SGLANG_PERFDRAFT_MKD_XCHG_SPLIT_SEND", "0") == "1"
 
 
 class MkdXchgParams(ctypes.Structure):
@@ -206,7 +209,7 @@ def _xchg_kernels(device_index: int, world: int) -> dict[str, jit.Kernel]:
     cubin = _compile(device_index, "mkd_xchg", (f"MKD_WORLD={world}",))
     return {
         name: jit.load(cubin, name, (XCHG_THREADS, 1, 1), 0)
-        for name in ("mkd_xchg_memo", "mkd_xchg_emb")
+        for name in ("mkd_xchg_memo", "mkd_xchg_emb", "mkd_xchg_memo_split")
     }
 
 
@@ -479,7 +482,11 @@ def mkd_xchg(
     )
     kernels = _xchg_kernels(device.index, world)
     _launch(
-        kernels["mkd_xchg_memo" if memo else "mkd_xchg_emb"],
+        kernels[
+            ("mkd_xchg_memo_split" if XCHG_SPLIT_SEND else "mkd_xchg_memo")
+            if memo
+            else "mkd_xchg_emb"
+        ],
         CHUNKS,
         p,
         device,

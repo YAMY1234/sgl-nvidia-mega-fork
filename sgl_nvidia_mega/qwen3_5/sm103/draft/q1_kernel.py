@@ -64,9 +64,11 @@ import torch
 import triton
 import triton.language as tl
 from cutlass.cute import experimental as ex
-from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.experimental import primitives as prim
+
+from sgl_nvidia_mega.qwen3_5.sm103.attention.skv2 import load_keys_ef, load_values_ef
 
 LOG2_448 = math.log2(448.0)
 
@@ -119,13 +121,16 @@ def load_values(
 
 class Q1SplitDecode:
     def __init__(
-        self, heads=4, nsplit=152, stages=2, slots=2, pdl=False, prefetch=True
+        self, heads=4, nsplit=152, stages=2, slots=2, pdl=False, prefetch=True, evict_first=False
     ):
         assert stages >= 1 and slots in (2, 3, 4) and 1 <= heads <= 12
         self.heads, self.nsplit, self.stages, self.slots = heads, nsplit, stages, slots
         # pdl: launched as a programmatic dependent; CTAs that land while the predecessor runs load their first
         # K / V tiles that hold no token written by this step, then wait (the merge launches at this grid's exit).
         self.pdl, self.prefetch = pdl, prefetch
+        # evict_first: K tiles stored rows-first and V tiles tokens-first in shared memory, loaded in page-high boxes
+        # through TMA atoms with an L2 evict-first policy (skv2.StockSplitDecode.evict_first; same arithmetic)
+        self.evict_first = evict_first
         self.rows = heads
         self.width = 32
         self.tile = 128
@@ -169,8 +174,18 @@ class Q1SplitDecode:
                 OperandMajorMode.MN,
             )
         )
+        # TMA atoms for the evict-first loads (one 64 x 128 B box of K, 128 B x 64 of V); unused without evict_first
+        op = cpasync.CopyBulkTensorTileG2SOp()
+        k_box = cute.tile_to_shape(
+            tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.K_SW128, dtype), (64, 128), order=(0, 1)
+        )
+        v_box = cute.tile_to_shape(
+            tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.MN_SW128, dtype), (128, 64), order=(1, 0)
+        )
+        tma_k, gk = cpasync.make_tiled_tma_atom(op, k, k_box, (64, 128))
+        tma_v, gv = cpasync.make_tiled_tma_atom(op, v, v_box, (128, 64))
         self.kernel(
-            q, k, v, table, lengths, partial, maxima, denom, qk_scale, out_scale, kq, vp
+            q, k, v, table, lengths, partial, maxima, denom, qk_scale, out_scale, kq, vp, tma_k, gk, tma_v, gv
         ).launch(
             grid=(self.nsplit, 1, 1), block=(384, 1, 1), stream=stream, use_pdl=self.pdl
         )
@@ -190,6 +205,10 @@ class Q1SplitDecode:
         out_scale: cutlass.Float32,
         kq: cute.TiledMma,
         vp: cute.TiledMma,
+        tma_k: cute.CopyAtom,
+        gk: cute.Tensor,
+        tma_v: cute.CopyAtom,
+        gv: cute.Tensor,
     ):
         tid, _, _ = cute.arch.thread_idx()
         split, _, _ = cute.arch.block_idx()
@@ -216,13 +235,21 @@ class Q1SplitDecode:
         sk = ex.allocate(
             dtype,
             cutlass.AddressSpace.smem,
-            cute.tile_to_shape(k_atom, (self.tile, 256, self.stages), order=(1, 0, 2)),
+            cute.tile_to_shape(
+                k_atom,
+                (self.tile, 256, self.stages),
+                order=(0, 1, 2) if self.evict_first else (1, 0, 2),
+            ),
             alignment=128,
         )
         sv = ex.allocate(
             dtype,
             cutlass.AddressSpace.smem,
-            cute.tile_to_shape(v_atom, (256, self.tile, self.stages), order=(0, 1, 2)),
+            cute.tile_to_shape(
+                v_atom,
+                (256, self.tile, self.stages),
+                order=(1, 0, 2) if self.evict_first else (0, 1, 2),
+            ),
             alignment=128,
         )
         sp = ex.allocate(
@@ -330,26 +357,52 @@ class Q1SplitDecode:
             if warp == 10:
                 for stage in cutlass.range_constexpr(self.stages):
                     if stage < npre:
-                        load_keys(
-                            k,
-                            table,
-                            sk,
-                            bk + stage,
-                            begin_page + stage * (self.tile // 64),
-                            stage,
-                            self.tile,
-                            length,
-                        )
-                        load_values(
-                            v,
-                            table,
-                            sv,
-                            bv + stage,
-                            begin_page + stage * (self.tile // 64),
-                            stage,
-                            self.tile,
-                            length,
-                        )
+                        if cutlass.const_expr(self.evict_first):
+                            load_keys_ef(
+                                tma_k,
+                                gk,
+                                table,
+                                sk,
+                                bk + stage,
+                                begin_page + stage * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
+                        else:
+                            load_keys(
+                                k,
+                                table,
+                                sk,
+                                bk + stage,
+                                begin_page + stage * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
+                        if cutlass.const_expr(self.evict_first):
+                            load_values_ef(
+                                tma_v,
+                                gv,
+                                table,
+                                sv,
+                                bv + stage,
+                                begin_page + stage * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
+                        else:
+                            load_values(
+                                v,
+                                table,
+                                sv,
+                                bv + stage,
+                                begin_page + stage * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
         if warp < 4:
@@ -541,46 +594,85 @@ class Q1SplitDecode:
                 )
                 for stage in cutlass.range_constexpr(self.stages):
                     if stage < nblk and stage >= npre:
-                        load_keys(
-                            k,
-                            table,
-                            sk,
-                            bk + stage,
-                            begin_page + stage * (self.tile // 64),
-                            stage,
-                            self.tile,
-                            length,
-                        )
+                        if cutlass.const_expr(self.evict_first):
+                            load_keys_ef(
+                                tma_k,
+                                gk,
+                                table,
+                                sk,
+                                bk + stage,
+                                begin_page + stage * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
+                        else:
+                            load_keys(
+                                k,
+                                table,
+                                sk,
+                                bk + stage,
+                                begin_page + stage * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
                 for it in cutlass.range(0, nblk):
                     stage = it % self.stages
                     if it >= npre:
                         cute.arch.mbarrier_wait(
                             bvfree + stage, phase=(it // self.stages + 1) % 2
                         )
-                        load_values(
-                            v,
-                            table,
-                            sv,
-                            bv + stage,
-                            begin_page + it * (self.tile // 64),
-                            stage,
-                            self.tile,
-                            length,
-                        )
+                        if cutlass.const_expr(self.evict_first):
+                            load_values_ef(
+                                tma_v,
+                                gv,
+                                table,
+                                sv,
+                                bv + stage,
+                                begin_page + it * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
+                        else:
+                            load_values(
+                                v,
+                                table,
+                                sv,
+                                bv + stage,
+                                begin_page + it * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
                     if it + self.stages < nblk:
                         cute.arch.mbarrier_wait(
                             bkfree + stage, phase=(it // self.stages) % 2
                         )
-                        load_keys(
-                            k,
-                            table,
-                            sk,
-                            bk + stage,
-                            begin_page + (it + self.stages) * (self.tile // 64),
-                            stage,
-                            self.tile,
-                            length,
-                        )
+                        if cutlass.const_expr(self.evict_first):
+                            load_keys_ef(
+                                tma_k,
+                                gk,
+                                table,
+                                sk,
+                                bk + stage,
+                                begin_page + (it + self.stages) * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
+                        else:
+                            load_keys(
+                                k,
+                                table,
+                                sk,
+                                bk + stage,
+                                begin_page + (it + self.stages) * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
         cute.arch.mbarrier_wait(bdenom, phase=0)
         for chunk in cutlass.range_constexpr(cute.ceil_div(rows, 12)):
             column = warp + 12 * chunk
@@ -661,6 +753,7 @@ class Q1SplitPlan:
         slots=2,
         pdl=False,
         release=False,
+        evict_first=None,
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("SKV2-Q1 storage must be prepared before graph capture")
@@ -679,8 +772,15 @@ class Q1SplitPlan:
         self.denom = torch.empty_like(self.maximum)
         self.pdl = pdl
         self.release = pdl and release
+        from sgl_nvidia_mega.qwen3_5.sm103.attention.skv2 import KV_EVICT_FIRST
+
         kernel = Q1SplitDecode(
-            self.heads, self.nsplit, stages=stages, slots=slots, pdl=pdl
+            self.heads,
+            self.nsplit,
+            stages=stages,
+            slots=slots,
+            pdl=pdl,
+            evict_first=KV_EVICT_FIRST if evict_first is None else evict_first,
         )
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)

@@ -35,6 +35,20 @@ MIN_ROWS = int(os.environ.get("SGLANG_PERFDRAFT_MOE_MKM_MIN_ROWS", "2"))
 MAX_ROWS = 64
 # draft steps (one row a request) of more rows keep SGLang's MoE; the extend is not capped (default: every width)
 STEP_MAX_ROWS = int(os.environ.get("SGLANG_PERFDRAFT_MOE_MKM_STEP_MAX_ROWS", str(MAX_ROWS)))
+# extends of rows in "<lo>-<hi>" keep SGLang's MoE (default none)
+EXTEND_SKIP = tuple(int(v) for v in os.environ.get("SGLANG_PERFDRAFT_MOE_MKM_EXTEND_SKIP", "0-0").split("-"))
+
+
+def _reserve_table(name: str) -> tuple:
+    return tuple(
+        tuple(int(v) for v in item.split(":")) for item in os.environ.get(name, "").split(",") if item
+    )
+
+
+# the draft MoE's own 32 / 64-token engine reserves, "<rows>:<sms>,..." as SGLANG_Q35_MKM_M32_RESERVE (default: the
+# target's): its shared expert is SGLang's BF16 one on the alternate stream, whose GEMMs need SMs beside the engine
+M32_RESERVE = _reserve_table("SGLANG_PERFDRAFT_MKM_M32_RESERVE")
+M64_RESERVE = _reserve_table("SGLANG_PERFDRAFT_MKM_M64_RESERVE")
 
 # the MoE slots moe.step reads, all off but the ones a width takes
 _SLOT_NAMES = (
@@ -98,6 +112,8 @@ class DraftMkm:
         here."""
         if rows_per_request == 1 and not MIN_ROWS <= rows <= STEP_MAX_ROWS:
             return False
+        if rows_per_request > 1 and EXTEND_SKIP[0] <= rows <= EXTEND_SKIP[1]:
+            return False
         return 1 <= rows <= MAX_ROWS
 
     def state(self, rows: int):
@@ -127,8 +143,15 @@ class DraftMkm:
         whose ``complete()`` is this rank's finalized rows, unreduced: the draft layer runs the all-reduce itself (the
         hop's finalize, or the all-reduce before its final norm), as after SGLang's own draft MoE."""
         from sgl_nvidia_mega.qwen3_5 import moe
+        from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm as mkm_kernel
 
-        return moe.step(layer, x, self.state(int(x.shape[0])), defer=True, reduce=_unreduced)
+        st = self.state(int(x.shape[0]))
+        if not (M32_RESERVE or M64_RESERVE):
+            return moe.step(layer, x, st, defer=True, reduce=_unreduced)
+        with mkm_kernel.reserve_tables(
+            M32_RESERVE or mkm_kernel.M32_RESERVE_BY_ROWS, M64_RESERVE or mkm_kernel.M64_RESERVE_BY_ROWS
+        ):
+            return moe.step(layer, x, st, defer=True, reduce=_unreduced)
 
 
 def _unreduced(rows: torch.Tensor) -> torch.Tensor:

@@ -633,26 +633,63 @@ def test_slot_draft_fin_hands_the_hop_only_the_deferred_output_it_reads(
 
 
 @pytest.mark.parametrize(
-    "rows, rows_per_request, step_max, want",
+    "rows, rows_per_request, step_max, extend_skip, want",
     [
-        (1, 1, 64, False),  # one-token steps keep the single launch (MIN_ROWS)
-        (2, 1, 64, True),
-        (24, 1, 64, True),
+        (1, 1, 64, (0, 0), False),  # one-token steps keep the single launch (MIN_ROWS)
+        (2, 1, 64, (0, 0), True),
+        (24, 1, 64, (0, 0), True),
         # SGLANG_PERFDRAFT_MOE_MKM_STEP_MAX_ROWS caps the draft steps only
-        (17, 1, 16, False),
-        (16, 1, 16, True),
-        (56, 7, 16, True),
-        (70, 7, 64, False),  # past the widest pass the path serves
+        (17, 1, 16, (0, 0), False),
+        (16, 1, 16, (0, 0), True),
+        (56, 7, 16, (0, 0), True),
+        (70, 7, 64, (0, 0), False),  # past the widest pass the path serves
+        # SGLANG_PERFDRAFT_MOE_MKM_EXTEND_SKIP leaves the extends of those rows to SGLang's MoE, not the steps
+        (14, 7, 64, (8, 21), False),
+        (21, 7, 64, (8, 21), False),
+        (28, 7, 64, (8, 21), True),
+        (7, 7, 64, (8, 21), True),
+        (14, 1, 64, (8, 21), True),
     ],
 )
 def test_the_draft_moe_takes_the_target_path_within_its_rows(
-    monkeypatch, rows, rows_per_request, step_max, want
+    monkeypatch, rows, rows_per_request, step_max, extend_skip, want
 ):
     from sgl_nvidia_mega.qwen3_5.draft import moe_mkm
 
     monkeypatch.setattr(moe_mkm, "MIN_ROWS", 2)
     monkeypatch.setattr(moe_mkm, "STEP_MAX_ROWS", step_max)
+    monkeypatch.setattr(moe_mkm, "EXTEND_SKIP", extend_skip)
     assert moe_mkm.DraftMkm(None, wide=True).takes(rows, rows_per_request) is want
+
+
+def test_a_callers_reserve_tables_stand_in_for_the_engines_own_while_it_launches(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm as kernel
+
+    m32, m64 = kernel.M32_MAX_TOKENS, kernel.M64_MAX_TOKENS
+    monkeypatch.setattr(kernel, "M32_RESERVE_BY_ROWS", ((21, 0),))
+    monkeypatch.setattr(kernel, "M64_RESERVE_BY_ROWS", ((35, 32),))
+    assert (kernel.reserved_sms(m32, 21), kernel.reserved_sms(m64, 35)) == (0, 32)
+    with kernel.reserve_tables(((21, 32),), ()):
+        assert kernel.reserved_sms(m32, 21) == 32
+        # past every bound of the caller's tables: the engines' defaults
+        assert kernel.reserved_sms(m64, 35) == kernel.RESERVED_SMS[m64]
+    assert (kernel.reserved_sms(m32, 21), kernel.reserved_sms(m64, 35)) == (0, 32)
+
+
+def test_the_draft_moe_launches_the_engines_with_its_own_reserves(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import moe
+    from sgl_nvidia_mega.qwen3_5.draft import moe_mkm
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm as kernel
+
+    seen = []
+    monkeypatch.setattr(moe, "step", lambda layer, x, st, defer, reduce: seen.append(kernel._TABLES))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    draft, x = moe_mkm.DraftMkm(None, wide=True), torch.zeros(21, 4)
+    draft(None, x)  # default: the target's tables
+    monkeypatch.setattr(moe_mkm, "M32_RESERVE", ((21, 32),))
+    draft(None, x)
+    assert seen == [None, (((21, 32),), kernel.M64_RESERVE_BY_ROWS)]
+    assert kernel._TABLES is None
 
 
 @pytest.mark.parametrize(

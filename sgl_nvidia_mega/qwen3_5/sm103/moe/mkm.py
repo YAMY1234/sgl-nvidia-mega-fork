@@ -15,6 +15,7 @@ turn and gathering each one's token rows).
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import logging
 import os
@@ -180,14 +181,37 @@ def engine_options(rows: int, plain: bool = False) -> tuple:
     return opts
 
 
+# PERF-DRAFT: a caller's own "<rows>:<sms>" tables for the 32 / 64-token engines while it launches (reserve_tables)
+_TABLES: tuple | None = None
+
+
+@contextlib.contextmanager
+def reserve_tables(m32: tuple, m64: tuple):
+    """The 32 / 64-token engines launched inside take these reserve tables in place of SGLANG_Q35_MKM_M32_RESERVE /
+    SGLANG_Q35_MKM_M64_RESERVE (past every bound, RESERVED_SMS as before)."""
+    global _TABLES
+    prev, _TABLES = _TABLES, (m32, m64)
+    try:
+        yield
+    finally:
+        _TABLES = prev
+
+
 def reserved_sms(rows: int, m: int) -> int:
     """The SMs the ``rows``-token engine leaves free at ``m`` rows."""
-    table = {M32_MAX_TOKENS: M32_RESERVE_BY_ROWS, M64_MAX_TOKENS: M64_RESERVE_BY_ROWS}.get(rows, ())
+    m32, m64 = _TABLES or (M32_RESERVE_BY_ROWS, M64_RESERVE_BY_ROWS)
+    table = {M32_MAX_TOKENS: m32, M64_MAX_TOKENS: m64}.get(rows, ())
     for bound, sms in table:
         if m <= bound:
-            if (rows, m) not in _LOGGED:
-                _LOGGED.add((rows, m))
-                logger.info("NVIDIA megakernel: Qwen3.5 %d-token engine leaves %d SMs free at %d rows", rows, sms, m)
+            if (rows, m, _TABLES) not in _LOGGED:
+                _LOGGED.add((rows, m, _TABLES))
+                logger.info(
+                    "NVIDIA megakernel: Qwen3.5 %d-token engine leaves %d SMs free at %d rows%s",
+                    rows,
+                    sms,
+                    m,
+                    " (caller's table)" if _TABLES else "",
+                )
             return sms
     return RESERVED_SMS[rows]
 

@@ -923,7 +923,8 @@ __device__ __forceinline__ uint4 rl_ld_cg4(const void* p) {
 }
 // SEP 0: CTAs 128..143 of the epilogue launch (waits as the epilogue does). SEP 1: a launch of its own right after the
 // epilogue (16 CTAs, no cluster): it runs once the epilogue triggers, which the epilogue does right after its own wait,
-// so the attention core has completed; it reads its operands through L2 (.cg) and does not wait on the epilogue.
+// so the attention core has completed; it reads its operands through L2 (.cg) and waits on the epilogue only at its
+// end.
 template <int SEP>
 __device__ __forceinline__ void mka_epilogue_rl_router(const EpiParams& p, const RlArgs& r, float (&red)[8][32][8],
                                                        RlSmem& sm) {
@@ -1031,6 +1032,9 @@ __device__ __forceinline__ void mka_epilogue_rl_router(const EpiParams& p, const
     rl_mc_st_v4f(dst, v[0], v[1], v[2], v[3]);
     rl_mc_st_v4f(dst + 4, v[4], v[5], v[6], v[7]);
   }
+  // SEP 1 completes only after the epilogue (which stores its rows after their push), so a later grid's PDL wait
+  // covers the epilogue as well
+  if (SEP) pdl_wait();
 }
 }  // namespace q35mka
 

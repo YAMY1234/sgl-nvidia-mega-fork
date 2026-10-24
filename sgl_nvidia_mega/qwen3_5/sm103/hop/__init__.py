@@ -209,11 +209,15 @@ def _kernels(device_index: int, deadline_ns: int) -> dict[str, jit.Kernel]:
 @cache
 def _rl_kernels(device_index: int, deadline_ns: int) -> dict[str, jit.Kernel]:
     major, minor = torch.cuda.get_device_capability(device_index)
+    import os
+
+    # SGLANG_PERFLL_MKM_EARLY=1: the consume writes the logits' sentinel first (with mkm's EARLY_PF in MKM7_DEFS)
+    sentinel = int(os.environ.get("SGLANG_PERFLL_MKM_EARLY", "0") == "1")
     cubin = jit.compile_source(
         RL_SOURCE.read_text(),
         "q35_hop_rl",
         f"sm_{major}{minor}a",
-        ("-std=c++17", "-default-device", f"-DQ35_HOP_DEADLINE_NS={deadline_ns}ull"),
+        ("-std=c++17", "-default-device", f"-DQ35_HOP_DEADLINE_NS={deadline_ns}ull", f"-DRL_SENTINEL={sentinel}"),
         headers(),
     )
     return {

@@ -222,6 +222,12 @@ constexpr int kARow = 132;  // FC1 accumulator row stride in floats: 16 B aligne
 #ifndef SPEC_STAGES  // ring stages warp 1 issues for its token's expert before the routing verdict (the rest after it)
 #define SPEC_STAGES 5
 #endif
+#ifndef EARLY_PF  // 1: before griddepcontrol.wait, warp 1 polls its token's logits (until no bf16 0xFFFF, the sentinel the
+#define EARLY_PF 0  // router-before-all-reduce consume writes before it triggers; at most EARLY_PF_NS) and prefetches its
+#endif              // pair's first SPEC_STAGES W13 stages into L2 (a hint: the stream itself is unchanged)
+#ifndef EARLY_PF_NS
+#define EARLY_PF_NS 5000
+#endif
 #ifndef PACE_D  // > 0: the producer issues stage st only once stage st - PACE_D has landed (bounded bytes in flight)
 #define PACE_D 0
 #endif  // partial row stride in floats: 16 B aligned, rows land on distinct banks
@@ -584,6 +590,11 @@ __device__ __forceinline__ void bulk_load_w(void* dst, const void* src, uint32_t
     bulk_load(dst, src, bytes, bar);
 }
 
+__device__ __forceinline__ uint64_t gtimer_ns() {
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
 __device__ __forceinline__ void stamp(const Params& p, int slot) {
   if (p.trace) p.trace[blockIdx.x * 16 + slot] = (long long)gtime();
 }
@@ -701,6 +712,49 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
   // and starts this pair's weight stream at once (a duplicate pair only wastes its first ring fill, mostly L2 hits)
   const int rtok = warp == 1 ? my_t : (warp == 0 ? 0 : warp - 1);
   uint32_t key = 0;
+  if (EARLY_PF && warp == 1) {
+    // the logits may still be in flight: poll this token's row for the sentinel, then prefetch (a hint only)
+    const uint4* src = reinterpret_cast<const uint4*>(p.logits + (size_t)my_t * kE + lane * 16);
+    uint4 v0, v1;
+    const uint64_t t0 = gtimer_ns();
+    bool ready = false;
+    while (true) {
+      asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v0.x), "=r"(v0.y), "=r"(v0.z), "=r"(v0.w) : "l"(src) : "memory");
+      asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v1.x), "=r"(v1.y), "=r"(v1.z), "=r"(v1.w) : "l"(src + 1) : "memory");
+      bool mine = true;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const uint32_t w = i < 4 ? (&v0.x)[i] : (&v1.x)[i - 4];
+        mine &= (w & 0xFFFFu) != 0xFFFFu && (w >> 16) != 0xFFFFu;
+      }
+      ready = __all_sync(0xffffffffu, mine);
+      // the deadline decision must be warp-uniform (the next round's __all_sync needs every lane)
+      if (ready || __any_sync(0xffffffffu, gtimer_ns() - t0 > (uint64_t)EARLY_PF_NS)) break;
+    }
+    if (ready) {
+      uint32_t keys[16];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const uint32_t w = i < 4 ? (&v0.x)[i] : (&v1.x)[i - 4];
+        keys[2 * i] = topk_key(w & 0xFFFFu, (uint32_t)(lane * 16 + 2 * i));
+        keys[2 * i + 1] = topk_key(w >> 16, (uint32_t)(lane * 16 + 2 * i + 1));
+      }
+      const uint32_t k = TOPK_RANK ? warp_top10(keys, (uint32_t)lane, s.cand[warp]) : warp_top10_redux(keys, (uint32_t)lane, s.cand[warp]);
+      uint32_t bits, e;
+      topk_unkey(__shfl_sync(0xffffffffu, k, my_k), bits, e);
+      if (lane == 0) {
+        for (int st = 0; st < SPEC_STAGES && st < kFc1Stages; ++st) {
+          asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" ::"l"(&tm13),
+                       "r"(st * 256), "r"((int)e * kN1 + (int)rank * kN1c) : "memory");
+          asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" ::"l"(&tm13),
+                       "r"(st * 256 + 128), "r"((int)e * kN1 + (int)rank * kN1c) : "memory");
+          const uint8_t* sf = p.w13_sf + (size_t)e * (kN1 * kH / 16) + (size_t)((int)rank * 64 + st * 8) * 512;
+          asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(sf), "r"(4096u) : "memory");
+        }
+      }
+      __syncwarp();
+    }
+  }
   asm volatile("griddepcontrol.wait;" ::: "memory");
   if (threadIdx.x == 32) stamp(p, 10);
   if (warp == 3 && lane == 0) {

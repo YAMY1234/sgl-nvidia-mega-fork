@@ -429,11 +429,18 @@ __device__ __forceinline__ void pull_both(const RlArgs& r, const Site& s, uint32
 
 // = hop.cu's consume_kernel<W>, plus: logit `frag` of the token from the router partials, and the NVFP4 input of the
 // norm row (block frag / 2 is this thread's 8 values and its lane neighbour's), as the router front quantizes it
+#ifndef RL_SENTINEL  // 1: the consume first writes bf16 0xFFFF over its logits and fences before it triggers, so a MoE launch
+#define RL_SENTINEL 0  // that polls the logits before its PDL wait (mkm EARLY_PF) sees either the sentinel or this step's value
+#endif
 template <int W, int POLL>
 __device__ __forceinline__ void consume_rl_kernel(const Args& a, const RlArgs& r) {
   __shared__ RowSmem rs;
   const int token = blockIdx.x;
   const int frag = blockIdx.y * kRowThreads + threadIdx.x;
+  if (RL_SENTINEL) {
+    r.logits[static_cast<size_t>(token) * kExperts + frag] = 0xFFFFu;
+    __threadfence();
+  }
   pdl_trigger();
   float gam[8];
   unpack8(ld_v4(a.gamma + static_cast<size_t>(frag) * kVec), gam);

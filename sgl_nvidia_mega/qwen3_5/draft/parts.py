@@ -91,6 +91,8 @@ class Parts:
         self.engaged: set = set()
         # sm103.draft.head_mx8.DraftHeadMx8 (SGLANG_PERFLP_DRAFT_HEAD_MXFP8)
         self.head_mx8: Optional[Any] = None
+        # draft.moe_mkm.DraftMkm: the draft MoE on the target's MoE path (SGLANG_PERFDRAFT_MOE_MKM)
+        self.moe_mkm: Optional[Any] = None
 
     @classmethod
     def build(cls, draft) -> Parts:
@@ -119,11 +121,19 @@ class Parts:
             parts.embed_full = parts._build_embed_full()
         if HEAD_MXFP8:
             parts.head_mx8 = parts._build_head_mx8()
+        from sgl_nvidia_mega.qwen3_5.draft import moe_mkm
+
+        if moe_mkm.ENABLED:
+            parts.moe_mkm, why = moe_mkm.DraftMkm.build(parts.layer.mlp)
+            if parts.moe_mkm is None:
+                raise RuntimeError(f"NVIDIA megakernel: SGLANG_PERFDRAFT_MOE_MKM cannot run: {why}")
         logger.info(
             "NVIDIA megakernel: Qwen3.5 MTP draft parts built (slots %s; MoE %s, hop "
             "%s, exchange %s, embedding %s, multi-request fc %s)",
             sorted(slots),
-            "single launch" if parts.moe is not None else "SGLang's",
+            ("target path" + (f" from {moe_mkm.MIN_ROWS} rows" if moe_mkm.MIN_ROWS > 1 else "") + ", ")
+            * (parts.moe_mkm is not None)
+            + ("single launch" if parts.moe is not None else "SGLang's"),
             "draft hop" if parts.hop is not None else "SGLang's",
             "MKD" if parts.mkd is not None else "SGLang's",
             "full table" if parts.embed_full is not None

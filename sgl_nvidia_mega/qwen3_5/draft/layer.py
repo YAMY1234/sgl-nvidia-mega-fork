@@ -132,9 +132,18 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
             else None
         ),
     )
+    # SGLANG_PERFDRAFT_MOE_MKM: the target's MoE path (NVFP4 experts) in place of the single launch and SGLang's MoE
+    mkm = (
+        parts.moe_mkm
+        if parts.moe_mkm is not None and parts.moe_mkm.takes(rows, rows_per_request)
+        else None
+    )
     moe = (
         parts.moe
-        if rows_per_request == 1 and parts.moe is not None and parts.moe.ready(rows)
+        if mkm is None
+        and rows_per_request == 1
+        and parts.moe is not None
+        and parts.moe.ready(rows)
         else None
     )
     if hop is not None:
@@ -159,7 +168,7 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         _note_fin(rows, "SGLang's: the experts do not defer their finalize")
         fin = False
     if fin:
-        owed = lay.mlp(moe_in, defer_finalize=True)
+        owed = mkm(lay, moe_in) if mkm is not None else lay.mlp(moe_in, defer_finalize=True)
         if _hop_takes(hop.hop, owed):
             _note_fin(rows, "in the final norm's hop (slot draft_fin)")
             out, _ = hop.hop.moe_finalize_all_reduce_rms_norm(
@@ -173,6 +182,8 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
             return out
         _note_fin(rows, "SGLang's: the hop does not read this deferred output")
         moe_out = owed.complete()
+    elif mkm is not None:
+        moe_out = mkm(lay, moe_in).complete()
     else:
         moe_out = moe(moe_in) if moe is not None else lay.mlp(moe_in)
     if hop is not None:

@@ -54,7 +54,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute import experimental as ex
-from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.experimental import primitives as prim
 
 
@@ -104,6 +104,71 @@ def load_values(
         ex.tma_load(source, dest, barrier.value, update_expect_tx=False)
 
 
+EVICT_FIRST = 0x12F0000000000000  # CUTLASS TMA::CacheHintSm90::EVICT_FIRST
+
+
+@cute.experimental.jit
+def load_keys_ef(
+    tma_k: cute.CopyAtom,
+    gk: cute.Tensor,
+    table: cute.Tensor,
+    sk: cute.Tensor,
+    barrier: cute.Pointer,
+    first_page: cutlass.Int32,
+    stage: cutlass.Int32,
+    tile: cutlass.Constexpr[int],
+    length: cutlass.Int32,
+):
+    """load_keys through a TMA atom with an L2 evict-first policy: two 64 x 128 B boxes per page (wide_box layout)."""
+    with cute.arch.elect_one():
+        cute.arch.mbarrier_arrive_and_expect_tx(barrier, tile * 256)
+        for half in cutlass.range_constexpr(tile // 64):
+            page_index = first_page + half
+            page = cutlass.Int32(0)
+            if page_index < cute.ceil_div(length, 64):
+                page = table[0, page_index]
+            for cb in cutlass.range_constexpr(2):
+                tks, tkg = cpasync.tma_partition(
+                    tma_k,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(cute.local_tile(sk[None, None, stage], (64, 128), (half, cb)), 0, 2),
+                    cute.group_modes(cute.local_tile(gk, (64, 128), (page, cb)), 0, 2),
+                )
+                cute.copy(tma_k, tkg, tks, tma_bar_ptr=barrier, cache_policy=cutlass.Int64(EVICT_FIRST))
+
+
+@cute.experimental.jit
+def load_values_ef(
+    tma_v: cute.CopyAtom,
+    gv: cute.Tensor,
+    table: cute.Tensor,
+    sv: cute.Tensor,
+    barrier: cute.Pointer,
+    first_page: cutlass.Int32,
+    stage: cutlass.Int32,
+    tile: cutlass.Constexpr[int],
+    length: cutlass.Int32,
+):
+    """load_values through a TMA atom with an L2 evict-first policy: two 128 B x 64 boxes per page (wide_box layout)."""
+    with cute.arch.elect_one():
+        cute.arch.mbarrier_arrive_and_expect_tx(barrier, tile * 256)
+        for half in cutlass.range_constexpr(tile // 64):
+            page_index = first_page + half
+            page = cutlass.Int32(0)
+            if page_index < cute.ceil_div(length, 64):
+                page = table[0, page_index]
+            for cb in cutlass.range_constexpr(2):
+                tvs, tvg = cpasync.tma_partition(
+                    tma_v,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(cute.local_tile(sv[None, None, stage], (128, 64), (cb, half)), 0, 2),
+                    cute.group_modes(cute.local_tile(gv, (128, 64), (cb, page)), 0, 2),
+                )
+                cute.copy(tma_v, tvg, tvs, tma_bar_ptr=barrier, cache_policy=cutlass.Int64(EVICT_FIRST))
+
+
 class StockSplitDecode:
     def __init__(
         self,
@@ -115,6 +180,8 @@ class StockSplitDecode:
         pdl=False,
         prefetch=True,
         trigger=False,
+        wide_box=False,
+        evict_first=False,
     ):
         assert stages >= 1 and slots in (2, 3, 4)
         self.heads, self.qlen, self.splits, self.stages, self.slots = (
@@ -129,6 +196,11 @@ class StockSplitDecode:
         # trigger: release the dependent (merge) after the wait; without it the merge launches at this grid's exit,
         # which measured faster (an early-resident merge returns from its wait later than a fresh launch starts).
         self.pdl, self.prefetch, self.trigger = pdl, prefetch, trigger
+        # wide_box: K tiles stored rows-first and V tiles tokens-first in shared memory, so one TMA box moves a page's
+        # 64 rows x 128 B (2 per page) instead of 8 x 128 B; evict_first (needs wide_box): those boxes load through
+        # TMA atoms with an L2 evict-first policy, so a long KV stream does not push out what the next kernels reuse
+        assert wide_box or not evict_first
+        self.wide_box, self.evict_first = wide_box, evict_first
         self.rows = heads * qlen
         self.width = 32 if self.rows <= 32 else 64
         self.tile = 128
@@ -172,8 +244,19 @@ class StockSplitDecode:
                 OperandMajorMode.MN,
             )
         )
+        # TMA atoms for the evict-first loads (wide_box layout: one 64 x 128 B box of K, 128 B x 64 of V); unused
+        # without evict_first
+        op = cpasync.CopyBulkTensorTileG2SOp()
+        k_box = cute.tile_to_shape(
+            tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.K_SW128, dtype), (64, 128), order=(0, 1)
+        )
+        v_box = cute.tile_to_shape(
+            tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.MN_SW128, dtype), (128, 64), order=(1, 0)
+        )
+        tma_k, gk = cpasync.make_tiled_tma_atom(op, k, k_box, (64, 128))
+        tma_v, gv = cpasync.make_tiled_tma_atom(op, v, v_box, (128, 64))
         self.kernel(
-            q, k, v, table, lengths, partial, maxima, denom, qk_scale, out_scale, kq, vp
+            q, k, v, table, lengths, partial, maxima, denom, qk_scale, out_scale, kq, vp, tma_k, gk, tma_v, gv
         ).launch(
             grid=(self.splits, 1, 1), block=(384, 1, 1), stream=stream, use_pdl=self.pdl
         )
@@ -193,6 +276,10 @@ class StockSplitDecode:
         out_scale: cutlass.Float32,
         kq: cute.TiledMma,
         vp: cute.TiledMma,
+        tma_k: cute.CopyAtom,
+        gk: cute.Tensor,
+        tma_v: cute.CopyAtom,
+        gv: cute.Tensor,
     ):
         tid, _, _ = cute.arch.thread_idx()
         split, _, _ = cute.arch.block_idx()
@@ -222,13 +309,21 @@ class StockSplitDecode:
         sk = ex.allocate(
             dtype,
             cutlass.AddressSpace.smem,
-            cute.tile_to_shape(k_atom, (self.tile, 256, self.stages), order=(1, 0, 2)),
+            cute.tile_to_shape(
+                k_atom,
+                (self.tile, 256, self.stages),
+                order=(0, 1, 2) if self.wide_box else (1, 0, 2),
+            ),
             alignment=128,
         )
         sv = ex.allocate(
             dtype,
             cutlass.AddressSpace.smem,
-            cute.tile_to_shape(v_atom, (256, self.tile, self.stages), order=(0, 1, 2)),
+            cute.tile_to_shape(
+                v_atom,
+                (256, self.tile, self.stages),
+                order=(1, 0, 2) if self.wide_box else (0, 1, 2),
+            ),
             alignment=128,
         )
         sp = ex.allocate(
@@ -328,26 +423,52 @@ class StockSplitDecode:
             if warp == 10:
                 for stage in cutlass.range_constexpr(self.stages):
                     if stage < npre:
-                        load_keys(
-                            k,
-                            table,
-                            sk,
-                            bk + stage,
-                            begin_page + stage * (self.tile // 64),
-                            stage,
-                            self.tile,
-                            length,
-                        )
-                        load_values(
-                            v,
-                            table,
-                            sv,
-                            bv + stage,
-                            begin_page + stage * (self.tile // 64),
-                            stage,
-                            self.tile,
-                            length,
-                        )
+                        if cutlass.const_expr(self.evict_first):
+                            load_keys_ef(
+                                tma_k,
+                                gk,
+                                table,
+                                sk,
+                                bk + stage,
+                                begin_page + stage * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
+                        else:
+                            load_keys(
+                                k,
+                                table,
+                                sk,
+                                bk + stage,
+                                begin_page + stage * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
+                        if cutlass.const_expr(self.evict_first):
+                            load_values_ef(
+                                tma_v,
+                                gv,
+                                table,
+                                sv,
+                                bv + stage,
+                                begin_page + stage * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
+                        else:
+                            load_values(
+                                v,
+                                table,
+                                sv,
+                                bv + stage,
+                                begin_page + stage * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
             if cutlass.const_expr(self.trigger):
@@ -516,46 +637,85 @@ class StockSplitDecode:
                 )
                 for stage in cutlass.range_constexpr(self.stages):
                     if stage < nblk and stage >= npre:
-                        load_keys(
-                            k,
-                            table,
-                            sk,
-                            bk + stage,
-                            begin_page + stage * (self.tile // 64),
-                            stage,
-                            self.tile,
-                            length,
-                        )
+                        if cutlass.const_expr(self.evict_first):
+                            load_keys_ef(
+                                tma_k,
+                                gk,
+                                table,
+                                sk,
+                                bk + stage,
+                                begin_page + stage * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
+                        else:
+                            load_keys(
+                                k,
+                                table,
+                                sk,
+                                bk + stage,
+                                begin_page + stage * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
                 for it in cutlass.range(0, nblk):
                     stage = it % self.stages
                     if it >= npre:
                         cute.arch.mbarrier_wait(
                             bvfree + stage, phase=(it // self.stages + 1) % 2
                         )
-                        load_values(
-                            v,
-                            table,
-                            sv,
-                            bv + stage,
-                            begin_page + it * (self.tile // 64),
-                            stage,
-                            self.tile,
-                            length,
-                        )
+                        if cutlass.const_expr(self.evict_first):
+                            load_values_ef(
+                                tma_v,
+                                gv,
+                                table,
+                                sv,
+                                bv + stage,
+                                begin_page + it * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
+                        else:
+                            load_values(
+                                v,
+                                table,
+                                sv,
+                                bv + stage,
+                                begin_page + it * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
                     if it + self.stages < nblk:
                         cute.arch.mbarrier_wait(
                             bkfree + stage, phase=(it // self.stages) % 2
                         )
-                        load_keys(
-                            k,
-                            table,
-                            sk,
-                            bk + stage,
-                            begin_page + (it + self.stages) * (self.tile // 64),
-                            stage,
-                            self.tile,
-                            length,
-                        )
+                        if cutlass.const_expr(self.evict_first):
+                            load_keys_ef(
+                                tma_k,
+                                gk,
+                                table,
+                                sk,
+                                bk + stage,
+                                begin_page + (it + self.stages) * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
+                        else:
+                            load_keys(
+                                k,
+                                table,
+                                sk,
+                                bk + stage,
+                                begin_page + (it + self.stages) * (self.tile // 64),
+                                stage,
+                                self.tile,
+                                length,
+                            )
         cute.arch.mbarrier_wait(bdenom, phase=0)
         for chunk in cutlass.range_constexpr(cute.ceil_div(self.rows, 12)):
             column = warp + 12 * chunk
@@ -578,6 +738,8 @@ from cutlass.cute.runtime import from_dlpack
 
 # SGLANG_PERFLL_SKV2_MERGE_RELEASE=1: the merge releases its own dependent at entry (StockSplitPlan.release)
 MERGE_RELEASE = os.environ.get("SGLANG_PERFLL_SKV2_MERGE_RELEASE", "0") == "1"
+# SGLANG_PERFLL_KV_EVICT_FIRST=1: K / V tiles in page-high boxes loaded with an L2 evict-first policy (same arithmetic)
+KV_EVICT_FIRST = os.environ.get("SGLANG_PERFLL_KV_EVICT_FIRST", "0") == "1"
 
 
 @triton.jit
@@ -717,6 +879,7 @@ class StockSplitPlan:
         merge_pdl=None,
         trigger=False,
         release=None,
+        evict_first=None,
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("SKV2 storage must be prepared before graph capture")
@@ -744,6 +907,8 @@ class StockSplitPlan:
             pdl=pdl,
             prefetch=prefetch,
             trigger=trigger,
+            wide_box=KV_EVICT_FIRST if evict_first is None else evict_first,
+            evict_first=KV_EVICT_FIRST if evict_first is None else evict_first,
         )
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)

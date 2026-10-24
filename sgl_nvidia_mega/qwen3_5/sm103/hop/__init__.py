@@ -26,6 +26,7 @@ equal to them bit for bit.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 from functools import cache
 from pathlib import Path
@@ -55,6 +56,7 @@ FIN_PREWAIT = os.environ.get("SGLANG_PERFLL_HOP_FIN_PREWAIT", "0") == "1"
 PIN_OPROJ = os.environ.get("SGLANG_PERFLL_PIN_OPROJ", "0") == "1"
 OPROJ_EARLY = os.environ.get("SGLANG_PERFLL_OPROJ_EARLY", "0") == "1"
 FIN_EARLY = os.environ.get("SGLANG_PERFLL_FIN_EARLY", "0") == "1"
+logger = logging.getLogger(__name__)
 # int32 0, 1, 2, ... buffers (data_ptr -> length) whose prefixes are identity row maps of a finalize
 _IDENTITY_ROWS: dict = {}
 
@@ -193,6 +195,9 @@ def _kernels(
 ) -> dict[str, jit.Kernel]:
     major, minor = torch.cuda.get_device_capability(device_index)
     pin_oproj, oproj_early, fin_early = (int(v) for v in switches)
+    if any(switches):
+        on = [n for n, v in zip(("PIN_OPROJ", "OPROJ_EARLY", "FIN_EARLY"), switches) if v]
+        logger.info("NVIDIA megakernel: Qwen3.5 hop kernels built with SGLANG_PERFLL_%s", ", SGLANG_PERFLL_".join(on))
     cubin = jit.compile_source(
         SOURCE.read_text(),
         "q35_hop",

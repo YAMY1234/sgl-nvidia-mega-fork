@@ -23,6 +23,7 @@ deadline is compiled in, as the decode hop's.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 from functools import cache
 from pathlib import Path
@@ -37,6 +38,7 @@ SOURCE = Path(__file__).parent / "src" / "draft_hop.cu"
 GEMV_SOURCE = Path(__file__).parent / "src" / "draft_gemv.cu"
 # A/Bs: the row-push GEMV's weights held ahead of its PDL wait (ptxas sinks them below it otherwise)
 PIN_GEMV = os.environ.get("SGLANG_PERFLL_PIN_DRAFT_GEMV", "0") == "1"
+logger = logging.getLogger(__name__)
 HIDDEN = decode_hop.HIDDEN
 GEMV_ROWS, GEMV_PUSH_ROWS = 4, 8  # warps (rows in flight) per CTA
 
@@ -93,6 +95,8 @@ def _gemv_cubin(device_index: int, k: int, pin: bool = PIN_GEMV):
     if k % 256:
         raise ValueError(f"draft GEMV: K {k} is not a multiple of 256")
     major, minor = torch.cuda.get_device_capability(device_index)
+    if pin:
+        logger.info("NVIDIA megakernel: Qwen3.5 draft GEMV (K %d) built with SGLANG_PERFLL_PIN_DRAFT_GEMV", k)
     return jit.compile_source(
         GEMV_SOURCE.read_text(),
         f"q35_draft_gemv_k{k}",

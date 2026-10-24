@@ -19,6 +19,7 @@ GEMM to bf16, optionally pushed into the decode hop's mailbox. Each launches clu
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 from functools import cache
 from pathlib import Path
@@ -34,6 +35,7 @@ SOURCE = Path(__file__).parent / "src" / "mka.cu"
 # A/Bs: weights held ahead of the PDL wait (ptxas sinks them below it otherwise): the epilogue, the late prologue
 PIN_EPI = os.environ.get("SGLANG_PERFLL_PIN_MKA_EPI", "0") == "1"
 PIN_PRO = os.environ.get("SGLANG_PERFLL_PIN_MKA_PRO", "0") == "1"
+logger = logging.getLogger(__name__)
 THREADS, CLUSTER, HEAD_DIM, HIDDEN, MAX_ROWS = 256, 8, 256, 4096, 8
 WIDE_MAX_ROWS = 112  # src/mka.cu kWideTiles 8-row tiles
 _INBOX = WIDE_MAX_ROWS // 8 * CLUSTER * 256 * 4
@@ -97,6 +99,9 @@ class EpiParams(ctypes.Structure):
 @cache
 def _kernels(device_index: int, pins: tuple = (PIN_EPI, PIN_PRO)) -> dict[str, jit.Kernel]:
     major, minor = torch.cuda.get_device_capability(device_index)
+    if any(pins):
+        on = [n for n, v in zip(("PIN_MKA_EPI", "PIN_MKA_PRO"), pins) if v]
+        logger.info("NVIDIA megakernel: Qwen3.5 MKA kernels built with SGLANG_PERFLL_%s", ", SGLANG_PERFLL_".join(on))
     cubin = jit.compile_source(
         SOURCE.read_text(),
         "q35_mka",

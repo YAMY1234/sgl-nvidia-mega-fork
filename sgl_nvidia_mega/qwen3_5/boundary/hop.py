@@ -22,6 +22,7 @@ equal bit for bit.
 from __future__ import annotations
 
 import logging
+import os
 from functools import partial
 from types import MethodType
 from typing import Optional
@@ -30,6 +31,8 @@ import msgspec
 import torch
 
 logger = logging.getLogger(__name__)
+# SGLANG_PERFLL_ROUTE_LIN (numeric, default off): the router partials ride the GDN out_proj push (sm103/hop)
+ROUTE_LIN = os.environ.get("SGLANG_PERFLL_ROUTE_LIN") == "1"
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -185,7 +188,7 @@ def build(model, ctx) -> Bound:
         device=torch.device("cuda", torch.cuda.current_device()),
         deadline_s=ctx.deadline_s,
         wide_max_m=wide_rows,
-        route_lin=os.environ.get("SGLANG_PERFLL_ROUTE_LIN") == "1",
+        route_lin=ROUTE_LIN,
     )
     global _ACTIVE
     _ACTIVE = hop
@@ -332,7 +335,7 @@ def layer_input(hop, layer, hidden, st):
     norm, residual, *fp8 = _finalize(
         hop, "layer input", owed, residual, _fused_norm_gamma(plan.norm), scale
     )
-    if hop.rl is not None:
+    if ROUTE_LIN and hop.rl is not None:
         # SGLANG_PERFLL_ROUTE_LIN: the layer's residual input, which its router partials read
         st.scratch["rlin.h0"] = (layer.layer_id, residual)
     stream.write(residual)
@@ -386,7 +389,7 @@ def moe_input(hop, layer, hidden, st):
 
     _engage("MoE input", rows)
     scale = lowm.moe_input_fp8_scale(layer, st)
-    if hop._pushed_rl:
+    if ROUTE_LIN and hop._pushed_rl:
         # SGLANG_PERFLL_ROUTE_LIN: the mixer pushed its router partial too; this hop also gives the MoE its logits
         # and NVFP4 input (moe/route.py routed_lin)
         lid, h0 = st.scratch.get("rlin.h0", (None, None))

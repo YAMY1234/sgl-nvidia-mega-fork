@@ -25,9 +25,14 @@ runs the rest of the shared expert (numeric).
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from sgl_nvidia_mega.qwen3_5.moe import route
+
+# SGLANG_PERFLL_ROUTE_LIN (numeric, default off): the MoE input's hop gives the router front's outputs
+_ROUTE_LIN = os.environ.get("SGLANG_PERFLL_ROUTE_LIN") == "1"
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -226,7 +231,7 @@ def _router_experts(mlp, x, defer: bool, st):
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
     if defer and st.slots.route:
-        rl = st.scratch.pop("rlin.moe", None)
+        rl = st.scratch.pop("rlin.moe", None) if _ROUTE_LIN else None
         if rl is not None and rl[0] == mlp.layer_id and st.slots.mkm:
             # SGLANG_PERFLL_ROUTE_LIN: the logits and NVFP4 input came out of the MoE input's hop
             return route.routed_lin(mlp, x, st.bound["moe"], *rl[1:])

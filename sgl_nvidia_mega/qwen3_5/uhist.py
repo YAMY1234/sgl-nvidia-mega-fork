@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 DIR = os.environ.get("SGLANG_PERFLL_UHIST", "")
 PIN = os.environ.get("SGLANG_PERFLL_PIN_LOGITS", "")
+ON = bool(DIR or PIN)
 _MAX_LAYERS, _ROW = 128, 168  # U of up to 16 rows x top-10
 _STATE: dict = {}
 

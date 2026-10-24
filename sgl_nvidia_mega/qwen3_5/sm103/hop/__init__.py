@@ -228,6 +228,9 @@ class Hop:
     """One process's mailbox and control block, shared by every hop of every step;
     construct on every rank of ``group`` (a collective) before any capture."""
 
+    rl = None  # SGLANG_PERFLL_ROUTE_LIN's router mailbox (set in __init__ when it is built)
+    _pushed_rl = False
+
     def __init__(
         self,
         *,

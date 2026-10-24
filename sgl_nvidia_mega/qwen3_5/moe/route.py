@@ -409,8 +409,11 @@ def _routed_experts(mlp, x, fused, logits, x_fp4, x_sf):
 
         maps = fused.mkm[mlp.layer_id]
         # measurement knobs (default off): pinned logits, the U histogram
-        out = mkm.routed(mlp, maps, fused.identity, uhist.pinned_logits(mlp.layer_id, logits), x_fp4, x_sf)
-        uhist.record(mlp.layer_id, mkm_kernel.LAST_TOPK_IDS)
+        if uhist.ON:
+            logits = uhist.pinned_logits(mlp.layer_id, logits)
+        out = mkm.routed(mlp, maps, fused.identity, logits, x_fp4, x_sf)
+        if uhist.ON:
+            uhist.record(mlp.layer_id, mkm_kernel.LAST_TOPK_IDS)
         return out
     topk_output = mlp.topk(x, logits)
     if not TopKOutputChecker.format_is_bypassed(topk_output):

@@ -202,13 +202,19 @@ def build(
             for mlp in layers
         },
         mkm_wide=wide,
-        identity=torch.arange(
-            mkm_kernel.M16_MAX_TOKENS * mkm_kernel.TOP_K,
-            dtype=torch.int32,
-            device="cuda",
-        ),
+        identity=_identity_rows(mkm_kernel.M16_MAX_TOKENS * mkm_kernel.TOP_K),
         shared=shared,
     )
+
+
+def _identity_rows(n: int):
+    """int32 0, 1, ..., n - 1: the mkm's finalize row map, registered with the hop (its finalize then needs no
+    map load)."""
+    from sgl_nvidia_mega.qwen3_5.sm103.hop import register_identity_rows
+
+    rows = torch.arange(n, dtype=torch.int32, device="cuda")
+    register_identity_rows(rows)
+    return rows
 
 
 def build_m32(
@@ -253,11 +259,7 @@ def build_m32(
             or mkm_kernel.weight_maps(mlp.experts.w13_weight, mlp.experts.w2_weight)
             for mlp in layers
         },
-        identity=torch.arange(
-            max(hi, mkm_kernel.M128_MAX_TOKENS) * mkm_kernel.TOP_K,
-            dtype=torch.int32,
-            device="cuda",
-        ),
+        identity=_identity_rows(max(hi, mkm_kernel.M128_MAX_TOKENS) * mkm_kernel.TOP_K),
     )
 
 

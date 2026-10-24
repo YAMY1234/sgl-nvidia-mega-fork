@@ -164,6 +164,43 @@ def test_hop_matches_flashinfer_fusion(rank, pair):
         torch.cuda.synchronize()
 
 
+def test_finalize_reads_routing_after_the_wait_and_identity_rows(rank, pair):
+    """The one-shot finalize reads its routing slots after griddepcontrol.wait; with a row map that is a prefix
+    of a registered identity buffer (the mkm's) it passes no map. Both the fusion's bits, against the kernel as it
+    was (slots staged before the wait), with a late rank and the routing written right before the launch."""
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop as H
+
+    fusion, hop = pair
+    world = ps.get_tp_group().world_size
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    identity = torch.arange(MAX_M * TOP_K, dtype=torch.int32, device=device)
+    H.register_identity_rows(identity)
+    scale = torch.tensor([0.05], device=device)
+    with torch.inference_mode():
+        for i, m in enumerate((1, 2, 5, 7, 15)):
+            for ident in (False, True):
+                x = _operands(m, device, rank, seed=400 + i)
+                if ident:
+                    x["permuted"] = identity[: m * TOP_K].view(m, TOP_K)
+                want = _run(fusion, "finalize", x)
+                # the routing rewritten by the launch right before (as the MoE writes it)
+                w = x["expert_weights"].clone()
+                x["expert_weights"].zero_()
+                x["expert_weights"].copy_(w)
+                if i % (world + 1) == rank:
+                    torch.cuda._sleep(1_000_000)
+                got = _run(hop, "finalize", x, fp8_scale=scale)
+                _same(got[:2], want)
+                old = H.FIN_PREWAIT
+                H.FIN_PREWAIT = True
+                try:
+                    prev = _run(hop, "finalize", dict(x, permuted=x["permuted"].clone()), fp8_scale=scale)
+                finally:
+                    H.FIN_PREWAIT = old
+                _same(prev, got)
+        torch.cuda.synchronize()
+
+
 def test_two_shot_hop_matches_flashinfer_fusion(rank, pair):
     """Past the one-shot rows the hop runs FlashInfer's BT protocol in one launch: the
     all-reduce past 15 rows and the finalize past 23, bit for bit (the finalize's 16-23 rows

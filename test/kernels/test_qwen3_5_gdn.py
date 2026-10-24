@@ -485,6 +485,60 @@ def test_core_is_gdn_verify_numerically(pad, history, bs):
     assert torch.allclose(got_ring[2], want_ring[2], rtol=0, atol=1e-5)
 
 
+@pytest.mark.parametrize("variant", [{}, {"early_dependents": True}, {"min_blocks": 3}, {"early_hist": True}])
+@pytest.mark.parametrize("bs", [1, 2, 4, 8, 64])
+@pytest.mark.parametrize("low", [False, True])
+@pytest.mark.parametrize("tp", [8, 16])
+def test_core_flat_stores_leave_every_byte_as_it_was(tp, low, bs, variant):
+    """SGLANG_PERFLL_GDN_CORE_FLAT (stores predicated, the update vectors stored after the output) writes
+    the FP8 output and this step's ring entries, with and without the low parts, byte for byte as the
+    branchy stores do, at TP8 and TP16 widths, write positions up to the ring's end, a padded request."""
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn.core import core
+
+    h, hv = (H, HV) if tp == 8 else (H // 2, HV // 2)
+    d = 2 * h * K + hv * V
+    g = torch.Generator(device="cuda").manual_seed(1000 * tp + 10 * bs + low)
+    ring_len, slots, tokens = 16, bs + 3, bs * DRAFT
+
+    def rand(*shape, scale=1.0):
+        return (torch.randn(*shape, device="cuda", generator=g) * scale).to(torch.bfloat16)
+
+    qkvz = rand(tokens, d + hv * V)
+    qkv, z = qkvz[:, :d], qkvz[:, d:].view(tokens, hv, V)
+    ba = rand(tokens, 2 * hv)
+    b, a = ba[:, :hv], ba[:, hv:]
+    A_log = torch.rand(hv, device="cuda", generator=g)
+    dt_bias = torch.rand(hv, device="cuda", generator=g)
+    state = rand(slots, hv, V, K, scale=0.05)
+    ring = [
+        rand(slots, hv, ring_len, V, scale=0.05),
+        rand(slots, h, ring_len, K, scale=0.09),
+        -torch.rand(slots, hv, ring_len, device="cuda", generator=g) * 0.5,
+        rand(slots, hv, ring_len, V, scale=1e-4) if low else None,
+        rand(slots, h, ring_len, K, scale=1e-4) if low else None,
+    ]
+    states = torch.randperm(slots, device="cuda", generator=g)[:bs].to(torch.int32)
+    replay = torch.randperm(slots, device="cuda", generator=g)[:bs]
+    if bs > 1:
+        states[-1] = -1
+    write_pos = torch.randint(0, ring_len, (slots,), device="cuda", generator=g).to(torch.int32)
+    cache_base = torch.randint(0, ring_len, (slots,), device="cuda", generator=g).to(torch.int32)
+    is_flush = torch.zeros(slots, dtype=torch.int8, device="cuda")
+    weight = rand(V)
+    scale = torch.tensor([0.02], device="cuda")
+    got = []
+    for flat in (False, True):
+        r = [None if t is None else t.clone() for t in ring]
+        y = torch.zeros(tokens, hv * V, dtype=torch.float8_e4m3fn, device="cuda")
+        core(qkv, z, a, b, A_log, dt_bias, state, *r, states, replay, write_pos, cache_base, is_flush, weight,
+             scale, 1e-6, y, rows_per_request=DRAFT, num_k_heads=h, flat=flat, **variant)
+        got.append((y.view(torch.uint8), r))
+    (y0, r0), (y1, r1) = got
+    assert torch.equal(y0, y1)
+    assert all(u is None and v is None or torch.equal(u, v) for u, v in zip(r0, r1))
+    assert not torch.equal(r1[0], ring[0])  # the step wrote ring entries
+
+
 # ------------------------------------------------------------------- slot gdn_front
 
 FRONT_SLOTS = 12

@@ -20,7 +20,9 @@
 //
 // Defines: TT (rows a request), HK / HV (key / value heads), NORM_F32 (FP32 norm weight), TRIGGER (2: release dependents at entry, 0: at exit),
 // STORE_O (also store the BF16 replay output, checks only), EARLY_HIST (1: the committed history -- keys, log-decays,
-// update vectors and their decays -- before the wait, held there; the same arithmetic, the same bits).
+// update vectors and their decays -- before the wait, held there; the same arithmetic, the same bits), FLAT_STORES
+// (1: the ring entries and FP8 outputs computed first and only their stores predicated, one low-part test, the update
+// vectors stored after the output; the same bits).
 
 typedef unsigned char u8;
 typedef unsigned short u16;
@@ -34,6 +36,9 @@ typedef unsigned int u32;
 #endif
 #ifndef EARLY_HIST
 #define EARLY_HIST 0
+#endif
+#ifndef FLAT_STORES
+#define FLAT_STORES 0
 #endif
 #ifndef NW
 #define NW 4  // warps; each owns VD / NW value columns as MT m16 tiles
@@ -444,6 +449,28 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
     const long long off = ((long long)hk * RING + ((base + wp + r) & (RING - 1))) * KD;
     u16* kp = p.ring_k + rid * p.k_slot + off;
     u16* klp = p.ring_klo ? p.ring_klo + rid * p.klo_slot + off : nullptr;
+#if FLAT_STORES
+    U4 vh[4], vl[4];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      u32 kh[4], kl[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const u32 wk = word(KR[c], i);
+        const float k0 = bflo(wk) * kmul, k1 = bfhi(wk) * kmul;
+        kh[i] = pack2(k0, k1);
+        kl[i] = pack2(k0 - bflo(kh[i]), k1 - bfhi(kh[i]));
+      }
+      vh[c].x = kh[0]; vh[c].y = kh[1]; vh[c].z = kh[2]; vh[c].w = kh[3];
+      vl[c].x = kl[0]; vl[c].y = kl[1]; vl[c].z = kl[2]; vl[c].w = kl[3];
+    }
+#pragma unroll
+    for (int c = 0; c < 4; ++c) st16(kp + 32 * c + 8 * q, vh[c]);
+    if (klp) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c) st16(klp + 32 * c + 8 * q, vl[c]);
+    }
+#else
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
       u32 kh[4], kl[4];
@@ -460,6 +487,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
       st16(kp + 32 * c + 8 * q, vh);
       if (klp) st16(klp + 32 * c + 8 * q, vl);
     }
+#endif
   }
 
   // head-common products: warp 0 k k^T (A), warp 1 k q^T (F), warps 2 / 3 the history scores
@@ -609,6 +637,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
     }
   }
   STAMP(6, U[2 * MT - 1][TT - 1] + U[0][TT - 1]);
+#if !FLAT_STORES
   // this step's update vectors (high, low parts) into the ring
   {
     u16* dp = p.ring_d + rid * p.d_slot + (long long)hv * RING * VD;
@@ -632,6 +661,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
       }
     }
   }
+#endif
   // output O[v, t] = e^{G_t} hw_q + sum_{s <= t} U[v, s] F[s][t]
   float O[MT][4];
   {
@@ -655,6 +685,36 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
         O[m][2 * h + 1] = eG1 * HQ[m][2 * h + 1] + a1;
       }
   }
+#if FLAT_STORES
+  // this step's update vectors (high, low parts) into the ring, off the output's path
+  {
+    u16* dp = p.ring_d + rid * p.d_slot + (long long)hv * RING * VD;
+    const bool w0 = ok0 && wp + t0 < RING, w1 = ok1 && wp + t1 < RING;
+    const int ph0 = (base + wp + t0) & (RING - 1), ph1 = (base + wp + t1) & (RING - 1);
+    if (p.ring_dlo) {
+      u16* dlp = p.ring_dlo + rid * p.dlo_slot + (long long)hv * RING * VD;
+#pragma unroll
+      for (int col = 0; col < 2 * MT; ++col) {
+        const int v = vb + 16 * (col >> 1) + 8 * (col & 1) + r;
+        const float d0 = pick8(U[col], t0), d1 = pick8(U[col], t1);
+        const u16 h0 = f2bf(d0), h1 = f2bf(d1);
+        const u16 l0 = f2bf(d0 - bf2f(h0)), l1 = f2bf(d1 - bf2f(h1));
+        if (w0) dp[ph0 * VD + v] = h0;
+        if (w0) dlp[ph0 * VD + v] = l0;
+        if (w1) dp[ph1 * VD + v] = h1;
+        if (w1) dlp[ph1 * VD + v] = l1;
+      }
+    } else {
+#pragma unroll
+      for (int col = 0; col < 2 * MT; ++col) {
+        const int v = vb + 16 * (col >> 1) + 8 * (col & 1) + r;
+        const u16 h0 = f2bf(pick8(U[col], t0)), h1 = f2bf(pick8(U[col], t1));
+        if (w0) dp[ph0 * VD + v] = h0;
+        if (w1) dp[ph1 * VD + v] = h1;
+      }
+    }
+  }
+#endif
 
   // gated RMSNorm over the head's 128 columns of the BF16-rounded replay output, then static FP8
   float xb[MT][4];
@@ -697,6 +757,31 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
   }
   const float rstd0 = rsqrtf(ss0 / (float)VD + p.eps);
   const float rstd1 = rsqrtf(ss1 / (float)VD + p.eps);
+#if FLAT_STORES
+  {
+    u8* y0 = p.y + (row0 + t0) * p.y_stride + hv * VD + vb + r;
+    u8* y1 = p.y + (row0 + t1) * p.y_stride + hv * VD + vb + r;
+    u8 yq[MT][4];
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        float yv = xb[m][i] * ((i & 1) ? rstd1 : rstd0) * nw[m][i >> 1];
+        yv *= zg[m][i];
+        yq[m][i] = f2e4m3(bfround(yv) * rscale);
+      }
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        if (i & 1) {
+          if (ok1) y1[16 * m + 8 * (i >> 1)] = yq[m][i];
+        } else {
+          if (ok0) y0[16 * m + 8 * (i >> 1)] = yq[m][i];
+        }
+      }
+  }
+#else
 #pragma unroll
   for (int m = 0; m < MT; ++m)
 #pragma unroll
@@ -711,6 +796,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
         p.y[(row0 + t) * p.y_stride + hv * VD + v] = f2e4m3(bfround(yv) * rscale);
       }
     }
+#endif
 #if PROF
   if (lane == 0) {
     const long long end = prof_time();

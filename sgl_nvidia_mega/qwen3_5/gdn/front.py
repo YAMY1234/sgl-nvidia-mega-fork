@@ -238,11 +238,12 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
         _ENGAGED.add((rows, x8 is not None))
         logger.info(
             "NVIDIA megakernel: Qwen3.5 slot gdn_front runs at %d rows "
-            "(SGLANG_PERFLL_GDN_PIN=%d, SGLANG_PERFLL_GDN_CORE_EARLY=%d, SGLANG_PERFLL_GDN_TRTFRONT=%d, fp8_x=%d, "
-            "prefetch=%d)",
+            "(SGLANG_PERFLL_GDN_PIN=%d, SGLANG_PERFLL_GDN_CORE_EARLY=%d, SGLANG_PERFLL_GDN_CORE_FLAT=%d, "
+            "SGLANG_PERFLL_GDN_TRTFRONT=%d, fp8_x=%d, prefetch=%d)",
             rows,
             front.PIN,
             core_kernel.EARLY,
+            core_kernel.FLAT,
             trt,
             x8 is not None,
             int(prefetch and not trt),

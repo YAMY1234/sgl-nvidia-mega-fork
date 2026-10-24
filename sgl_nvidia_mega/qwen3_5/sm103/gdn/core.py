@@ -12,7 +12,9 @@ load before ``griddepcontrol.wait``, every activation (q / k / v, z, a, b) after
 With ``SGLANG_PERFLL_GDN_CORE_EARLY=1`` (``early_hist``; grids of one CTA an SM) the committed
 history -- the ring's keys, log-decays and update vectors of earlier steps, with their decays --
 also loads before the wait and is held there with the checkpoint rows, instead of costing L2 round
-trips after it; the same arithmetic, the same bits.
+trips after it; the same arithmetic, the same bits. With ``SGLANG_PERFLL_GDN_CORE_FLAT=1``
+(``flat``) the ring entries and FP8 outputs are computed first and only their stores predicated,
+and the update vectors are stored after the output; the same bits.
 """
 
 from __future__ import annotations
@@ -37,6 +39,8 @@ EARLY = os.environ.get("SGLANG_PERFLL_GDN_CORE_EARLY", "0") == "1"
 RELEASE_MIN_ROWS = int(os.environ.get("SGLANG_PERFLL_GDN_CORE_RELEASE", "0") or 0)
 # SGLANG_PERFLL_GDN_CORE_RELEASE_MAX=<rows>: and up to that many rows (0: no cap), so only A/B-measured widths release
 RELEASE_MAX_ROWS = int(os.environ.get("SGLANG_PERFLL_GDN_CORE_RELEASE_MAX", "0") or 0)
+# predicated stores instead of a branch region a store (FLAT_STORES)
+FLAT = os.environ.get("SGLANG_PERFLL_GDN_CORE_FLAT", "0") == "1"
 
 
 class Params(ctypes.Structure):
@@ -95,6 +99,7 @@ def _kernel(
     warps: int = 4,
     min_blocks: int = 1,
     early_hist: bool = False,
+    flat: bool = False,
 ) -> jit.Kernel:
     major, minor = torch.cuda.get_device_capability(device_index)
     defines = dict(
@@ -110,7 +115,9 @@ def _kernel(
     )
     if early_hist:
         defines["EARLY_HIST"] = 1
-    source = "".join(f"#define {k} {v}\n" for k, v in defines.items())
+    if flat:
+        defines["FLAT_STORES"] = 1
+    source ="".join(f"#define {k} {v}\n" for k, v in defines.items())
     cubin = jit.compile_source(
         source + SOURCE.read_text(),
         "q35_gdn_core",
@@ -125,9 +132,9 @@ def build(device_index: int, rows: int, hk: int, hv: int, norm_f32: bool) -> Non
     (no compile inside a step: CUDA-graph capture refuses it)."""
     for trigger in (0, 2):
         for min_blocks in (1, 3):
-            _kernel(device_index, rows, hk, hv, norm_f32, trigger, False, min_blocks=min_blocks)
+            _kernel(device_index, rows, hk, hv, norm_f32, trigger, False, min_blocks=min_blocks, flat=FLAT)
         if EARLY:
-            _kernel(device_index, rows, hk, hv, norm_f32, trigger, False, early_hist=True)
+            _kernel(device_index, rows, hk, hv, norm_f32, trigger, False, early_hist=True, flat=FLAT)
 
 
 @cache
@@ -176,6 +183,7 @@ def core(
     warps: int = 4,
     min_blocks: Optional[int] = None,
     early_hist: Optional[bool] = None,
+    flat: Optional[bool] = None,
 ) -> torch.Tensor:
     """Write the gated RMSNorm of the verify output as FP8 into ``out`` [rows, HV * V].
 
@@ -185,7 +193,8 @@ def core(
     [slots, HV | H, 16, V | K] (low parts optional) with cursors by ``replay_indices``; the first
     ``state_indices.numel()`` requests of ``rows_per_request`` rows each. ``o_out`` [rows, HV, V]
     BF16 also receives the replay output (checks only). ``early_hist`` (default ``EARLY``) loads the
-    committed history before the PDL wait when the grid runs one CTA an SM (same bits)."""
+    committed history before the PDL wait when the grid runs one CTA an SM (same bits); ``flat``
+    (default ``FLAT``) predicates the stores (same bits)."""
     rows, T = qkv.shape[0], rows_per_request
     n = rows // T
     HV = checkpoint.shape[1]
@@ -279,6 +288,7 @@ def core(
         warps,
         min_blocks,
         early_hist,
+        FLAT if flat is None else flat,
     )
     jit.launch(kernel, (n * HV, 1, 1), [p], torch.cuda.current_stream(qkv.device).cuda_stream)
     return out

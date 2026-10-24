@@ -632,6 +632,29 @@ def test_slot_draft_fin_hands_the_hop_only_the_deferred_output_it_reads(
     assert layer._hop_takes(hop, owed) is want
 
 
+@pytest.mark.parametrize(
+    "rows, rows_per_request, step_max, want",
+    [
+        (1, 1, 64, False),  # one-token steps keep the single launch (MIN_ROWS)
+        (2, 1, 64, True),
+        (24, 1, 64, True),
+        # SGLANG_PERFDRAFT_MOE_MKM_STEP_MAX_ROWS caps the draft steps only
+        (17, 1, 16, False),
+        (16, 1, 16, True),
+        (56, 7, 16, True),
+        (70, 7, 64, False),  # past the widest pass the path serves
+    ],
+)
+def test_the_draft_moe_takes_the_target_path_within_its_rows(
+    monkeypatch, rows, rows_per_request, step_max, want
+):
+    from sgl_nvidia_mega.qwen3_5.draft import moe_mkm
+
+    monkeypatch.setattr(moe_mkm, "MIN_ROWS", 2)
+    monkeypatch.setattr(moe_mkm, "STEP_MAX_ROWS", step_max)
+    assert moe_mkm.DraftMkm(None, wide=True).takes(rows, rows_per_request) is want
+
+
 def test_the_draft_embeds_through_the_exchange_where_it_fits():
     from sgl_nvidia_mega.qwen3_5.draft.parts import Parts
     from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import MAX_ROWS

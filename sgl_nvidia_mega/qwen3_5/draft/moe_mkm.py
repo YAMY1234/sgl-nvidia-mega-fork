@@ -33,6 +33,8 @@ ENABLED = os.environ.get("SGLANG_PERFDRAFT_MOE_MKM", "0") == "1"
 MIN_ROWS = int(os.environ.get("SGLANG_PERFDRAFT_MOE_MKM_MIN_ROWS", "2"))
 # the widest pass it serves: the draft extend of 8 requests (7 rows each)
 MAX_ROWS = 64
+# draft steps (one row a request) of more rows keep SGLang's MoE; the extend is not capped (default: every width)
+STEP_MAX_ROWS = int(os.environ.get("SGLANG_PERFDRAFT_MOE_MKM_STEP_MAX_ROWS", str(MAX_ROWS)))
 
 # the MoE slots moe.step reads, all off but the ones a width takes
 _SLOT_NAMES = (
@@ -94,7 +96,7 @@ class DraftMkm:
     def takes(self, rows: int, rows_per_request: int) -> bool:
         """Whether a draft pass of ``rows`` rows (a draft step, or the extend's rows_per_request rows a request) runs
         here."""
-        if rows_per_request == 1 and rows < MIN_ROWS:
+        if rows_per_request == 1 and not MIN_ROWS <= rows <= STEP_MAX_ROWS:
             return False
         return 1 <= rows <= MAX_ROWS
 

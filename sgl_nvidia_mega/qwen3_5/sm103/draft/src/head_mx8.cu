@@ -146,6 +146,19 @@ SGL_DEVICE uint32_t key16(bf16_t v, bool& nan) {
   return (b & 0x8000u) ? (~b & 0xffffu) : (b | 0x8000u);
 }
 
+/// \brief draft_top1.cu's 32-bit order key of a logit (the larger value wins; -0.0 as +0.0; a NaN maps
+/// to nan_key) and its packed 64-bit key with the vocabulary id (the lower id wins on equal values).
+SGL_DEVICE uint32_t value_key32(float v, uint32_t nan_key) {
+  if (v != v) return nan_key;
+  if (v == 0.0f) v = 0.0f;
+  const uint32_t bits = __float_as_uint(v);
+  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+SGL_DEVICE unsigned long long pack_key(uint32_t vkey, uint32_t id) {
+  return (static_cast<unsigned long long>(vkey) << 32) | static_cast<unsigned long long>(0xFFFFFFFFu - id);
+}
+
 }  // namespace head_mx8
 
 struct HeadMx8Params {
@@ -157,6 +170,12 @@ struct HeadMx8Params {
   int32_t n;
   int32_t m;        // rows of x (the kernel's kM)
   int32_t reverse;  // 1: walk the groups from the end (alternate draft steps, as mkd_head)
+  // kKeys (PERF-DRAFT, head_mx8_keys_m<M>): no logits; each row's draft_top1 key over this shard folded into
+  // keys[row] (atomicMax, zero before the launch: the exchange's read leaves it zero)
+  unsigned long long* keys;
+  int32_t vocab_start;  // global id of weight row 0
+  int32_t vocab_size;   // ids >= vocab_size are padding and never chosen
+  uint32_t nan_key;
 };
 
 /**
@@ -164,13 +183,14 @@ struct HeadMx8Params {
  * kK / (32 * kSliceBlocks) warps (gridDim.x <= ceil(n / 8)). kMkd (kM == 1): mkd_head's PDL
  * points and per-CTA packed maxima; else TRT-LLM's (trigger once the activation is staged).
  */
-template <int kK, int kSliceBlocks, int kM, bool kMkd>
+template <int kK, int kSliceBlocks, int kM, bool kMkd, bool kKeys = false>
 SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
   using namespace device;
   using namespace head_mx8;
   constexpr int kTokenTiles = (kM + kTokens - 1) / kTokens;
   using L = Layout<kK, kSliceBlocks, kTokenTiles>;
-  static_assert(kM >= 1 && kM <= 2 * kTokens && (!kMkd || kM == 1));
+  static_assert(kM >= 1 && kM <= 2 * kTokens && (!kMkd || kM == 1) && !(kMkd && kKeys));
+  __shared__ unsigned long long s_keys[2 * kTokens];
   static_assert(kSliceBlocks == 8, "one 8-byte scale load per weight row and warp");
   static_assert(!HEAD_MX8_TMA_WARPS || L::kWarps >= kRows, "a warp per tile row");
   extern __shared__ __align__(128) uint8_t smem[];
@@ -229,6 +249,7 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
     fence_mbarrier_init();
   }
   if (tidx < L::kTokensPad) s_amax[tidx] = 0u;
+  if (kKeys && tidx < 2 * kTokens) s_keys[tidx] = 0ull;
   __syncthreads();
 
   // ---- the first two tiles (static weights: before the PDL wait) ----
@@ -302,6 +323,8 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
   const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   uint32_t best = 0u;
   bool nan = false;
+  unsigned long long kbest = 0ull;  // kKeys: this thread's best key of its token
+  const int ids_end = p.vocab_size - p.vocab_start;
   for (int i = 0; i < my_tiles; ++i) {
     const int slot = i % 2;
     mbar_wait(&mbar[slot], static_cast<uint32_t>((i / 2) % 2));
@@ -364,7 +387,15 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
 #pragma unroll
         for (int w = 0; w < L::kWarps; ++w) total = total + s_part[((slot * L::kWarps + w) * 4 * kTokenTiles + tidx / 32) * 32 + lane];
         const bf16_t v = __float2bfloat16_rn(total * inv);
-        p.logits[static_cast<int64_t>(out_token) * n + row] = v;
+        if constexpr (kKeys) {
+          if (row < ids_end) {
+            const unsigned long long k = pack_key(value_key32(__bfloat162float(v), p.nan_key),
+                                                  static_cast<uint32_t>(p.vocab_start + row));
+            kbest = k > kbest ? k : kbest;
+          }
+        } else {
+          p.logits[static_cast<int64_t>(out_token) * n + row] = v;
+        }
         if constexpr (kMkd) {
           const uint32_t k = key16(v, nan);
           best = max(best, (k << 16) | (0xffffu - static_cast<uint32_t>(row)));
@@ -373,6 +404,18 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
     }
   }
 
+  if constexpr (kKeys) {
+    // lanes q, q + 4, ... (g = 0..7) reduce the same token; then one shared fold per (warp, q) and one
+    // global fold per row and CTA
+#pragma unroll
+    for (int mask = 4; mask < 32; mask <<= 1) {
+      const unsigned long long o = __shfl_xor_sync(0xffffffffu, kbest, mask);
+      kbest = o > kbest ? o : kbest;
+    }
+    if (reducer && g == 0 && kbest != 0ull) atomicMax(&s_keys[out_token], kbest);
+    __syncthreads();
+    if (tidx < kM && s_keys[tidx] != 0ull) atomicMax(p.keys + tidx, s_keys[tidx]);
+  }
   if constexpr (kMkd) {
     best = __reduce_max_sync(0xffffffffu, best);
     const uint32_t nan_any = __reduce_or_sync(0xffffffffu, nan ? 1u : 0u);
@@ -416,3 +459,25 @@ HEAD_MX8_GEMV(13)
 HEAD_MX8_GEMV(14)
 HEAD_MX8_GEMV(15)
 HEAD_MX8_GEMV(16)
+
+#define HEAD_MX8_KEYS(rows)                                                                       \
+  extern "C" __global__ void __launch_bounds__(16 * 32, 1) head_mx8_keys_m##rows(const HeadMx8Params __grid_constant__ p) { \
+    sglang::head_mx8_kernel<4096, 8, rows, false, true>(p);                                     \
+  }
+
+HEAD_MX8_KEYS(1)
+HEAD_MX8_KEYS(2)
+HEAD_MX8_KEYS(3)
+HEAD_MX8_KEYS(4)
+HEAD_MX8_KEYS(5)
+HEAD_MX8_KEYS(6)
+HEAD_MX8_KEYS(7)
+HEAD_MX8_KEYS(8)
+HEAD_MX8_KEYS(9)
+HEAD_MX8_KEYS(10)
+HEAD_MX8_KEYS(11)
+HEAD_MX8_KEYS(12)
+HEAD_MX8_KEYS(13)
+HEAD_MX8_KEYS(14)
+HEAD_MX8_KEYS(15)
+HEAD_MX8_KEYS(16)

@@ -121,6 +121,10 @@ class Parts:
             parts.embed_full = parts._build_embed_full()
         if HEAD_MXFP8:
             parts.head_mx8 = parts._build_head_mx8()
+            from sgl_nvidia_mega.qwen3_5.draft import layer as draft_layer
+
+            if draft_layer.TOP1_KEYS and parts.top1x is not None:
+                parts.head_mx8.prepare_keys()
         from sgl_nvidia_mega.qwen3_5.draft import moe_mkm
 
         if moe_mkm.ENABLED:

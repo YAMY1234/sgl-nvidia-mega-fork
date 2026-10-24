@@ -157,6 +157,10 @@ class HeadMx8Params(ctypes.Structure):
         ("n", ctypes.c_int32),
         ("m", ctypes.c_int32),
         ("reverse", ctypes.c_int32),
+        ("keys", ctypes.c_void_p),
+        ("vocab_start", ctypes.c_int32),
+        ("vocab_size", ctypes.c_int32),
+        ("nan_key", ctypes.c_uint32),
     ]
 
 
@@ -203,16 +207,24 @@ def _launch(
     logits: torch.Tensor,
     part,
     reverse: bool,
+    keys=None,
+    vocab_start: int = 0,
+    vocab_size: int = 0,
+    nan_key: int = 0,
 ) -> None:
     p = HeadMx8Params(
         x=x.data_ptr(),
         w=values.data_ptr(),
         s=scales.data_ptr(),
-        logits=logits.data_ptr(),
+        logits=0 if logits is None else logits.data_ptr(),
         part=0 if part is None else part.data_ptr(),
         n=int(values.shape[0]),
         m=int(x.shape[0]),
         reverse=int(bool(reverse)),
+        keys=0 if keys is None else keys.data_ptr(),
+        vocab_start=vocab_start,
+        vocab_size=vocab_size,
+        nan_key=nan_key,
     )
     stream = torch.cuda.current_stream(x.device).cuda_stream
     jit.launch(kernel, (ctas, 1, 1), [p], stream)
@@ -231,6 +243,25 @@ def nvrtc_gemv(
     kernel = _kernel(x.device.index, f"head_mx8_m{m}", smem_bytes(1 if m <= 8 else 2))
     _launch(kernel, ctas, x, values, scales, out, None, False)
     return out
+
+
+def nvrtc_keys(
+    x: torch.Tensor,
+    values: torch.Tensor,
+    scales: torch.Tensor,
+    keys: torch.Tensor,
+    ctas: int,
+    *,
+    vocab_start: int,
+    vocab_size: int,
+    nan_key: int,
+) -> None:
+    """PERF-DRAFT: no logits; each row's draft_top1 key (top1.py: the bf16 logit's order key, then the lowest
+    vocabulary id) over this shard folded into ``keys`` [>= m] int64 (zero before the launch) with atomicMax, from
+    the same logits ``nvrtc_gemv`` stores (head_mx8_keys_m<m>)."""
+    m = int(x.shape[0])
+    kernel = _kernel(x.device.index, f"head_mx8_keys_m{m}", smem_bytes(1 if m <= 8 else 2))
+    _launch(kernel, ctas, x, values, scales, None, None, False, keys, vocab_start, vocab_size, nan_key)
 
 
 def mkd_head_mx8(
@@ -301,6 +332,7 @@ class DraftHeadMx8:
         for m in range(1, self.max_rows + 1):
             self._gemv(x[:m], out[:m])
         torch.cuda.synchronize(dev)
+        self._keys_ready = False
 
     def supports(self, rows: int) -> bool:
         return 0 < rows <= self.max_rows
@@ -351,6 +383,29 @@ class DraftHeadMx8:
         self._gemv(x, out)
         self.note(site, m)
         return out
+
+    def prepare_keys(self) -> None:
+        """Load and run once every row count's key fold (before capture; PERF-DRAFT)."""
+        dev = self.values.device
+        x = torch.zeros(self.max_rows, self.k, dtype=torch.bfloat16, device=dev)
+        keys = torch.zeros(self.max_rows, dtype=torch.int64, device=dev)
+        for m in range(1, self.max_rows + 1):
+            nvrtc_keys(x[:m], self.values, self.scales, keys, self.ctas, vocab_start=0, vocab_size=self.n, nan_key=0)
+        torch.cuda.synchronize(dev)
+        self._keys_ready = True
+
+    def fold_keys(
+        self, hidden: torch.Tensor, keys: torch.Tensor, *, vocab_start: int, vocab_size: int, nan_key: int, site: str
+    ) -> None:
+        """The draft_top1 keys of the final-norm rows ``hidden`` [m, 4096] over this shard folded into ``keys``
+        (PERF-DRAFT; the logits ``logits`` would return, not stored)."""
+        m = int(hidden.shape[0])
+        if not self._keys_ready or not self.supports(m) or hidden.shape[1] != self.k:
+            raise ValueError(f"MXFP8 draft head keys: rows {tuple(hidden.shape)} (prepared {self._keys_ready})")
+        x = hidden.to(torch.bfloat16).contiguous()
+        nvrtc_keys(x, self.values, self.scales, keys, self.ctas, vocab_start=vocab_start, vocab_size=vocab_size,
+                   nan_key=nan_key)
+        self.note(f"{site} (keys)", m)
 
     def prepare_mkd(self, smem_pad: int) -> None:
         """Load and run once the MKD head kernel for ``smem_pad`` (before capture)."""

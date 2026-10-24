@@ -63,16 +63,26 @@ class DraftTop1Params(ctypes.Structure):
 
 
 @cache
-def _kernel(device_index: int, world: int) -> jit.Kernel:
+def _cubin(device_index: int, world: int) -> bytes:
     major, minor = torch.cuda.get_device_capability(device_index)
-    cubin = jit.compile_source(
+    return jit.compile_source(
         (SRC / "draft_top1.cu").read_text(),
         f"q35_draft_top1_{world}",
         f"sm_{major}{minor}a",
         ("-std=c++17", "-default-device", f"-DMKD_WORLD={world}"),
         headers={"mkd_common.cuh": (SRC / "mkd_common.cuh").read_text()},
     )
-    return jit.load(cubin, "draft_top1_xchg", (THREADS, 1, 1), 0)
+
+
+@cache
+def _kernel(device_index: int, world: int) -> jit.Kernel:
+    return jit.load(_cubin(device_index, world), "draft_top1_xchg", (THREADS, 1, 1), 0)
+
+
+@cache
+def _keys_kernel(device_index: int, world: int) -> jit.Kernel:
+    """draft_top1_keys_xchg (PERF-DRAFT): the exchange of keys a draft head GEMV already folded."""
+    return jit.load(_cubin(device_index, world), "draft_top1_keys_xchg", (THREADS, 1, 1), 0)
 
 
 def build(device_index: int, world: int) -> None:
@@ -80,6 +90,7 @@ def build(device_index: int, world: int) -> None:
     if world not in WORLDS:
         raise ValueError(f"the sharded top-1 serves TP {WORLDS}, not {world}")
     _kernel(device_index, world)
+    _keys_kernel(device_index, world)
 
 
 class Top1Exchange:
@@ -179,6 +190,46 @@ class Top1Exchange:
         chunks = (self.vocab_local + CHUNK - 1) // CHUNK
         _launch_2d(kernel, (chunks, m), p, self.device)
 
+
+    def exchange_keys(
+        self,
+        m: int,
+        tokens: torch.Tensor,
+        column: int,
+        *,
+        nan_key: int,
+        topk_p: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
+        mrope_positions: Optional[torch.Tensor] = None,
+    ) -> None:
+        """``__call__``'s outputs from the keys a draft head GEMV folded into ``self.keys`` (PERF-DRAFT,
+        SGLANG_PERFDRAFT_TOP1_KEYS): one CTA exchanges them (no scan of the logits)."""
+        if not 1 <= m <= MAX_ROWS:
+            raise ValueError(f"sharded top-1 keys: {m} rows (1-{MAX_ROWS})")
+        if tokens.dtype != torch.int64 or tokens.dim() != 2 or tokens.shape[0] < m:
+            raise ValueError(f"sharded top-1 keys: tokens {tokens.dtype} {tuple(tokens.shape)}")
+        p = DraftTop1Params(
+            logits=0,
+            keys=self.keys.data_ptr(),
+            epoch=self.epoch.data_ptr(),
+            mc=self.mc,
+            uc=self.uc,
+            tokens=tokens.data_ptr(),
+            topk_p=0 if topk_p is None else topk_p.data_ptr(),
+            positions=0 if positions is None else positions.data_ptr(),
+            mrope=0 if mrope_positions is None else mrope_positions.data_ptr(),
+            tokens_stride=tokens.stride(0),
+            mrope_stride=0 if mrope_positions is None else mrope_positions.stride(0),
+            row_stride=0,
+            m=m,
+            vocab_local=self.vocab_local,
+            vocab_start=self.vocab_start,
+            vocab_size=self.vocab_size,
+            column=column,
+            rank=self.rank,
+            nan_key=nan_key,
+        )
+        _launch_2d(_keys_kernel(self.device.index, self.world), (1, 1), p, self.device)
 
 def _launch_2d(kernel: jit.Kernel, grid: tuple[int, int], params, device) -> None:
     """``jit.launch`` of a (x, y) grid on the current stream, as a programmatic dependent."""

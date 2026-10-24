@@ -89,7 +89,9 @@ struct DraftTop1Params {
 };
 
 // grid (chunks, m): chunk c of row r scans columns [c * kThreads * kVec, ...) of the row.
-template <int kWorld>
+// kFolded (draft_top1_keys_xchg, grid (1, 1)): the previous grid (the draft head GEMV) already folded
+// each row's key of this rank into keys[row]; the one CTA only exchanges them (PERF-DRAFT).
+template <int kWorld, bool kFolded = false>
 SGL_DEVICE void draft_top1_xchg_kernel(const DraftTop1Params& p) {
   using namespace device;
   using namespace draft_top1;
@@ -106,6 +108,9 @@ SGL_DEVICE void draft_top1_xchg_kernel(const DraftTop1Params& p) {
   const bf16_t* src = p.logits + static_cast<int64_t>(row) * p.row_stride;
 
   PDLWaitPrimary<true>();
+  if constexpr (kFolded) {
+    if (threadIdx.x == 0) s_last = true;
+  } else {
   uint64_t best = 0;
   if (col0 + kVec <= ids_end && (p.row_stride % kVec) == 0) {
     vec_t v;
@@ -136,6 +141,7 @@ SGL_DEVICE void draft_top1_xchg_kernel(const DraftTop1Params& p) {
     __threadfence();
     const uint32_t total = gridDim.x * gridDim.y;
     s_last = atomicAdd(p.epoch + 1, 1u) == total - 1;
+  }
   }
   __syncthreads();
   if (!s_last) return;
@@ -196,4 +202,8 @@ using sglang::DraftTop1Params;
 
 extern "C" __global__ void __launch_bounds__(256) draft_top1_xchg(const DraftTop1Params __grid_constant__ p) {
   sglang::draft_top1_xchg_kernel<MKD_WORLD>(p);
+}
+
+extern "C" __global__ void __launch_bounds__(256) draft_top1_keys_xchg(const DraftTop1Params __grid_constant__ p) {
+  sglang::draft_top1_xchg_kernel<MKD_WORLD, true>(p);
 }

@@ -24,6 +24,7 @@ SGLang's CuTe DSL fusion takes a deferred finalize (the norm then scales by the 
 from __future__ import annotations
 
 import logging
+import os
 from functools import partial
 
 import torch
@@ -76,6 +77,9 @@ def fc_input(parts, token_ids, hidden):
     hidden = lm.pre_fc_norm_hidden(hidden)
     return lm.fc(torch.cat([embeds, hidden], dim=-1))
 
+
+# SGLANG_PERFDRAFT_TOP1_KEYS (PERF-DRAFT, default off): top1_into's head folds the argmax keys (top1_into)
+TOP1_KEYS = os.environ.get("SGLANG_PERFDRAFT_TOP1_KEYS", "0") == "1"
 
 # Slot draft_hop on the draft extend's rows too: their FFN input all-reduce + residual +
 # norm in the hop's MNNVL rounding, which equals what 2.2 runs there (FlashInfer's MNNVL
@@ -252,6 +256,20 @@ def top1_into(
 ) -> None:
     """Slot draft_multi's top-1 of the final-norm rows ``hidden``: the LM head on this
     rank's vocabulary shard, then the sharded argmax exchange, which writes the tokens
-    into ``tokens[:, column]`` (and ``outputs``: topk_p, positions, mrope_positions)."""
+    into ``tokens[:, column]`` (and ``outputs``: topk_p, positions, mrope_positions).
+    SGLANG_PERFDRAFT_TOP1_KEYS (PERF-DRAFT, as TensorRT-LLM's draft head): the MXFP8 head folds each row's key
+    over the shard itself and the exchange only trades the keys (the same keys, ties and NaN rule)."""
+    head, x = parts.head_mx8, parts.top1x
+    if TOP1_KEYS and head is not None and head.supports(hidden.shape[0]):
+        head.fold_keys(
+            hidden,
+            x.keys,
+            vocab_start=x.vocab_start,
+            vocab_size=x.vocab_size,
+            nan_key=nan_key,
+            site=f"{site} top1_into",
+        )
+        x.exchange_keys(int(hidden.shape[0]), tokens, column, nan_key=nan_key, **outputs)
+        return
     logits = lm_head(parts, hidden, f"{site} top1_into")
-    parts.top1x(logits, tokens, column, nan_key=nan_key, **outputs)
+    x(logits, tokens, column, nan_key=nan_key, **outputs)

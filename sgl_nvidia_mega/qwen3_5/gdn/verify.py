@@ -379,7 +379,7 @@ def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
     """Slot gdn_core: the ReplaySSM verify of the convolved rows ``qkv``, the gated norm
     and its static FP8 output in one launch (``sm103/gdn/core.py``), then ``out_proj``
     (FlashInfer's BMM, or the hop's push GEMM with ``opts.push``)."""
-    from sgl_nvidia_mega.qwen3_5.sm103.gdn.core import core
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn.core import RELEASE_BMM, core
 
     attn, pools = gdn.attn, st.view.mamba
     li = pools.layer_ids.index(attn.layer_id)
@@ -392,6 +392,11 @@ def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
     def ring(t):
         return None if t is None else t[li]
 
+    # SGLANG_PERFLL_GDN_CORE_RELEASE: out_proj's BMM (cuBLASLt nvjet, a programmatic dependent) may start at the core's entry
+    release = RELEASE_BMM and not opts.push and not st.slots.lowm_outproj
+    if release and ("release", rows) not in _ENGAGED:
+        _ENGAGED.add(("release", rows))
+        logger.info("NVIDIA megakernel: Qwen3.5 slot gdn_core releases out_proj's BMM at its entry at %d rows", rows)
     core(
         qkv,
         z,
@@ -416,7 +421,7 @@ def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
         x,
         rows_per_request=st.binding.tokens_per_request,
         num_k_heads=attn.num_k_heads,
-        early_dependents=opts.push,
+        early_dependents=opts.push or release,
     )
     if opts.push:
         hop = st.bound["boundary"].hop

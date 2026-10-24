@@ -2789,6 +2789,7 @@ def test_the_draft_moe_target_path_hands_off_unreduced():
         patch.object(moe, "_router_experts", lambda mlp, x, defer, st: deferred),
         patch.object(flashinfer_trtllm, "finalize_flashinfer_trtllm_deferred_output", lambda d, s: finalized),
         patch("sglang.srt.layers.moe.utils.sum_post_experts_output", lambda t: 8 * t),
+        patch.object(torch.cuda, "is_current_stream_capturing", lambda: False),
     ):
         draft = DraftMkm(route.Bound(route=True), wide=True)(layer, x).complete()
         target = moe.step(layer, x, SimpleNamespace(slots=plan.Slots(), bound={}, scratch={}), defer=True)

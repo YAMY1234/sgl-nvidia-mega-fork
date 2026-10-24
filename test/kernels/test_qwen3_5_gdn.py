@@ -966,7 +966,7 @@ def test_trt_front_reads_its_rows_and_state_index_after_its_pdl_wait():
     start = {n: o[n].clone() for n in ("state", "phys")}
     # both builds launched once first (a first launch loads the module: slower than the producer's delay)
     _run_trt_front(o, x8, _trt_outputs(o), x=x)
-    skip = trt_front._SPECS["fp8", o["w"].shape[0]]._replace(unsafe_skip_wait=True)
+    skip = trt_front._SPECS["fp8", o["w"].shape[0], 1]._replace(unsafe_skip_wait=True)
     trt_lowm.prepare(skip)
 
     def run_skip(outs):

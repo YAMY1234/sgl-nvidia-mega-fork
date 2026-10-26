@@ -226,6 +226,7 @@ def _front_step(layer, x, st):
     from sglang.srt.layers.quantization.fp8_utils import flashinfer_bmm_fp8
     from sglang.srt.runtime_context import get_parallel
 
+    from sgl_nvidia_mega.qwen3_5 import lowm
     from sgl_nvidia_mega.qwen3_5.attention import split_kv
     from sgl_nvidia_mega.qwen3_5.sm103.attention.gate_quant import gate_quant
     from sgl_nvidia_mega.qwen3_5.sm103.draft.front import (
@@ -235,7 +236,19 @@ def _front_step(layer, x, st):
     m = x.shape[0]
     attn = layer.attn
     width = layer.num_heads * layer.head_dim
-    qkv, _ = layer.qkv_proj(x)
+    # slot hop_fp8: qkv_proj reads the hop's E4M3 copy of x (no quantize kernel)
+    x8 = lowm.take_fp8(st, x) if st.slots.hop_fp8 else None
+    if x8 is not None:
+        lowm.engaged("hop_fp8", "qkv_proj bmm", m)
+        qkv = flashinfer_bmm_fp8(
+            x8,
+            layer.qkv_proj.weight,
+            layer.qkv_proj.input_scale,
+            layer.qkv_proj.weight_scale,
+            x.dtype,
+        )
+    else:
+        qkv, _ = layer.qkv_proj(x)
     q_gate, k, v = qkv.split(
         [
             2 * width,
@@ -269,6 +282,15 @@ def _front_step(layer, x, st):
     )
     o = attn(q.reshape(m, width), None, None, st.fb).reshape(m, width)
     oq = gate_quant(o.contiguous(), gate.reshape(m, width), layer.o_proj.input_scale)
+    if st.slots.lowm_oproj:
+        # slot lowm_out: o_proj on the low-M launch, pushing into the hop with lowm_push
+        hop = None
+        if st.slots.lowm_push:
+            from sgl_nvidia_mega.qwen3_5.boundary import hop as boundary_hop
+
+            if boundary_hop.takes_moe_input(st.bound["boundary"].hop, layer, st, m):
+                hop = st.bound["boundary"].hop
+        return lowm.row_parallel(layer.o_proj, oq, torch.bfloat16, "o_proj", hop)
     # the same allocation as RowParallelLinear's output, which the boundary all-reduces
     with use_symmetric_memory(
         get_parallel().tp_group, disabled=not is_allocation_symmetric()

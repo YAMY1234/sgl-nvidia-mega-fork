@@ -762,6 +762,7 @@ def _gdn_verify_setup(log, *, ring_len=16, temporal_dtype=torch.bfloat16, draft=
         fb=SimpleNamespace(req_pool_indices=k["req"]),
         binding=SimpleNamespace(tokens_per_request=draft),
         view=SimpleNamespace(gdn=meta, mamba=pools),
+        slots=plan.Slots(),
         scratch={},
     )
     return verify, gdn, st
@@ -1083,7 +1084,7 @@ def test_the_gdn_front_slot_runs_the_front_the_verify_the_norm_and_out_proj(push
         patch.object(
             verify,
             "_out_proj",
-            lambda linear, fp8, dtype: (
+            lambda linear, fp8, dtype, *slot: (
                 log.append(("out_proj", linear, fp8, dtype)) or "partial"
             ),
         ),
@@ -2427,7 +2428,9 @@ def test_the_hop_slot_runs_where_sglang_runs_its_cutedsl_kernel(cutedsl_gates, p
     for run in ("sglang", "plugin"):
         stream = ResidualStream(residual)
         fb = _verify_batch(stream)
-        st = SimpleNamespace(fb=fb, model=SimpleNamespace(norm=final))
+        st = SimpleNamespace(
+            fb=fb, model=SimpleNamespace(norm=final), slots=plan.Slots()
+        )
         if point == "MoE input":
             handle = layer.attn_boundary.finish(part, fb)
             x = (

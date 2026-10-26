@@ -178,6 +178,7 @@ def binding_reasons() -> list[str]:
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
+    runtime.apply_expert_parallel(cfg.ep_size or 1)
     return text_config_reasons(hf_config) + binding_reasons() + runtime.slot_reasons()
 
 
@@ -197,6 +198,8 @@ SPEC = MegakernelSpec(
             Feature.MULTI_NODE_TP,
             # HiCache: covered steps read only running requests' pages
             Feature.KV_OFFLOAD,
+            # TEP (MoE TP x EP): the slots in runtime.EP_STOCK_SLOTS stay off
+            Feature.EXPERT_PARALLEL,
         }
     ),
     numerics=NUMERICS,

@@ -129,7 +129,10 @@ def build(
     if not fused:
         return Bound(route=True, shared=shared)
     for i, mlp in zip(range(m.start_layer, m.end_layer), layers):
-        reason = mkm.unsupported(mlp)
+        expert_parallel = mlp.experts.num_local_experts != mlp.experts.num_experts
+        reason = (
+            mkm.routing_unsupported(mlp) if expert_parallel else mkm.unsupported(mlp)
+        )
         if reason:
             return Bound(route=True, reason=f"mkm: layer {i}: {reason}")
     intermediate = layers[0].experts.w2_weight.shape[-1] * 2

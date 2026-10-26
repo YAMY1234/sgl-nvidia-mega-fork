@@ -589,6 +589,11 @@ def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch):
         model=SimpleNamespace(start_layer=0, end_layer=1, layers=layers)
     )
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"route"}))
+    # runtime.build reads moe_ep_size (expert parallelism); no process groups here
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=8, moe_ep_size=1),
+    )
     ctx = SimpleNamespace(widths=(7,), tokens_per_request=7, deadline_s=60.0)
     want = "layer 0: router gate torch.float16 (512, 4096)"
     assert route.build(model, 7, fused=False).reason == want

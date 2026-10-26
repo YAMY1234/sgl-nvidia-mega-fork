@@ -70,6 +70,7 @@ SGLANG_READS = {
         "bind_extend_graphs",
         "begin_draft_round",
     ),
+    "srt/runtime_context.py": ("get_parallel", '"moe_ep_size"'),
 }
 
 ARCHITECTURE = "Qwen3_5ForCausalLMMTP"
@@ -200,6 +201,11 @@ def _requested() -> frozenset:
 
 
 def _build(model, hf_config, ctx) -> MtpDraft:
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.qwen3_5 import runtime
+
+    runtime.apply_expert_parallel(get_parallel().moe_ep_size)
     return MtpDraft(
         model,
         binding=ctx.binding,
@@ -218,7 +224,9 @@ SPEC = MegakernelSpec(
         dtypes=target.REQUIREMENTS.dtypes,
         decode_graph_backends=target.REQUIREMENTS.decode_graph_backends,
     ),
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # under expert parallelism the draft MoE and the slots on it stay SGLang's
+    # (runtime.EP_STOCK_SLOTS)
+    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.EXPERT_PARALLEL}),
     numerics=numerics(_requested()),
     # the draft's forward stays SGLang's: no width is built
     max_rows=0,

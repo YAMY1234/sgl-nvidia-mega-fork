@@ -23,10 +23,14 @@ come from a served draft extend (2.2's take_fc_buf / fill_fc decision).
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
 from sgl_nvidia_mega.qwen3_5 import plan
 from sgl_nvidia_mega.qwen3_5.draft import LOOP_BS, SERVED_BS, layer
+
+logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -55,6 +59,7 @@ class DraftLoop:
     def __init__(self, parts, *, num_steps: int):
         self.parts = parts
         self.num_steps = num_steps
+        self._filled = False
         if "draft_q1" in parts.slots and parts.attention.q1 is None:
             from sgl_nvidia_mega.qwen3_5.draft.attention import build_q1
 
@@ -79,6 +84,13 @@ class DraftLoop:
             and not io.from_served_extend
         ):
             mkd.fill_fc(io.topk_index, io.hidden_states)
+            if not self._filled:
+                # the first round after a prefill, or on a PD decode after the transfer
+                self._filled = True
+                logger.info(
+                    "NVIDIA megakernel: draft_loop fills its first step's fc from the "
+                    "round's input (no served draft extend before it)"
+                )
 
     @torch.no_grad()
     def step(self, io) -> None:

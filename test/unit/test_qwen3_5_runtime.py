@@ -140,6 +140,23 @@ def test_the_runtime_gives_the_executor_the_build_contexts_binding(monkeypatch):
     assert built.binding == "EagleBinding" and built.summary() == "slots none (stock)"
 
 
+def test_slot_skv2_cp_builds_as_a_graph_variant_of_slot_skv2(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2", "skv2_cp"}))
+    monkeypatch.setattr(split_kv, "cp_reason", lambda: "")
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    ctx = SimpleNamespace(
+        widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
+    )
+    assert runtime.slot_reasons() == []
+    built = runtime.build(model, ctx)
+    variants = built.graph_variants["target_verify"]
+    assert variants.capture_labels == ("split_kv_stock", "split_kv_long", "split_kv_cp")
+
+
 def _draft_ctx():
     return SimpleNamespace(
         widths=(), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
@@ -240,6 +257,105 @@ def test_the_draft_extend_takes_the_split_kv_variants_with_slot_draft_skv2(
     built = draft.SPEC.build("lm", SimpleNamespace(context_len=4096), _draft_ctx())
     assert sorted(built.graph_variants) == ["draft_extend", "draft_loop"]
     assert built.graph_variants["draft_extend"] is route.EXTEND
+
+
+def test_the_cp_slots_offer_the_draft_runners_a_cp_variant(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import draft
+    from sgl_nvidia_mega.qwen3_5.attention import route
+
+    slots = {"draft_loop", "draft_q1", "draft_q1_cp", "draft_extend", "draft_skv2"}
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots | {"draft_skv2_cp"}))
+    assert runtime.slot_reasons() == []
+    built = draft.SPEC.build("lm", SimpleNamespace(context_len=4096), _draft_ctx())
+    loop = built.graph_variants["draft_loop"]
+    extend = built.graph_variants["draft_extend"]
+    assert loop.capture_labels == ("q1_stock", "q1_long", "q1_cp")
+    assert extend.capture_labels == (
+        "split_kv_stock",
+        "split_kv_long",
+        "split_kv_cp",
+    )
+
+    def one(n):
+        return SimpleNamespace(
+            batch_size=1, attention_kv_len_lower_bound=n, seq_lens_cpu=None
+        )
+
+    draft_cross = route.CP_MIN_KV["draft"]
+    extend_cross = route.CP_MIN_KV["extend"]
+    assert [
+        loop.select(one(n)) for n in (16383, 16384, draft_cross - 1, draft_cross)
+    ] == [
+        "q1_stock",
+        "q1_long",
+        "q1_long",
+        "q1_cp",
+    ]
+    assert [
+        extend.select(one(n)) for n in (32767, 32768, extend_cross - 1, extend_cross)
+    ] == ["split_kv_stock", "split_kv_long", "split_kv_long", "split_kv_cp"]
+
+    monkeypatch.setattr(
+        runtime, "SLOTS", frozenset({"draft_loop", "draft_q1_cp", "skv2_cp"})
+    )
+    assert sorted(r.split(": ", 1)[1] for r in runtime.slot_reasons()) == [
+        "slot 'draft_q1_cp' takes slot 'draft_q1''s long-KV graph variant's place "
+        "from its length up",
+        "slot 'skv2_cp' takes slot 'skv2''s long-KV graph variant's place from its "
+        "length up",
+    ]
+
+
+@pytest.mark.parametrize("rows, label", [(1, "q1_cp"), (7, "split_kv_cp")])
+def test_the_draft_decode_takes_cp_lite_for_one_request_in_its_cp_variant(
+    monkeypatch, rows, label
+):
+    from sgl_nvidia_mega.qwen3_5.attention import route, split_kv
+    from sgl_nvidia_mega.qwen3_5.draft import attention as draft_attention
+
+    heads, dim, page = 4, 256, 64
+    calls = []
+
+    class CpLite:
+        def attend(
+            self, q, kv, pages, lens, q_len, bmm1, bmm2, ws, layer, owner, min_bs=None
+        ):
+            calls.append((tuple(q.shape), q_len, bmm1, bmm2, min_bs))
+            return torch.ones(q.shape[0], heads, dim, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(split_kv, "cp_lite", CpLite)
+    monkeypatch.setattr(draft_attention, "_q1_label", lambda: label)
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_buffer", lambda name, make: None
+    )
+    attn = draft_attention.Attention.__new__(draft_attention.Attention)
+    attn.layer = SimpleNamespace(
+        attn=SimpleNamespace(
+            layer_id=5,
+            scaling=0.5,
+            sliding_window_size=-1,
+            tp_q_head_num=heads,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            head_dim=dim,
+        )
+    )
+    attn.heads, attn.head_dim, attn.page_size = heads, dim, page
+    attn.q1 = attn.skv2 = None
+    attn._noted = set()
+    attn.cp_b1 = draft_attention.DraftCP(split_kv, route, steps=True, extend=True)
+    cache = torch.zeros(4 * page, 1, dim, dtype=torch.float8_e4m3fn)
+    kv = SimpleNamespace(
+        layer_ids=(5,), k=(cache,), v=(cache,), k_scale=(2.0,), v_scale=(3.0,)
+    )
+    meta = SimpleNamespace(
+        page_table=torch.zeros(1, 4, dtype=torch.int32),
+        cache_seqlens=torch.full((1,), 100, dtype=torch.int32),
+    )
+    q8 = torch.zeros(rows, heads * dim, dtype=torch.float8_e4m3fn)
+    out = attn.decode(q8, meta, kv, rows_per_request=rows)
+    assert out.shape == (rows, heads * dim) and bool((out == 1).all())
+    assert calls == [((rows, heads, dim), rows, 1.0, 3.0, 1)]
 
 
 @pytest.mark.parametrize(

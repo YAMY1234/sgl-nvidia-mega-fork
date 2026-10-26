@@ -15,6 +15,12 @@ symmetric pool as ``RowParallelLinear``'s output. The weights are packed at buil
 slot ``mka_push`` the epilogue also pushes its rows into the decode hop's mailbox where
 the MoE input's all-reduce will run the hop for them, and that all-reduce only consumes
 (the branch's MKA_PUSH).
+
+Steps of several requests (TP8, with ``multi_request``): up to ``FUSED_MAX_ROWS`` rows
+the wide entries of the same kernels; past it the front path, which keeps SGLang's qkv
+and o_proj GEMMs and fuses the rest bit for bit: the q / k norm, RoPE and gate split with
+the FP8 q and K / V write in one launch (the attention front of slot ``draft_front``),
+and the output gate with o_proj's static FP8 input quantization in one launch.
 """
 
 from __future__ import annotations
@@ -66,7 +72,12 @@ SGLANG_READS = {
         "k",
         "v",
     ),
+    "srt/layers/quantization/fp8_utils.py": ("flashinfer_bmm_fp8",),
 }
+
+# the widest step the fused kernels serve; wider steps take the front path, which measured
+# faster from four requests on (TP8, results/trt-1022/l2a micro e58d29c)
+FUSED_MAX_ROWS = 14
 
 # the packed (qkv, o_proj) weights per full-attention layer id, filled at build
 WEIGHTS: dict = {}
@@ -145,7 +156,13 @@ def step(layer, x, st):
     m = x.shape[0]
     if m not in _ENGAGED:
         _ENGAGED.add(m)
-        logger.info("NVIDIA megakernel: Qwen3.5 slot mka runs at %d rows", m)
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 slot mka runs at %d rows (%s)",
+            m,
+            "fused" if m <= FUSED_MAX_ROWS else "front path",
+        )
+    if m > FUSED_MAX_ROWS:
+        return _front_step(layer, x, st)
     attn = layer.attn
     width = layer.num_heads * layer.head_dim
     q = torch.empty((m, width), dtype=torch.float8_e4m3fn, device=x.device)
@@ -197,6 +214,72 @@ def step(layer, x, st):
     if hop is not None:
         hop.mark_pushed(out)
     return out
+
+
+def _front_step(layer, x, st):
+    """The front path of a wide step: SGLang's qkv GEMM, the front with the FP8 KV write,
+    the attention, the gate with o_proj's input quantization, SGLang's o_proj GEMM."""
+    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+        use_symmetric_memory,
+    )
+    from sglang.srt.layers.dp_attention import is_allocation_symmetric
+    from sglang.srt.layers.quantization.fp8_utils import flashinfer_bmm_fp8
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.gate_quant import gate_quant
+    from sgl_nvidia_mega.qwen3_5.sm103.draft.front import (
+        fused_qk_gemma_rmsnorm_rope_gate,
+    )
+
+    m = x.shape[0]
+    attn = layer.attn
+    width = layer.num_heads * layer.head_dim
+    qkv, _ = layer.qkv_proj(x)
+    q_gate, k, v = qkv.split(
+        [
+            2 * width,
+            layer.num_kv_heads * layer.head_dim,
+            layer.num_kv_heads * layer.head_dim,
+        ],
+        dim=-1,
+    )
+    i = st.view.kv.layer_ids.index(attn.layer_id)
+    k_scale, v_scale = split_kv.kv_scales(attn, x.device)
+    rope = layer.rotary_emb
+    q, _, gate = fused_qk_gemma_rmsnorm_rope_gate(
+        q_gate,
+        k,
+        layer.q_norm.weight.data,
+        layer.k_norm.weight.data,
+        rope.cos_sin_cache,
+        st.positions,
+        layer.q_norm.variance_epsilon,
+        layer.num_heads,
+        layer.num_kv_heads,
+        layer.head_dim,
+        rope.rotary_dim,
+        has_gate=True,
+        mrope_axis_map=rope.axis_map,
+        v=v,
+        kv_cache=(st.view.kv.k[i], st.view.kv.v[i]),
+        cache_loc=st.fb.out_cache_loc,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    o = attn(q.reshape(m, width), None, None, st.fb).reshape(m, width)
+    oq = gate_quant(o.contiguous(), gate.reshape(m, width), layer.o_proj.input_scale)
+    # the same allocation as RowParallelLinear's output, which the boundary all-reduces
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
+        return flashinfer_bmm_fp8(
+            oq,
+            layer.o_proj.weight,
+            layer.o_proj.input_scale,
+            layer.o_proj.weight_scale,
+            torch.bfloat16,
+        )
 
 
 def _push_hop(layer, st, m: int):

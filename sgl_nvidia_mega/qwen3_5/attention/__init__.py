@@ -47,7 +47,7 @@ SGLANG_MIRRORS = {
     "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer.self_attention": "db0f4d98e0fb1abf",
 }
 
-ATTENTION_SLOTS = ("skv2", "mka", "mka_push")
+ATTENTION_SLOTS = ("skv2", "skv2_cp", "mka", "mka_push")
 
 
 class Bound(msgspec.Struct, frozen=True):
@@ -55,6 +55,7 @@ class Bound(msgspec.Struct, frozen=True):
 
     skv2: bool = False  # slot skv2 serves every full-attention layer
     mka: bool = False
+    mka_wide: bool = False  # mka's wide entries serve the steps of several requests
     mka_push: bool = False
     reason: str = ""  # why a requested slot is not built
 
@@ -87,10 +88,20 @@ def build(model, ctx) -> Bound:
             )
         if reason:
             return Bound(reason=f"layer {i}: {reason}")
+    if "skv2_cp" in SLOTS:
+        reason = split_kv.cp_reason()
+        if reason:
+            return Bound(reason=f"slot skv2_cp: {reason}")
     if "mka" in SLOTS:
         for _, layer in layers:
             mka.pack(layer)
-    return Bound(skv2="skv2" in SLOTS, mka="mka" in SLOTS, mka_push="mka_push" in SLOTS)
+    mka_on = "mka" in SLOTS
+    return Bound(
+        skv2="skv2" in SLOTS,
+        mka=mka_on,
+        mka_wide=mka_on and all(layer.num_heads == 4 for _, layer in layers),
+        mka_push="mka_push" in SLOTS,
+    )
 
 
 def pool_reasons(view, binding, skv2: bool = True, mka: bool = False) -> list[str]:

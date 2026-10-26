@@ -212,12 +212,18 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
         **{**dict.fromkeys(plan.Facts.__struct_fields__, True), "mkm_wide": False}
     )
     assert _on(plan.slots(7, every)) == sorted(plan.Slots.__struct_fields__)
-    # two requests: the 16-row router front, the GDN chain and the hop's one-shot rows
-    assert _on(plan.slots(14, every)) == ["gdn_pdl", "gdn_verify", "hop", "route"]
-    # four requests and wider: past the router front's and one-shot all-reduce's rows
-    assert _on(plan.slots(28, every)) == ["gdn_pdl", "gdn_verify"]
-    for rows in (56, 112, 224, 448, 896):
-        assert _on(plan.slots(rows, every)) == ["gdn_pdl", "gdn_verify"]
+    # two requests: also MKA's wide entries and their push into the hop
+    assert _on(plan.slots(14, every)) == [
+        "gdn_pdl",
+        "gdn_verify",
+        "hop",
+        "mka",
+        "mka_push",
+        "route",
+    ]
+    # Wider requests take MKA's bitwise front path.
+    for rows in (28, 56, 112, 224, 448, 896):
+        assert _on(plan.slots(rows, every)) == ["gdn_pdl", "gdn_verify", "mka"]
     # SGLang offers every multiple of 7 up to MAX_ROWS; every request count is a candidate
     offered = tuple(range(7, plan.MAX_ROWS + 1, 7))
     assert plan.candidates(offered, 7) == offered
@@ -236,6 +242,15 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     attention = plan.Facts(skv2=True, mka=True, mka_push=True, hop=True)
     assert plan.covered((7, 14, 28), attention, 7) == (7, 14)
     assert _on(plan.slots(14, attention)) == ["hop"]
+    wide_attention = plan.Facts(mka=True, mka_wide=True)
+    assert plan.covered((7, 14, 28, 56, 112, 224), wide_attention, 7) == (
+        7,
+        14,
+        28,
+        56,
+        112,
+        224,
+    )
     # mkm_wide: mkm's 16-token engine at two requests, not past the router front's rows
     wide = plan.Facts(route=True, mkm=True, mkm_wide=True)
     assert _on(plan.slots(14, wide)) == ["mkm", "route"]
@@ -258,6 +273,10 @@ def test_the_slot_plans_row_bounds_are_the_kernels():
     assert plan.MKM_WIDE_MAX_ROWS == mkm.M16_MAX_TOKENS
     assert plan.GDN_PUSH_MAX_ROWS == hop.OPROJ_MAX_M
     assert plan.MKA_MAX_ROWS == mka.MAX_ROWS
+    from sgl_nvidia_mega.qwen3_5.attention import mka as mka_step
+
+    assert plan.MKA_WIDE_MAX_ROWS == plan.MAX_ROWS
+    assert mka_step.FUSED_MAX_ROWS <= mka.WIDE_MAX_ROWS
 
 
 def test_a_numeric_slot_turns_the_claim_into_its_tolerances():

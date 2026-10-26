@@ -26,24 +26,35 @@ KEY = "SGLANG_Q35FLY_DRAFT_HEAD_EXCHANGE"
 COUNT = 17  # prime to the three epoch slots and the four-arm pattern
 
 
-@pytest.mark.parametrize("mxfp8", [False, True])
-def test_mixed_graph_exact_with_skew_and_epoch_wrap(ranks, mxfp8, monkeypatch):
+@pytest.fixture(scope="module")
+def hp2_boundary(ranks):
+    """One process group and one multicast boundary for both arithmetic cases."""
     from sgl_nvidia_mega.qwen3_5.draft import xchg as boundary_mod
     from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(KEY, "0")
+        patch.setenv("Q35MF_AB_VARIANTS", json.dumps({"A": {KEY: "0"}, "H": {KEY: "1"}}))
+        patch.setattr(boundary_mod, "HEAD_PARTIAL", False)
+        patch.setattr(boundary_mod, "HEAD_EXCHANGE", False)
+        patch.setattr(kernels, "PARTIAL_ROWS4", True)
+        patch.setattr(kernels, "XCHG_SPLIT_SEND", True)
+        mkd, _ = base.boundary.__wrapped__(ranks)
+        yield mkd
+
+
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_mixed_graph_exact_with_skew_and_epoch_wrap(ranks, hp2_boundary, mxfp8):
     from sgl_nvidia_mega.qwen3_5.sm103.draft.head_mx8 import DraftHeadMx8
 
     rank, world, _, cpu_group = ranks
     assert world in (4, 8)
-    monkeypatch.setenv(KEY, "0")
-    monkeypatch.setenv("Q35MF_AB_VARIANTS", json.dumps({"A": {KEY: "0"}, "H": {KEY: "1"}}))
-    monkeypatch.setattr(boundary_mod, "HEAD_PARTIAL", False)
-    monkeypatch.setattr(boundary_mod, "HEAD_EXCHANGE", False)
-    monkeypatch.setattr(kernels, "PARTIAL_ROWS4", True)
-    monkeypatch.setattr(kernels, "XCHG_SPLIT_SEND", True)
-    mkd, _ = base.boundary.__wrapped__(ranks)
+    mkd = hp2_boundary
     assert mkd._head_exchange_available and not mkd.fuse_head_exchange
     if mxfp8:
         mkd.set_head_mx8(DraftHeadMx8(mkd.lm_head_weight, max_rows=1, gemv="nvrtc"))
+    else:
+        mkd.head_mx8 = None
 
     inputs = base._randn(COUNT, base.H, g=base._gen(35100))
     positions = torch.zeros(1, dtype=torch.int64, device="cuda")

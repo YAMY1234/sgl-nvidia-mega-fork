@@ -316,11 +316,7 @@ class Attention:
         attn = self.layer.attn
         bmm1_scale = 1.0 * kv.k_scale[0] * attn.scaling
         bmm2_scale = kv.v_scale[0]
-        if (
-            self.cp_b1 is not None
-            and q8.shape[0] == rows_per_request
-            and self.cp_b1.takes(rows_per_request)
-        ):
+        if self.cp_b1 is not None and self.cp_b1.takes(rows_per_request, q8.shape[0]):
             o = self.cp_b1.run(self, q8, meta, kv, rows_per_request)
             if o is not None:
                 return o
@@ -423,30 +419,37 @@ class DraftCP:
     """Slots draft_q1_cp / draft_skv2_cp: in the draft loop's ``Q1_CP`` and the draft
     extend's ``SPLIT_KV_CP`` graph variants (one request past its measured crossover),
     the decode of the request's rows as CP-lite, which then serves one request
-    (SGLang's q35_cp_lite through ``attention.split_kv.cp_core``'s call)."""
+    (SGLang's q35_cp_lite through ``attention.split_kv.cp_core``'s call). Slot
+    draft_multi also preserves CP-lite on multi-request graphs where SGLang built it;
+    CP-lite's own shape gate decides whether it runs."""
 
-    def __init__(self, split_kv, route, steps: bool, extend: bool):
+    def __init__(self, split_kv, route, steps: bool, extend: bool, multi: bool = False):
         self.split_kv, self.route = split_kv, route
-        self.steps, self.extend = steps, extend
+        self.steps, self.extend, self.multi = steps, extend, multi
         self._logged: set = set()
 
     @classmethod
     def build(cls, parts):
         steps = "draft_q1_cp" in parts.slots
         extend = "draft_skv2_cp" in parts.slots
-        if not (steps or extend):
+        multi = "draft_multi" in parts.slots
+        if not (steps or extend or multi):
             return None
         from sgl_nvidia_mega.qwen3_5.attention import route, split_kv
 
         why = split_kv.cp_reason()
         if why:
+            if multi and not (steps or extend):
+                return None
             raise RuntimeError(
                 f"NVIDIA megakernel: slots draft_q1_cp / draft_skv2_cp cannot run: {why}"
             )
-        return cls(split_kv, route, steps, extend)
+        return cls(split_kv, route, steps, extend, multi)
 
-    def takes(self, rows_per_request: int) -> bool:
-        """The graph being captured is this decode's CP variant."""
+    def takes(self, rows_per_request: int, rows: int) -> bool:
+        """Whether this graph lets CP-lite try the decode."""
+        if self.multi and rows > rows_per_request:
+            return True
         label = _q1_label()
         if rows_per_request == 1:
             return self.steps and label == Q1_CP
@@ -455,21 +458,38 @@ class DraftCP:
     def run(self, attention, q8, meta, kv, rows_per_request: int):
         layer = attention.layer
         attn = layer.attn
-        o = self.split_kv.cp_core(attn, q8, kv, meta, attention, rows_per_request)
+        multi = q8.shape[0] > rows_per_request
+        o = self.split_kv.cp_core(
+            attn,
+            q8,
+            kv,
+            meta,
+            attention,
+            rows_per_request,
+            min_bs=None if multi else 1,
+        )
         if o is not None and torch.cuda.is_current_stream_capturing():
             key = (rows_per_request, q8.shape[0])
             if key not in self._logged:
                 self._logged.add(key)
-                logger.info(
-                    "NVIDIA megakernel: Qwen3.5 MTP draft slot %s runs the %s's %d "
-                    "rows as CP-lite (from %d tokens of KV)",
-                    "draft_q1_cp" if rows_per_request == 1 else "draft_skv2_cp",
-                    "step" if rows_per_request == 1 else "extend",
-                    q8.shape[0],
-                    self.route.cp_min_length(
-                        "draft" if rows_per_request == 1 else "extend"
-                    ),
-                )
+                if multi:
+                    logger.info(
+                        "NVIDIA megakernel: Qwen3.5 MTP draft slot draft_multi keeps "
+                        "CP-lite for %d requests x %d rows",
+                        q8.shape[0] // rows_per_request,
+                        rows_per_request,
+                    )
+                else:
+                    logger.info(
+                        "NVIDIA megakernel: Qwen3.5 MTP draft slot %s runs the %s's "
+                        "%d rows as CP-lite (from %d tokens of KV)",
+                        "draft_q1_cp" if rows_per_request == 1 else "draft_skv2_cp",
+                        "step" if rows_per_request == 1 else "extend",
+                        q8.shape[0],
+                        self.route.cp_min_length(
+                            "draft" if rows_per_request == 1 else "extend"
+                        ),
+                    )
         return o
 
 

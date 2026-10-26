@@ -156,6 +156,29 @@ def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
             {"gdn_verify", "gdn_front"},
             "slot 'gdn_front' runs slot 'gdn_pdl''s dependent verify",
         ),
+        (
+            {"gdn_trt_front"},
+            "slot 'gdn_trt_front' replaces slot 'gdn_front' in front of slot "
+            "'gdn_core'",
+        ),
+        (
+            {"route_lin"},
+            "slot 'route_lin' runs the router before the all-reduce",
+        ),
+        (
+            {
+                "route",
+                "mkm",
+                "hop",
+                "gdn_verify",
+                "gdn_push",
+                "mka",
+                "mka_push",
+                "route_lin",
+                "route_shared",
+            },
+            "slot 'route_lin' needs 'lowm_se' to replace 'route_shared'",
+        ),
         ({"route_shared"}, "slot 'route_shared' runs in slot 'route''s launch"),
         ({"route", "mkm_wide"}, "slot 'mkm_wide' is slot 'mkm''s 16-token engine"),
         (
@@ -241,6 +264,24 @@ def _on(slots):
     return sorted(name for name in plan.Slots.__struct_fields__ if getattr(slots, name))
 
 
+def test_the_trt_gdn_front_widens_slot_gdn_front_to_four_requests():
+    """The custom front serves one request; the explicit TRT front serves four."""
+    front = plan.Facts(gdn_verify=True, gdn_pdl=True, gdn_front=True)
+    assert plan.slots(7, front).gdn_front
+    assert not plan.slots(14, front).gdn_front
+    trt = plan.Facts(
+        gdn_verify=True,
+        gdn_pdl=True,
+        gdn_front=True,
+        gdn_trt_front=True,
+    )
+    for rows in (7, 14, 21, 28):
+        slots = plan.slots(rows, trt)
+        assert slots.gdn_front and slots.gdn_trt_front
+    assert not plan.slots(35, front).gdn_front
+    assert not plan.slots(35, trt).gdn_front
+
+
 def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     # every slot built except mkm's 16-token engine (mkm_wide, below)
     every = plan.Facts(
@@ -263,7 +304,9 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(14, every)) == [
         "gdn_conv",
         "gdn_core",
+        "gdn_front",
         "gdn_pdl",
+        "gdn_trt_front",
         "gdn_verify",
         "hop",
         "hop_fp8",
@@ -279,6 +322,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     # Three requests keep only the shared expert's validated low-M launch.
     three = plan.slots(21, every)
     assert three.lowm_se
+    assert three.gdn_front and three.gdn_trt_front
     assert not (three.lowm_in or three.lowm_outproj or three.lowm_oproj)
     # The 28/56-row low-M paths stay stock; GDN core and MKA serve through 224.
     for rows in (28, 56, 112, 224):
@@ -290,6 +334,8 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
             "mka",
             "route_topk",
         ]
+        if rows <= plan.GDN_TRT_FRONT_MAX_ROWS:
+            expected.extend(("gdn_front", "gdn_trt_front"))
         if rows <= plan.MKM_M32_MAX_ROWS:
             expected.append("mkm_m32")
         if plan.MKM_M32_MAX_ROWS < rows <= plan.MKM_M64_MAX_ROWS:
@@ -474,4 +520,10 @@ def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
     assert dict(attention.tolerances) == {
         **spec.NUMERIC_TOLERANCES["skv2"],
         **spec.NUMERIC_TOLERANCES["mka"],
+    }
+    small = spec.numerics(frozenset({"gdn_front", "gdn_trt_front", "route_lin"}))
+    assert dict(small.tolerances) == {
+        **spec.NUMERIC_TOLERANCES["gdn_front"],
+        **spec.NUMERIC_TOLERANCES["gdn_trt_front"],
+        **spec.NUMERIC_TOLERANCES["route_lin"],
     }

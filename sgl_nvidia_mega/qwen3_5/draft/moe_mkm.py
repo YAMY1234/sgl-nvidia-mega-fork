@@ -81,12 +81,7 @@ class DraftMkm:
             route=True,
             mkm={mlp.layer_id: maps},
             mkm_wide=wide,
-            # the hop's finalize takes registered identity rows without a map load
-            identity=torch.arange(
-                mkm_kernel.M128_MAX_TOKENS * mkm_kernel.TOP_K,
-                dtype=torch.int32,
-                device="cuda",
-            ),
+            identity=route.identity_rows(mkm_kernel.M128_MAX_TOKENS * mkm_kernel.TOP_K),
             topk=True,
             m32={mlp.layer_id: maps},
             m64=True,

@@ -425,7 +425,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     )
     for rows in (7, 14):
         assert _on(plan.slots(rows, s_tier)) == ["lowm_se", "route", "route_pre_topk"]
-    assert _on(plan.slots(21, s_tier)) == ["route_topk"]
+    assert _on(plan.slots(21, s_tier)) == ["lowm_se", "route_topk"]
     # SGLang offers every multiple of 7 up to MAX_ROWS; every request count is a candidate
     offered = tuple(range(7, plan.MAX_ROWS + 1, 7))
     assert plan.candidates(offered, 7) == offered
@@ -574,12 +574,17 @@ def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
     assert claim.kind is NumericsKind.TOLERANCE
     assert dict(claim.tolerances) == spec.NUMERIC_TOLERANCES["gdn_push"]
     shared = spec.numerics(frozenset({"route", "route_shared"}))
-    assert dict(shared.tolerances) == spec.NUMERIC_TOLERANCES["route_shared"]
+    assert dict(shared.tolerances) == {
+        **spec.NUMERIC_TOLERANCES["route"],
+        **spec.NUMERIC_TOLERANCES["route_shared"],
+    }
     both = spec.numerics(frozenset({"gdn_verify", "gdn_pdl", "gdn_front", "gdn_push"}))
     assert dict(both.tolerances) == {
         **spec.NUMERIC_TOLERANCES["gdn_push"],
         **spec.NUMERIC_TOLERANCES["gdn_front"],
     }
+    core = spec.numerics(frozenset({"gdn_verify", "gdn_core"}))
+    assert dict(core.tolerances) == spec.NUMERIC_TOLERANCES["gdn_core"]
     attention = spec.numerics(frozenset({"skv2", "mka", "mka_push", "hop"}))
     assert attention.kind is NumericsKind.TOLERANCE
     assert dict(attention.tolerances) == {

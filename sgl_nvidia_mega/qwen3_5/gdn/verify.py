@@ -139,7 +139,12 @@ SGLANG_MIRRORS = {
         "739e7115c370ac01",
     ),
     "srt/layers/linear.py:RowParallelLinear.forward": "b291a3c452e428a5",
-    "srt/layers/quantization/fp8_utils.py:apply_fp8_linear_bmm_flashinfer": "c66562e1de0008db",
+    # The follow-up also accepts an already-quantized FP8 input, which is the path
+    # _out_proj mirrors; the BF16 path remains the stock alternative.
+    "srt/layers/quantization/fp8_utils.py:apply_fp8_linear_bmm_flashinfer": (
+        "c66562e1de0008db",
+        "c94a4f1a622c2fe0",
+    ),
     "srt/layers/quantization/modelopt_quant.py:ModelOptFp8LinearMethod.apply": "91b563cf074bff42",
 }
 

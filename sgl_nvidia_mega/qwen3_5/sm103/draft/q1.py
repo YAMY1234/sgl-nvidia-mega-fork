@@ -266,7 +266,7 @@ class Q1Decode:
         return plan
 
     def __call__(
-        self, query, kv_cache, block_tables, seq_lens, *, out, qk_scale, v_scale
+        self, query, kv_cache, block_tables, seq_lens, *, out, qk_scale, v_scale, gate=None
     ) -> torch.Tensor:
         """``_run_q1``: the merged output [1, heads, 256] bf16 in ``out``."""
         from sgl_nvidia_mega.qwen3_5.sm103.draft.q1_kernel import skv2_q1_decode
@@ -281,6 +281,7 @@ class Q1Decode:
             qk_scale=qk_scale,
             v_scale=v_scale,
             out=out,
+            gate=gate,
         )
 
     def step(
@@ -293,6 +294,7 @@ class Q1Decode:
         scaling: float,
         out: Optional[torch.Tensor] = None,
         q_scale: float = 1.0,
+        gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """One draft step's attention for ``layer_id`` on the draft's pool ``kv``
         (``KvPoolBuffers``) and the step's ``AttnStepMetadata``: [1, heads, 256]
@@ -316,6 +318,12 @@ class Q1Decode:
         )
         if why is not None:
             raise ValueError(f"SKV2-Q1 cannot serve this step: {why}")
+        if gate is not None and (
+            gate.dtype != torch.bfloat16
+            or gate.shape != (1, query.shape[1] * HEAD_DIM)
+            or not gate.is_contiguous()
+        ):
+            raise ValueError("SKV2-Q1 merge gate must be contiguous BF16 [1, heads * 256]")
         if out is None:
             out = torch.empty_like(query, dtype=torch.bfloat16)
         return self(
@@ -326,6 +334,7 @@ class Q1Decode:
             out=out,
             qk_scale=float(bmm1),
             v_scale=float(bmm2),
+            gate=gate,
         )
 
     def prepare(self, heads: int, kv, layer_id: int, step) -> None:
@@ -346,7 +355,8 @@ class Q1Decode:
 
 @cache
 def build(
-    device_index: int, heads: int = 4, pdl: bool = True, release: bool = True
+    device_index: int, heads: int = 4, pdl: bool = True, release: bool = True,
+    merge_gate: bool = False,
 ) -> None:
     """Import CuTe DSL and Triton and compile the fp32 merge for ``heads`` rows and
     this GPU's SM count (as ``Q1Decode(pdl, release)`` runs it); each layout's
@@ -380,4 +390,13 @@ def build(
             num_warps=MERGE_WARPS,
             **({"launch_pdl": True} if pdl else {}),
         )
+        if merge_gate:
+            gate = torch.zeros((1, heads * HEAD_DIM), dtype=torch.bfloat16, device=device)
+            _q1_merge[(heads, HEAD_DIM // MERGE_BLOCK_D, 1)](
+                partial, maximum, denom, lengths, out, heads, nsplit,
+                triton.next_power_of_2(nsplit), MERGE_BLOCK_D,
+                USE_GDC=pdl, RELEASE=pdl and release, GATE=True, gate=gate,
+                num_warps=MERGE_WARPS,
+                **({"launch_pdl": True} if pdl else {}),
+            )
     torch.cuda.synchronize(device)

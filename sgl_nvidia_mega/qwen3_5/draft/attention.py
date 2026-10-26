@@ -19,7 +19,9 @@ decode as the q1 split-KV kernel (``sm103/draft/q1``).
 from __future__ import annotations
 
 import importlib
+import json
 import logging
+import os
 
 import torch
 
@@ -43,6 +45,9 @@ QKN_PDL = True
 # kernel's arithmetic, in place of that kernel; 2: also, under Q1_PDL, the q1 merge
 # releases that o_proj at entry
 GATE_FOLD = 2
+# Default-off: move the existing gated push GEMV's BF16 gate into q1's merge.
+Q1_MERGE_GATE_ENV = "SGLANG_Q35FLY_DRAFT_Q1_MERGE_GATE"
+Q1_MERGE_GATE = os.environ.get(Q1_MERGE_GATE_ENV, "0") == "1"
 
 
 class Q1Variants:
@@ -217,6 +222,32 @@ class Attention:
         # slots draft_q1_cp / draft_skv2_cp: one request's steps / extend in their
         # CP graph variant run CP-lite at one request (DraftCP)
         self.cp_b1 = DraftCP.build(parts)
+        gate_variants = json.loads(os.environ.get("Q35MF_AB_VARIANTS") or "{}")
+        self._merge_gate_ab = bool(gate_variants)
+        self._merge_gate_available = Q1_MERGE_GATE or any(
+            arm.get(Q1_MERGE_GATE_ENV) == "1" for arm in gate_variants.values()
+        )
+
+    def _merge_gate_takes(self, x, gate, rows_per_request, o_proj):
+        """Only the TP8 one-row q1-long + gated hop GEMV edge; no state per step."""
+        return (
+            self._merge_gate_available
+            and (
+                os.environ.get(Q1_MERGE_GATE_ENV, "0") == "1"
+                if self._merge_gate_ab else Q1_MERGE_GATE
+            )
+            and rows_per_request == 1
+            and x.shape[0] == 1
+            and self.heads == 4
+            and self.q1 is not None
+            and _q1_label() == Q1_LONG
+            and self.layer.attn_output_gate
+            and GATE_FOLD
+            and o_proj is not None
+            and gate is not None
+            and gate.shape == (1, self.heads * self.head_dim)
+            and gate.is_contiguous()
+        )
 
     def __call__(
         self, x, positions, cache_loc, meta, kv, *, rows_per_request: int, o_proj=None
@@ -229,6 +260,14 @@ class Attention:
         layer = self.layer
         if self.front:
             q8, gate = self._front(x, positions, cache_loc, kv)
+            if self._merge_gate_takes(x, gate, rows_per_request, o_proj):
+                o = self.q1(
+                    q8.reshape(1, self.heads, self.head_dim), kv, meta, gate=gate
+                ).view(1, -1)
+                self._note(
+                    "Q35FLY q1-long merge applies the BF16 output gate; ungated hop o_proj"
+                )
+                return o_proj(o)
             o = self.decode(q8, meta, kv, rows_per_request)
         else:
             q, k, v, gate = layer.forward_prepare_cuda_fused(
@@ -528,7 +567,10 @@ def build_q1(parts):
     if why is not None:
         raise RuntimeError(f"NVIDIA megakernel: slot draft_q1 cannot run: {why}")
     release = GATE_FOLD == 2
-    q1.build(device.index, heads=attention.heads, pdl=Q1_PDL, release=release)
+    q1.build(
+        device.index, heads=attention.heads, pdl=Q1_PDL, release=release,
+        merge_gate=attention._merge_gate_available,
+    )
     decode = q1.Q1Decode(pdl=Q1_PDL, release=release)
     if Q1_PDL:
         logger.info(
@@ -537,7 +579,7 @@ def build_q1(parts):
         )
     attn = parts.layer.attn
 
-    def run(q8, kv, meta):
-        return decode.step(q8, kv, attn.layer_id, meta, scaling=attn.scaling)
+    def run(q8, kv, meta, *, gate=None):
+        return decode.step(q8, kv, attn.layer_id, meta, scaling=attn.scaling, gate=gate)
 
     return run

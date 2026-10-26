@@ -713,6 +713,8 @@ def _q1_merge(
     BLOCK_D: tl.constexpr,
     USE_GDC: tl.constexpr = False,
     RELEASE: tl.constexpr = False,
+    GATE: tl.constexpr = False,
+    gate=None,
 ):
     if RELEASE:  # the consumer's own dependency wait still covers this grid's stores
         tl.extra.cuda.gdc_launch_dependents()
@@ -737,7 +739,23 @@ def _q1_merge(
     )
     o = tl.sum(part.to(tl.float32) * w[:, None], 0)
     # Denominators are sums of P x 448; partials are O / 448.
-    tl.store(out + row * 256 + d, (o / (total * (1.0 / 448.0))).to(tl.bfloat16))
+    if GATE:
+        # Preserve BOTH BF16 cutpoints of merge -> gate_mul8 -> GEMV. This is
+        # draft_gemv.cu's exact instruction sequence, not tl.sigmoid/rcp.
+        x = (o / (total * (1.0 / 448.0))).to(tl.bfloat16).to(tl.float32)
+        g = tl.load(gate + row * 256 + d).to(tl.float32)
+        y = tl.inline_asm_elementwise(
+            "mul.rn.f32 $0, $1, 0fBFB8AA3B;\n"
+            "ex2.approx.f32 $0, $0;\n"
+            "add.rn.f32 $0, $0, 0f3F800000;\n"
+            "div.full.f32 $0, 0f3F800000, $0;\n"
+            "mul.rn.f32 $0, $2, $0;",
+            constraints="=&f,f,f", args=[g, x], dtype=tl.float32,
+            is_pure=True, pack=1,
+        )
+        tl.store(out + row * 256 + d, y.to(tl.bfloat16))
+    else:
+        tl.store(out + row * 256 + d, (o / (total * (1.0 / 448.0))).to(tl.bfloat16))
 
 
 class Q1SplitPlan:
@@ -809,7 +827,7 @@ class Q1SplitPlan:
         )
         return tuple(from_dlpack(t) for t in tensors)
 
-    def run(self, query, kv, table, lengths, *, qk_scale, v_scale, out):
+    def run(self, query, kv, table, lengths, *, qk_scale, v_scale, out, gate=None):
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self.compiled(
@@ -832,12 +850,13 @@ class Q1SplitPlan:
             RELEASE=self.release,
             num_warps=4,
             **({"launch_pdl": True} if self.pdl else {}),
+            **({"GATE": True, "gate": gate} if gate is not None else {}),
         )
         return out
 
 
-def skv2_q1_decode(query, kv, table, lengths, plan, *, qk_scale, v_scale, out):
+def skv2_q1_decode(query, kv, table, lengths, plan, *, qk_scale, v_scale, out, gate=None):
     """q1 decode for one request through a prepared plan; same contract as trtllm_batch_decode_with_kv_cache."""
     return plan.run(
-        query, kv, table, lengths, qk_scale=qk_scale, v_scale=v_scale, out=out
+        query, kv, table, lengths, qk_scale=qk_scale, v_scale=v_scale, out=out, gate=gate
     )

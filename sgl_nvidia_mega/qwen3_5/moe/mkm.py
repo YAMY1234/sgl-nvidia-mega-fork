@@ -161,7 +161,16 @@ def routing_unsupported(mlp) -> str:
     return ""
 
 
-def routed(mlp, maps: tuple, identity: torch.Tensor, logits, x_fp4, x_sf, routing=None):
+def routed(
+    mlp,
+    maps: tuple,
+    identity: torch.Tensor,
+    logits,
+    x_fp4,
+    x_sf,
+    routing=None,
+    wide_bal: bool = False,
+):
     """The deferred-finalize output of ``mlp``'s routed experts from the router front's
     logits and quantized input (``maps``: the layer's weight TMA maps; ``identity``:
     0, 1, ... int32; ``routing``: route_topk's ids and weights, for the 64-token engine)."""
@@ -184,6 +193,7 @@ def routed(mlp, maps: tuple, identity: torch.Tensor, logits, x_fp4, x_sf, routin
         experts.g1_scale_c,
         experts.g2_alphas,
         routing=routing,
+        wide_bal=wide_bal,
     )
     deferred = FlashInferTrtllmDeferredFinalizeOutput(
         gemm2_out=gemm2_out,

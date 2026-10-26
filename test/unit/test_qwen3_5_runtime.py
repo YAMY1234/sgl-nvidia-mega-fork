@@ -127,6 +127,7 @@ def test_expert_parallel_keeps_route_and_boundary_slots(monkeypatch):
             "mkm_m128",
             "mkm_m256",
             "mkm_m512",
+            "mkm_wide_bal",
             "hop",
             "gdn_push",
             "draft_moe",
@@ -145,6 +146,7 @@ def test_expert_parallel_keeps_route_and_boundary_slots(monkeypatch):
             "mkm_m128",
             "mkm_m256",
             "mkm_m512",
+            "mkm_wide_bal",
             "draft_moe",
         }
     )

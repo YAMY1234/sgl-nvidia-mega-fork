@@ -41,9 +41,19 @@ class Engine(NamedTuple):
     defines: tuple = ()  # extra compile options
 
 
+# The validated TP8 schedule changes only when the weight and scale-factor loads issue;
+# the engine's rows remain bitwise identical.
+MKM7_DEFINES = (
+    "-DSPEC_STAGES=3",
+    "-DPACE_D=4",
+    "-DFC2SF_PRE=0",
+)
+
 # per intermediate size a rank holds (TP8, TP4)
 ENGINES = {
-    128: Engine("mkm_moe.cu", "q35_mkm_moe", 211968, "CU_TENSOR_MAP_SWIZZLE_64B"),
+    128: Engine(
+        "mkm_moe.cu", "q35_mkm_moe", 211968, "CU_TENSOR_MAP_SWIZZLE_64B", MKM7_DEFINES
+    ),
     256: Engine(
         "mkm_moe_tp4.cu", "q35_mkm_moe_tp4", 216064, "CU_TENSOR_MAP_SWIZZLE_128B"
     ),
@@ -116,6 +126,36 @@ RESERVED_SMS = {
     M256_MAX_TOKENS: 0,
     M512_MAX_TOKENS: 0,
 }
+ONEPASS_MAX_ROWS = 42
+
+
+def engine_options(rows: int, plain: bool = False) -> tuple:
+    """Validated bitwise schedule defines for a wide engine.
+
+    The 64-token engine keeps its stock schedule past ``ONEPASS_MAX_ROWS``.
+    """
+    if rows == M32_MAX_TOKENS:
+        return (
+            "-DTHR_D=2",
+            "-DTOPK_NOINLINE=1",
+            "-DONEPASS=1",
+            "-DMMA_SFONLY=1",
+        )
+    if rows == M64_MAX_TOKENS:
+        return ("-DMMA_SFONLY=1",) + (() if plain else ("-DONEPASS=1",))
+    return ()
+
+
+def reserved_sms(rows: int, m: int) -> int:
+    """The validated SM reserve for an engine bucket at an actual row count."""
+    if rows == M32_MAX_TOKENS and m <= 21:
+        return 0
+    if rows == M64_MAX_TOKENS:
+        if m <= 35:
+            return 32
+        if m <= 42:
+            return 16
+    return RESERVED_SMS[rows]
 
 
 class Params(ctypes.Structure):
@@ -166,8 +206,15 @@ def engine_rows(m: int) -> int:
     return next(r for r in ENGINE_ROWS if m <= r)
 
 
+def onepass_plain(rows: int, m: int) -> bool:
+    """Whether ``m`` rows use the 64-token engine's stock two-pass schedule."""
+    return rows == M64_MAX_TOKENS and m > ONEPASS_MAX_ROWS
+
+
 @cache
-def _kernel(device_index: int, intermediate: int, rows: int) -> jit.Kernel:
+def _kernel(
+    device_index: int, intermediate: int, rows: int, plain: bool = False
+) -> jit.Kernel:
     """The engine of ``engine_rows`` bound ``rows`` at ``intermediate`` per rank."""
     engine = {
         MAX_TOKENS: ENGINES,
@@ -188,7 +235,8 @@ def _kernel(device_index: int, intermediate: int, rows: int) -> jit.Kernel:
             "-default-device",
             f"-DQ35_MKM_SMEM_BYTES={engine.smem_bytes}",
         )
-        + engine.defines,
+        + engine.defines
+        + engine_options(rows, plain),
     )
     return jit.load(cubin, engine.kernel, (THREADS, 1, 1), engine.smem_bytes)
 
@@ -254,6 +302,8 @@ def build(
     for hi in ENGINE_ROWS:
         if min_rows <= hi and max_rows > lo:
             _kernel(device_index, intermediate, hi)
+            if onepass_plain(hi, max(lo + 1, min(max_rows, hi))):
+                _kernel(device_index, intermediate, hi, True)
         lo = hi
 
 
@@ -363,15 +413,14 @@ def mkm_moe(
         out=gemm2_out.data_ptr(),
         num_tokens=m,
     )
-    kernel = _kernel(device.index, intermediate, rows)
+    kernel = _kernel(device.index, intermediate, rows, onepass_plain(rows, m))
     stream = torch.cuda.current_stream().cuda_stream
     if rows in (M32_MAX_TOKENS, M64_MAX_TOKENS, M128_MAX_TOKENS) + WIDE_ROWS:
         # min(M * 10, SMs) CTAs, one per SM, each running its share of the distinct experts
         # (the wide engines: every SM, CTA c running experts c, c + G, ...)
-        sms = (
-            torch.cuda.get_device_properties(device).multi_processor_count
-            - RESERVED_SMS[rows]
-        )
+        sms = torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count - reserved_sms(rows, m)
         ids_in = 0 if routing is None else routing[0].data_ptr()
         if rows in WIDE_ROWS and not (
             routing[0].is_contiguous() and ids_in % 16 == 0 and sms >= WIDE_MIN_SMS

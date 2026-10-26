@@ -271,6 +271,10 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
         "mka_push",
         "route",
     ]
+    # Three requests keep only the shared expert's validated low-M launch.
+    three = plan.slots(21, every)
+    assert three.lowm_se
+    assert not (three.lowm_in or three.lowm_outproj or three.lowm_oproj)
     # The 28/56-row low-M paths stay stock; GDN core and MKA serve through 224.
     for rows in (28, 56, 112, 224):
         expected = [
@@ -387,10 +391,34 @@ def test_the_slot_plans_row_bounds_are_the_kernels():
     assert mka_step.FUSED_MAX_ROWS <= mka.WIDE_MAX_ROWS
 
 
+def test_the_validated_moe_schedules_are_shape_closed():
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm
+
+    assert mkm.MKM7_DEFINES == (
+        "-DSPEC_STAGES=3",
+        "-DPACE_D=4",
+        "-DFC2SF_PRE=0",
+    )
+    assert mkm.engine_options(32) == (
+        "-DTHR_D=2",
+        "-DTOPK_NOINLINE=1",
+        "-DONEPASS=1",
+        "-DMMA_SFONLY=1",
+    )
+    assert mkm.engine_options(64) == ("-DMMA_SFONLY=1", "-DONEPASS=1")
+    assert mkm.engine_options(64, plain=True) == ("-DMMA_SFONLY=1",)
+    assert [mkm.reserved_sms(32, rows) for rows in (21, 22)] == [0, 32]
+    assert [mkm.reserved_sms(64, rows) for rows in (35, 42, 43)] == [32, 16, 0]
+    assert not mkm.onepass_plain(64, 42)
+    assert mkm.onepass_plain(64, 43)
+
+
 def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
     from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
 
-    assert spec.numerics(frozenset({"route", "hop"})).kind is NumericsKind.BITWISE
+    route = spec.numerics(frozenset({"route", "hop"}))
+    assert route.kind is NumericsKind.TOLERANCE
+    assert dict(route.tolerances) == spec.NUMERIC_TOLERANCES["route"]
     tiled_route = spec.numerics(frozenset({"route_topk", "route_gemm"}))
     assert tiled_route.kind is NumericsKind.TOLERANCE
     assert dict(tiled_route.tolerances) == spec.NUMERIC_TOLERANCES["route_gemm"]

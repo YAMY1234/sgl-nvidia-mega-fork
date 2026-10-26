@@ -144,6 +144,27 @@ __device__ __forceinline__ uint32_t gate_quant4(const __nv_bfloat16* o, const __
           << 16);
 }
 
+// The same roundings on operands already in registers (the wide kernels batch their loads).
+__device__ __forceinline__ uint32_t quant4_static_r(const uint2 raw, float inv) {
+  const __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
+  const __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
+  float f[4] = {__low2float(v01), __high2float(v01), __low2float(v23), __high2float(v23)};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) f[i] = fminf(fmaxf(__fmul_rn(f[i], inv), -448.f), 448.f);
+  return e4m3x2(f[0], f[1]) | (e4m3x2(f[2], f[3]) << 16);
+}
+__device__ __forceinline__ uint32_t gate_quant4_r(const uint2 ro, const uint2 rg, float inv) {
+  const __nv_bfloat162 o01 = *reinterpret_cast<const __nv_bfloat162*>(&ro.x);
+  const __nv_bfloat162 o23 = *reinterpret_cast<const __nv_bfloat162*>(&ro.y);
+  const __nv_bfloat162 g01 = *reinterpret_cast<const __nv_bfloat162*>(&rg.x);
+  const __nv_bfloat162 g23 = *reinterpret_cast<const __nv_bfloat162*>(&rg.y);
+  return e4m3x2(gate_quant1(__low2float(o01), __low2float(g01), inv),
+                gate_quant1(__high2float(o01), __high2float(g01), inv)) |
+         (e4m3x2(gate_quant1(__low2float(o23), __low2float(g23), inv),
+                 gate_quant1(__high2float(o23), __high2float(g23), inv))
+          << 16);
+}
+
 // Inbox slot s of a 256-row tile -> row: warp w = s/32 holds rows 32w + {g, g+8, g+16, g+24}.
 __device__ __forceinline__ int slot_row(int s) { return 32 * (s >> 5) + ((s >> 2) & 7) + 8 * (s & 3); }
 
@@ -512,6 +533,301 @@ __device__ __forceinline__ void mka_epilogue_kernel(const EpiParams p) {
   if (!kEarlyTrigger) pdl_trigger();
 }
 
+
+// Wide steps (9-112 rows, several requests' verify rows; TP8, no split gate launch): the same per-CTA math as
+// the kernels above on ceil(M/8) token tiles in one epoch. Weights load once; every tile's MMA reuses them, and
+// each tile's partial rows go straight to their owner (token t to rank t mod 8, inbox slot t / 8) with no
+// barrier between tiles. Tile t's arithmetic equals the narrow kernel's on rows [8t, 8t + 8), bit for bit.
+constexpr int kWideTiles = 14;  // 112 rows
+constexpr int kInboxBytes = kCluster * 256 * 4;  // one owned token's inbox
+
+template <bool kEarlyTrigger>
+__device__ __forceinline__ void mka_prologue_wide_kernel(const ProParams p) {
+  extern __shared__ __align__(16) unsigned char wsm[];
+  float* inbox = reinterpret_cast<float*>(wsm);                                       // [tile][rank][256]
+  uint2* bfr = reinterpret_cast<uint2*>(wsm + kWideTiles * kInboxBytes);              // [tile][16][32]
+  __shared__ float red8[8];
+  __shared__ float nrm[256];
+  __shared__ float tcs[kWideTiles][2 * kHalfRot];
+  __shared__ int64_t tslot[kWideTiles];
+  __shared__ __align__(8) uint64_t ibar;
+  const int rank = (int)cluster_ctarank();
+  const int nq = p.nq;
+  const int unit = blockIdx.x / kCluster;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t4 = lane & 3;
+  if (tid == 0) {
+    mbar_init(&ibar, 1);
+    mbar_init_fence();
+  }
+  __syncthreads();
+  cluster_arrive_relaxed();
+
+  uint4 a[16][2];
+  {
+    const uint4* wb = p.w + (size_t)(unit * kCluster + rank) * (8 * 16 * 2 * 32) + warp * 1024 + lane;
+#pragma unroll
+    for (int s = 0; s < 16; ++s)
+#pragma unroll
+      for (int b = 0; b < 2; ++b) a[s][b] = ldg_nc_v4(wb + (s * 2 + b) * 32);
+  }
+  const bool is_q = unit < 2 * nq && (unit & 1) == 0;
+  const bool is_gate = unit < 2 * nq && (unit & 1) == 1;
+  const bool is_k = unit == 2 * nq;
+  const bool needs_norm = is_q || is_k;
+  const int f = slot_row(tid);
+  const bool rot = needs_norm && f < 2 * kHalfRot;
+  const int rl = f & (kHalfRot - 1);
+  const float sx = __ldg(p.sx), sw = __ldg(p.sw);
+  __nv_bfloat16 nwr = __float2bfloat16_rn(0.f);
+  if (needs_norm) nwr = (is_q ? p.qnw : p.knw)[f];
+  float kvs = 1.f;
+  if (is_k) kvs = __ldg(p.k_scale);
+  if (!needs_norm && !is_gate) kvs = __ldg(p.v_scale);
+
+  pdl_wait();
+  if (kEarlyTrigger) pdl_trigger();
+  const float inv_sx = div_full(1.0f, sx);
+  const float alpha = __fmul_rn(sx, sw);
+  const int m = p.m;
+  const int tiles = (m + 7) >> 3;
+  const int own = rank < m ? (m - rank + 7) >> 3 : 0;  // tokens rank, rank + 8, ...
+  // the owned tokens' cache slots and cos / sin, all in flight at once
+  if (tid < own) {
+    const int tok = 8 * tid + rank;
+    tslot[tid] = p.loc_i32 ? (int64_t)__ldg(static_cast<const int32_t*>(p.loc) + tok)
+                           : __ldg(static_cast<const int64_t*>(p.loc) + tok);
+  }
+  if (needs_norm) {
+    for (int i = tid; i < own * kHalfRot; i += kThreads) {
+      const int o = i / kHalfRot, l = i % kHalfRot;
+      const int64_t ps = __ldg(p.pos + __ldg(p.axis + l) * p.pos_stride + 8 * o + rank);
+      tcs[o][l] = __ldg(p.cos_sin + ps * p.cs_stride + l);
+      tcs[o][kHalfRot + l] = __ldg(p.cos_sin + ps * p.cs_stride + kHalfRot + l);
+    }
+  }
+  // x's tiles in batches of 4, every load of a batch in flight before its first use
+  for (int t0 = 0; t0 < tiles; t0 += 4) {
+    uint2 raw[4][2][2];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const bool tok_ok = 8 * (t0 + u) + g < m;
+      const __nv_bfloat16* xr = p.x + (size_t)(8 * (t0 + u) + g) * 4096 + rank * 512 + 4 * t4;
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh)
+          raw[u][i][hh] = tok_ok ? *reinterpret_cast<const uint2*>(xr + (2 * warp + i) * 32 + hh * 16)
+                                 : make_uint2(0u, 0u);
+    }
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      if (t0 + u >= tiles) break;
+      const bool tok_ok = 8 * (t0 + u) + g < m;
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+        bfr[((t0 + u) * 16 + 2 * warp + i) * 32 + lane] =
+            tok_ok ? make_uint2(quant4_static_r(raw[u][i][0], inv_sx), quant4_static_r(raw[u][i][1], inv_sx))
+                   : make_uint2(0u, 0u);
+    }
+  }
+  __syncthreads();
+  if (tid == 0 && own) mbar_expect_tx(&ibar, own * kInboxBytes);
+  cluster_wait();
+  const uint32_t bar = smem_u32(&ibar);
+  for (int t = 0; t < tiles; ++t) {
+    float ch[2][4][4];
+#pragma unroll
+    for (int b = 0; b < 2; ++b)
+#pragma unroll
+      for (int c = 0; c < 4; ++c)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) ch[b][c][i] = 0.f;
+#pragma unroll
+    for (int s = 0; s < 16; ++s) {
+      const uint2 bb = bfr[(t * 16 + s) * 32 + lane];
+      mma_e4m3(ch[0][s & 3], a[s][0], bb.x, bb.y);
+      mma_e4m3(ch[1][s & 3], a[s][1], bb.x, bb.y);
+    }
+    float acc[2][4];
+#pragma unroll
+    for (int b = 0; b < 2; ++b)
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+        acc[b][i] = __fadd_rn(__fadd_rn(ch[b][0][i], ch[b][1][i]), __fadd_rn(ch[b][2][i], ch[b][3][i]));
+    const uint32_t src = smem_u32(&inbox[(t * kCluster + rank) * 256 + warp * 32 + g * 4]);
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const int tok = 2 * t4 + j;
+      if (8 * t + tok < m)
+        st_async_v4(mapa(src, tok), acc[0][j], acc[0][2 + j], acc[1][j], acc[1][2 + j], mapa(bar, tok));
+    }
+  }
+  if (!own) {
+    if (!kEarlyTrigger) pdl_trigger();
+    return;
+  }
+  mbar_wait(&ibar, 0);  // also keeps this CTA alive until every peer's push has landed
+
+  for (int o = 0; o < own; ++o) {
+    const int tok = 8 * o + rank;
+    float v = 0.f;
+#pragma unroll
+    for (int r = 0; r < kCluster; ++r) v = __fadd_rn(v, inbox[(o * kCluster + r) * 256 + tid]);
+    v = bf16_round(__fmul_rn(v, alpha));
+    const int64_t slot = tslot[o];
+    if (is_gate) {
+      p.gate_out[(size_t)tok * nq * kHeadDim + (unit >> 1) * kHeadDim + f] = __float2bfloat16_rn(v);
+    } else if (!needs_norm) {
+      p.v_cache[(size_t)slot * kHeadDim + f] = e4m3(__fmul_rn(__fdiv_rn(1.0f, kvs), v));
+    } else {
+      float ss = __fmul_rn(v, v);
+#pragma unroll
+      for (int sh = 16; sh > 0; sh >>= 1) ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, sh));
+      if (lane == 0) red8[warp] = ss;
+      __syncthreads();
+      float tot = 0.f;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) tot = __fadd_rn(tot, red8[i]);
+      const float inv = rsqrt_approx_ftz(__fadd_rn(div_full(tot, 256.0f), p.eps));
+      float n = bf16_round(__fmul_rn(__fadd_rn(__bfloat162float(nwr), 1.0f), __fmul_rn(inv, v)));
+      nrm[f] = n;
+      __syncthreads();
+      if (rot) {
+        const float cs_c = tcs[o][rl], cs_s = tcs[o][kHalfRot + rl];
+        const float x1 = f < kHalfRot ? n : nrm[f - kHalfRot];
+        const float x2 = f < kHalfRot ? nrm[f + kHalfRot] : n;
+        n = f < kHalfRot ? bf16_round(__fmaf_rn(cs_c, x1, -__fmul_rn(cs_s, x2)))
+                         : bf16_round(__fmaf_rn(x1, cs_s, __fmul_rn(cs_c, x2)));
+      }
+      if (is_k)
+        p.k_cache[(size_t)slot * kHeadDim + f] = e4m3(__fmul_rn(__fdiv_rn(1.0f, kvs), n));
+      else
+        p.q_out[(size_t)tok * nq * kHeadDim + (unit >> 1) * kHeadDim + f] = e4m3(n);
+      __syncthreads();  // red8 / nrm are reused by the next token
+    }
+  }
+  if (!kEarlyTrigger) pdl_trigger();
+}
+
+template <int NQ, bool kEarlyTrigger>
+__device__ __forceinline__ void mka_epilogue_wide_kernel(const EpiParams p) {
+  constexpr int kSteps = NQ;
+  constexpr int kK = NQ * kHeadDim;
+  constexpr int kWarpU4 = kSteps * 2 * 32;
+  extern __shared__ __align__(16) unsigned char wsm[];
+  float* inbox = reinterpret_cast<float*>(wsm);                           // [tile][rank][256]
+  uint2* bfr = reinterpret_cast<uint2*>(wsm + kWideTiles * kInboxBytes);  // [tile][kSteps][32]
+  __shared__ __align__(16) __nv_bfloat16 ob[256];
+  __shared__ __align__(8) uint64_t ibar;
+  const int rank = (int)cluster_ctarank();
+  const int unit = blockIdx.x / kCluster;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t4 = lane & 3;
+  if (tid == 0) {
+    mbar_init(&ibar, 1);
+    mbar_init_fence();
+  }
+  __syncthreads();
+  cluster_arrive_relaxed();
+
+  uint4 a[kSteps][2];
+  {
+    const uint4* wb = p.w + (size_t)(unit * kCluster + rank) * (8 * kWarpU4) + warp * kWarpU4 + lane;
+#pragma unroll
+    for (int s = 0; s < kSteps; ++s)
+#pragma unroll
+      for (int b = 0; b < 2; ++b) a[s][b] = ldg_nc_v4(wb + (s * 2 + b) * 32);
+  }
+  const float sx = __ldg(p.sx), sw = __ldg(p.sw);
+
+  pdl_wait();
+  if (kEarlyTrigger) pdl_trigger();
+  const float inv_sx = div_full(1.0f, sx);
+  const float alpha = __fmul_rn(sx, sw);
+  const int m = p.m;
+  const int tiles = (m + 7) >> 3;
+  const int own = rank < m ? (m - rank + 7) >> 3 : 0;
+  static_assert(2 * kSteps == 8, "one (step, half) per warp");
+  {
+    // every tile's operands in flight before the first use
+    const int s = warp >> 1, h = warp & 1;
+    uint2 ro[kWideTiles], rg[kWideTiles];
+#pragma unroll
+    for (int t = 0; t < kWideTiles; ++t) {
+      const bool ok = 8 * t + g < m;
+      const size_t off = (size_t)(8 * t + g) * kK + rank * (kSteps * 32) + 4 * t4 + s * 32 + h * 16;
+      ro[t] = ok ? *reinterpret_cast<const uint2*>(p.attn + off) : make_uint2(0u, 0u);
+      rg[t] = ok ? *reinterpret_cast<const uint2*>(p.gate + off) : make_uint2(0u, 0u);
+    }
+#pragma unroll
+    for (int t = 0; t < kWideTiles; ++t) {
+      if (t >= tiles) break;
+      uint32_t* bw = reinterpret_cast<uint32_t*>(bfr + t * kSteps * 32);
+      bw[(s * 32 + lane) * 2 + h] = 8 * t + g < m ? gate_quant4_r(ro[t], rg[t], inv_sx) : 0u;
+    }
+  }
+  __syncthreads();
+  if (tid == 0 && own) mbar_expect_tx(&ibar, own * kInboxBytes);
+  cluster_wait();
+  const uint32_t bar = smem_u32(&ibar);
+  constexpr int kCh = kSteps < 4 ? kSteps : 4;
+  for (int t = 0; t < tiles; ++t) {
+    float ch[2][kCh][4];
+#pragma unroll
+    for (int b = 0; b < 2; ++b)
+#pragma unroll
+      for (int c = 0; c < kCh; ++c)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) ch[b][c][i] = 0.f;
+#pragma unroll
+    for (int s = 0; s < kSteps; ++s) {
+      const uint2 bb = bfr[(t * kSteps + s) * 32 + lane];
+      mma_e4m3(ch[0][s % kCh], a[s][0], bb.x, bb.y);
+      mma_e4m3(ch[1][s % kCh], a[s][1], bb.x, bb.y);
+    }
+    float acc[2][4];
+#pragma unroll
+    for (int b = 0; b < 2; ++b)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        float x = ch[b][0][i];
+#pragma unroll
+        for (int c = 1; c < kCh; ++c) x = __fadd_rn(x, ch[b][c][i]);
+        acc[b][i] = x;
+      }
+    const uint32_t src = smem_u32(&inbox[(t * kCluster + rank) * 256 + warp * 32 + g * 4]);
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const int tok = 2 * t4 + j;
+      if (8 * t + tok < m)
+        st_async_v4(mapa(src, tok), acc[0][j], acc[0][2 + j], acc[1][j], acc[1][2 + j], mapa(bar, tok));
+    }
+  }
+  if (!own) {
+    if (!kEarlyTrigger) pdl_trigger();
+    return;
+  }
+  mbar_wait(&ibar, 0);
+  const uint32_t stage = p.push ? q35hop::stage_peek(p.site) : 0u;
+  for (int o = 0; o < own; ++o) {
+    const int tok = 8 * o + rank;
+    float v = 0.f;
+#pragma unroll
+    for (int r = 0; r < kCluster; ++r) v = __fadd_rn(v, inbox[(o * kCluster + r) * 256 + tid]);
+    const __nv_bfloat16 out = __float2bfloat16_rn(__fmul_rn(v, alpha));
+    if (p.push) {
+      ob[slot_row(tid)] = out;
+      __syncthreads();
+      if (tid < 32)
+        q35hop::push_frag(p.site, stage, tok, unit * 32 + tid, *reinterpret_cast<const uint4*>(&ob[8 * tid]));
+      __syncthreads();  // ob is reused by the next token
+    }
+    p.out[(size_t)tok * 4096 + unit * kHeadDim + slot_row(tid)] = out;
+  }
+  if (!kEarlyTrigger) pdl_trigger();
+}
+
 }  // namespace q35mka
 
 // C-linkage entries, one per instantiation the launcher uses (mka.py)
@@ -535,4 +851,16 @@ extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_epilogu
 }
 extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_epilogue_q8_late(const q35mka::EpiParams p) {
   q35mka::mka_epilogue_kernel<8, false>(p);
+}
+extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_prologue_wide(const q35mka::ProParams p) {
+  q35mka::mka_prologue_wide_kernel<true>(p);
+}
+extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_prologue_wide_late(const q35mka::ProParams p) {
+  q35mka::mka_prologue_wide_kernel<false>(p);
+}
+extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_epilogue_wide_q4(const q35mka::EpiParams p) {
+  q35mka::mka_epilogue_wide_kernel<4, true>(p);
+}
+extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_epilogue_wide_q4_late(const q35mka::EpiParams p) {
+  q35mka::mka_epilogue_wide_kernel<4, false>(p);
 }

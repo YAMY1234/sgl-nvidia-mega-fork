@@ -122,7 +122,7 @@ class Qwen35Verify:
         # the attention graph variants per SGLang runner ("target_verify"), which it
         # captures once it takes a megakernel's (attention/route.py)
         self.graph_variants = (
-            {"target_verify": attention.route.VERIFY}
+            {"target_verify": attention.route.verify_variants()}
             if any(s.skv2 for s in slots.values())
             else {}
         )

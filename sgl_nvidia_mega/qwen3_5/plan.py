@@ -17,8 +17,9 @@ gdn_pdl's verify) covers one request of 7 rows, ``route_shared`` (numeric: the s
 expert's gate/up in route's launch) up to 8 rows. ``skv2`` runs the full attention's core
 of one request through the split-KV attention of SGLang branch
 nvidia/qwen35-agentx-gb300, ``mka`` the fused attention prologue and epilogue around it
-(up to 8 rows), and ``mka_push`` (with ``hop``) has the epilogue push its rows into the
-hop.
+(up to 8 rows; with four query heads a rank, its wide entries up to 14 rows and past
+them its front path, bit for bit SGLang's, at every width), and ``mka_push`` (with
+``hop``) has the epilogue push its rows into the hop.
 """
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ GDN_PUSH_MAX_ROWS = 8
 # the rows slot route_shared's shared stage fits shared memory for
 ROUTE_SHARED_ROWS = 8
 MKA_MAX_ROWS = 8
+# with four query heads a rank: the wide entries, then the front path (attention/mka.py)
+MKA_WIDE_MAX_ROWS = MAX_ROWS
 
 
 class Slots(msgspec.Struct, frozen=True):
@@ -87,6 +90,7 @@ class Facts(msgspec.Struct, frozen=True):
     )
     skv2: bool = False  # SKV2 for every full-attention layer
     mka: bool = False  # the fused prologue and epilogue for every full-attention layer
+    mka_wide: bool = False  # with its wide entries (four query heads a rank)
     mka_push: bool = False  # with the epilogue's push into the hop
 
 
@@ -95,7 +99,7 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         raise ValueError(f"{rows} rows are outside the covered widths 1-{MAX_ROWS}")
     route = facts.route and rows <= ROUTE_MAX_ROWS
     hop = facts.hop and rows <= HOP_MAX_ROWS
-    mka = facts.mka and rows <= MKA_MAX_ROWS
+    mka = facts.mka and rows <= (MKA_WIDE_MAX_ROWS if facts.mka_wide else MKA_MAX_ROWS)
     return Slots(
         route=route,
         mkm=route

@@ -163,6 +163,9 @@ ENGINE_ONEPASS = os.environ.get("SGLANG_Q35_MKM_ONEPASS", "0") == "1"
 ENGINE_MMA_SFONLY = os.environ.get("SGLANG_Q35_MKM_MMA_SFONLY", "0") == "1"
 # ONEPASS in the 64-token engine only up to this many rows (past it, the plain build: B8's 56 rows lost 0.04 ms a round)
 ENGINE_ONEPASS_MAX_ROWS = int(os.environ.get("SGLANG_Q35_MKM_ONEPASS_MAX_ROWS", "64"))
+# R14-KSMALL: rank owner CTAs by their first item's rows before placing M64 tail items. Read dynamically so one service
+# can capture baseline and candidate CUDA graphs under Q35MF_AB_VARIANTS; setting it at boot also prebuilds both cubins.
+M64_TAIL_SCHED_ENV = "SGLANG_R14_KSMALL_M64_TAIL_SCHED"
 # PERF-LL: the wide engines deal the units past each CTA's own first expert to balance the CTAs (BAL_SPLIT), bit for bit;
 # up to SGLANG_PERFLL_MKM_WIDE_BAL_MAX_ROWS rows (0: every row count), the static split's build past them
 ENGINE_WIDE_BAL = os.environ.get("SGLANG_PERFLL_MKM_WIDE_BAL", "0") == "1"
@@ -286,7 +289,13 @@ def onepass_plain(rows: int, m: int) -> bool:
 
 
 @cache
-def _kernel(device_index: int, intermediate: int, rows: int, plain: bool = False) -> jit.Kernel:
+def _kernel(
+    device_index: int,
+    intermediate: int,
+    rows: int,
+    plain: bool = False,
+    m64_tail_sched: bool = False,
+) -> jit.Kernel:
     """The engine of ``engine_rows`` bound ``rows`` at ``intermediate`` per rank."""
     engine = {
         MAX_TOKENS: ENGINES,
@@ -308,7 +317,8 @@ def _kernel(device_index: int, intermediate: int, rows: int, plain: bool = False
             f"-DQ35_MKM_SMEM_BYTES={engine.smem_bytes}",
         )
         + engine.defines
-        + engine_options(rows, plain),
+        + engine_options(rows, plain)
+        + (("-DR14_M64_TAIL_SCHED=1",) if m64_tail_sched else ()),
     )
     return jit.load(cubin, engine.kernel, (THREADS, 1, 1), engine.smem_bytes)
 
@@ -374,8 +384,12 @@ def build(
     for hi in ENGINE_ROWS:
         if min_rows <= hi and max_rows > lo:
             _kernel(device_index, intermediate, hi)
+            if hi == M64_MAX_TOKENS and os.environ.get(M64_TAIL_SCHED_ENV, "0") == "1":
+                _kernel(device_index, intermediate, hi, m64_tail_sched=True)
             if onepass_plain(hi, max(lo + 1, min(max_rows, hi))):
                 _kernel(device_index, intermediate, hi, True)
+                if hi == M64_MAX_TOKENS and os.environ.get(M64_TAIL_SCHED_ENV, "0") == "1":
+                    _kernel(device_index, intermediate, hi, True, m64_tail_sched=True)
                 logger.info(
                     "NVIDIA megakernel: Qwen3.5 %d-token engine runs %s up to %d rows, its plain build past them",
                     hi,
@@ -492,7 +506,13 @@ def mkm_moe(
         out=gemm2_out.data_ptr(),
         num_tokens=m,
     )
-    kernel = _kernel(device.index, intermediate, rows, onepass_plain(rows, m))
+    kernel = _kernel(
+        device.index,
+        intermediate,
+        rows,
+        onepass_plain(rows, m),
+        rows == M64_MAX_TOKENS and os.environ.get(M64_TAIL_SCHED_ENV, "0") == "1",
+    )
     stream = torch.cuda.current_stream().cuda_stream
     if rows in (M32_MAX_TOKENS, M64_MAX_TOKENS, M128_MAX_TOKENS) + WIDE_ROWS:
         # min(M * 10, SMs) CTAs, one per SM, each running its share of the distinct experts

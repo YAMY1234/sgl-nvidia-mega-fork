@@ -261,6 +261,9 @@ static_assert(DRAIN_SMEM == 0, "x's shared memory holds the next item's rows whi
 #define ONEPASS 0
 #endif
 static_assert(!(ONEPASS && TAIL8), "ONEPASS drains its one FC2 pass on the TMEM warpgroup");
+#ifndef R14_M64_TAIL_SCHED  // 1: give second items to the lightest owner CTAs instead of CTA 0, 1, ...
+#define R14_M64_TAIL_SCHED 0
+#endif
 #ifndef THR_D  // a CTA with one item, in a grid where some CTAs have two, keeps at most THR_D ring stages in flight
 #define THR_D 0  // (its HBM share goes to the CTAs on the critical path); 0 = off
 #endif
@@ -1065,6 +1068,24 @@ q35_mkm_moe_m64(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       const int xc = s.ids[my_t][my_k];
       const bool owner = s.first[xc] == slot;
       const int D = G - nf_g, dc = slot - nf_c;  // duplicate CTAs; this one's rank among them
+#if R14_M64_TAIL_SCHED
+      // Owner CTAs keep their speculative first unit. Rank them by that unit's row count (then slot) so handed-out
+      // units past the empty duplicate CTAs land on the lightest first units. Experts with a second row group have
+      // cnt > 16 and therefore rank last. This changes only item placement; each item's rows and arithmetic stay exact.
+      int tail_rank = 0;
+      if (owner) {
+        int lower = 0;
+        const int my_rows = s.cnt[xc];
+        for (int s2 = lane; s2 < G; s2 += 32) {
+          const int e2 = s.ids[s2 / kTopK][s2 % kTopK];
+          if (s.first[e2] == s2) {
+            const int rows2 = s.cnt[e2];
+            lower += rows2 < my_rows || (rows2 == my_rows && s2 < slot);
+          }
+        }
+        tail_rank = __reduce_add_sync(0xffffffffu, lower);
+      }
+#endif
       // the whole warp walks the items (nth_unit is warp-collective); lane 0 writes them
       int ni = 0;
       auto add = [&](int e, int grp) {
@@ -1092,11 +1113,21 @@ q35_mkm_moe_m64(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
         nth_unit(dc, e, grp);
         add(e, grp);
       }
+#if R14_M64_TAIL_SCHED
+      if (owner) {
+        for (int o = D + tail_rank; o < O; o += nf_g) {
+          int e, grp;
+          nth_unit(o, e, grp);
+          add(e, grp);
+        }
+      }
+#else
       for (int o = D + slot; o < O; o += G) {
         int e, grp;
         nth_unit(o, e, grp);
         add(e, grp);
       }
+#endif
       __syncwarp();
       const int nall = ni;
       if (lane == 0) {

@@ -79,8 +79,6 @@ SGLANG_READS = {
     ),
     "srt/layers/layer_boundary/fusions/cutedsl.py": (
         "CuteDSLFusion",
-        "MoeDeferredFinalize",
-        "_fused_norm_gamma",
         "_finalize_add_norm",
         "_ffn_input_all_reduce_add_norm",
         "_finalize_eligible",
@@ -88,12 +86,16 @@ SGLANG_READS = {
         "hidden_size",
         "top_k",
         "rms_epsilon",
+    ),
+    "srt/layers/layer_boundary/fusions/moe_finalize.py": (
+        "MoeDeferredFinalize",
         "routed_output",
         "expert_weights",
         "permuted_indices",
         "gated_shared_output",
         "m",
     ),
+    "srt/layers/layer_boundary/fusions/norm.py": ("fused_norm_gamma",),
     "srt/layers/layer_boundary/residual/batch.py": ("stream_of", "clear"),
     "srt/layers/layer_boundary/residual/stream.py": (
         "DeclaredSum",
@@ -123,9 +125,9 @@ SGLANG_MIRRORS = {
     "srt/layers/layer_boundary/stage.py:StageBoundary._select": "f317ed475a7672cf",
     "srt/layers/layer_boundary/prepare.py:_run_entry": "639740496fc09d2d",
     "srt/layers/layer_boundary/prepare.py:_reduce_update_read": "67badae13f96d80f",
-    "srt/layers/layer_boundary/fusions/cutedsl.py:CuteDSLFusion._finalize_add_norm": "46767c09458d7e1e",
-    "srt/layers/layer_boundary/fusions/cutedsl.py:CuteDSLFusion._ffn_input_all_reduce_add_norm": "84163a5a5a695823",
-    "srt/layers/layer_boundary/residual/batch.py:final_norm": "b4a1b4813ca5ac17",
+    "srt/layers/layer_boundary/fusions/cutedsl.py:CuteDSLFusion._finalize_add_norm": "51d463a1cecbbb64",
+    "srt/layers/layer_boundary/fusions/cutedsl.py:CuteDSLFusion._ffn_input_all_reduce_add_norm": "010e06f02e64affa",
+    "srt/layers/layer_boundary/residual/batch.py:final_norm": "13008609a1a7fd8a",
 }
 
 # the (point, rows) the slot has run at (each logged once, as engagement evidence)
@@ -214,10 +216,8 @@ def refusals(m, world: int) -> list[str]:
 def path_refusals(layer) -> list[str]:
     """Why the ordinary paths of ``layer``'s two stages are not the ones mirrored."""
     from sglang.srt.layers.layer_boundary.construction import BatchVariant
-    from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
-        CuteDSLFusion,
-        _fused_norm_gamma,
-    )
+    from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
+    from sglang.srt.layers.layer_boundary.fusions.norm import fused_norm_gamma
     from sglang.srt.layers.layer_boundary.prepare import (
         _attn_input_default,
         _reduce_update_read,
@@ -229,7 +229,7 @@ def path_refusals(layer) -> list[str]:
         plan, name = stage.plan, stage.kind.name.lower()
         if (
             not isinstance(plan.fusions, CuteDSLFusion)
-            or _fused_norm_gamma(plan.norm) is None
+            or fused_norm_gamma(plan.norm) is None
         ):
             out.append(f"its {name} input runs no CuTe DSL fusion")
             continue
@@ -295,10 +295,10 @@ def layer_input(hop, layer, hidden, st):
     """``attn_boundary.prepare`` of a layer whose input completes the previous MoE's
     finalize handoff (``hidden``), with the hop as its kernel; None where that
     prepare would not run the CuTe DSL kernel."""
-    from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
+    from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
         MoeDeferredFinalize,
-        _fused_norm_gamma,
     )
+    from sglang.srt.layers.layer_boundary.fusions.norm import fused_norm_gamma
     from sglang.srt.layers.layer_boundary.residual.batch import stream_of
 
     stream = stream_of(st.fb)
@@ -313,7 +313,7 @@ def layer_input(hop, layer, hidden, st):
         return None
     owed, residual = stream.input(hidden)
     norm, residual = _finalize(
-        hop, "layer input", owed, residual, _fused_norm_gamma(plan.norm)
+        hop, "layer input", owed, residual, fused_norm_gamma(plan.norm)
     )
     stream.write(residual)
     return norm
@@ -340,7 +340,7 @@ def moe_input(hop, layer, hidden, st):
     ``attn_boundary.finish`` recorded it), with the hop as its kernel; None where that
     prepare would not run the CuTe DSL kernel. A partial the mixer already pushed is
     only consumed."""
-    from sglang.srt.layers.layer_boundary.fusions.cutedsl import _fused_norm_gamma
+    from sglang.srt.layers.layer_boundary.fusions.norm import fused_norm_gamma
     from sglang.srt.layers.layer_boundary.residual.batch import stream_of
     from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
 
@@ -362,7 +362,7 @@ def moe_input(hop, layer, hidden, st):
         return None
     _engage("MoE input", rows)
     norm, residual = hop.all_reduce_residual_rms_norm(
-        local_contribution=part, residual=residual, gamma=_fused_norm_gamma(plan.norm)
+        local_contribution=part, residual=residual, gamma=fused_norm_gamma(plan.norm)
     )
     stream.write(residual)
     return norm
@@ -371,7 +371,9 @@ def moe_input(hop, layer, hidden, st):
 def final_norm(hop, hidden, st):
     """``residual_batch.final_norm`` of the last MoE's finalize handoff (``hidden``)
     with the hop as its kernel; None when the stream holds no handoff the hop takes."""
-    from sglang.srt.layers.layer_boundary.fusions.cutedsl import MoeDeferredFinalize
+    from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
+        MoeDeferredFinalize,
+    )
     from sglang.srt.layers.layer_boundary.residual.batch import clear, stream_of
 
     stream = stream_of(st.fb)

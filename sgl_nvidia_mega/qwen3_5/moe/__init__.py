@@ -48,7 +48,7 @@ SGLANG_READS = {
     ),
     "srt/layers/moe/fused_moe_triton/layer.py": ("forward_deferred_finalize",),
     "srt/layers/moe/utils.py": ("sum_post_experts_output",),
-    "srt/layers/layer_boundary/fusions/cutedsl.py": (
+    "srt/layers/layer_boundary/fusions/moe_finalize.py": (
         "MoeDeferredFinalize",
         "from_flashinfer",
         "from_flashinfer(gated_shared_output)",
@@ -62,7 +62,7 @@ SGLANG_READS = {
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock.forward": "1994cd43fba4fbde",
+    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock.forward": "633ff9a686d3ea28",
     "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock.forward_normal_dual_stream": "afae959064cc8cd7",
     "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_router_experts": "32d09f01b77d76b5",
 }
@@ -92,7 +92,9 @@ def step(layer, x: torch.Tensor, st, defer: bool):
     """``layer``'s MoE on the normed input ``x`` [rows, hidden]: the deferred-finalize
     handoff with ``defer``, else the unreduced rows [rows, hidden]."""
     from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
-    from sglang.srt.layers.layer_boundary.fusions.cutedsl import MoeDeferredFinalize
+    from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
+        MoeDeferredFinalize,
+    )
     from sglang.srt.layers.moe.utils import sum_post_experts_output
     from sglang.srt.model_executor.runner import get_is_capture_mode
 

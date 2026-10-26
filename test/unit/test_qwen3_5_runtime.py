@@ -360,6 +360,7 @@ def test_the_draft_decode_keeps_cp_lite_for_cp_variants_and_multi_request(
 
     monkeypatch.setattr(split_kv, "cp_lite", CpLite)
     monkeypatch.setattr(draft_attention, "_q1_label", lambda: label)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
         "sglang.srt.runtime_context.get_buffer", lambda name, make: None
     )
@@ -536,7 +537,7 @@ def test_the_draft_extends_moe_output_is_reduced_once(
 
 
 def test_only_tep8_draft_fin_uses_the_target_mnnvl_workspace(monkeypatch):
-    from sglang.srt.layers import flashinfer_mnnvl_cutedsl
+    import sglang.srt.layers.flashinfer_mnnvl_cutedsl as flashinfer_mnnvl_cutedsl
 
     from sgl_nvidia_mega.qwen3_5.draft import layer
 

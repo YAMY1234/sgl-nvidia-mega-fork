@@ -78,7 +78,12 @@ SGLANG_READS = {
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend.forward_extend": "8e36076dafabff66",
+    # Stock and the SGLang follow-up's CP-lite dispatch; the metadata this module
+    # mirrors is unchanged by the dispatch around the fixed-q-length call.
+    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend.forward_extend": (
+        "8e36076dafabff66",
+        "d7e7c1fe125739e6",
+    ),
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._should_use_fused_fp8_path": "e0b14791d523a019",
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._fused_fp8_qkv_kv_cache": "363661c3585e6a0f",
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._get_bmm_scales": "90a1387e8f561611",

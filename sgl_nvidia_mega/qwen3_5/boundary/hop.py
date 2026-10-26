@@ -373,7 +373,7 @@ def moe_input(hop, layer, hidden, st):
 
     _engage("MoE input", rows)
     scale = lowm.moe_input_fp8_scale(layer, st)
-    if hop._pushed_rl:
+    if st.slots.route_lin and hop._pushed_rl:
         # Slot route_lin: the mixer pushed its router partial too; this hop also gives
         # the MoE its logits and NVFP4 input (moe/route.py routed_lin).
         lid, h0 = st.scratch.get("rlin.h0", (None, None))

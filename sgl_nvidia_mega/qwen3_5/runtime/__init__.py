@@ -7,9 +7,12 @@ prepared and before the KV cache is sized."""
 
 from __future__ import annotations
 
+import logging
 import os
 
 import msgspec
+
+logger = logging.getLogger(__name__)
 
 # The kernel slots that run by default, and the ones that run only when requested
 # (until step-level timing and accuracy runs move them to the default list)
@@ -44,6 +47,9 @@ DRAFT_SLOTS: tuple[str, ...] = (
     "draft_skv2",
 )
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
+# These slots run all 512 experts themselves. Under expert parallelism, keep the
+# route-only and boundary slots but let SGLang's EP path run the routed experts.
+EP_STOCK_SLOTS = frozenset({"mkm", "mkm_wide", "draft_moe"})
 
 
 def _requested_slots() -> frozenset:
@@ -56,6 +62,18 @@ def _requested_slots() -> frozenset:
 
 
 SLOTS = _requested_slots()
+
+
+def apply_expert_parallel(ep_size: int) -> frozenset:
+    """Drop ``EP_STOCK_SLOTS`` from ``SLOTS`` when the MoE runs expert-parallel
+    (``ep_size`` > 1); returns the dropped names. Every process calls it before reading
+    ``SLOTS`` (config check, target build, draft build)."""
+    global SLOTS
+    if ep_size <= 1:
+        return frozenset()
+    dropped = SLOTS & EP_STOCK_SLOTS
+    SLOTS = SLOTS - EP_STOCK_SLOTS
+    return dropped
 
 
 def slot_reasons() -> list[str]:
@@ -128,7 +146,7 @@ SGLANG_READS = {
         "deadline_s",
         "binding",
     ),
-    "srt/runtime_context.py": ("get_parallel", '"tp_size"'),
+    "srt/runtime_context.py": ("get_parallel", '"tp_size"', '"moe_ep_size"'),
 }
 
 
@@ -144,16 +162,23 @@ def build(model, ctx):
     """Each package's build, the slot plan per width and the executor; ``ctx`` is
     SGLang's BuildContext."""
     import torch
+    from sglang.srt.runtime_context import get_parallel
 
     from sgl_nvidia_mega.qwen3_5 import attention, boundary, gdn, moe
     from sgl_nvidia_mega.qwen3_5 import plan as slot_plan
     from sgl_nvidia_mega.qwen3_5.runtime import parity
     from sgl_nvidia_mega.qwen3_5.runtime.executor import Qwen35Verify
 
+    dropped = apply_expert_parallel(get_parallel().moe_ep_size)
+    if dropped:
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 under expert parallelism (moe_ep_size %d): "
+            "slots %s run SGLang's EP path",
+            get_parallel().moe_ep_size,
+            sorted(dropped),
+        )
     multi = slot_plan.MULTI_REQUEST in SLOTS
     if multi:
-        from sglang.srt.runtime_context import get_parallel
-
         multi = slot_plan.multi_request(get_parallel().tp_size, SLOTS)
     widths = slot_plan.candidates(ctx.widths, ctx.tokens_per_request, multi)
     if not widths:

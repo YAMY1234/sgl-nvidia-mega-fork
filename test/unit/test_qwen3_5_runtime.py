@@ -23,6 +23,11 @@ def registered(monkeypatch):
     monkeypatch.setattr(registry, "_REGISTRY", {})
     monkeypatch.delenv(plugin.PARITY_SORT_ENV, raising=False)
     plugin.register()
+    # the target and draft builds read moe_ep_size (expert parallelism); no process groups here
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=8, moe_ep_size=1),
+    )
 
 
 # ---------------------------------------------------------------- the covered steps
@@ -71,7 +76,7 @@ def test_the_build_covers_more_requests_only_where_a_slot_runs(
     monkeypatch.setattr(runtime, "SLOTS", frozenset())
     monkeypatch.setattr(
         "sglang.srt.runtime_context.get_parallel",
-        lambda: SimpleNamespace(tp_size=tp_size),
+        lambda: SimpleNamespace(tp_size=tp_size, moe_ep_size=1),
     )
     model = SimpleNamespace(
         model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
@@ -108,6 +113,19 @@ def test_verify_sample_is_refused_with_the_switch_that_replaces_it(monkeypatch):
         "'verify_sample' is no longer an entry: drop it; an SGLang with post-verify "
         "graphs turns them on with SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1"
     ]
+
+
+def test_expert_parallel_keeps_route_and_boundary_slots(monkeypatch):
+    requested = frozenset(
+        {"route", "mkm", "mkm_wide", "hop", "gdn_push", "draft_moe", "draft_hop"}
+    )
+    monkeypatch.setattr(runtime, "SLOTS", requested)
+    assert runtime.apply_expert_parallel(1) == frozenset()
+    assert runtime.SLOTS == requested
+    assert runtime.apply_expert_parallel(8) == frozenset(
+        {"mkm", "mkm_wide", "draft_moe"}
+    )
+    assert runtime.SLOTS == frozenset({"route", "hop", "gdn_push", "draft_hop"})
 
 
 def test_the_runtime_gives_the_executor_the_build_contexts_binding(monkeypatch):

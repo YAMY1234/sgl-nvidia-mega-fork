@@ -74,11 +74,27 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
 
     lay = parts.layer
     residual = x
-    hop = parts.hop if rows_per_request == 1 else None
+    rows = x.shape[0]
+    # the draft hop takes the steps whose rows fit the target hop's mailbox; the
+    # single-launch MoE the steps of at most its token count
+    hop = (
+        parts.hop
+        if rows_per_request == 1
+        and parts.hop is not None
+        and parts.hop.hop.supports(rows)
+        else None
+    )
     # a draft step of one request pushes its o_proj into the hop and releases the next
     # launch early; of two requests it takes only the hop's all-reduce points
     push = hop if x.shape[0] == 1 else None
-    extend_hop = parts.hop if rows_per_request > 1 and EXTEND_MNNVL else None
+    extend_hop = (
+        parts.hop
+        if rows_per_request > 1
+        and EXTEND_MNNVL
+        and parts.hop is not None
+        and parts.hop.hop.supports(rows)
+        else None
+    )
     attn_out = parts.attention(
         lay.input_layernorm(x),
         positions,
@@ -92,7 +108,11 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
             else None
         ),
     )
-    moe = parts.moe if rows_per_request == 1 else None
+    moe = (
+        parts.moe
+        if rows_per_request == 1 and parts.moe is not None and parts.moe.ready(rows)
+        else None
+    )
     if hop is not None:
         moe_in, residual = hop.ffn_input(
             attn_out,
@@ -134,3 +154,12 @@ def top1(parts, hidden):
     logits = tensor_model_parallel_all_gather(logits)
     logits = logits[:, : lm.logits_processor.vocab_size]
     return torch.argmax(logits, dim=-1)
+
+
+def top1_into(parts, hidden, tokens, column: int, *, nan_key: int, **outputs) -> None:
+    """Slot draft_multi's top-1 of the final-norm rows ``hidden``: the LM head on this
+    rank's vocabulary shard, then the sharded argmax exchange, which writes the tokens
+    into ``tokens[:, column]`` (and ``outputs``: topk_p, positions, mrope_positions)."""
+    lm = parts.lm
+    logits = lm.logits_processor._compute_lm_head(hidden, lm.lm_head, None)
+    parts.top1x(logits, tokens, column, nan_key=nan_key, **outputs)

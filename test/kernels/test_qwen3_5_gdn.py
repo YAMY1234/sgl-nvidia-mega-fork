@@ -31,7 +31,7 @@ import torch
 
 H, K, HV, V = 2, 128, 8, 128  # per rank at TP8: 16 / 64 heads over 8
 D = 2 * H * K + HV * V  # the conv's q / k / v channels
-DRAFT, WIDTH, SLOTS = 7, 4, 9
+DRAFT, WIDTH, SLOTS = 7, 4, 136
 
 
 def _gpu_ready() -> bool:
@@ -56,11 +56,11 @@ def _projection(bs, views, g):
     return qkvz[:, :D] if views else qkvz[:, :D].contiguous()
 
 
-# a covered step's requests (slot gdn_verify covers B1, B2 and B4) and their slots
-REQUESTS = (1, 2, 4)
-STATE_SLOTS = (4, 7, 0, 8)
-RING_SLOTS = (3, 5, 0, 8)
-REPLAY_SLOTS = (1, 2, 4, 6)
+# a covered step's requests (slot gdn_verify covers B1 to B128) and their slots
+REQUESTS = (1, 2, 4, 8, 16, 32, 64, 128)
+STATE_SLOTS = (4, 7, 0, 8, *range(39, 11, -1), *range(135, 39, -1))
+RING_SLOTS = (3, 5, 0, 8, *range(12, 136))
+REPLAY_SLOTS = (1, 2, 4, 6, *range(10, 134))
 
 
 @pytest.mark.parametrize("bs", REQUESTS)

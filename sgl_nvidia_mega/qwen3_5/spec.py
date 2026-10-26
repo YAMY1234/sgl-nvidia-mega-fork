@@ -3,26 +3,36 @@
 """The Qwen3.5 megakernel's spec: the setups it serves and its build.
 
 SGLang checks the requirements at argument resolution and the model at load
-(``sglang.srt.megakernels``); an unsupported setup stops the server on every rank,
-listing every reason. This module stays light: SGLang imports it in the launcher.
+(``sglang.kernels.plugin_kernels.nvidia``); an unsupported setup stops the server on
+every rank, listing every reason. This module stays light: SGLang imports it in the
+launcher.
 """
 
 from __future__ import annotations
 
-from sglang.srt.megakernels.spec import (
-    Feature,
-    MegakernelSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-)
+try:
+    from sglang.kernels.plugin_kernels.nvidia.spec import (
+        Feature,
+        MegakernelSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.megakernels.spec import (
+        Feature,
+        MegakernelSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
 
 from sgl_nvidia_mega.qwen3_5 import TEXT_CONFIG, runtime
 from sgl_nvidia_mega.qwen3_5.plan import MAX_ROWS
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/megakernels/spec.py": (
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "Feature",
         "SPECULATIVE_DECODING",
         "MULTI_NODE_TP",
@@ -53,11 +63,13 @@ SGLANG_READS = {
         "startup_weight_load_mode",
     ),
     "srt/configs/qwen3_5.py": ("text_config",),
-    "srt/megakernels/eagle_binding.py": ("EagleForwardView",),
+    "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
+        "EagleForwardView",
+    ),
 }
 
 ARCHITECTURE = "Qwen3_5MoeForConditionalGeneration"
-# the sglang.srt.megakernels contract this spec is written against
+# The SGLang megakernel contract this spec is written against.
 API_VERSION = 1
 
 REQUIREMENTS = Requirements(
@@ -154,10 +166,13 @@ def binding_reasons() -> list[str]:
     """[] when this SGLang has the EAGLE binding whose forward view the covered steps
     read (``Step.view``, an ``EagleForwardView``)."""
     try:
-        from sglang.srt.megakernels.eagle_binding import EagleForwardView  # noqa: F401
+        from sglang.srt.kernel_plugins.nvidia.eagle_binding import (  # noqa: F401
+            EagleForwardView,
+        )
     except ImportError as e:
         return [
-            f"this SGLang has no EAGLE forward view (megakernels/eagle_binding.py: {e})"
+            f"this SGLang has no EAGLE forward view "
+            f"(kernel_plugins/nvidia/eagle_binding.py: {e})"
         ]
     return []
 

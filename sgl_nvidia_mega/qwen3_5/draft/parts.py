@@ -39,7 +39,7 @@ SGLANG_READS = {
         "mlp",
         "attn",
     ),
-    "srt/megakernels/eagle_binding.py": (
+    "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "tp_rank",
         "tp_size",
         "tp_device_group",

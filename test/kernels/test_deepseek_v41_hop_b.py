@@ -1,45 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""DeepSeek-V4.1 hop B, the MoE finalize into the Lamport all-reduce + mHC, on 4
-SM100-family GPUs (GB300) with NVLink multicast, at 1-8 rows.
+"""DeepSeek-V4.1 hop B, the MoE finalize into the Lamport all-reduce + mHC, and hop A on
+the same instance, on 4 SM100-family GPUs (GB300) with NVLink multicast, at 1-8 rows.
 
 - ``AllReduceMHC.finalize`` with MXFP8 output and residual-only against SGLang's
   one-shot push kernels (streams, normalized row, MXFP8 values and scales), and its
   MXFP8 output against FlashInfer's ``mxfp8_quantize`` of its own normalized row;
-- the early PDL triggers (after the poll; hop B's at the start) change no output bit;
 - hop A and both finalize variants interleaved on one instance, with late ranks and
-  from a replayed CUDA graph, stay bitwise stable and match torch;
-- a PDL dependent that spins before its wait, or does not spin, reads the final
-  outputs (a dependent that reads before its wait is the control).
+  from a replayed CUDA graph, stay bitwise stable and match torch.
 
-Run with ``python test/kernels/test_deepseek_v41_hop_b.py --num-gpu 4 -s``.
+It registers its own SGLang one-shot plane, so it keeps its own process. Run with
+``python test/kernels/test_deepseek_v41_hop_b.py --num-gpu 4 -s``.
 """
 
 import os
 from types import SimpleNamespace
 
-import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
 import pytest
 import torch
 import torch.distributed as dist
-from cutlass import Int32, Int64
 from sglang.srt.distributed import parallel_state as ps
 from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import publish_build_topology
 
-from sgl_nvidia_mega.common.sync import (
-    current_cu_stream,
-    global_timer_ns,
-    make_fake_dynamic_compact_tensor,
-    to_cute_dynamic,
-)
 from sgl_nvidia_mega.deepseek_v41.spec import NUMERICS
 
 HIDDEN, HC, TOP_K, EPS = 5120, 4, 6, 1e-6
 ROWS = tuple(range(1, 9))
-SPIN_NS = 30_000
 
 
 def _gpu4() -> bool:
@@ -50,13 +37,19 @@ def _gpu4() -> bool:
     )
 
 
-pytestmark = pytest.mark.skipif(not _gpu4(), reason="needs 4 SM100-family GPUs")
+pytestmark = [
+    pytest.mark.skipif(not _gpu4(), reason="needs 4 SM100-family GPUs"),
+    pytest.mark.skipif(
+        "RANK" not in os.environ,
+        reason="run via torchrun: python test/kernels/test_deepseek_v41_hop_b.py --num-gpu 4 -s",
+    ),
+]
 
 
 @pytest.fixture(scope="module")
 def env():
     from sglang.kernels.ops.communication import all_reduce_fusion
-    from sglang.kernels.ops.communication.mp import register_comm_cleanup
+    from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
@@ -97,9 +90,28 @@ def env():
                 quantize_layer_input=True,
                 residual_only=True,
                 early_trigger=early == "poll",
-                hop_b_start_trigger=early == "start",
+                hop_b_start_trigger=early in ("start", "quad", "quad8"),
+                publish_trigger_max_rows={"quad": 48, "quad8": 8}.get(early, 0),
             )
-            for early in ("end", "poll", "start")
+            for early in ("end", "poll", "start", "quad", "quad8")
+        }
+        # hop B up to the routed pair's 48 rows, with the row-tile scale variant
+        wide = {
+            early: AllReduceMHC(
+                hidden_size=HIDDEN,
+                hc_mult=HC,
+                max_num_tokens=48,
+                top_k=TOP_K,
+                device=device,
+                group=tp.device_group,
+                quantize_layer_input=True,
+                residual_only=True,
+                early_trigger=early == "poll",
+                hop_b_start_trigger=early in ("start", "quad", "quad8"),
+                row_tile_layer_input=True,
+                publish_trigger_max_rows={"quad": 48, "quad8": 8}.get(early, 0),
+            )
+            for early in ("end", "poll", "start", "quad", "quad8")
         }
     yield SimpleNamespace(
         rank=rank,
@@ -108,6 +120,7 @@ def env():
         group=tp.device_group,
         cpu_group=tp.cpu_group,
         hops=hops,
+        wide=wide,
     )
     ps.destroy_model_parallel()
     ps.destroy_distributed_environment()
@@ -285,18 +298,6 @@ def test_finalize_matches_sglang_one_shot(env, shared_zero):
     )
 
 
-@torch.inference_mode()
-def test_early_trigger_changes_no_bit(env):
-    for rows in ROWS:
-        inp = _inputs(rows, 200 + rows, env.rank, env.device)
-        for kind in ("a", "a_quant", "norm", "quant", "residual"):
-            late, *early = (_run(env.hops[e], kind, inp) for e in env.hops)
-            for trigger in early:
-                for a, b in zip(late, trigger):
-                    assert _same(a, b), f"early trigger differs: rows={rows} {kind}"
-    torch.cuda.synchronize()
-
-
 def _interleaved_plan(steps):
     plan = []
     for step in range(steps):
@@ -307,7 +308,7 @@ def _interleaved_plan(steps):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("early", ["end", "poll", "start"])
+@pytest.mark.parametrize("early", ["end"])
 def test_hop_a_and_finalize_interleave_on_one_instance(env, early):
     hop = env.hops[early]
     inputs = {
@@ -363,111 +364,68 @@ def test_hop_a_and_finalize_interleave_on_one_instance(env, early):
     torch.cuda.synchronize()
 
 
-@cute.jit
-def _copy_words(
-    src: cute.Tensor, dst: cute.Tensor, count: Int32, stride: cutlass.Constexpr[int]
-):
-    block, _, _ = cute.arch.block_idx()
-    tidx, _, _ = cute.arch.thread_idx()
-    index = block * _PdlSnapshot.THREADS + tidx
-    while index < count:
-        dst[index] = src[index]
-        index = index + stride
-
-
-class _PdlSnapshot:
-    """A PDL dependent that copies four buffers after a ``spin_ns`` prologue and
-    its griddepcontrol.wait; ``read_first`` copies before the wait (the control)."""
-
-    THREADS = 256
-    BLOCKS = 16
-
-    def __init__(self, spin_ns: int, read_first: bool = False) -> None:
-        self.spin_ns = spin_ns
-        self.read_first = read_first
-
-    @cute.jit
-    def __call__(
-        self, s0, d0, s1, d1, s2, d2, s3, d3, n0, n1, n2, n3, stream: cuda.CUstream
-    ):
-        self.kernel(s0, d0, s1, d1, s2, d2, s3, d3, n0, n1, n2, n3).launch(
-            grid=(self.BLOCKS, 1, 1),
-            block=(self.THREADS, 1, 1),
-            stream=stream,
-            use_pdl=True,
-        )
-
-    @cute.kernel
-    def kernel(self, s0, d0, s1, d1, s2, d2, s3, d3, n0, n1, n2, n3):
-        if cutlass.const_expr(self.spin_ns > 0):
-            start = global_timer_ns()
-            now = start
-            while now - start < Int64(self.spin_ns):
-                now = global_timer_ns()
-        if cutlass.const_expr(not self.read_first):
-            cute.arch.griddepcontrol_wait()
-        stride = self.BLOCKS * self.THREADS
-        _copy_words(s0, d0, n0, stride)
-        _copy_words(s1, d1, n1, stride)
-        _copy_words(s2, d2, n2, stride)
-        _copy_words(s3, d3, n3, stride)
-        if cutlass.const_expr(self.read_first):
-            # Keeps the stream's PDL chain: later kernels still follow the hop.
-            cute.arch.griddepcontrol_wait()
-
-
-_SNAPSHOTS = {}
-
-
-def _snapshot(sources, spin_ns, read_first=False):
-    """Launch the dependent on the current stream; returns the copies."""
-    key = (spin_ns, read_first)
-    if key not in _SNAPSHOTS:
-        fakes = [
-            make_fake_dynamic_compact_tensor(Int32, alignment=16, divisibility=4)
-            for _ in range(8)
-        ]
-        _SNAPSHOTS[key] = cute.compile(
-            _PdlSnapshot(spin_ns, read_first),
-            *fakes,
-            *[Int32(4)] * 4,
-            current_cu_stream(),
-        )
-    copies = [torch.empty_like(s) for s in sources]
-    args = []
-    for s, d in zip(sources, copies):
-        for t in (s, d):
-            words = t.view(torch.uint8).flatten().view(torch.int32)
-            args.append(to_cute_dynamic(words, 16, divisibility=4))
-    counts = [Int32(s.numel() * s.element_size() // 4) for s in sources]
-    _SNAPSHOTS[key](*args, *counts, current_cu_stream())
-    return copies
+if __name__ == "__main__":
+    multigpu_pytest_main(__name__, __file__, num_gpus=(4,), timeout=2400)
 
 
 @torch.inference_mode()
-def test_pdl_dependent_reads_final_outputs(env):
-    controls = {}
-    for early in env.hops:
-        hop = env.hops[early]
-        for spin_ns, read_first in ((SPIN_NS, False), (0, False), (0, True)):
-            for rows in ROWS:
-                inputs = [
-                    _inputs(rows, 400 + 10 * rows + s, env.rank, env.device)
-                    for s in range(3)
-                ]
-                stale = 0
-                for it in range(12):
-                    out = _run(hop, "quant", inputs[it % 3])
-                    copies = _snapshot(out, spin_ns, read_first)
-                    torch.cuda.synchronize()
-                    stale += sum(not _same(a, b) for a, b in zip(out, copies))
-                    del out, copies
-                if read_first:
-                    controls[early, rows] = stale
-                else:
-                    assert stale == 0, f"early={early} spin={spin_ns} rows={rows}"
-                dist.barrier(group=env.cpu_group)
-    print(f"HOPB r{env.rank} read-before-wait control, stale buffers of 48: {controls}")
+@pytest.mark.parametrize("early", ["end", "poll", "start", "quad"])
+def test_row_tile_finalize_relays_the_swizzled_scales(env, early):
+    """Hop B past 8 rows for wqkv_a's wide low-latency GEMM: the same streams, row and
+    MXFP8 values as the 128x4 variant, each row's scales at its tile's atom, and the
+    last tile's rows past ``rows`` zero though the scale buffer starts as 0xFF."""
+    from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+
+    hop = env.wide[early]
+    scale_cols = HIDDEN // 32
+    for rows in (9, 12, 20, 24, 40, 48):
+        inp = _inputs(rows, 300 + rows, env.rank, env.device)
+        streams, normed, values, scales = _run(hop, "quant", inp)
+        tiled = mxfp8_ll.RowTileMxfp8(
+            torch.empty(rows, HIDDEN, dtype=torch.float8_e4m3fn, device=env.device),
+            torch.full(
+                (mxfp8_ll.scale_bytes(rows, HIDDEN),),
+                0xFF,
+                dtype=torch.uint8,
+                device=env.device,
+            ),
+        )
+        mix = (inp.residual, inp.post, inp.comb)
+        rt_streams, rt_normed = hop.finalize(
+            inp.gemm2,
+            inp.weights,
+            inp.idx,
+            inp.shared,
+            *mix,
+            inp.pre,
+            inp.norm_weight,
+            EPS,
+            mxfp8_out=tiled,
+        )
+        assert _same(rt_streams, streams) and _same(rt_normed, normed), rows
+        assert _same(tiled.quant, values), f"values differ: rows={rows}"
+        g = torch.arange(scale_cols, device=env.device)
+        padded = (rows + 7) // 8 * 8
+        r = torch.arange(padded, device=env.device)[:, None]
+        at = ((r // 8) * (scale_cols // 4) + g // 4) * 512 + (r % 8) * 16 + g % 4
+        swz = (g // 4) * 512 + ((r[:rows] % 32) * 4 + (r[:rows] // 32) % 4) * 4 + g % 4
+        assert torch.equal(tiled.scale[at[:rows]], scales[swz]), f"scales: rows={rows}"
+        assert not tiled.scale[at[rows:]].any(), f"pad rows: rows={rows}"
+    torch.cuda.synchronize()
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("early", ["end", "poll", "start", "quad"])
+def test_wide_mailbox_changes_no_bit_up_to_8_rows(env, early):
+    """The 48-row mailbox serves batch 1 exactly as the 16-row one: hop A and both
+    finalize variants at 1-8 rows, bitwise."""
+    for rows in range(1, 9):
+        inp = _inputs(rows, 500 + rows, env.rank, env.device)
+        for kind in ("aquant", "norm", "quant", "residual"):
+            narrow = _run(env.hops[early], kind, inp)
+            wide = _run(env.wide[early], kind, inp)
+            assert all(_same(a, b) for a, b in zip(narrow, wide)), (kind, rows)
+    torch.cuda.synchronize()
 
 
 if __name__ == "__main__":

@@ -99,7 +99,7 @@ SGLANG_READS = {
     "srt/layers/dp_attention.py": ("is_allocation_symmetric",),
     "srt/runtime_context.py": ("get_parallel",),
     "srt/model_executor/forward_batch_info.py": ("req_pool_indices",),
-    "srt/megakernels/eagle_binding.py": (
+    "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "mamba",
         "tokens_per_request",
         "gdn",

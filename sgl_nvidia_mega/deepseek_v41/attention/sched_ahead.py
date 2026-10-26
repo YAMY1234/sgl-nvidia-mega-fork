@@ -39,7 +39,7 @@ SGLANG_READS = {
     ),
     "kernels/ops/attention/dsv4/decode_attention_sm100.py": ("MAX_BATCH",),
     "srt/runtime_context.py": ("get_platform", '"is_blackwell"'),
-    "srt/megakernels/binding.py": (
+    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
         "ForwardView",
         "metadata",
         "kv_pool",

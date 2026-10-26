@@ -30,7 +30,7 @@ from sgl_nvidia_mega.qwen3_5.draft import LOOP_BS, SERVED_BS, layer
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/megakernels/eagle_binding.py": (
+    "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "EagleDraftLoopIO",
         "num_requests",
         "num_steps",

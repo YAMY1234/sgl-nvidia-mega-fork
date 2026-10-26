@@ -4,7 +4,11 @@
 registry and no hook on SGLang's code, except the parity test's own."""
 
 import pytest
-from sglang.srt.megakernels import spec as registry
+
+try:
+    from sglang.kernels.plugin_kernels.nvidia import spec as registry
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.megakernels import spec as registry
 
 from sgl_nvidia_mega import plugin
 
@@ -26,10 +30,10 @@ def test_register_registers_every_spec_and_no_hook(hooks, monkeypatch):
     plugin.register()
     assert registry._REGISTRY == dict(plugin.SPECS)
     assert hooks == []
-    # each registered path resolves to the spec SGLang checks
+    # Every registered path resolves to the spec SGLang checks.
     for architecture, _ in plugin.SPECS:
         spec, why = registry.find_spec(architectures=[architecture], isa="sm_103")
-        assert spec is not None, why
+        assert spec is not None, (architecture, why)
 
 
 def test_the_parity_sort_hook_registers_only_for_its_test(hooks, monkeypatch):
@@ -45,12 +49,3 @@ def test_the_entry_point_is_the_one_sglang_checks():
     project = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text())
     entry_points = project["project"]["entry-points"]["sglang.srt.plugins"]
     assert entry_points == {registry.ENTRY_POINT: "sgl_nvidia_mega.plugin:register"}
-
-
-def test_an_sglang_without_the_framework_registers_nothing(hooks, monkeypatch, caplog):
-    import sys
-
-    monkeypatch.setitem(sys.modules, "sglang.srt.megakernels.spec", None)
-    plugin.register()
-    assert registry._REGISTRY == {} and hooks == []
-    assert "has no sglang.srt.megakernels" in caplog.text

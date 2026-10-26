@@ -8,8 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from sglang.srt.megakernels import guards
-from sglang.srt.megakernels import spec as registry
+from sglang.kernels.plugin_kernels.nvidia import spec as registry
+from sglang.srt.kernel_plugins.nvidia import binding as guards
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -123,7 +123,9 @@ def test_each_refusal_names_its_reason(kw, want):
 
 def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
     # an import of this name now raises ImportError
-    monkeypatch.setitem(sys.modules, "sglang.srt.megakernels.eagle_binding", None)
+    monkeypatch.setitem(
+        sys.modules, "sglang.srt.kernel_plugins.nvidia.eagle_binding", None
+    )
     assert "this SGLang has no EAGLE forward view" in _refusal()
 
 
@@ -243,7 +245,7 @@ def test_the_slot_plans_row_bounds_are_the_kernels():
 
 
 def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
-    from sglang.srt.megakernels.spec import NumericsKind
+    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
 
     assert spec.numerics(frozenset({"route", "hop"})).kind is NumericsKind.BITWISE
     claim = spec.numerics(frozenset({"gdn_verify", "hop", "gdn_push"}))

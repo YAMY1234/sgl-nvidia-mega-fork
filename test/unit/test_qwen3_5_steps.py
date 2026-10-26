@@ -11,8 +11,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from sglang.srt.megakernels import spec as registry
-from sglang.srt.megakernels.spec import Step
+from sglang.kernels.plugin_kernels.nvidia import spec as registry
+from sglang.kernels.plugin_kernels.nvidia.spec import Step
 from sglang.srt.models import qwen2_moe, qwen3_5
 
 from sgl_nvidia_mega import plugin

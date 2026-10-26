@@ -29,7 +29,11 @@ from __future__ import annotations
 from functools import partial
 
 import torch
-from sglang.srt.megakernels.spec import Step
+
+try:
+    from sglang.kernels.plugin_kernels.nvidia.spec import Step
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.megakernels.spec import Step
 
 from sgl_nvidia_mega.qwen3_5 import attention, boundary, gdn, logits, moe
 from sgl_nvidia_mega.qwen3_5.attention import route as _attention_route  # noqa: F401
@@ -40,7 +44,7 @@ from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     # Step, and the BuiltMegakernel members SGLang reads
-    "srt/megakernels/spec.py": (
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "Step",
         "mode",
         "rows",
@@ -72,7 +76,7 @@ SGLANG_READS = {
         "get_global_expert_distribution_recorder",
         "with_current_layer",
     ),
-    "srt/megakernels/eagle_binding.py": (
+    "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "tokens_per_request",
         "mamba",
     ),
@@ -94,6 +98,9 @@ class Qwen35Verify:
 
     # the target offers no draft sampler (BuiltMegakernel)
     draft_sampler = None
+    draft_loop = None
+    draft_extend = None
+    begin_draft_round = None
 
     def __init__(
         self,

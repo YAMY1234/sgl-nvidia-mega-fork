@@ -183,8 +183,8 @@ def test_repeat_and_graph_replay(weights):
 
 def test_draft_moe_two_tokens(weights):
     """DraftMoe on a loaded block's weights: two tokens are two launches in order."""
-    # the draft package's spec needs an SGLang with sglang.srt.megakernels
-    pytest.importorskip("sglang.srt.megakernels.spec")
+    # The draft package needs SGLang's NVIDIA megakernel contract.
+    pytest.importorskip("sglang.kernels.plugin_kernels.nvidia.spec")
     from sgl_nvidia_mega.qwen3_5.draft.moe import DraftMoe
 
     mlp = SimpleNamespace(

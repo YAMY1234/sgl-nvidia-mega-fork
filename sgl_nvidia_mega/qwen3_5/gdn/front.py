@@ -68,7 +68,7 @@ SGLANG_READS = {
         '"weight_scale"',
     ),
     "srt/layers/quantization/unquant.py": ("UnquantizedLinearMethod",),
-    "srt/megakernels/eagle_binding.py": (
+    "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "gdn",
         "mamba",
         "state_indices",

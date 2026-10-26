@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The SGLang names this package reads and the SGLang target its parity test hooks,
-pinned on CPU against the installed SGLang.
+"""The SGLang names this package reads and the binding code SGLang tolerates it
+calling, pinned on CPU against the installed SGLang.
 
 The megakernel lives outside SGLang, so it reads SGLang by name (its specs plug into
-``sglang.srt.megakernels``) and its parity test hooks one SGLang function by dotted
-path (``plugin.TEST_HOOKS``). Every module that imports from
-``sglang`` lists what it reads in ``SGLANG_READS``. A refactor that renames one fails here, naming the file to
-repair, instead of failing at a GPU server's startup. A module whose stock step mirrors
-the body of an SGLang function lists it in ``SGLANG_MIRRORS`` with the digest of its
-code (its tokens without comments or docstring; a tuple of digests where the supported
-SGLangs differ), so a changed branch fails here too.
-The checks are static (AST and tokens): no module of this package is imported. Run it
-against each SGLang this package supports, and nightly against SGLang main.
+``sglang.kernels.plugin_kernels.nvidia``). Every module that imports from
+``sglang`` lists what it reads in ``SGLANG_READS``. A refactor that renames one
+fails here, naming the file to repair, instead of failing at a GPU server's startup.
+A module whose stock step mirrors an SGLang function lists it in ``SGLANG_MIRRORS``
+with the digest of its code, so a changed branch fails here too. A file that moved
+between SGLang versions is named newest first, ``"new.py|old.py"``; the first one
+present is checked. The checks are static (AST and tokens): no package module is
+imported. Run them against every supported SGLang and nightly against main.
 """
 
 import ast
@@ -35,6 +34,15 @@ PACKAGE = Path(sgl_nvidia_mega.__file__).resolve().parent
 @lru_cache(maxsize=None)
 def _tree(path: Path) -> ast.Module:
     return ast.parse(path.read_text())
+
+
+def _files(pattern: str) -> list:
+    """The files a ``SGLANG_READS`` key names: its first alternative that exists."""
+    for alternative in pattern.split("|"):
+        files = sorted(ROOT.glob(alternative))
+        if files:
+            return files
+    return []
 
 
 @lru_cache(maxsize=None)
@@ -103,7 +111,7 @@ def test_every_sglang_import_is_declared(path):
 def test_sglang_provides_what_the_plugin_reads(path):
     missing = []
     for pattern, names in _declared(path).items():
-        files = sorted(ROOT.glob(pattern))
+        files = _files(pattern)
         assert files, f"{_id(path)}: no file matches {pattern}"
         provided = frozenset().union(*map(_provided, files))
         missing += [f"{pattern}: {n}" for n in names if n not in provided]
@@ -113,31 +121,9 @@ def test_sglang_provides_what_the_plugin_reads(path):
     )
 
 
-def _hook_targets() -> list:
-    """``plugin.TEST_HOOKS``' SGLang targets, read from the source (no import)."""
-    for node in _tree(PACKAGE / "plugin.py").body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "TEST_HOOKS" for t in node.targets
-        ):
-            return [target for target, _, _ in ast.literal_eval(node.value)]
-    return []
-
-
-@pytest.mark.parametrize("target", _hook_targets())
-def test_every_hook_target_resolves(target):
-    """``module.Class.function``: the class in that module defines the function."""
-    module, owner, name = target.rsplit(".", 2)
-    path = ROOT / Path(*module.split(".")[1:]).with_suffix(".py")
-    assert path.is_file(), f"{target}: no {path.relative_to(ROOT.parent)}"
-    classes = {n.name: n for n in _tree(path).body if isinstance(n, ast.ClassDef)}
-    assert owner in classes, f"{target}: no class {owner}"
-    defined = {n.name for n in classes[owner].body if isinstance(n, ast.FunctionDef)}
-    assert name in defined, f"{target}: {owner} does not define {name}"
-
-
 # What SGLang's binding file tolerates the megakernel still calling, writing and
 # reading; any change there must be reviewed here
-BINDING = "srt/megakernels/binding.py"
+BINDING = "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py"
 PINNED_TOLERATED = {
     "TOLERATED_CALLABLES": (
         "ForwardView.attention",
@@ -145,6 +131,7 @@ PINNED_TOLERATED = {
         "ForwardView.swa_out_cache_loc",
         "ForwardView.low_ratio_sources",
         "ForwardView.core_compressor",
+        "KdaStepView.track_decode_state",
         "KvPoolView.set_swa_key_buffer_radix_fused_norm_rope",
         "KvPoolView.pool",
         "sglang.kernels.ops",
@@ -164,7 +151,7 @@ PINNED_TOLERATED = {
 
 
 def _binding_tuple(name: str) -> tuple:
-    for node in _tree(ROOT / BINDING).body:
+    for node in _tree(_files(BINDING)[0]).body:
         if isinstance(node, ast.Assign) and any(
             isinstance(t, ast.Name) and t.id == name for t in node.targets
         ):
@@ -183,17 +170,38 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
     callables = {
         name.split(".", 1)[1]
         for name in PINNED_TOLERATED["TOLERATED_CALLABLES"]
-        if name.startswith(("ForwardView.", "KvPoolView."))
+        if name.startswith(("ForwardView.", "KdaStepView.", "KvPoolView."))
     }
     data = {
         "ForwardView",
+        "HybridPoolView",
+        "HybridStepView",
+        "PreparationView",
+        "block_table",
+        "cache",
+        "capacity",
+        "conv",
+        "kda",
+        "layer_mapping",
+        "logical_dtype",
         "KvPoolView",
         "MegakernelBinding",
         "metadata",
+        "mla",
+        "page_size",
+        "post_capture_active",
+        "reserved_capacity",
+        "sequence_lengths",
+        "serving_capacity",
+        "state",
+        "state_indices",
+        "storage_dtype",
+        "temporal",
         "kv_pool",
         "trtllm_attn",
         "uniform_fp8",
         "request_window",
+        "write_slots",
         "forward_view",
         "engram_history",
         "engram_host_table",

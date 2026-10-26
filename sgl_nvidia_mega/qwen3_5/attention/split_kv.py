@@ -52,7 +52,7 @@ SGLANG_READS = {
         "fused_fp8_qkv_kv_cache(v_scale)",
     ),
     "kernels/ops/attention/utils.py": ("canonicalize_stride",),
-    "srt/megakernels/eagle_binding.py": (
+    "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "attn",
         "kv",
         "page_table",

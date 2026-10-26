@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from sglang.srt.megakernels import spec as registry
-from sglang.srt.megakernels.spec import Step
+from sglang.kernels.plugin_kernels.nvidia import spec as registry
+from sglang.kernels.plugin_kernels.nvidia.spec import Step
 
 from sgl_nvidia_mega import plugin
 from sgl_nvidia_mega.qwen3_5 import (
@@ -88,7 +88,7 @@ def test_the_build_covers_more_requests_only_where_a_slot_runs(
 
 
 def test_the_build_hands_over_the_binding_and_every_entry_stays_sglangs():
-    from sglang.srt.megakernels.spec import ENTRIES
+    from sglang.kernels.plugin_kernels.nvidia.spec import ENTRIES
 
     from sgl_nvidia_mega.qwen3_5 import draft
 
@@ -129,7 +129,7 @@ def _draft_ctx():
 
 
 def test_the_mtp_draft_covers_no_step():
-    from sglang.srt.megakernels.spec import ENTRIES
+    from sglang.kernels.plugin_kernels.nvidia.spec import ENTRIES
 
     from sgl_nvidia_mega.qwen3_5 import draft
 
@@ -144,7 +144,7 @@ def test_the_mtp_draft_covers_no_step():
 
 
 def test_the_draft_entries_are_offered_only_on_request(monkeypatch):
-    from sglang.srt.megakernels.spec import ENTRIES
+    from sglang.kernels.plugin_kernels.nvidia.spec import ENTRIES
 
     from sgl_nvidia_mega.qwen3_5 import draft
 

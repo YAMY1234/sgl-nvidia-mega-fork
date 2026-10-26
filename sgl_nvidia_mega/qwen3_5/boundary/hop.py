@@ -107,7 +107,9 @@ SGLANG_READS = {
     ),
     "srt/layers/layer_boundary/residual/add_norm.py": ("is_plain_add",),
     "srt/layers/layernorm.py": ('"gemma_weight"',),
-    "srt/megakernels/runtime.py": ("megakernel_agree",),
+    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/runtime.py": (
+        "megakernel_agree",
+    ),
     "srt/runtime_context.py": ("get_parallel", '"tp_group"', "get_exec"),
     "srt/distributed/parallel_state.py": ("device_group", "world_size"),
 }
@@ -142,7 +144,10 @@ class Bound(msgspec.Struct, frozen=True):
 def build(model, ctx) -> Bound:
     """The hop when slot ``hop`` is requested and every layer's boundary is the path
     mirrored here. A collective: every rank builds it or none does."""
-    from sglang.srt.megakernels.runtime import megakernel_agree
+    try:
+        from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+        from sglang.srt.megakernels.runtime import megakernel_agree
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_nvidia_mega.qwen3_5 import plan, runtime

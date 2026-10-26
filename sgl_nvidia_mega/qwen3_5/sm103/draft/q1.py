@@ -11,7 +11,7 @@ differs from trtllm-gen; SGLang branch nvidia/qwen35-agentx-gb300 serves it at K
 
 The draft step has no forward batch or attention backend. ``Q1Decode.step`` takes the
 step's ``AttnStepMetadata`` and the draft's ``KvPoolBuffers``
-(``sglang.srt.megakernels.eagle_binding``), forms the paged cache view and the BMM
+(``sglang.srt.kernel_plugins.nvidia.eagle_binding``), forms the paged cache view and the BMM
 scales the way the backend does, and runs the plan of that input layout. The query
 is the step's FP8 query as the backend hands it to the kernel: the attention front's
 FP8 output, with no query scale (q_scale 1.0).
@@ -28,7 +28,7 @@ import torch
 SGLANG_READS = {
     "kernels/ops/attention/utils.py": ("canonicalize_stride",),
     "srt/environ.py": ("envs", "SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR"),
-    "srt/megakernels/eagle_binding.py": (
+    "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "AttnStepMetadata",
         "KvPoolBuffers",
         "page_table",

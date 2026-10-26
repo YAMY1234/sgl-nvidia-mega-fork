@@ -60,7 +60,12 @@ SGLANG_READS = {
     "srt/layers/dp_attention.py": ("is_allocation_symmetric",),
     "srt/runtime_context.py": ("get_parallel",),
     "srt/model_executor/forward_batch_info.py": ("out_cache_loc",),
-    "srt/megakernels/eagle_binding.py": ("kv", "layer_ids", "k", "v"),
+    "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
+        "kv",
+        "layer_ids",
+        "k",
+        "v",
+    ),
 }
 
 # the packed (qkv, o_proj) weights per full-attention layer id, filled at build

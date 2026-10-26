@@ -10,6 +10,8 @@ SM100-family GPUs (GB300) with NVLink multicast, against torch on the same input
   rounded once to bf16, bit for bit;
 - the memo rows equal the split fc's partials summed in rank order (checked at
   construction), and the split fc's gather and rank-order sum are exact;
+- the one-launch all-sum equals the gather and rank-order sum bit for bit, also from a
+  CUDA graph;
 - a whole draft round (five steps, the extend exchange with extend fc) replays from a CUDA
   graph with fresh inputs, equal to its eager run;
 - the sharded top-1 of slot draft_multi (``sm103/draft/top1``) picks, for 1-16 rows, the
@@ -118,7 +120,14 @@ def _want_token(local_logits, group, nan_as):
     return int(torch.argmax(full))  # the first maximum: the lowest id
 
 
-def test_step_exchange_picks_the_global_argmax(ranks, boundary):
+@pytest.mark.parametrize("split_send", [False, True])
+def test_step_exchange_picks_the_global_argmax(
+    ranks, boundary, split_send, monkeypatch
+):
+    """The split-send and serial-send schedules produce the same boundary outputs."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    monkeypatch.setattr(kernels, "SPLIT_MEMO_SEND", split_send)
     rank, world, group, _ = ranks
     mkd, _ = boundary
     n_embed = world // 2
@@ -212,6 +221,64 @@ def test_extend_exchange_nan_rules(ranks, boundary, nan_key):
         assert int(topk_index) == want
 
 
+def test_extend_mkd_head_is_the_scan_path(ranks, boundary):
+    """The one-request MKD head, side-stream partial and maxima exchange equal the
+    shard GEMV, logits scan and serial partial, eager and under graph replay."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, cpu_group = ranks
+    mkd, _ = boundary
+
+    def scan_path(x):
+        logits = torch.empty(1, VOCAB, dtype=torch.bfloat16, device="cuda")
+        part = torch.zeros(mkd.head_part.numel(), dtype=torch.int32, device="cuda")
+        kernels.mkd_draft_head(x, mkd.lm_head_weight, logits, part)
+        mkd.note_draft_input()
+        _, ti = mkd.exchange_extend(logits, x)
+        return [logits, ti.clone(), mkd.fc_buf.clone()]
+
+    def head_path(x):
+        logits = mkd.extend_head(x)
+        assert logits is not None
+        mkd.note_draft_input()
+        _, ti = mkd.exchange_extend(logits, x, mkd_head=True)
+        return [logits, ti.clone(), mkd.fc_buf.clone()]
+
+    def same(got, want):
+        assert torch.equal(got[0].view(torch.int16), want[0].view(torch.int16))
+        assert int(got[1]) == int(want[1]) == _want_token(want[0], group, -1e30)
+        assert torch.equal(got[2].view(torch.int16), want[2].view(torch.int16))
+
+    with torch.inference_mode():
+        rows = [_randn(1, H, g=_gen(7300 + s)) for s in range(4)]
+        for x in rows:
+            want = scan_path(x)
+            got = head_path(x)
+            torch.cuda.synchronize()
+            same(got, want)
+        dist.barrier(group=cpu_group)
+        static = rows[0].clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            head_path(static)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = head_path(static)
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        for x in rows:
+            want = scan_path(x)
+            static.copy_(x)
+            graph.replay()
+            torch.cuda.synchronize()
+            same(captured, want)
+            dist.barrier(group=cpu_group)
+
+
 @pytest.mark.parametrize("m", [1, 2, 7])
 def test_split_fc_gathers_and_sums_in_rank_order(ranks, boundary, m):
     from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
@@ -239,6 +306,121 @@ def test_split_fc_gathers_and_sums_in_rank_order(ranks, boundary, m):
         )
         ref = (x.float() @ weights["fc"].float().T).bfloat16()
         torch.testing.assert_close(got.float(), ref.float(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.fixture(scope="module")
+def allsum(ranks):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, cpu_group = ranks
+    return kernels.FcAllsum(
+        world=world,
+        rank=rank,
+        group=group,
+        cpu_group=cpu_group,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+
+
+def _fp32_partials(m, rank, seed):
+    """Rank ``rank``'s fp32 partials, with signed zeros in the first columns of every rank."""
+    p = torch.randn(m, H, device="cuda", generator=_gen(seed + 31 * rank)) * 4.0
+    p[:, :8] = -0.0
+    return p
+
+
+def _gather_ordered_sum(mkd, partial, world):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    out = torch.empty(partial.shape, dtype=torch.bfloat16, device="cuda")
+    return kernels.ordered_partial_sum(mkd._fc_gather(partial), world, out)
+
+
+@pytest.mark.parametrize("m", [1, 2, 7, 16])
+def test_fc_allsum_is_the_gather_and_ordered_sum(ranks, boundary, allsum, m):
+    """One launch gives FcGather + ordered_partial_sum's rows bit for bit, -0.0
+    sums included, over calls that visit every stage twice."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, _ = ranks
+    mkd, _ = boundary
+    with torch.inference_mode():
+        for call in range(2 * kernels.ALLSUM_STAGES):
+            partial = _fp32_partials(m, rank, 1000 * m + call)
+            got = allsum(
+                partial, torch.empty(m, H, dtype=torch.bfloat16, device="cuda")
+            )
+            want = _gather_ordered_sum(mkd, partial, world)
+            torch.cuda.synchronize()
+            assert torch.equal(got.view(torch.int16), want.view(torch.int16)), call
+
+
+def test_fc_allsum_replays_from_a_cuda_graph(ranks, boundary, allsum):
+    rank, world, group, cpu_group = ranks
+    mkd, _ = boundary
+    m = NUM_STEPS + 1
+    with torch.inference_mode():
+        partial = _fp32_partials(m, rank, 5000)
+        out = torch.empty(m, H, dtype=torch.bfloat16, device="cuda")
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            allsum(partial, out)
+        torch.cuda.current_stream().wait_stream(stream)
+        dist.barrier(group=cpu_group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            allsum(partial, out)
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        for call in range(4):
+            partial.copy_(_fp32_partials(m, rank, 5100 + call))
+            graph.replay()
+            want = _gather_ordered_sum(mkd, partial, world)
+            torch.cuda.synchronize()
+            assert torch.equal(out.view(torch.int16), want.view(torch.int16)), call
+            dist.barrier(group=cpu_group)
+
+
+@pytest.mark.parametrize("ctas", [8, 24, 0])
+def test_hidden_partial_rows4_is_the_one_row_kernel(ranks, boundary, ctas):
+    """The four-row load schedule equals the one-row kernel at every hidden slice."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, _, _ = ranks
+    mkd, weights = boundary
+    width = mkd.width
+    with torch.inference_mode():
+        h = _randn(1, H, g=_gen(7100 + rank + ctas))
+        shard = _randn(H, width, g=_gen(7200 + rank), scale=0.02)
+        got = {}
+        for rows_per_iter in (1, 4):
+            for col in range(0, H, width):
+                out = torch.full(
+                    (1, H), float("nan"), dtype=torch.float32, device="cuda"
+                )
+                epoch_done = torch.tensor([11, 0], dtype=torch.int32, device="cuda")
+                sync = torch.zeros(2, dtype=torch.int32, device="cuda")
+                kernels.mkd_hidden_partial(
+                    h,
+                    shard,
+                    weights["norm_hid"],
+                    EPS,
+                    col,
+                    out,
+                    epoch_done,
+                    sync,
+                    world,
+                    ctas=ctas,
+                    rows_per_iter=rows_per_iter,
+                )
+                torch.cuda.synchronize()
+                assert sync.tolist() == [0, 11], (rows_per_iter, col)
+                got[(rows_per_iter, col)] = out
+        for col in range(0, H, width):
+            assert torch.equal(
+                got[(4, col)].view(torch.int32), got[(1, col)].view(torch.int32)
+            ), col
 
 
 def test_round_replays_from_a_cuda_graph(ranks, boundary):

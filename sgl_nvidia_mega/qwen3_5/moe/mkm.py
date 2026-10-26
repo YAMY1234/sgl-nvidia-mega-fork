@@ -170,6 +170,7 @@ def routed(
     x_sf,
     routing=None,
     wide_bal: bool = False,
+    m16_max_rows: int = 16,
 ):
     """The deferred-finalize output of ``mlp``'s routed experts from the router front's
     logits and quantized input (``maps``: the layer's weight TMA maps; ``identity``:
@@ -194,6 +195,7 @@ def routed(
         experts.g2_alphas,
         routing=routing,
         wide_bal=wide_bal,
+        m16_max_rows=m16_max_rows,
     )
     deferred = FlashInferTrtllmDeferredFinalizeOutput(
         gemm2_out=gemm2_out,

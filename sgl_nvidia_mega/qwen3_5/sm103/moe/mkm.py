@@ -204,8 +204,14 @@ ENGINE_ROWS = (
 ROUTED_ENGINES = (M64_MAX_TOKENS, M128_MAX_TOKENS, M256_MAX_TOKENS, M512_MAX_TOKENS)
 
 
-def engine_rows(m: int) -> int:
-    """The bound of the engine that serves ``m`` rows."""
+def engine_rows(m: int, m16_max_rows: int = M16_MAX_TOKENS) -> int:
+    """The bound of the engine that serves ``m`` rows.
+
+    A caller may hand the tail of the 16-token range to the 32-token engine. Both
+    consume the same router logits and NVFP4 rows and produce identical values.
+    """
+    if m16_max_rows < m <= M16_MAX_TOKENS:
+        return M32_MAX_TOKENS
     return next(r for r in ENGINE_ROWS if m <= r)
 
 
@@ -391,6 +397,7 @@ def mkm_moe(
     g2_alpha: torch.Tensor,
     routing: tuple | None = None,
     wide_bal: bool = False,
+    m16_max_rows: int = M16_MAX_TOKENS,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(gemm2_out bf16 [M * 10, 4096], expert_weights bf16 [M, 10]) for logits [M, 512]
     bf16 (M <= 7, at TP8 M <= 128) and the router front's x_fp4 [M, 2048] / x_sf [M, 256]
@@ -407,7 +414,7 @@ def mkm_moe(
     )
     if not 1 <= m <= widest:
         raise ValueError(f"mkm: {m} rows (1-{widest})")
-    rows = engine_rows(m)
+    rows = engine_rows(m, m16_max_rows)
     if routing is not None and rows not in ROUTED_ENGINES:
         raise ValueError(
             f"mkm: a given routing needs a 64-512-token engine, not {m} rows"

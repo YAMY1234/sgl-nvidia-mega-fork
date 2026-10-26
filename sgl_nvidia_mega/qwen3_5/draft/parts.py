@@ -74,6 +74,8 @@ class Parts:
         self.embedx: Optional[Any] = None
         # (entry, bs) pairs whose capture logged the engagement line
         self.engaged: set = set()
+        # draft.moe_mkm.DraftMkm: compatible quantized draft experts on the target path
+        self.moe_mkm: Optional[Any] = None
 
     @classmethod
     def build(cls, draft) -> Parts:
@@ -98,11 +100,25 @@ class Parts:
             parts.top1x = parts._build_top1x()
         if "draft_embed" in slots:
             parts.embedx = parts._build_embedx()
+        if "draft_moe" in slots:
+            from sgl_nvidia_mega.qwen3_5.draft import moe_mkm
+
+            parts.moe_mkm, why = moe_mkm.DraftMkm.build(parts.layer.mlp)
+            if parts.moe_mkm is None:
+                logger.info(
+                    "NVIDIA megakernel: draft MoE target path unavailable (%s)", why
+                )
         logger.info(
             "NVIDIA megakernel: Qwen3.5 MTP draft parts built (slots %s; MoE %s, hop "
             "%s, exchange %s)",
             sorted(slots),
-            "single launch" if parts.moe is not None else "SGLang's",
+            (
+                "single launch at one row, target path from two rows"
+                if parts.moe_mkm is not None
+                else "single launch"
+                if parts.moe is not None
+                else "SGLang's"
+            ),
             "draft hop" if parts.hop is not None else "SGLang's",
             "MKD" if parts.mkd is not None else "SGLang's",
         )

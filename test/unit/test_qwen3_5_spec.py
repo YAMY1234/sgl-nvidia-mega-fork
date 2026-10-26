@@ -186,6 +186,8 @@ def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
             "slot 'mkm_wide' serves the steps of more than one request ('multi_request')",
         ),
         ({"mkm_m32"}, "slot 'mkm_m32' takes slot 'route_topk''s rows"),
+        ({"route_pre"}, "unknown slot 'route_pre'"),
+        ({"route_pre_front"}, "unknown slot 'route_pre_front'"),
         (
             {"route_topk", "mkm_m32"},
             "slot 'mkm_m32' serves the steps of more than two requests ('multi_request')",
@@ -283,9 +285,13 @@ def test_the_trt_gdn_front_widens_slot_gdn_front_to_four_requests():
 
 
 def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
-    # every slot built except mkm's 16-token engine (mkm_wide, below)
+    # Every public slot is built except mkm's 16-token engine (mkm_wide, below).
     every = plan.Facts(
-        **{**dict.fromkeys(plan.Facts.__struct_fields__, True), "mkm_wide": False}
+        **{
+            **dict.fromkeys(plan.Facts.__struct_fields__, True),
+            "mkm_wide": False,
+            "tep8_moe": False,
+        }
     )
     assert _on(plan.slots(7, every)) == sorted(
         set(plan.Slots.__struct_fields__)
@@ -296,6 +302,8 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
             "mkm_m256",
             "mkm_m512",
             "route_gemm",
+            "route_pre",
+            "route_pre_topk",
             "route_shared",
             "route_topk",
         }
@@ -361,6 +369,63 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]
     assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]
     assert not plan.slots(28, plan.Facts(route_gemm=True)).route_gemm
+    # TEP8's routed-body plan is internal: S1/S2 use route plus a routing-only
+    # top-k launch, M uses the low-M shared expert, and L uses route-big. It
+    # supersedes the all-expert MKM engines and the numeric tiled router front.
+    tep8 = dict(route=True, route_topk=True, tep8_moe=True)
+    for rows in (7, 14):
+        assert _on(plan.slots(rows, plan.Facts(**tep8))) == [
+            "route",
+            "route_pre_topk",
+        ]
+    for rows in (21, 28):
+        assert _on(plan.slots(rows, plan.Facts(**tep8))) == ["route_topk"]
+    tier_m = plan.Facts(
+        **tep8,
+        route_gemm=True,
+        lowm_se=True,
+        lowm_se_pre=True,
+    )
+    for rows in (21, 28):
+        assert _on(plan.slots(rows, tier_m)) == [
+            "lowm_se",
+            "route_pre",
+            "route_topk",
+        ]
+    tier_l = plan.Facts(
+        **tep8,
+        route_gemm=True,
+        mkm=True,
+        mkm_wide=True,
+        mkm_m32=True,
+        mkm_m64=True,
+        mkm_m128=True,
+        mkm_m256=True,
+        mkm_m512=True,
+    )
+    for rows in (35, 112, 224, 448, 672, 896):
+        assert _on(plan.slots(rows, tier_l)) == ["route_pre", "route_topk"]
+    assert plan.lowm_se_pre_rows(8, tep8_m=True) == 28
+    assert plan.lowm_se_pre_rows(4, tep8_m=True) == 0
+    assert [plan.moe_front_tier(r) for r in (7, 14, 28, 35, 224, 231, 896)] == [
+        "S1",
+        "S2",
+        "M",
+        "L1",
+        "L1",
+        "L2",
+        "L2",
+    ]
+    # The S tiers run beside the low-M shared expert and replace route_shared.
+    s_tier = plan.Facts(
+        **tep8,
+        route_shared=True,
+        lowm_se=True,
+        mkm=True,
+    )
+    for rows in (7, 14):
+        assert _on(plan.slots(rows, s_tier)) == ["lowm_se", "route", "route_pre_topk"]
+    assert _on(plan.slots(21, s_tier)) == ["route_topk"]
     # SGLang offers every multiple of 7 up to MAX_ROWS; every request count is a candidate
     offered = tuple(range(7, plan.MAX_ROWS + 1, 7))
     assert plan.candidates(offered, 7) == offered

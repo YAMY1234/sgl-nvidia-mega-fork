@@ -14,7 +14,10 @@ SM100-family GPUs (GB300) with NVLink multicast, against torch on the same input
   graph with fresh inputs, equal to its eager run;
 - the sharded top-1 of slot draft_multi (``sm103/draft/top1``) picks, for 1-16 rows, the
   argmax of the all-gathered logits under both NaN rules (ties to the lowest id, -0.0 as
-  +0.0), writes the token column, 1.0 and positions + 1, and replays from a CUDA graph.
+  +0.0), writes the token column, 1.0 and positions + 1, and replays from a CUDA graph;
+- the embedding exchange of slot draft_embed (``sm103/draft/embed``) gives, for 1-128 rows,
+  the rows of SGLang's vocabulary-parallel embedding (masked lookup + all-reduce) bit for
+  bit, -0.0 entries included, and replays from a CUDA graph.
 
 The bitwise comparison with the kernels of SGLang branch nvidia/qwen35-agentx-gb300 needs that
 branch installed as ``sglang`` and is not part of this test.
@@ -427,6 +430,96 @@ def test_sharded_top1_replays_from_a_cuda_graph(ranks, top1x):
                 assert torch.equal(tokens[:, col], want)
             assert (positions == NUM_STEPS - 1).all()
             dist.barrier(group=cpu_group)
+
+
+V_EMBED = 512  # embedding rows a rank holds here
+
+
+@pytest.fixture(scope="module")
+def embedx(ranks):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import EmbedExchange
+
+    rank, world, group, cpu_group = ranks
+    full = _randn(world * V_EMBED, H, g=_gen(9100))  # the same table on every rank
+    full[3, :64] = -0.0
+    full[V_EMBED, 1::2] = -0.0  # rank 1's first row
+    table = full[rank * V_EMBED : (rank + 1) * V_EMBED].contiguous()
+    ex = EmbedExchange(
+        world=world,
+        table=table,
+        vocab_start=rank * V_EMBED,
+        vocab_local=V_EMBED,
+        group=group,
+        cpu_group=cpu_group,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    return ex, table
+
+
+def _embed_want(table, ids, rank, group):
+    """SGLang's VocabParallelEmbedding at TP > 1: out-of-shard ids read row 0 and are
+    zeroed, then the all-reduce."""
+    start = rank * V_EMBED
+    mask = (ids < start) | (ids >= start + V_EMBED)
+    rows = torch.nn.functional.embedding((ids - start) * ~mask, table)
+    rows.masked_fill_(mask.unsqueeze(-1), 0)
+    dist.all_reduce(rows, group=group)
+    return rows
+
+
+def _embed_ids(world, m, seed):
+    ids = torch.randint(0, world * V_EMBED, (m,), device="cuda", generator=_gen(seed))
+    edges = [3, V_EMBED, V_EMBED - 1, world * V_EMBED - 1, 0]
+    ids[: min(m, len(edges))] = torch.tensor(edges[:m], device="cuda")
+    return ids
+
+
+@pytest.mark.parametrize("m", [1, 2, 7, 16, 28, 112, 128])
+def test_embedding_exchange_is_the_vocab_parallel_embedding(ranks, embedx, m):
+    rank, world, group, cpu_group = ranks
+    ex, table = embedx
+    ids = _embed_ids(world, m, 9200 + m)
+    tokens = torch.zeros(m, NUM_STEPS, dtype=torch.int64, device="cuda")
+    tokens[:, 2] = ids  # a strided column, as the draft tokens' next column
+    got = ex(tokens[:, 2])
+    want = _embed_want(table, ids, rank, group)
+    torch.cuda.synchronize()
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+    dist.barrier(group=cpu_group)
+
+
+def test_embedding_exchange_replays_from_a_cuda_graph(ranks, embedx):
+    rank, world, group, cpu_group = ranks
+    ex, table = embedx
+    m = 16
+    ids = torch.zeros(m, dtype=torch.int64, device="cuda")
+    outs = []
+
+    def run():
+        outs.clear()
+        for _ in range(NUM_STEPS - 1):
+            outs.append(ex(ids))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    dist.barrier(group=cpu_group)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    torch.cuda.synchronize()
+    dist.barrier(group=cpu_group)
+    for seed in (1, 2, 3):
+        ids.copy_(_embed_ids(world, m, 9300 + seed))
+        graph.replay()
+        torch.cuda.synchronize()
+        want = _embed_want(table, ids, rank, group)
+        assert all(
+            torch.equal(o.view(torch.int16), want.view(torch.int16)) for o in outs
+        )
+        dist.barrier(group=cpu_group)
 
 
 if __name__ == "__main__":

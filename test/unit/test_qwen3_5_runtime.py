@@ -117,15 +117,40 @@ def test_verify_sample_is_refused_with_the_switch_that_replaces_it(monkeypatch):
 
 def test_expert_parallel_keeps_route_and_boundary_slots(monkeypatch):
     requested = frozenset(
-        {"route", "mkm", "mkm_wide", "hop", "gdn_push", "draft_moe", "draft_hop"}
+        {
+            "route",
+            "route_topk",
+            "mkm",
+            "mkm_wide",
+            "mkm_m32",
+            "mkm_m64",
+            "mkm_m128",
+            "mkm_m256",
+            "mkm_m512",
+            "hop",
+            "gdn_push",
+            "draft_moe",
+            "draft_hop",
+        }
     )
     monkeypatch.setattr(runtime, "SLOTS", requested)
     assert runtime.apply_expert_parallel(1) == frozenset()
     assert runtime.SLOTS == requested
     assert runtime.apply_expert_parallel(8) == frozenset(
-        {"mkm", "mkm_wide", "draft_moe"}
+        {
+            "mkm",
+            "mkm_wide",
+            "mkm_m32",
+            "mkm_m64",
+            "mkm_m128",
+            "mkm_m256",
+            "mkm_m512",
+            "draft_moe",
+        }
     )
-    assert runtime.SLOTS == frozenset({"route", "hop", "gdn_push", "draft_hop"})
+    assert runtime.SLOTS == frozenset(
+        {"route", "route_topk", "hop", "gdn_push", "draft_hop"}
+    )
 
 
 def test_the_runtime_gives_the_executor_the_build_contexts_binding(monkeypatch):

@@ -921,7 +921,9 @@ SGL_DEVICE void router_front_kernel(const Params& p) {
 
   const uint32_t warp = threadIdx.x / 32;
   const uint32_t expert0 = blockIdx.x * kExpertsPerCta;
-  const uint32_t M = p.num_tokens;
+  // token tile blockIdx.y: rows [t0, t0 + M) of x, logits and the NVFP4 input (one tile without route_gemm)
+  const uint32_t t0 = blockIdx.y * kMaxM;
+  const uint32_t M = min(p.num_tokens - t0, kMaxM);
   const uint32_t tb = blockIdx.x * 8;
   float* s_part = reinterpret_cast<float*>(smem + L::kPart);
   const uint32_t bar_w = smem_addr(smem + L::kBarW);
@@ -964,7 +966,7 @@ SGL_DEVICE void router_front_kernel(const Params& p) {
 #pragma unroll
     for (uint32_t row = 0; row < kMaxM; ++row) {
       if (row < M) {
-        bulk_load(smem_addr(smem + L::kX + row * kRowBytes), p.x + static_cast<size_t>(row) * kHidden, kHidden * 2,
+        bulk_load(smem_addr(smem + L::kX + row * kRowBytes), p.x + static_cast<size_t>(t0 + row) * kHidden, kHidden * 2,
                   bar_x);
       }
     }
@@ -986,8 +988,8 @@ SGL_DEVICE void router_front_kernel(const Params& p) {
       uint32_t sf;
       uint2 packed;
       quantize_block(src[0], src[1], p.global_scale[0], sf, packed);
-      *reinterpret_cast<uint2*>(p.x_fp4 + static_cast<size_t>(blockIdx.x) * (kHidden / 2) + blk * 8) = packed;
-      p.x_sf[static_cast<size_t>(blockIdx.x) * kBlocksPerRow + blk] = static_cast<uint8_t>(sf);
+      *reinterpret_cast<uint2*>(p.x_fp4 + static_cast<size_t>(t0 + blockIdx.x) * (kHidden / 2) + blk * 8) = packed;
+      p.x_sf[static_cast<size_t>(t0 + blockIdx.x) * kBlocksPerRow + blk] = static_cast<uint8_t>(sf);
     }
   }
   __syncthreads();
@@ -997,7 +999,7 @@ SGL_DEVICE void router_front_kernel(const Params& p) {
     const uint32_t e = threadIdx.x % kExpertsPerCta;
     const float lo = s_part[m * kExpertsPerCta + e];
     const float hi = s_part[(16 + m) * kExpertsPerCta + e];
-    p.logits[m * kExperts + expert0 + e] = __float2bfloat16_rn(__fadd_rn(lo, hi));
+    p.logits[(t0 + m) * kExperts + expert0 + e] = __float2bfloat16_rn(__fadd_rn(lo, hi));
   }
   if (has_sh && threadIdx.x < M * 8) {
     const uint32_t m = threadIdx.x / 8;

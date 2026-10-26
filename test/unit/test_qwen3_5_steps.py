@@ -338,6 +338,7 @@ def test_the_route_shared_slot_starts_the_shared_expert_after_the_router_launch(
             weight=k["sh_w"], input_scale=k["sh_in"], weight_scale=k["sh_ws"]
         ),
         _enable_silu_fp4_quant_fusion=False,
+        _silu_fp8_quant_fusion=False,
         act_fn=log.op("act", "act_out"),
         down_proj=log.op("down_proj", ("down_out", None)),
     )
@@ -481,7 +482,9 @@ def test_the_mkm_slot_runs_the_routed_experts_on_the_router_fronts_outputs(captu
 
         mlp.experts.dispatcher.combine = combine
         bound = SimpleNamespace(
-            mkm={3: "maps"}, identity=torch.arange(70, dtype=torch.int32)
+            mkm={3: "maps"},
+            identity=torch.arange(70, dtype=torch.int32),
+            m16_max_rows=16,
         )
         st = SimpleNamespace(slots=slots, bound={"moe": bound})
         fused = patch.object(
@@ -513,7 +516,11 @@ def test_the_mkm_slot_runs_the_routed_experts_on_the_router_fronts_outputs(captu
                 "c(512,)",
                 "g2(512,)",
             ),
-            (("routing", None),),
+            (
+                ("m16_max_rows", 16),
+                ("routing", None),
+                ("wide_bal", False),
+            ),
         ),
         ("combine", "main"),
     ]
@@ -1363,9 +1370,10 @@ def test_trt_lowm_takes_trts_gdn_tactics_and_refuses_an_unprepared_launch(
     from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
 
     conv_w = torch.zeros(d, 4, dtype=torch.bfloat16)
-    state = torch.zeros(3, d, 3, dtype=torch.bfloat16)
-    windows = torch.zeros(3, d, 9, dtype=torch.bfloat16).as_strided(
-        (3, 7, d, 3), (d * 9, 1, 9, 1)
+    pool_requests = max(3, requests)
+    state = torch.zeros(pool_requests, d, 3, dtype=torch.bfloat16)
+    windows = torch.zeros(pool_requests, d, 9, dtype=torch.bfloat16).as_strided(
+        (pool_requests, 7, d, 3), (d * 9, 1, 9, 1)
     )
     for act, tactic in (("fp8", tactic_fp8), ("quant", tactic_quant)):
         s = trt_front.spec(act, qkvz, ba, conv_w, state, windows, requests)
@@ -1386,7 +1394,10 @@ def test_trt_lowm_takes_trts_gdn_tactics_and_refuses_an_unprepared_launch(
             and not s.release_after_wait
             and not s.unsafe_skip_wait
         )
-        assert s.conv_shapes[3] == ((3, 7, d, 3), (d * 9, 1, 9, 1))
+        assert s.conv_shapes[3] == (
+            (pool_requests, 7, d, 3),
+            (d * 9, 1, 9, 1),
+        )
     with pytest.raises(RuntimeError, match="not prepared"):
         trt_lowm.run(s, out=torch.zeros(7 * requests, qkvz, dtype=torch.bfloat16))
     with patch.object(torch.cuda, "is_current_stream_capturing", lambda: True):
@@ -2608,7 +2619,7 @@ def _pushing_hop(log):
     from sgl_nvidia_mega.qwen3_5.sm103 import hop as sm103_hop
 
     hop = object.__new__(sm103_hop.Hop)
-    hop.max_m, hop._pushed = 8, None
+    hop.max_m, hop._pushed, hop._pushed_rl = 8, None, False
     hop._args = lambda m, residual, gamma, scale: (SimpleNamespace(m=m), ("out",))
     hop._launch = lambda name, args, ctas, cluster=None: log.append(name)
     hop._consume = lambda args: log.append("consume")

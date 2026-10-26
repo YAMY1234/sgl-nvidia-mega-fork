@@ -251,7 +251,7 @@ def _router_experts(mlp, x, defer: bool, st):
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
     if defer and st.slots.route:
-        rl = st.scratch.pop("rlin.moe", None)
+        rl = st.scratch.pop("rlin.moe", None) if st.slots.route_lin else None
         if rl is not None and rl[0] == mlp.layer_id and st.slots.mkm:
             # Slot route_lin produced the logits and NVFP4 input in the preceding hop.
             return route.routed_lin(mlp, x, st.bound["moe"], *rl[1:])

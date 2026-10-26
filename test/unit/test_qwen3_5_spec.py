@@ -214,6 +214,8 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(7, every)) == sorted(plan.Slots.__struct_fields__)
     # two requests: also MKA's wide entries and their push into the hop
     assert _on(plan.slots(14, every)) == [
+        "gdn_conv",
+        "gdn_core",
         "gdn_pdl",
         "gdn_verify",
         "hop",
@@ -221,9 +223,22 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
         "mka_push",
         "route",
     ]
-    # Wider requests take MKA's bitwise front path.
-    for rows in (28, 56, 112, 224, 448, 896):
-        assert _on(plan.slots(rows, every)) == ["gdn_pdl", "gdn_verify", "mka"]
+    # The one-launch GDN core and MKA front serve through 224 rows.
+    for rows in (28, 56, 112, 224):
+        assert _on(plan.slots(rows, every)) == [
+            "gdn_conv",
+            "gdn_core",
+            "gdn_pdl",
+            "gdn_verify",
+            "mka",
+        ]
+    for rows in (448, 896):
+        assert _on(plan.slots(rows, every)) == [
+            "gdn_conv",
+            "gdn_pdl",
+            "gdn_verify",
+            "mka",
+        ]
     # SGLang offers every multiple of 7 up to MAX_ROWS; every request count is a candidate
     offered = tuple(range(7, plan.MAX_ROWS + 1, 7))
     assert plan.candidates(offered, 7) == offered

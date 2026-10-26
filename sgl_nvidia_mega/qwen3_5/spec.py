@@ -106,10 +106,12 @@ REQUIREMENTS = Requirements(
 )
 
 # Against SGLang's forward on the same GPU (test/e2e/test_qwen3_5_stock_parity.py): the
-# stock step and the bitwise slots (route, mkm, gdn_verify, gdn_pdl, hop) reproduce it
-# bit for bit. A numeric slot's outputs are held to fp64 on the same quantized operands
+# stock step and the bitwise slots (mkm, gdn_verify, gdn_pdl, hop) reproduce it bit for
+# bit. A numeric slot's outputs are held to stock or fp64 on the same quantized operands
 # (test/kernels), at most these multiples of the error of SGLang's own op.
 NUMERIC_TOLERANCES = {
+    # Four router GEMV chains sum in another order than SGLang's cuBLAS GEMM.
+    "route": {"route.router_logits.bf16_ulp_vs_stock": 1.0},
     # The tiled router front stays within one BF16 ULP of SGLang's whole-M GEMM.
     "route_gemm": {"route_gemm.router_logits.bf16_ulp_vs_stock": 1.0},
     "gdn_push": {

@@ -71,12 +71,12 @@ MKA_MAX_ROWS = 8
 MKA_WIDE_MAX_ROWS = MAX_ROWS
 # slots lowm / lowm_se: the rows up to which each low-M launch measured faster than SGLang's quantize +
 # cuBLAS path on GB300 (results/trt-1022/l6): the input projections (in_proj_qkvz + in_proj_ba, qkv_proj),
-# the output projections (out_proj, o_proj) and the shared expert. The wider 28/
-# 56-row launches regressed the target step, so they stay on SGLang's stock path.
+# the output projections (out_proj, o_proj) and the shared expert. The shared expert's
+# 21-row launch also measured faster; the 28/56-row launches stay on SGLang's stock path.
 LOWM_IN_MAX_ROWS = 14
 LOWM_OUTPROJ_MAX_ROWS = 14
 LOWM_OPROJ_MAX_ROWS = 14
-LOWM_SE_MAX_ROWS = 14
+LOWM_SE_MAX_ROWS = 21
 
 
 class Slots(msgspec.Struct, frozen=True):

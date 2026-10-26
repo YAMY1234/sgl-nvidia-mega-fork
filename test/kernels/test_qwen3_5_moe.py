@@ -112,7 +112,7 @@ def _inputs(m, seed):
     )
 
 
-def _fused(layer, logits, x_fp4, x_sf):
+def _fused(layer, logits, x_fp4, x_sf, **kwargs):
     return mkm.mkm_moe(
         layer["maps"],
         logits,
@@ -123,6 +123,7 @@ def _fused(layer, logits, x_fp4, x_sf):
         layer["g1"],
         layer["g1c"],
         layer["g2"],
+        **kwargs,
     )
 
 
@@ -182,6 +183,21 @@ def test_mkm_is_the_trtllm_routed_experts(layer, m, seed, shared_route):
     rows, weights = _fused(layer, logits, x_fp4, x_sf)
     want_rows, want_weights = _stock(layer, logits, x_fp4, x_sf)
     assert want_weights.dtype == torch.bfloat16
+    assert torch.equal(weights.view(torch.int16), want_weights.view(torch.int16))
+    differ = (rows.view(torch.int16) != want_rows.view(torch.int16)).any(dim=1)
+    assert not differ.any(), f"rows {differ.nonzero().flatten().tolist()} differ"
+
+
+@pytest.mark.parametrize("m", [13, 14, 16])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_draft_32_token_engine_is_the_trtllm_routed_experts(layer, m, seed):
+    """The draft's rows past 12 use the 32-token engine with identical values."""
+    if layer["inter"] not in mkm.M32_ENGINES:
+        pytest.skip("no 32-token engine at this intermediate")
+    logits, x_fp4, x_sf = _inputs(m, seed)
+    assert mkm.engine_rows(m, m16_max_rows=12) == mkm.M32_MAX_TOKENS
+    rows, weights = _fused(layer, logits, x_fp4, x_sf, m16_max_rows=12)
+    want_rows, want_weights = _stock(layer, logits, x_fp4, x_sf)
     assert torch.equal(weights.view(torch.int16), want_weights.view(torch.int16))
     differ = (rows.view(torch.int16) != want_rows.view(torch.int16)).any(dim=1)
     assert not differ.any(), f"rows {differ.nonzero().flatten().tolist()} differ"

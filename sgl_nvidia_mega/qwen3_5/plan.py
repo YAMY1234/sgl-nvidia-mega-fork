@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Which kernel fills each slot of a covered step, per width (rows), fixed at build.
 
-A slot runs only where it is requested (``SGLANG_NVIDIA_MEGAKERNEL_SLOTS``), built and
-inside its row bounds; every other op is SGLang's own. The covered steps are the
+A slot runs only where the runtime's default or explicit slot policy requests it, it is
+built and the rows are inside its bounds; every other op is SGLang's own. The covered steps are the
 target verify of 1 to 128 requests (``REQUESTS``: every decode graph batch size SGLang
 captures up to 128); a width of more than one request is covered only where a slot runs.
 ``route`` (the router GEMM and the routed experts' NVFP4 input in one launch) runs up to

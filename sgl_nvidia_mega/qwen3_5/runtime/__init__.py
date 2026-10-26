@@ -14,15 +14,10 @@ import msgspec
 
 logger = logging.getLogger(__name__)
 
-# The kernel slots that run by default, and the ones that run only when requested
-# (until step-level timing and accuracy runs move them to the default list)
-SHIPPED_SLOTS: tuple[str, ...] = ()
-OPT_IN_SLOTS: tuple[str, ...] = (
-    "route",
+# Bitwise, shape-bounded paths run whenever the Qwen3.5 megakernel is enabled. Numeric
+# paths stay behind the one comma-separated slot policy below; BAL is opt-in too.
+SHIPPED_SLOTS: tuple[str, ...] = (
     "route_topk",
-    "route_gemm",
-    "mkm",
-    "mkm_wide",
     "mkm_m32",
     "mkm_m64",
     "mkm_m128",
@@ -30,10 +25,21 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "mkm_m512",
     "gdn_verify",
     "gdn_pdl",
-    "gdn_core",
-    # the verify conv with every x row loaded first and the windows in one store a channel (bitwise)
     "gdn_conv",
     "hop",
+    "hop_fp8",
+    "multi_request",
+    "draft_loop",
+    "draft_extend",
+    "draft_multi",
+    "draft_embed",
+)
+OPT_IN_SLOTS: tuple[str, ...] = (
+    "route",
+    "route_gemm",
+    "mkm",
+    "mkm_wide",
+    "gdn_core",
     "gdn_push",
     "gdn_front",
     "gdn_trt_front",
@@ -46,12 +52,10 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "lowm_out",
     "lowm_se",
     "lowm_push",
-    "hop_fp8",
 )
-# Steps of more than one request (TP8's decode graphs of batch sizes 2 to 128), covered only
-# when requested in the same variable: covering them costs the one-request step about
-# 0.3% at TP8
-OPT_IN_COVERAGE: tuple[str, ...] = ("multi_request",)
+# Optional coverage names requested in the same variable. Multi-request coverage is
+# shipped because every covered width keeps its own shape instead of padding.
+OPT_IN_COVERAGE: tuple[str, ...] = ()
 # Graph or build variants of a slot, requested in the same variable: no width of their
 # own. BAL stays opt-in because its serving evidence covers TP8 only.
 # skv2_cp: one long request past the measured crossover runs CP-lite in place of SKV2,
@@ -123,13 +127,17 @@ def apply_expert_parallel(ep_size: int) -> frozenset:
 
 def slot_reasons() -> list[str]:
     """Why the requested slots cannot be served ([] when they can)."""
-    known = (
-        *SHIPPED_SLOTS,
-        *OPT_IN_SLOTS,
-        *OPT_IN_COVERAGE,
-        *OPT_IN_VARIANTS,
-        *DRAFT_ENTRIES,
-        *DRAFT_SLOTS,
+    known = tuple(
+        dict.fromkeys(
+            (
+                *SHIPPED_SLOTS,
+                *OPT_IN_SLOTS,
+                *OPT_IN_COVERAGE,
+                *OPT_IN_VARIANTS,
+                *DRAFT_ENTRIES,
+                *DRAFT_SLOTS,
+            )
+        )
     )
     reasons = [
         f"{SLOTS_ENV}: unknown slot {name!r} (known: {', '.join(known) or 'none'})"

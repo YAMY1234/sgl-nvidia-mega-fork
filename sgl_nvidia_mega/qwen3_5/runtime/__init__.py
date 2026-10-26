@@ -19,8 +19,15 @@ logger = logging.getLogger(__name__)
 SHIPPED_SLOTS: tuple[str, ...] = ()
 OPT_IN_SLOTS: tuple[str, ...] = (
     "route",
+    "route_topk",
+    "route_gemm",
     "mkm",
     "mkm_wide",
+    "mkm_m32",
+    "mkm_m64",
+    "mkm_m128",
+    "mkm_m256",
+    "mkm_m512",
     "gdn_verify",
     "gdn_pdl",
     "gdn_core",
@@ -67,7 +74,18 @@ DRAFT_SLOTS: tuple[str, ...] = (
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 # These slots run all 512 experts themselves. Under expert parallelism, keep the
 # route-only and boundary slots but let SGLang's EP path run the routed experts.
-EP_STOCK_SLOTS = frozenset({"mkm", "mkm_wide", "draft_moe"})
+EP_STOCK_SLOTS = frozenset(
+    {
+        "mkm",
+        "mkm_wide",
+        "mkm_m32",
+        "mkm_m64",
+        "mkm_m128",
+        "mkm_m256",
+        "mkm_m512",
+        "draft_moe",
+    }
+)
 
 
 def _requested_slots() -> frozenset:
@@ -123,10 +141,47 @@ def slot_reasons() -> list[str]:
             f"{SLOTS_ENV}: slot 'mkm_wide' serves the steps of more than one request "
             "('multi_request')"
         )
+    if "mkm_m32" in SLOTS and "route_topk" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'mkm_m32' takes slot 'route_topk''s rows")
+    if "mkm_m32" in SLOTS and "multi_request" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'mkm_m32' serves the steps of more than two requests "
+            "('multi_request')"
+        )
+    if "mkm_m64" in SLOTS and "route_topk" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'mkm_m64' runs on slot 'route_topk''s routing"
+        )
+    if "mkm_m64" in SLOTS and "multi_request" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'mkm_m64' serves the steps of more than four requests "
+            "('multi_request')"
+        )
+    if "mkm_m128" in SLOTS and "route_topk" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'mkm_m128' runs on slot 'route_topk''s routing"
+        )
+    if "mkm_m128" in SLOTS and "multi_request" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'mkm_m128' serves the steps of more than nine requests "
+            "('multi_request')"
+        )
+    for name, more in (("mkm_m256", "18"), ("mkm_m512", "36")):
+        if name in SLOTS and "route_topk" not in SLOTS:
+            reasons.append(
+                f"{SLOTS_ENV}: slot '{name}' runs on slot 'route_topk''s routing"
+            )
+        if name in SLOTS and "multi_request" not in SLOTS:
+            reasons.append(
+                f"{SLOTS_ENV}: slot '{name}' serves the steps of more than {more} requests "
+                "('multi_request')"
+            )
     if "route_shared" in SLOTS and "route" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'route_shared' runs in slot 'route''s launch"
         )
+    if "route_gemm" in SLOTS and "route_topk" not in SLOTS:
+        reasons.append(f"{SLOTS_ENV}: slot 'route_gemm' runs inside slot 'route_topk'")
     if "gdn_push" in SLOTS and not {"gdn_verify", "hop"} <= SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_push' pushes slot 'gdn_verify''s out_proj into "
@@ -247,8 +302,15 @@ def build(model, ctx):
     }
     facts = slot_plan.Facts(
         route=bound["moe"].route,
+        route_topk=bound["moe"].topk,
+        route_gemm=bound["moe"].gemm,
         mkm=bool(bound["moe"].mkm),
         mkm_wide=bound["moe"].mkm_wide,
+        mkm_m32=bool(bound["moe"].m32) and "mkm_m32" in SLOTS,
+        mkm_m64=bool(bound["moe"].m64),
+        mkm_m128=bool(bound["moe"].m128),
+        mkm_m256=bool(bound["moe"].m256),
+        mkm_m512=bool(bound["moe"].m512),
         gdn_verify=bound["gdn"].gdn_verify,
         gdn_pdl=bound["gdn"].gdn_pdl,
         gdn_core=bound["gdn"].gdn_core,
@@ -291,6 +353,34 @@ def build(model, ctx):
         <= slot_plan.MKM_MAX_ROWS
         else set()
     )
+    if (
+        slot_plan.widest(pctx.widths, slot_plan.MKM_M32_MAX_ROWS)
+        <= slot_plan.MKM_WIDE_MAX_ROWS
+    ):
+        vacuous.add("mkm_m32")
+    if (
+        slot_plan.widest(pctx.widths, slot_plan.MKM_M64_MAX_ROWS)
+        <= slot_plan.MKM_M32_MAX_ROWS
+    ):
+        vacuous.add("mkm_m64")
+    if (
+        slot_plan.widest(pctx.widths, slot_plan.MKM_M128_MAX_ROWS)
+        <= slot_plan.MKM_M64_MAX_ROWS
+    ):
+        vacuous.add("mkm_m128")
+    if (
+        slot_plan.widest(pctx.widths, slot_plan.MKM_M256_MAX_ROWS)
+        <= slot_plan.MKM_M128_MAX_ROWS
+    ):
+        vacuous.add("mkm_m256")
+    if (
+        slot_plan.widest(pctx.widths, slot_plan.MKM_M512_MAX_ROWS)
+        <= slot_plan.MKM_M256_MAX_ROWS
+    ):
+        vacuous.add("mkm_m512")
+    # route_topk has nothing to serve where slot route covers every width
+    if "route" in SLOTS and max(pctx.widths) <= slot_plan.ROUTE_MAX_ROWS:
+        vacuous.update({"route_topk", "route_gemm"})
     missing = sorted(name for name in target_slots - vacuous if not built[name])
     if missing:
         raise RuntimeError(

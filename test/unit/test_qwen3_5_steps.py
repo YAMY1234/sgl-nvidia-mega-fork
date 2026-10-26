@@ -513,7 +513,7 @@ def test_the_mkm_slot_runs_the_routed_experts_on_the_router_fronts_outputs(captu
                 "c(512,)",
                 "g2(512,)",
             ),
-            (),
+            (("routing", None),),
         ),
         ("combine", "main"),
     ]

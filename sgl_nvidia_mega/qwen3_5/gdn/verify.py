@@ -390,7 +390,11 @@ def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
     """Slot gdn_core: the ReplaySSM verify of the convolved rows ``qkv``, the gated norm
     and its static FP8 output in one launch (``sm103/gdn/core.py``), then ``out_proj``
     (FlashInfer's BMM, or the hop's push GEMM with ``opts.push``)."""
-    from sgl_nvidia_mega.qwen3_5.sm103.gdn.core import core
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn.core import (
+        RELEASE_MAX_ROWS,
+        RELEASE_MIN_ROWS,
+        core,
+    )
 
     attn, pools = gdn.attn, st.view.mamba
     li = pools.layer_ids.index(attn.layer_id)
@@ -403,6 +407,19 @@ def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
     def ring(t):
         return None if t is None else t[li]
 
+    # cuBLASLt's programmatic-dependent out-projection may start at the core's entry
+    # over the validated row window.
+    release = (
+        RELEASE_MIN_ROWS <= rows <= RELEASE_MAX_ROWS
+        and not opts.push
+        and not st.slots.lowm_outproj
+    )
+    if release and ("release", rows) not in _ENGAGED:
+        _ENGAGED.add(("release", rows))
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 slot gdn_core releases out_proj's BMM at its entry at %d rows",
+            rows,
+        )
     core(
         qkv,
         z,
@@ -427,16 +444,38 @@ def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
         x,
         rows_per_request=st.binding.tokens_per_request,
         num_k_heads=attn.num_k_heads,
-        early_dependents=opts.push,
+        early_dependents=opts.push or release,
     )
     if opts.push:
-        return st.bound["boundary"].hop.out_proj_push(
+        hop = st.bound["boundary"].hop
+        h0 = _route_lin_h0(hop, attn.layer_id, rows, st)
+        if h0 is not None:
+            # Slot route_lin: the router partial rides the out_proj push.
+            return hop.out_proj_push_rl(
+                x_fp8=x,
+                packed_w=st.bound["gdn"].packed[attn.layer_id],
+                input_scale=gdn.out_proj.input_scale,
+                weight_scale=gdn.out_proj.weight_scale,
+                rl_w=st.bound["gdn"].rlin[attn.layer_id],
+                h0=h0,
+            )
+        return hop.out_proj_push(
             x_fp8=x,
             packed_w=st.bound["gdn"].packed[attn.layer_id],
             input_scale=gdn.out_proj.input_scale,
             weight_scale=gdn.out_proj.weight_scale,
         )
     return _out_proj(gdn.out_proj, x, qkv.dtype, st, opts.lowm_push)
+
+
+def _route_lin_h0(hop, layer_id: int, rows: int, st):
+    """The layer input when slot route_lin can ride the out_proj push; else None."""
+    if not st.slots.route_lin or hop.rl is None or layer_id not in st.bound["gdn"].rlin:
+        return None
+    lid, h0 = st.scratch.get("rlin.h0", (None, None))
+    if lid != layer_id or h0 is None or tuple(h0.shape) != (rows, 4096):
+        return None
+    return h0
 
 
 def _core(attn, mixed_qkv, a, b, st, opts):

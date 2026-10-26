@@ -222,6 +222,7 @@ def _hoisted_kernel():
     ):
         if USE_GDC:
             tl.extra.cuda.gdc_wait()
+            # Keep this release after the wait: ReplaySSM (no wait_for_gate_producer) reads a / b before its wait.
             tl.extra.cuda.gdc_launch_dependents()
         idx_seq = tl.program_id(0)
         idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)

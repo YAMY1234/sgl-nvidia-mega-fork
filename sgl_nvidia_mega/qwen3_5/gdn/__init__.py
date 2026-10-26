@@ -48,6 +48,8 @@ SGLANG_READS = {
     ),
     "srt/layers/attention/hybrid_linear_attn_backend.py": ("linear_attn_backend",),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    "srt/layers/layer_boundary/fusions/norm.py": ("fused_norm_gamma",),
+    "srt/runtime_context.py": ("get_parallel",),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
@@ -70,6 +72,9 @@ class Bound(msgspec.Struct, frozen=True):
     packed: dict = msgspec.field(default_factory=dict)
     # slot gdn_front: layer id -> in_proj_qkvz's weights packed for the front
     front: dict = msgspec.field(default_factory=dict)
+    gdn_trt_front: bool = False  # TensorRT-LLM front built through four requests
+    # slot route_lin (numeric): layer id -> router-before-all-reduce packed weights
+    rlin: dict = msgspec.field(default_factory=dict)
     error: object = None  # the front's sticky error word, int32, zero
     reason: str = ""  # why a requested slot is not built
 
@@ -103,6 +108,11 @@ def build(model, ctx) -> Bound:
                 packed[gdn.attn.layer_id] = pack_out_proj(gdn.out_proj.weight.t())
             except ValueError as e:
                 return Bound(reason=f"layer {i}: {e}")
+    rlin = {}
+    if packed and "route_lin" in SLOTS:
+        rlin, reason = _route_lin(m, gdns)
+        if reason:
+            return Bound(reason=f"slot route_lin: {reason}")
     front_packed, error = {}, None
     if "gdn_front" in SLOTS:
         import torch
@@ -138,6 +148,8 @@ def build(model, ctx) -> Bound:
         gdn_conv="gdn_conv" in SLOTS,
         packed=packed,
         front=front_packed,
+        gdn_trt_front="gdn_trt_front" in SLOTS,
+        rlin=rlin,
         error=error,
     )
 
@@ -202,3 +214,46 @@ def step(layer, x, st):
     core = core.reshape(*core.shape[:-2], core.shape[-2] * core.shape[-1])
     out, _ = gdn.out_proj(core)
     return out
+
+
+def _route_lin(m, gdns) -> tuple[dict, str]:
+    """Packed route-lin weights for every GDN layer, or why they cannot be built."""
+    import torch
+    import torch.distributed as dist
+    from sglang.srt.layers.layer_boundary.fusions.norm import fused_norm_gamma
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.qwen3_5.sm103.hop import RL_WORLD, pack_router_lin
+
+    group = get_parallel().tp_group
+    if group.world_size != RL_WORLD:
+        return {}, f"TP {group.world_size} (serves TP {RL_WORLD})"
+    rank = dist.get_rank(group.device_group)
+    out = {}
+    for i, gdn in gdns:
+        layer = m.layers[i]
+        mlp = getattr(layer, "mlp", None)
+        boundary = getattr(layer, "ffn_boundary", None)
+        norm = getattr(getattr(boundary, "plan", None), "norm", None)
+        gamma = fused_norm_gamma(norm) if norm is not None else None
+        if (
+            mlp is None
+            or getattr(mlp, "gate", None) is None
+            or gamma is None
+            or layer.layer_id != gdn.attn.layer_id
+            or getattr(mlp, "layer_id", layer.layer_id) != layer.layer_id
+        ):
+            return {}, f"layer {i} has no router or fusible FFN-input norm"
+        try:
+            with torch.no_grad():
+                out[gdn.attn.layer_id] = pack_router_lin(
+                    mlp.gate.weight,
+                    gamma,
+                    gdn.out_proj.weight.t(),
+                    gdn.out_proj.input_scale,
+                    gdn.out_proj.weight_scale,
+                    rank,
+                )
+        except ValueError as error:
+            return {}, f"layer {i}: {error}"
+    return out, ""

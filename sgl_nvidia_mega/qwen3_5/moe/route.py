@@ -131,6 +131,7 @@ class Bound(msgspec.Struct, frozen=True):
     m128: bool = False  # slot mkm_m128: the 128-token engine built (on m32's maps)
     m256: bool = False  # slot mkm_m256: the 256-token engine built (on m32's maps)
     m512: bool = False  # slot mkm_m512: the 512-token engine built (on m32's maps)
+    wide_bal: bool = False  # opt-in balanced work split for mkm_m256 / mkm_m512
     reason: str = ""  # why a requested slot is not built
 
 
@@ -201,6 +202,7 @@ def build_m32(
     m128: bool = False,
     m256: bool = False,
     m512: bool = False,
+    wide_bal: bool = False,
 ) -> Bound:
     """Slots mkm_m32 / mkm_m64 / mkm_m128 / mkm_m256 / mkm_m512 on ``bound`` (route_topk
     built): the 32 / 64 / 128 / 256 / 512-token engines and every MoE layer's weight maps
@@ -226,6 +228,7 @@ def build_m32(
         intermediate,
         hi,
         min_rows=mkm_kernel.ENGINE_ROWS[bounds.index(lo) + 1] + 1,
+        wide_bal=wide_bal,
     )
     return msgspec.structs.replace(
         bound,
@@ -233,6 +236,7 @@ def build_m32(
         m128=m128,
         m256=m256,
         m512=m512,
+        wide_bal=wide_bal and (m256 or m512),
         m32={
             mlp.layer_id: bound.mkm.get(mlp.layer_id)
             or mkm_kernel.weight_maps(mlp.experts.w13_weight, mlp.experts.w2_weight)
@@ -475,4 +479,5 @@ def routed_given(mlp, x: torch.Tensor, bound: Bound, slot: str):
         x_fp4,
         x_sf,
         routing=(ids, weights),
+        wide_bal=bound.wide_bal,
     )

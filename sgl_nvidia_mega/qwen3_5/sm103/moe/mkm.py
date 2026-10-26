@@ -127,9 +127,10 @@ RESERVED_SMS = {
     M512_MAX_TOKENS: 0,
 }
 ONEPASS_MAX_ROWS = 42
+WIDE_BAL_MAX_ROWS = 0  # 0 means every row count served by a wide engine
 
 
-def engine_options(rows: int, plain: bool = False) -> tuple:
+def engine_options(rows: int, plain: bool = False, wide_bal: bool = False) -> tuple:
     """Validated bitwise schedule defines for a wide engine.
 
     The 64-token engine keeps its stock schedule past ``ONEPASS_MAX_ROWS``.
@@ -143,6 +144,8 @@ def engine_options(rows: int, plain: bool = False) -> tuple:
         )
     if rows == M64_MAX_TOKENS:
         return ("-DMMA_SFONLY=1",) + (() if plain else ("-DONEPASS=1",))
+    if rows in WIDE_ROWS and wide_bal and not plain:
+        return ("-DBAL_SPLIT=1",)
     return ()
 
 
@@ -206,14 +209,25 @@ def engine_rows(m: int) -> int:
     return next(r for r in ENGINE_ROWS if m <= r)
 
 
-def onepass_plain(rows: int, m: int) -> bool:
-    """Whether ``m`` rows use the 64-token engine's stock two-pass schedule."""
-    return rows == M64_MAX_TOKENS and m > ONEPASS_MAX_ROWS
+def plain_schedule(rows: int, m: int, wide_bal: bool = False) -> bool:
+    """Whether ``m`` rows use an engine's stock schedule.
+
+    The 64-token engine returns to two FC2 passes above its validated bound. An
+    opt-in balanced wide engine would likewise return to its static split above a
+    nonzero ``WIDE_BAL_MAX_ROWS``; zero covers every row count.
+    """
+    if rows == M64_MAX_TOKENS:
+        return m > ONEPASS_MAX_ROWS
+    return rows in WIDE_ROWS and wide_bal and 0 < WIDE_BAL_MAX_ROWS < m
 
 
 @cache
 def _kernel(
-    device_index: int, intermediate: int, rows: int, plain: bool = False
+    device_index: int,
+    intermediate: int,
+    rows: int,
+    plain: bool = False,
+    wide_bal: bool = False,
 ) -> jit.Kernel:
     """The engine of ``engine_rows`` bound ``rows`` at ``intermediate`` per rank."""
     engine = {
@@ -236,7 +250,7 @@ def _kernel(
             f"-DQ35_MKM_SMEM_BYTES={engine.smem_bytes}",
         )
         + engine.defines
-        + engine_options(rows, plain),
+        + engine_options(rows, plain, wide_bal),
     )
     return jit.load(cubin, engine.kernel, (THREADS, 1, 1), engine.smem_bytes)
 
@@ -295,15 +309,17 @@ def build(
     intermediate: int = 128,
     max_rows: int = MAX_TOKENS,
     min_rows: int = 1,
+    wide_bal: bool = False,
 ) -> None:
     """Compile the engines that serve ``intermediate`` per rank on ``min_rows`` to
     ``max_rows`` rows (no compile inside a step)."""
     lo = 0
     for hi in ENGINE_ROWS:
         if min_rows <= hi and max_rows > lo:
-            _kernel(device_index, intermediate, hi)
-            if onepass_plain(hi, max(lo + 1, min(max_rows, hi))):
-                _kernel(device_index, intermediate, hi, True)
+            balanced = wide_bal and hi in WIDE_ROWS
+            _kernel(device_index, intermediate, hi, wide_bal=balanced)
+            if plain_schedule(hi, max(lo + 1, min(max_rows, hi)), wide_bal=balanced):
+                _kernel(device_index, intermediate, hi, True, balanced)
         lo = hi
 
 
@@ -374,6 +390,7 @@ def mkm_moe(
     g1_scale_c: torch.Tensor,
     g2_alpha: torch.Tensor,
     routing: tuple | None = None,
+    wide_bal: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(gemm2_out bf16 [M * 10, 4096], expert_weights bf16 [M, 10]) for logits [M, 512]
     bf16 (M <= 7, at TP8 M <= 128) and the router front's x_fp4 [M, 2048] / x_sf [M, 256]
@@ -381,7 +398,8 @@ def mkm_moe(
     as uint8 (the engine follows I); g1_alpha, g1_scale_c, g2_alpha [512] fp32. With
     ``routing`` (route_topk's ids int32 / weights bf16 [M, 10]; 33 to 64 rows, and required
     at 65 to 512) the engine takes that routing instead of ranking the logits, and returns
-    those weights."""
+    those weights. ``wide_bal`` selects the opt-in balanced unit split of the 256 /
+    512-token engines."""
     m = logits.shape[0]
     intermediate = w2_sf.shape[2] * 16
     widest = max_tokens(
@@ -413,7 +431,14 @@ def mkm_moe(
         out=gemm2_out.data_ptr(),
         num_tokens=m,
     )
-    kernel = _kernel(device.index, intermediate, rows, onepass_plain(rows, m))
+    balanced = wide_bal and rows in WIDE_ROWS
+    kernel = _kernel(
+        device.index,
+        intermediate,
+        rows,
+        plain_schedule(rows, m, wide_bal=balanced),
+        balanced,
+    )
     stream = torch.cuda.current_stream().cuda_stream
     if rows in (M32_MAX_TOKENS, M64_MAX_TOKENS, M128_MAX_TOKENS) + WIDE_ROWS:
         # min(M * 10, SMs) CTAs, one per SM, each running its share of the distinct experts

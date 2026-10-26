@@ -52,6 +52,7 @@ EXTEND_MKD_HEAD = os.environ.get("SGLANG_PERFDRAFT_EXTEND_MKD_HEAD", "0") == "1"
 # Q35FLY (default off, equivalent arithmetic): head CTAs compute the hidden-half
 # FC in their weight-prefetch window, then all CTAs continue the head.
 HEAD_PARTIAL = os.environ.get("SGLANG_Q35FLY_DRAFT_HEAD_PARTIAL", "0") == "1"
+HEAD_EXCHANGE = os.environ.get("SGLANG_Q35FLY_DRAFT_HEAD_EXCHANGE", "0") == "1"
 
 # Memo rows built per launch at construction
 _MEMO_BLOCK = 4096
@@ -280,6 +281,20 @@ class MkdBoundary:
 
             prepare(dev.index, self.world, self.head_pad, False)
             logger.info("Q35FLY draft head+partial prepared on hidden rank %d", self.rank)
+        self._head_exchange_available = HEAD_EXCHANGE or any(
+            v.get("SGLANG_Q35FLY_DRAFT_HEAD_EXCHANGE") == "1"
+            for v in head_partial_variants.values()
+        )
+        self._head_exchange_input = None
+        self._head_exchange_done = None
+        if self._head_exchange_available:
+            from sgl_nvidia_mega.qwen3_5.sm103.draft.head_exchange import CLUSTER, prepare
+
+            if self.head_part is None or not memo:
+                raise RuntimeError("HP2 requires an installed MKD head and memo candidates")
+            self._head_exchange_ctas = self.head_part.numel() // CLUSTER * CLUSTER
+            self._head_exchange_done = torch.zeros(1, dtype=torch.int32, device=dev)
+            prepare(dev.index, self.world, self.head_pad, False, self._head_exchange_ctas)
         # extend_fc: the draft extend's exchange writes fc_buf for the next draft's first
         # step. input_seq counts calls that produce a draft input; fc_buf_key is the
         # input_seq whose extend wrote fc_buf.
@@ -450,10 +465,18 @@ class MkdBoundary:
         )
         return self._head_partial_available and enabled
 
+    @property
+    def fuse_head_exchange(self) -> bool:
+        enabled = (
+            os.environ.get("SGLANG_Q35FLY_DRAFT_HEAD_EXCHANGE", "0") == "1"
+            if self._head_partial_ab else HEAD_EXCHANGE
+        )
+        return self._head_exchange_available and enabled
+
     def _partial_ctas(self) -> int:
         """SMs left to the side-stream hidden partial on a hidden rank's step that sends
         one; 0 keeps one partial CTA per SM, queued behind the head."""
-        if self.fuse_head_partial or not self.is_hidden_rank or self.last_step or self.head_part is None:
+        if self.fuse_head_partial or self.fuse_head_exchange or not self.is_hidden_rank or self.last_step or self.head_part is None:
             return 0
         return max(0, min(self.partial_sms, self.head_part.numel() - 1))
 
@@ -468,6 +491,12 @@ class MkdBoundary:
         # the rest
         ctas = self.head_part.numel() - self._partial_ctas()
         self.head_part_cur = self.head_part[:ctas]
+        if self.fuse_head_exchange:
+            self.head_part_cur = self.head_part[:self._head_exchange_ctas]
+            self._head_exchange_input = (x, self.step % 2 == 1,
+                                         self.is_hidden_rank and not self.last_step)
+            self.head_used = True
+            return logits
         # Alternate the row walk per draft step: the next step re-reads first what is still in L2
         # (T1: -1.9 to -2.4 us per call on the TP8 shard).
         if self.fuse_head_partial and self.is_hidden_rank and not self.last_step:
@@ -504,6 +533,18 @@ class MkdBoundary:
         )
         self.partial_pending = True
 
+    def _launch_head_exchange(self, exchange):
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.head_exchange import launch
+
+        x, reverse, with_partial = self._head_exchange_input
+        norm = self.norm_hidden
+        launch(x, self.lm_head_weight, self._fc_shard, norm.weight.data,
+               norm.variance_epsilon, self.slice_start, self.own_partial,
+               self.epoch_done, self.partial_sync, self._head_exchange_done,
+               self.world, exchange, reverse=reverse, smem_pad=self.head_pad,
+               head_mx8=self.head_mx8, with_partial=with_partial)
+        self._head_exchange_input = None
+
     def set_head_mx8(self, head_mx8) -> None:
         """PERF-LP: the one-row head reads ``head_mx8``'s draft-only MXFP8 copy of the
         lm_head shard (``mkd_head_mx8``: the same logits rounding and per-CTA maxima)."""
@@ -515,6 +556,11 @@ class MkdBoundary:
             from sgl_nvidia_mega.qwen3_5.sm103.draft.head_partial import prepare
 
             prepare(self.lm_head_weight.device.index, self.world, self.head_pad, True)
+        if self._head_exchange_available:
+            from sgl_nvidia_mega.qwen3_5.sm103.draft.head_exchange import prepare
+
+            prepare(self.lm_head_weight.device.index, self.world, self.head_pad,
+                    True, self._head_exchange_ctas)
 
     def head_follows(self) -> bool:
         """Whether the draft head is the next launch after this step's final norm (an
@@ -537,7 +583,7 @@ class MkdBoundary:
     def hidden_partial(self, hidden_states: torch.Tensor) -> None:
         """This rank's hidden-slice fc partial for the next draft step, on a side stream;
         the exchange waits on its flag, not on a stream join."""
-        if not self.is_hidden_rank or self.last_step or self.fuse_head_partial:
+        if not self.is_hidden_rank or self.last_step or self.fuse_head_partial or self.fuse_head_exchange:
             return
         norm = self.norm_hidden
         self.side_stream.wait_stream(torch.cuda.current_stream())
@@ -607,6 +653,7 @@ class MkdBoundary:
             partial_flag=partial_flag,
             scan_part=self.scan_part,
             head_part=self.head_part_cur if self.head_used else None,
+            head_exchange=self._launch_head_exchange if self._head_exchange_input is not None else None,
         )
         self.head_used = False
         self.pending = not self.last_step
@@ -693,6 +740,12 @@ class MkdBoundary:
         ):
             return None
         x = hidden_states.to(torch.bfloat16).contiguous()
+        if self.fuse_head_exchange:
+            logits = torch.empty(1, self.lm_head_weight.shape[0], dtype=torch.bfloat16, device=x.device)
+            self.head_part_cur = self.head_part[:self._head_exchange_ctas]
+            self._head_exchange_input = (x, False, self.is_hidden_rank)
+            self.head_used = True
+            return logits
         partial_ctas = (
             max(0, min(self.partial_sms, self.head_part.numel() - 1))
             if self.is_hidden_rank and not self.fuse_head_partial
@@ -811,6 +864,7 @@ class MkdBoundary:
             else None,
             scan_part=self.scan_part,
             head_part=self.head_part_cur if mkd_head and self.head_used else None,
+            head_exchange=self._launch_head_exchange if self._head_exchange_input is not None else None,
         )
         if mkd_head:
             self.head_used = False

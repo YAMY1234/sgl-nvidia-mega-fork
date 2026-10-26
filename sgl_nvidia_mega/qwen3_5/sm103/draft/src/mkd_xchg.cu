@@ -119,7 +119,8 @@ struct MkdXchgParams {
  * [c * H / kChunks, ...) of the candidate and partial rows. Every CTA redoes the shard
  * argmax (a few tens of KB from L2) so no CTA waits for another before sending.
  */
-template <int kH, int kWorld, bool kMemo, int kChunks, int kThreads, bool kUsePDL, bool kSplitSend = false>
+template <int kH, int kWorld, bool kMemo, int kChunks, int kThreads, bool kUsePDL,
+          bool kSplitSend = false, bool kClusterTail = false>
 SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
   using namespace device;
   using vec_t = AlignedVector<bf16_t, 8>;
@@ -130,6 +131,10 @@ SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
   constexpr int kPartWords = kCols;
   constexpr int kRec = 2 + kCandWords + kPartWords;
   constexpr int kWarps = kThreads / 32;
+  // HP2 may alternate with the original 16-chunk graph while a slower peer
+  // still reads the preceding epoch. Keep the original physical rank/slot
+  // stride; only the records within a rank become eight wider chunks.
+  constexpr int kPacketWords = 16 * (2 + (kMemo ? kH / 16 : kH / 32) + kH / 16);
   static_assert(kH % (kChunks * 2) == 0);
 
   __shared__ uint32_t s_v[kWarps];
@@ -142,7 +147,9 @@ SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
   __shared__ uint32_t s_tag;
   __shared__ uint32_t s_best;
 
-  const int c = static_cast<int>(blockIdx.x);
+  // HP2: the last completed head cluster owns the exchange, irrespective of
+  // that cluster's physical position in the grid. Default entry code is unchanged.
+  const int c = kClusterTail ? static_cast<int>(blockIdx.x) % kChunks : static_cast<int>(blockIdx.x);
   const int warp = static_cast<int>(threadIdx.x / 32);
   const int lane = static_cast<int>(get_lane_id());
 
@@ -299,7 +306,10 @@ SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
   const int64_t brow = bidx;
 
   // Send this CTA's chunk of the packet to every rank (self included).
-  uint64_t* dst = p.mc + ((static_cast<int64_t>(slot) * kWorld + p.rank) * kChunks + c) * kRec;
+  const int64_t send_offset = kClusterTail
+      ? (static_cast<int64_t>(slot) * kWorld + p.rank) * kPacketWords + c * kRec
+      : ((static_cast<int64_t>(slot) * kWorld + p.rank) * kChunks + c) * kRec;
+  uint64_t* dst = p.mc + send_offset;
   if (threadIdx.x == 0) {
     mkd_xchg::mc_store(dst, best, tag);
     mkd_xchg::mc_store(dst + 1, hot_pos, tag);
@@ -341,7 +351,12 @@ SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
   const uint64_t t_sent = mkd_xchg::now_ns();
   // Receive in one batch: every rank's key and candidate chunk, and the hidden ranks'
   // partial chunks; the winner's candidate is then picked from shared memory.
-  auto rec = [&](int s) { return p.uc + ((static_cast<int64_t>(slot) * kWorld + s) * kChunks + c) * kRec; };
+  auto rec = [&](int s) {
+    const int64_t offset = kClusterTail
+        ? (static_cast<int64_t>(slot) * kWorld + s) * kPacketWords + c * kRec
+        : ((static_cast<int64_t>(slot) * kWorld + s) * kChunks + c) * kRec;
+    return p.uc + offset;
+  };
   constexpr int kHead = 2 + kCandWords;
   const int head = payload ? kHead : 2;
   const int heads = kWorld * head;

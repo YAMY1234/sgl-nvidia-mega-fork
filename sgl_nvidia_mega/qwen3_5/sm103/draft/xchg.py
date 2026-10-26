@@ -379,6 +379,7 @@ def mkd_xchg(
     partial_flag: Optional[torch.Tensor] = None,
     scan_part: Optional[torch.Tensor] = None,
     head_part: Optional[torch.Tensor] = None,
+    head_exchange=None,
 ) -> None:
     """Shard argmax + multicast exchange + selection for one draft token (2.2's
     ``mkd_xchg``, same arguments). ``cand`` holds bf16 embedding rows or fp32 memo rows of
@@ -480,6 +481,11 @@ def mkd_xchg(
         pf=jit.null_or_pointer(prefetch).value,
         pf_bytes=pf_bytes,
     )
+    if head_exchange is not None:
+        if not memo or head_part is None or trace is not None or prefetch is not None:
+            raise ValueError("HP2 requires a memo head, without trace/prefetch payloads")
+        head_exchange(p)
+        return
     kernels = _xchg_kernels(device.index, world)
     _launch(
         kernels[

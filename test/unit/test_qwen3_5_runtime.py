@@ -401,6 +401,10 @@ def test_the_draft_decode_keeps_cp_lite_for_cp_variants_and_multi_request(
         ({"draft_moe"}, "slot 'draft_moe' runs inside entry 'draft_loop'"),
         ({"draft_loop", "draft_hop"}, "slot 'draft_hop' runs on slot 'hop''s mailbox"),
         (
+            {"draft_loop", "draft_fin"},
+            "slot 'draft_fin' runs in slot 'draft_hop''s final norm",
+        ),
+        (
             {"draft_loop", "draft_skv2"},
             "slot 'draft_skv2' runs inside entry 'draft_extend'",
         ),
@@ -418,6 +422,117 @@ def test_the_draft_decode_keeps_cp_lite_for_cp_variants_and_multi_request(
 def test_the_draft_slots_name_what_they_need(monkeypatch, slots, want):
     monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
     assert [r.split(": ", 1)[1] for r in runtime.slot_reasons()] == [want]
+
+
+def test_the_draft_target_path_uses_its_validated_engine_ranges():
+    from sgl_nvidia_mega.qwen3_5.draft import moe_mkm
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm
+
+    draft = moe_mkm.DraftMkm(None, wide=True)
+    assert [
+        draft.takes(rows, per_request)
+        for rows, per_request in ((1, 1), (2, 1), (7, 7), (64, 1), (65, 1))
+    ] == [
+        False,
+        True,
+        True,
+        True,
+        False,
+    ]
+    assert [mkm.engine_rows(rows, m16_max_rows=12) for rows in (7, 12, 13, 16, 17)] == [
+        mkm.MAX_TOKENS,
+        mkm.M16_MAX_TOKENS,
+        mkm.M32_MAX_TOKENS,
+        mkm.M32_MAX_TOKENS,
+        mkm.M32_MAX_TOKENS,
+    ]
+
+
+@pytest.mark.parametrize(
+    "fused, path, taken, want",
+    [
+        (False, "sglang", True, ["mlp", "all_reduce", "norm"]),
+        (False, "mkm", True, ["mkm", "complete", "all_reduce", "norm"]),
+        (True, "sglang", True, ["mlp deferred", "fin"]),
+        (True, "mkm", True, ["mkm", "fin"]),
+        (True, "sglang", False, ["mlp deferred", "complete", "norm"]),
+        (True, "mkm", False, ["mkm", "complete", "all_reduce", "norm"]),
+    ],
+)
+def test_the_draft_extends_moe_output_is_reduced_once(
+    monkeypatch, fused, path, taken, want
+):
+    from sgl_nvidia_mega.qwen3_5.draft import layer
+
+    rows, log = 14, []
+    x = torch.ones(rows, 4)
+    routed = torch.bfloat16 if taken else torch.float32
+
+    def owed(reduced):
+        def complete():
+            log.append("complete")
+            return 8 * x if reduced else x
+
+        return SimpleNamespace(
+            m=rows,
+            routed_output=torch.zeros(1, dtype=routed),
+            expert_weights=torch.zeros(1, dtype=torch.bfloat16),
+            permuted_indices=torch.zeros(1, dtype=torch.int32),
+            gated_shared_output=torch.zeros(1, dtype=torch.bfloat16),
+            complete=complete,
+        )
+
+    def mlp(h, defer_finalize=False):
+        log.append("mlp deferred" if defer_finalize else "mlp")
+        return owed(reduced=True) if defer_finalize else h
+
+    def fin(*, residual, gamma, **_):
+        log.append("fin")
+        return residual + gamma, residual
+
+    def norm(h, residual):
+        log.append("norm")
+        return h + residual, residual
+
+    def mkm(lay, h):
+        log.append("mkm")
+        return owed(reduced=False)
+
+    mlp.supports_deferred_finalize = True
+    mkm.takes = lambda r, rows_per_request: True
+    norm.gemma_weight = 100.0
+    extend_hop = SimpleNamespace(
+        hop=SimpleNamespace(
+            supports=lambda m: m <= rows,
+            moe_finalize_all_reduce_rms_norm=fin,
+        ),
+        ffn_input=lambda h, residual, norm, moe_single_launch: (h, residual),
+    )
+    parts = SimpleNamespace(
+        layer=SimpleNamespace(
+            input_layernorm=lambda h: h,
+            post_attention_layernorm=None,
+            mlp=mlp,
+        ),
+        attention=lambda h, *args, rows_per_request, o_proj: h,
+        hop=extend_hop,
+        moe=None,
+        moe_mkm=mkm if path == "mkm" else None,
+        slots=frozenset({"draft_hop", "draft_fin"} if fused else {"draft_hop"}),
+        model=SimpleNamespace(norm=norm),
+    )
+
+    def all_reduce(h):
+        log.append("all_reduce")
+        return 8 * h
+
+    monkeypatch.setattr(
+        "sglang.srt.distributed.tensor_model_parallel_all_reduce", all_reduce
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    out = layer.layer(parts, x, None, None, None, None, rows_per_request=7)
+    assert log == want
+    assert torch.equal(out, x + 100.0 if "fin" in log else 8 * x + x)
 
 
 class _DraftParts:

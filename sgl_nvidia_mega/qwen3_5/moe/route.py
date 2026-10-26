@@ -132,6 +132,9 @@ class Bound(msgspec.Struct, frozen=True):
     m256: bool = False  # slot mkm_m256: the 256-token engine built (on m32's maps)
     m512: bool = False  # slot mkm_m512: the 512-token engine built (on m32's maps)
     wide_bal: bool = False  # opt-in balanced work split for mkm_m256 / mkm_m512
+    # A caller-specific upper bound for the 16-token engine. The draft uses 12 so
+    # its alternate-stream shared expert can overlap rows 13-16 with the 32-token engine.
+    m16_max_rows: int = 16
     reason: str = ""  # why a requested slot is not built
 
 
@@ -383,7 +386,15 @@ def _routed_experts(mlp, x, fused, logits, x_fp4, x_sf):
     experts = mlp.experts
     if fused is not None:
         maps = fused.mkm[mlp.layer_id]
-        return mkm.routed(mlp, maps, fused.identity, logits, x_fp4, x_sf)
+        return mkm.routed(
+            mlp,
+            maps,
+            fused.identity,
+            logits,
+            x_fp4,
+            x_sf,
+            m16_max_rows=fused.m16_max_rows,
+        )
     topk_output = mlp.topk(x, logits)
     if not TopKOutputChecker.format_is_bypassed(topk_output):
         raise RuntimeError("the router front requires logits-based bypassed TopK")
@@ -451,7 +462,15 @@ def routed_m32(mlp, x: torch.Tensor, bound: Bound, gemm: bool = False):
     else:
         logits, _ = mlp.gate(x)
         _, _, x_fp4, x_sf = router.route_topk_quant(logits, x, scale)
-    return mkm.routed(mlp, bound.m32[mlp.layer_id], bound.identity, logits, x_fp4, x_sf)
+    return mkm.routed(
+        mlp,
+        bound.m32[mlp.layer_id],
+        bound.identity,
+        logits,
+        x_fp4,
+        x_sf,
+        m16_max_rows=bound.m16_max_rows,
+    )
 
 
 def routed_given(mlp, x: torch.Tensor, bound: Bound, slot: str):
@@ -480,4 +499,5 @@ def routed_given(mlp, x: torch.Tensor, bound: Bound, slot: str):
         x_sf,
         routing=(ids, weights),
         wide_bal=bound.wide_bal,
+        m16_max_rows=bound.m16_max_rows,
     )

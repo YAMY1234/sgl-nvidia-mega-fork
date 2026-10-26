@@ -44,6 +44,8 @@ _INBOX = WIDE_MAX_ROWS // 8 * CLUSTER * 256 * 4
 ENTRIES = {
     "q35mka_prologue": 0,
     "q35mka_prologue_late": 0,
+    "q35mka_prologue_fp8": 0,
+    "q35mka_prologue_fp8_late": 0,
     "q35mka_gate": 0,
     "q35mka_epilogue_q4": 0,
     "q35mka_epilogue_q4_rl": 0,
@@ -198,8 +200,13 @@ def prologue(
     nq: int,
     eps: float,
     early_trigger: bool = True,
+    x8: Optional[torch.Tensor] = None,
 ) -> None:
-    """The branch's ``prologue`` (its host function's checks and launches)."""
+    """The branch's prologue, optionally reading the hop's exact static E4M3 copy.
+
+    ``x8`` is supported only for the TP8 seven-row entry. It replaces the
+    activation loads/quantization; every MMA and output operation is unchanged.
+    """
     w_main, w_gate = w_packed
     wide = x.shape[0] > MAX_ROWS
     if (
@@ -224,8 +231,19 @@ def prologue(
     if cache_loc.dtype not in (torch.int64, torch.int32):
         raise ValueError(f"MKA prologue: cache_loc of {cache_loc.dtype}")
     split = w_gate.numel() > 0
+    if x8 is not None and (
+        x.shape[0] != 7
+        or nq != 4
+        or split
+        or x8.dtype != torch.float8_e4m3fn
+        or x8.shape != x.shape
+        or x8.device != x.device
+        or not x8.is_contiguous()
+    ):
+        raise ValueError("MKA prologue: x8 requires contiguous TP8 E4M3 [7, 4096]")
     p = ProParams(
-        x=x.data_ptr(),
+        # The selected entry determines this pointer's dtype; the ABI is intact.
+        x=(x if x8 is None else x8).data_ptr(),
         w=w_main.data_ptr(),
         sx=sx.data_ptr(),
         sw=sw.data_ptr(),
@@ -251,7 +269,11 @@ def prologue(
         wg=w_gate.data_ptr() if split else None,
     )
     if not split:
-        name = "q35mka_prologue" + ("_wide" if wide else "") + ("" if early_trigger else "_late")
+        name = (
+            "q35mka_prologue"
+            + ("_fp8" if x8 is not None else "_wide" if wide else "")
+            + ("" if early_trigger else "_late")
+        )
         _launch(name, (2 * nq + 2) * CLUSTER, p, x.device)
         return
     # The gate launch must start while the prologue runs, so the prologue triggers right after its wait.

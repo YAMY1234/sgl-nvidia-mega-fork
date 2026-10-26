@@ -379,7 +379,11 @@ def layer_input_fp8_scale(layer, st, rows: int):
         if st.slots.gdn_front and not (rows % trt_front.ROWS == 0 and trt_front.takes(rows // trt_front.ROWS)):
             return None
         return layer.linear_attn.in_proj_qkvz.input_scale
-    if st.slots.mka and rows <= mka.FUSED_MAX_ROWS:
+    if (
+        st.slots.mka
+        and rows <= mka.FUSED_MAX_ROWS
+        and not mka.hop_fp8_input(rows, layer.num_heads)
+    ):
         return None
     return layer.qkv_proj.input_scale
 

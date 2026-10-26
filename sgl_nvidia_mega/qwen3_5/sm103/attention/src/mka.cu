@@ -178,7 +178,7 @@ __device__ __forceinline__ uint32_t gate_quant4_r(const uint2 ro, const uint2 rg
 __device__ __forceinline__ int slot_row(int s) { return 32 * (s >> 5) + ((s >> 2) & 7) + 8 * (s & 3); }
 
 struct ProParams {
-  const __nv_bfloat16* x;  // [M, 4096]
+  const __nv_bfloat16* x;  // [M, 4096]; the _fp8 entry interprets this as exact E4M3 bytes
   const uint4* w;          // packed qkv(+gate) weights
   const float* sx;
   const float* sw;
@@ -206,7 +206,7 @@ struct ProParams {
 
 // grid = (2*nq + 2) units x 8 ranks; unit u = qkv rows [256u, 256u + 256) (q_h, gate_h per head, then k,
 // v); rank r = K chunk [512r, 512r + 512) for the GEMM and token r for the epilogue.
-template <bool kEarlyTrigger>
+template <bool kEarlyTrigger, bool kFp8Input = false>
 __device__ __forceinline__ void mka_prologue_kernel(const ProParams p) {
   __shared__ __align__(16) float inbox[kCluster][256];
   __shared__ __align__(16) uint2 bfr[16][32];
@@ -278,12 +278,22 @@ __device__ __forceinline__ void mka_prologue_kernel(const ProParams p) {
   }
   {
     const bool tok_ok = g < m;
-    const __nv_bfloat16* xr = p.x + (size_t)g * 4096 + rank * 512 + 4 * t;
+    const size_t offset = (size_t)g * 4096 + rank * 512 + 4 * t;
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const int s = 2 * warp + i;
-      bfr[s][lane] = tok_ok ? make_uint2(quant4_static(xr + s * 32, inv_sx), quant4_static(xr + s * 32 + 16, inv_sx))
-                            : make_uint2(0u, 0u);
+      if constexpr (kFp8Input) {
+        // The hop rounds norm to BF16 before exact static quantization. These
+        // live loads stay after pdl_wait, as the original BF16 loads did.
+        const uint8_t* xr = reinterpret_cast<const uint8_t*>(p.x) + offset;
+        bfr[s][lane] = tok_ok ? make_uint2(*reinterpret_cast<const uint32_t*>(xr + s * 32),
+                                          *reinterpret_cast<const uint32_t*>(xr + s * 32 + 16))
+                              : make_uint2(0u, 0u);
+      } else {
+        const __nv_bfloat16* xr = p.x + offset;
+        bfr[s][lane] = tok_ok ? make_uint2(quant4_static(xr + s * 32, inv_sx), quant4_static(xr + s * 32 + 16, inv_sx))
+                              : make_uint2(0u, 0u);
+      }
     }
   }
   __syncthreads();
@@ -861,6 +871,14 @@ __device__ __forceinline__ void mka_epilogue_wide_kernel(const EpiParams p) {
 // C-linkage entries, one per instantiation the launcher uses (mka.py)
 extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_prologue(const q35mka::ProParams p) {
   q35mka::mka_prologue_kernel<true>(p);
+}
+
+extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_prologue_fp8(const q35mka::ProParams p) {
+  q35mka::mka_prologue_kernel<true, true>(p);
+}
+
+extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_prologue_fp8_late(const q35mka::ProParams p) {
+  q35mka::mka_prologue_kernel<false, true>(p);
 }
 namespace q35mka {
 // ---------------------------------------------------------------- router before the all-reduce (SGLANG_PERFLL_ROUTE_LIN)

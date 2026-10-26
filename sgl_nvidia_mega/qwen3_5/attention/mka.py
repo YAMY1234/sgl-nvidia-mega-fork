@@ -84,6 +84,19 @@ WEIGHTS: dict = {}
 _ENGAGED: set = set()
 
 
+def hop_fp8_input(rows: int, num_heads: int) -> bool:
+    """Q35FLY: consume the hop's exact E4M3 rows on TP8 B1 only.
+
+    Read at graph capture so same-service A/B variants can independently select
+    this path. Wider fused/front entries keep their existing input contract.
+    """
+    return (
+        rows == 7
+        and num_heads == 4
+        and os.environ.get("SGLANG_Q35FLY_MKA_HOP_FP8", "0") == "1"
+    )
+
+
 def _per_tensor_fp8(linear) -> bool:
     method = linear.quant_method
     return (
@@ -203,6 +216,13 @@ def step(layer, x, st):
     i = st.view.kv.layer_ids.index(attn.layer_id)
     k_scale, v_scale = split_kv.kv_scales(attn, x.device)
     w_qkv, w_o = WEIGHTS[attn.layer_id]
+    x8 = None
+    if st.slots.hop_fp8 and hop_fp8_input(m, layer.num_heads):
+        from sgl_nvidia_mega.qwen3_5 import lowm
+
+        x8 = lowm.take_fp8(st, x)
+        if x8 is not None:
+            lowm.engaged("hop_fp8", "MKA fused prologue", m)
     kernels.prologue(
         x=x.contiguous(),
         w_packed=w_qkv,
@@ -222,6 +242,7 @@ def step(layer, x, st):
         gate_out=gate,
         nq=layer.num_heads,
         eps=layer.q_norm.variance_epsilon,
+        **({"x8": x8} if x8 is not None else {}),
     )
     if st.slots.skv2:
         o = split_kv.core(attn, q, st)

@@ -232,7 +232,7 @@ class _MkaStep:
         self.loc.copy_(torch.randperm(POOL_SLOTS, device="cuda", generator=g)[:m])
         self.attn.copy_(torch.randn(self.attn.shape, device="cuda", generator=g))
 
-    def run(self, ops, early_trigger=True):
+    def run(self, ops, early_trigger=True, x8=None):
         from sgl_nvidia_mega.qwen3_5.sm103.attention import mka
 
         mka.prologue(
@@ -255,6 +255,7 @@ class _MkaStep:
             nq=HEADS,
             eps=1e-6,
             early_trigger=early_trigger,
+            x8=x8,
         )
         mka.epilogue(
             attn=self.attn,
@@ -297,6 +298,50 @@ def test_mka_replays_in_a_cuda_graph_bit_for_bit():
         step.run(ops)
         assert _same(replayed, step.bits())
         assert torch.isfinite(step.out.float()).all()
+
+
+@pytest.mark.parametrize("early", [False, True])
+@pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
+def test_q35fly_mka_hop_fp8_eager_and_graph_bitwise(early, loc_dtype):
+    """Exact input reuse must preserve Q, gate, all KV bytes and the epilogue.
+
+    The graph quantizes fresh BF16 inputs before every candidate replay, so a
+    stale x8 capture cannot pass. TP8 hop production is a separate serving gate.
+    """
+    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+
+    g = torch.Generator(device="cuda").manual_seed(10626)
+    ops = _mka_operands(g)
+    step = _MkaStep(7, g)
+    step.loc = step.loc.to(loc_dtype)
+
+    def candidate():
+        x8, _ = static_quant_fp8(step.x, ops["qkv_sx"])
+        step.run(ops, early_trigger=early, x8=x8)
+
+    def bits():
+        torch.cuda.synchronize()
+        return [t.clone().view(torch.uint8) for t in (step.q, step.gate, step.k, step.v, step.out)]
+
+    # Include saturation, signed zero and tiny values in addition to random rows.
+    values = torch.tensor(
+        [0.0, -0.0, 1e-8, -1e-8, 8.96, -8.96, 20.0, -20.0],
+        dtype=torch.bfloat16, device="cuda",
+    )
+    step.x[:, :8] = values
+    step.run(ops, early_trigger=early)
+    want = bits()
+    candidate()
+    assert _same(want, bits())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        candidate()
+    for _ in range(3):
+        step.fill(g)
+        step.run(ops, early_trigger=early)
+        want = bits()
+        graph.replay()
+        assert _same(want, bits())
 
 
 @pytest.mark.parametrize("m", [7, 14])

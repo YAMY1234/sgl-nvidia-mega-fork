@@ -137,6 +137,22 @@ NUMERIC_TOLERANCES = {
         "mka.o_proj.rel_l2_vs_stock": 1.05,
         "mka.o_proj.max_abs_vs_stock": 2.0,
     },
+    # the low-M launches against fp64 on the same E4M3 operands (test/kernels/test_qwen3_5_lowm.py)
+    "lowm_in": {
+        "lowm_in.in_proj_qkvz.rel_max_vs_stock": 1.05,
+        "lowm_in.in_proj_ba.rel_max_vs_stock": 1.05,
+        "lowm_in.qkv_proj.rel_max_vs_stock": 1.05,
+    },
+    "lowm_out": {
+        "lowm_out.out_proj.rel_max_vs_stock": 1.05,
+        "lowm_out.o_proj.rel_max_vs_stock": 1.05,
+    },
+    "lowm_se": {"lowm_se.shared_expert.rel_l2_vs_stock": 2e-2},
+    # the pushed partial is lowm_out's; the all-reduce that consumes it is the fusion's (test_qwen3_5_hop.py)
+    "lowm_push": {
+        "lowm_push.out_proj.rel_max_vs_stock": 1.05,
+        "lowm_push.o_proj.rel_max_vs_stock": 1.05,
+    },
 }
 
 

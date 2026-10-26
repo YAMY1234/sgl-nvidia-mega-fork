@@ -157,9 +157,15 @@ def _dual_stream(mlp, x, use_fused_gate: bool, defer: bool, st):
         # routed FC2 stays on the current stream, the finalize's PDL dependency
         routed = _router_experts(mlp, x, True, st)
         with torch.cuda.stream(mlp.alt_stream):
-            shared = mlp._forward_shared_experts(x, apply_gate=False)
-            if shared is not None:
-                shared = mlp._gate_shared_output_out_of_place(x, shared)
+            if st.slots.lowm_se:
+                from sgl_nvidia_mega.qwen3_5 import lowm
+
+                x8 = lowm.take_fp8(st, x) if st.slots.hop_fp8 else None
+                shared = lowm.shared_expert(mlp, x, st.bound["lowm"], x8)
+            else:
+                shared = mlp._forward_shared_experts(x, apply_gate=False)
+                if shared is not None:
+                    shared = mlp._gate_shared_output_out_of_place(x, shared)
         current.wait_stream(mlp.alt_stream)
         return routed, shared
     shared = (

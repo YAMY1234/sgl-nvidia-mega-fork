@@ -44,8 +44,8 @@ struct MkdHeadParams {
  * \brief One warp per weight row at a time, all 16 lane vectors of the row in flight; x in shared
  * memory. The first row of every warp is loaded before the PDL wait (weights are static).
  */
-template <int kK, int kWarps, bool kUsePDL>
-SGL_DEVICE void mkd_head_kernel(const MkdHeadParams& p) {
+template <int kK, int kWarps, bool kUsePDL, typename InputWork = MkdHeadNoInputWork>
+SGL_DEVICE void mkd_head_kernel(const MkdHeadParams& p, InputWork input_work = {}) {
   using namespace device;
   constexpr int kVecs = kK / 8 / 32;
   __shared__ alignas(16) bf16_t s_x[kK];
@@ -64,6 +64,7 @@ SGL_DEVICE void mkd_head_kernel(const MkdHeadParams& p) {
   }
   PDLWaitPrimary<kUsePDL>();
   PDLTriggerSecondary<kUsePDL>();
+  input_work();
   for (int i = static_cast<int>(threadIdx.x); i < kK / 8; i += kWarps * 32) {
     reinterpret_cast<uint4*>(s_x)[i] = reinterpret_cast<const uint4*>(p.x)[i];
   }

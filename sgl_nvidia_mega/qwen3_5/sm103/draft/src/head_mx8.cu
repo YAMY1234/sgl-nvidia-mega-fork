@@ -183,8 +183,9 @@ struct HeadMx8Params {
  * kK / (32 * kSliceBlocks) warps (gridDim.x <= ceil(n / 8)). kMkd (kM == 1): mkd_head's PDL
  * points and per-CTA packed maxima; else TRT-LLM's (trigger once the activation is staged).
  */
-template <int kK, int kSliceBlocks, int kM, bool kMkd, bool kKeys = false>
-SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
+template <int kK, int kSliceBlocks, int kM, bool kMkd, bool kKeys = false,
+          typename InputWork = MkdHeadNoInputWork>
+SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p, InputWork input_work = {}) {
   using namespace device;
   using namespace head_mx8;
   constexpr int kTokenTiles = (kM + kTokens - 1) / kTokens;
@@ -259,6 +260,7 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
   }
   PDLWaitPrimary<true>();
   if constexpr (kMkd) PDLTriggerSecondary<true>();
+  input_work();
 
   // ---- this warp's activation slice as f16 B fragments ----
   // act[t][b][j]: row 8t + g, K elements 32 (warp * kSliceBlocks + b) + 8q + 2j, + 1, as bf16

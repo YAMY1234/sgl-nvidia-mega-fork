@@ -25,6 +25,7 @@ arms a one-row step, the exchange leaves ``pending`` for the next step's ``fc``.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 from typing import Callable, Optional
@@ -47,6 +48,10 @@ FC_GEMV = os.environ.get("SGLANG_PERFLL_DRAFT_FC_GEMV", "0") == "1"
 # draft step's (extend_head): the one-row MKD head, whose per-CTA maxima spare the exchange its scan of the shard logits,
 # with the next draft's hidden partial beside it on the side stream, in place of the shard GEMV and a serial partial
 EXTEND_MKD_HEAD = os.environ.get("SGLANG_PERFDRAFT_EXTEND_MKD_HEAD", "0") == "1"
+
+# Q35FLY (default off, equivalent arithmetic): head CTAs compute the hidden-half
+# FC in their weight-prefetch window, then all CTAs continue the head.
+HEAD_PARTIAL = os.environ.get("SGLANG_Q35FLY_DRAFT_HEAD_PARTIAL", "0") == "1"
 
 # Memo rows built per launch at construction
 _MEMO_BLOCK = 4096
@@ -260,6 +265,21 @@ class MkdBoundary:
         self.head_pad = head_smem_pad
         self.partial_sms = partial_sms
         self._install_head(head, dev)
+        # Capability is built once, even when the first same-boot A/B arm is off.
+        # Capture-time dispatch below follows each arm's environment. This does
+        # not depend on the optional SGLang ab_variants helper (absent in R11).
+        head_partial_variants = json.loads(os.environ.get("Q35MF_AB_VARIANTS") or "{}")
+        self._head_partial_ab = bool(head_partial_variants)
+        self._head_partial_available = self.head_part is not None and (
+            HEAD_PARTIAL
+            or any(v.get("SGLANG_Q35FLY_DRAFT_HEAD_PARTIAL") == "1"
+                   for v in head_partial_variants.values())
+        )
+        if self._head_partial_available and self.is_hidden_rank:
+            from sgl_nvidia_mega.qwen3_5.sm103.draft.head_partial import prepare
+
+            prepare(dev.index, self.world, self.head_pad, False)
+            logger.info("Q35FLY draft head+partial prepared on hidden rank %d", self.rank)
         # extend_fc: the draft extend's exchange writes fc_buf for the next draft's first
         # step. input_seq counts calls that produce a draft input; fc_buf_key is the
         # input_seq whose extend wrote fc_buf.
@@ -273,6 +293,7 @@ class MkdBoundary:
         self.step = 0
         self.last_step = False
         self.partial_pending = False
+        self._partial_side_stream_pending = False
         self._extend_head_noted = False
         # the vocabulary exchange's per-step outputs (DraftVocabExchange)
         self.num_rows = 1
@@ -419,10 +440,20 @@ class MkdBoundary:
             self.partial_sms,
         )
 
+    @property
+    def fuse_head_partial(self) -> bool:
+        # This runs while building/capturing the draft step, not on graph replay.
+        # An A arm must retain its original side stream and 24-SM reservation.
+        enabled = (
+            os.environ.get("SGLANG_Q35FLY_DRAFT_HEAD_PARTIAL", "0") == "1"
+            if self._head_partial_ab else HEAD_PARTIAL
+        )
+        return self._head_partial_available and enabled
+
     def _partial_ctas(self) -> int:
         """SMs left to the side-stream hidden partial on a hidden rank's step that sends
         one; 0 keeps one partial CTA per SM, queued behind the head."""
-        if not self.is_hidden_rank or self.last_step or self.head_part is None:
+        if self.fuse_head_partial or not self.is_hidden_rank or self.last_step or self.head_part is None:
             return 0
         return max(0, min(self.partial_sms, self.head_part.numel() - 1))
 
@@ -439,7 +470,9 @@ class MkdBoundary:
         self.head_part_cur = self.head_part[:ctas]
         # Alternate the row walk per draft step: the next step re-reads first what is still in L2
         # (T1: -1.9 to -2.4 us per call on the TP8 shard).
-        if self.head_mx8 is not None:
+        if self.fuse_head_partial and self.is_hidden_rank and not self.last_step:
+            self._head_with_partial(x, logits, reverse=self.step % 2 == 1)
+        elif self.head_mx8 is not None:
             self.head_mx8.mkd_head(
                 x,
                 logits,
@@ -459,6 +492,18 @@ class MkdBoundary:
         self.head_used = True
         return logits
 
+    def _head_with_partial(self, x, logits, *, reverse):
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.head_partial import head_with_partial
+
+        norm = self.norm_hidden
+        head_with_partial(
+            x, self.lm_head_weight, logits, self.head_part_cur, self._fc_shard,
+            norm.weight.data, norm.variance_epsilon, self.slice_start,
+            self.own_partial, self.epoch_done, self.partial_sync, self.world,
+            reverse=reverse, smem_pad=self.head_pad, head_mx8=self.head_mx8,
+        )
+        self.partial_pending = True
+
     def set_head_mx8(self, head_mx8) -> None:
         """PERF-LP: the one-row head reads ``head_mx8``'s draft-only MXFP8 copy of the
         lm_head shard (``mkd_head_mx8``: the same logits rounding and per-CTA maxima)."""
@@ -466,6 +511,10 @@ class MkdBoundary:
             return
         head_mx8.prepare_mkd(self.head_pad)
         self.head_mx8 = head_mx8
+        if self._head_partial_available and self.is_hidden_rank:
+            from sgl_nvidia_mega.qwen3_5.sm103.draft.head_partial import prepare
+
+            prepare(self.lm_head_weight.device.index, self.world, self.head_pad, True)
 
     def head_follows(self) -> bool:
         """Whether the draft head is the next launch after this step's final norm (an
@@ -488,7 +537,7 @@ class MkdBoundary:
     def hidden_partial(self, hidden_states: torch.Tensor) -> None:
         """This rank's hidden-slice fc partial for the next draft step, on a side stream;
         the exchange waits on its flag, not on a stream join."""
-        if not self.is_hidden_rank or self.last_step:
+        if not self.is_hidden_rank or self.last_step or self.fuse_head_partial:
             return
         norm = self.norm_hidden
         self.side_stream.wait_stream(torch.cuda.current_stream())
@@ -506,13 +555,15 @@ class MkdBoundary:
                 ctas=self._partial_ctas(),
             )
         self.partial_pending = True
+        self._partial_side_stream_pending = True
 
     def _join_side_streams(self) -> None:
         # Joins only end graph capture cleanly: the exchange syncs on flags; a join before
         # the exchange would cost its early launch.
-        if self.partial_pending:
+        if self._partial_side_stream_pending:
             torch.cuda.current_stream().wait_stream(self.side_stream)
-            self.partial_pending = False
+            self._partial_side_stream_pending = False
+        self.partial_pending = False
 
     def exchange(
         self,
@@ -644,10 +695,10 @@ class MkdBoundary:
         x = hidden_states.to(torch.bfloat16).contiguous()
         partial_ctas = (
             max(0, min(self.partial_sms, self.head_part.numel() - 1))
-            if self.is_hidden_rank
+            if self.is_hidden_rank and not self.fuse_head_partial
             else 0
         )
-        if self.is_hidden_rank:
+        if self.is_hidden_rank and not self.fuse_head_partial:
             norm = self.norm_hidden
             self.side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.side_stream):
@@ -664,11 +715,14 @@ class MkdBoundary:
                     ctas=partial_ctas,
                 )
             self.partial_pending = True
+            self._partial_side_stream_pending = True
         logits = torch.empty(
             1, self.lm_head_weight.shape[0], dtype=torch.bfloat16, device=x.device
         )
         self.head_part_cur = self.head_part[: self.head_part.numel() - partial_ctas]
-        if self.head_mx8 is not None:
+        if self.fuse_head_partial and self.is_hidden_rank:
+            self._head_with_partial(x, logits, reverse=False)
+        elif self.head_mx8 is not None:
             self.head_mx8.mkd_head(
                 x, logits, self.head_part_cur, reverse=False, smem_pad=self.head_pad
             )
@@ -689,7 +743,9 @@ class MkdBoundary:
                 "%s head on %d CTAs, %s",
                 "MXFP8" if self.head_mx8 is not None else "BF16",
                 self.head_part_cur.numel(),
-                f"hidden partial on {partial_ctas} SMs of the side stream"
+                "hidden partial inside head"
+                if self.is_hidden_rank and self.fuse_head_partial
+                else f"hidden partial on {partial_ctas} SMs of the side stream"
                 if self.is_hidden_rank
                 else "no partial (embedding rank)",
             )

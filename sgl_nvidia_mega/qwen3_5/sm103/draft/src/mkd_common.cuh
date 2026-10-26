@@ -27,6 +27,12 @@ namespace sglang {
 using fp32_t = float;
 using bf16_t = __nv_bfloat16;
 
+// A compile-time hook after the head's static-weight prefetch and PDL wait.
+// The default instantiation has no instructions or state.
+struct MkdHeadNoInputWork {
+  SGL_DEVICE void operator()() const {}
+};
+
 namespace device {
 
 inline constexpr uint32_t kWarpThreads = 32u;

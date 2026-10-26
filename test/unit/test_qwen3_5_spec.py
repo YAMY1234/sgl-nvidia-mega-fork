@@ -597,3 +597,13 @@ def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
         **spec.NUMERIC_TOLERANCES["gdn_trt_front"],
         **spec.NUMERIC_TOLERANCES["route_lin"],
     }
+
+
+def test_the_shipped_policy_claims_bitwise_numerics():
+    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
+
+    from sgl_nvidia_mega.qwen3_5 import draft
+
+    shipped = frozenset(runtime.SHIPPED_SLOTS)
+    assert spec.numerics(shipped).kind is NumericsKind.BITWISE
+    assert draft.numerics(shipped).kind is NumericsKind.BITWISE

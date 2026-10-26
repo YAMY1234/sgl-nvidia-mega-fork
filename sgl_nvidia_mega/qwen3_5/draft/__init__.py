@@ -3,9 +3,9 @@
 """Qwen3.5's MTP draft on SM103 (GB300): the megakernel draft spec and its built
 object.
 
-The draft's forward stays SGLang's (the built object covers no step width). Requested
-in ``SGLANG_NVIDIA_MEGAKERNEL_SLOTS``, the built object offers SGLang's EAGLE draft
-entries for one request (bs 1), which run inside SGLang's draft graphs:
+The draft's forward stays SGLang's (the built object covers no step width). Selected by
+the Qwen3.5 runtime policy, the built object offers SGLang's EAGLE draft entries, which
+run inside SGLang's draft graphs:
 
 - ``draft_loop`` (with ``begin_draft_round``): the whole draft loop of a served draft
   graph (``loop``);
@@ -202,7 +202,7 @@ class MtpDraft:
 
 
 def _requested() -> frozenset:
-    """The draft's entries and slots in SGLANG_NVIDIA_MEGAKERNEL_SLOTS."""
+    """The draft entries and slots selected by the Qwen3.5 runtime policy."""
     from sgl_nvidia_mega.qwen3_5 import runtime
 
     return runtime.SLOTS & (set(runtime.DRAFT_ENTRIES) | set(runtime.DRAFT_SLOTS))

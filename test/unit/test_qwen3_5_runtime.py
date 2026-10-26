@@ -46,6 +46,37 @@ def _batch(verify=True):
     )
 
 
+def test_the_default_policy_ships_only_bitwise_shape_bounded_paths(monkeypatch):
+    monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    assert runtime._requested_slots() == frozenset(
+        {
+            "route_topk",
+            "mkm_m32",
+            "mkm_m64",
+            "mkm_m128",
+            "mkm_m256",
+            "mkm_m512",
+            "gdn_verify",
+            "gdn_pdl",
+            "gdn_conv",
+            "hop",
+            "hop_fp8",
+            "multi_request",
+            "draft_loop",
+            "draft_extend",
+            "draft_multi",
+            "draft_embed",
+        }
+    )
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    assert runtime.slot_reasons() == []
+
+
+def test_an_explicit_empty_policy_keeps_every_slot_off(monkeypatch):
+    monkeypatch.setenv(runtime.SLOTS_ENV, "")
+    assert runtime._requested_slots() == frozenset()
+
+
 def test_only_target_verify_steps_of_built_widths_are_covered():
     built = _verify()
     ids = torch.zeros(7, dtype=torch.int64)
@@ -92,7 +123,7 @@ def test_the_build_covers_more_requests_only_where_a_slot_runs(
     assert built.widths == want and built.summary() == "slots none (stock)"
 
 
-def test_the_build_hands_over_the_binding_and_every_entry_stays_sglangs():
+def test_the_build_hands_over_the_binding_and_ships_the_bitwise_draft_entries():
     from sglang.kernels.plugin_kernels.nvidia.spec import ENTRIES
 
     from sgl_nvidia_mega.qwen3_5 import draft
@@ -104,7 +135,11 @@ def test_the_build_hands_over_the_binding_and_every_entry_stays_sglangs():
     assert built.plan(ids, _batch()) == Step(mode="target_verify", rows=7)
     target, mtp = built, draft.SPEC.build("lm", None, _draft_ctx())
     assert [n for n in ENTRIES if getattr(target, n, None) is not None] == []
-    assert [n for n in ENTRIES if getattr(mtp, n, None) is not None] == []
+    assert [n for n in ENTRIES if getattr(mtp, n, None) is not None] == [
+        "draft_loop",
+        "draft_extend",
+        "begin_draft_round",
+    ]
 
 
 def test_verify_sample_is_refused_with_the_switch_that_replaces_it(monkeypatch):
@@ -201,11 +236,15 @@ def test_the_mtp_draft_covers_no_step():
     )
     assert built.plan(torch.zeros(7, dtype=torch.int64), _batch()) is None
     assert (draft.ARCHITECTURE, "sgl_nvidia_mega.qwen3_5.draft:SPEC") in plugin.SPECS
-    # without a request every draft phase stays SGLang's
-    assert [n for n in ENTRIES if getattr(built, n, None) is not None] == []
+    # Entries replace SGLang's draft graphs, not a model-forward width.
+    assert [n for n in ENTRIES if getattr(built, n, None) is not None] == [
+        "draft_loop",
+        "draft_extend",
+        "begin_draft_round",
+    ]
 
 
-def test_the_draft_entries_are_offered_only_on_request(monkeypatch):
+def test_an_explicit_policy_controls_the_draft_entries(monkeypatch):
     from sglang.kernels.plugin_kernels.nvidia.spec import ENTRIES
 
     from sgl_nvidia_mega.qwen3_5 import draft

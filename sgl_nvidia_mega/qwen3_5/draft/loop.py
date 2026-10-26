@@ -28,7 +28,7 @@ import logging
 import torch
 
 from sgl_nvidia_mega.qwen3_5 import plan
-from sgl_nvidia_mega.qwen3_5.draft import LOOP_BS, SERVED_BS, layer
+from sgl_nvidia_mega.qwen3_5.draft import LOOP_BS, MULTI_LOOP_BS, SERVED_BS, layer
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,8 @@ class DraftLoop:
 
         if not plan.multi_request(self.parts.binding.tp_size, SLOTS):
             return self.step if bs == SERVED_BS else None
-        return self.step if bs in LOOP_BS else None
+        multi = MULTI_LOOP_BS if "draft_multi" in self.parts.slots else ()
+        return self.step if bs in LOOP_BS + multi else None
 
     def begin_round(self, io) -> None:
         """On the host before a served draft graph replays: the first step's fc when
@@ -102,6 +103,8 @@ class DraftLoop:
         positions, mrope = io.positions, io.mrope_positions
         if parts.mkd is not None and io.num_requests == SERVED_BS:
             self._mkd_steps(io, steps)
+        elif parts.top1x is not None and io.num_requests in MULTI_LOOP_BS:
+            self._multi_steps(io, steps)
         else:
             token, hidden = io.topk_index.view(-1), io.hidden_states
             for i in range(steps):
@@ -116,10 +119,12 @@ class DraftLoop:
             mrope.sub_(steps)
 
     def _fc(self, token, hidden):
-        """A step's fc output outside the exchange: slot draft_xchg's row-split fc, else
-        SGLang's."""
+        """A step's fc output outside the exchange: slot draft_xchg's row-split fc up to
+        its widest batch, else SGLang's."""
+        from sgl_nvidia_mega.qwen3_5.draft.xchg import FC_SPLIT_MAX_TOKENS
+
         mkd = self.parts.mkd
-        if mkd is None:
+        if mkd is None or token.shape[0] > FC_SPLIT_MAX_TOKENS:
             return layer.fc_input(self.parts, token, hidden)
         return mkd.split_fc(self.parts.model.embed_tokens(token), hidden)
 
@@ -139,6 +144,28 @@ class DraftLoop:
             io.kv,
             rows_per_request=1,
         )
+
+    def _multi_steps(self, io, steps: int) -> None:
+        """The steps of more requests with slot draft_multi: SGLang's model step (with
+        the split fc where slot draft_xchg runs), then the sharded top-1, which writes
+        the token column and advances the positions in one launch; the next step embeds
+        that column. Drafts SGLang's split argmax would choose (a NaN as -1e30)."""
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.top1 import NAN_KEY_SPLIT_ARGMAX
+
+        tokens = io.draft_tokens_out
+        token, hidden = io.topk_index.view(-1), io.hidden_states
+        for i in range(steps):
+            hidden = self._model_step(io, i, self._fc(token, hidden))
+            layer.top1_into(
+                self.parts,
+                hidden,
+                tokens,
+                i + 1,
+                nan_key=NAN_KEY_SPLIT_ARGMAX,
+                positions=io.positions,
+                mrope_positions=io.mrope_positions,
+            )
+            token = tokens[:, i + 1]
 
     def _mkd_steps(self, io, steps: int) -> None:
         """The steps with slot draft_xchg, in 2.2's order: fc from the exchange, the

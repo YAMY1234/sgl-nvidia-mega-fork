@@ -45,6 +45,9 @@ class SplitKVGraphVariants(msgspec.Struct, frozen=True):
     min_length: int
     # capture order matters where the variants share a graph memory pool
     capture_labels: ClassVar[tuple[str, ...]] = (SPLIT_KV_STOCK, SPLIT_KV_LONG)
+    # select picks the stock label past one request (and the steps read the label only
+    # for one), so SGLang captures one graph at every larger batch size
+    max_batch_size: ClassVar[int] = 1
 
     def select(self, forward_batch) -> str:
         if forward_batch.batch_size != 1:

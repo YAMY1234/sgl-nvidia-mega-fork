@@ -214,11 +214,14 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(7, every)) == sorted(plan.Slots.__struct_fields__)
     # two requests: the 16-row router front, the GDN chain and the hop's one-shot rows
     assert _on(plan.slots(14, every)) == ["gdn_pdl", "gdn_verify", "hop", "route"]
-    # four requests: past the router front's and the one-shot all-reduce's rows
+    # four requests and wider: past the router front's and one-shot all-reduce's rows
     assert _on(plan.slots(28, every)) == ["gdn_pdl", "gdn_verify"]
-    # SGLang offers every multiple of 7 up to MAX_ROWS; three requests are not covered
+    for rows in (56, 112, 224, 448, 896):
+        assert _on(plan.slots(rows, every)) == ["gdn_pdl", "gdn_verify"]
+    # SGLang offers every multiple of 7 up to MAX_ROWS; every request count is a candidate
     offered = tuple(range(7, plan.MAX_ROWS + 1, 7))
-    assert plan.candidates(offered, 7) == (7, 14, 28)
+    assert plan.candidates(offered, 7) == offered
+    assert plan.candidates(offered + (903,), 7) == offered
     assert plan.candidates(offered, 7, multi=False) == (7,)
     # more than one request only when requested, and only at TP8; TP4 keeps the
     # one-request step it is checked at
@@ -226,6 +229,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert not plan.multi_request(8, frozenset())
     assert not plan.multi_request(4, frozenset({"multi_request"}))
     assert plan.covered((7, 14, 28), every, 7) == (7, 14, 28)
+    assert plan.covered((7, 448, 896), every, 7) == (7, 448, 896)
     # one request is always covered, more only where a slot runs
     assert plan.covered((7, 14, 28), plan.Facts(), 7) == (7,)
     assert plan.covered((7, 14, 28), plan.Facts(route=True, mkm=True), 7) == (7, 14)

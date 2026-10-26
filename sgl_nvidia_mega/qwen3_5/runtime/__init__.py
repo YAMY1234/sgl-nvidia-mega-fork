@@ -45,6 +45,9 @@ DRAFT_SLOTS: tuple[str, ...] = (
     "draft_hop",
     "draft_front",
     "draft_skv2",
+    # draft_loop and draft_extend also serve TP8's draft graphs of 2 to 128 requests,
+    # and those of two or more take the sharded top-1 (with multi_request)
+    "draft_multi",
 )
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 # These slots run all 512 experts themselves. Under expert parallelism, keep the
@@ -126,6 +129,11 @@ def slot_reasons() -> list[str]:
             reasons.append(f"{SLOTS_ENV}: slot {name!r} runs inside entry 'draft_loop'")
     if "draft_hop" in SLOTS and "hop" not in SLOTS:
         reasons.append(f"{SLOTS_ENV}: slot 'draft_hop' runs on slot 'hop''s mailbox")
+    if "draft_multi" in SLOTS and "multi_request" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'draft_multi' serves the draft steps of two or more "
+            "requests ('multi_request')"
+        )
     if "draft_skv2" in SLOTS and "draft_extend" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'draft_skv2' runs inside entry 'draft_extend'"

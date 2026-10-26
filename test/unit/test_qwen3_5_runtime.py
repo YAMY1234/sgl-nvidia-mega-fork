@@ -333,9 +333,17 @@ def test_the_cp_slots_offer_the_draft_runners_a_cp_variant(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("rows, label", [(1, "q1_cp"), (7, "split_kv_cp")])
-def test_the_draft_decode_takes_cp_lite_for_one_request_in_its_cp_variant(
-    monkeypatch, rows, label
+@pytest.mark.parametrize(
+    "rows,label,requests,min_bs",
+    [
+        (1, "q1_cp", 1, 1),
+        (7, "split_kv_cp", 1, 1),
+        (1, "q1_stock", 4, None),
+        (7, "split_kv_stock", 4, None),
+    ],
+)
+def test_the_draft_decode_keeps_cp_lite_for_cp_variants_and_multi_request(
+    monkeypatch, rows, label, requests, min_bs
 ):
     from sgl_nvidia_mega.qwen3_5.attention import route, split_kv
     from sgl_nvidia_mega.qwen3_5.draft import attention as draft_attention
@@ -370,19 +378,21 @@ def test_the_draft_decode_takes_cp_lite_for_one_request_in_its_cp_variant(
     attn.heads, attn.head_dim, attn.page_size = heads, dim, page
     attn.q1 = attn.skv2 = None
     attn._noted = set()
-    attn.cp_b1 = draft_attention.DraftCP(split_kv, route, steps=True, extend=True)
+    attn.cp_b1 = draft_attention.DraftCP(
+        split_kv, route, steps=True, extend=True, multi=requests > 1
+    )
     cache = torch.zeros(4 * page, 1, dim, dtype=torch.float8_e4m3fn)
     kv = SimpleNamespace(
         layer_ids=(5,), k=(cache,), v=(cache,), k_scale=(2.0,), v_scale=(3.0,)
     )
     meta = SimpleNamespace(
-        page_table=torch.zeros(1, 4, dtype=torch.int32),
-        cache_seqlens=torch.full((1,), 100, dtype=torch.int32),
+        page_table=torch.zeros(requests, 4, dtype=torch.int32),
+        cache_seqlens=torch.full((requests,), 100, dtype=torch.int32),
     )
-    q8 = torch.zeros(rows, heads * dim, dtype=torch.float8_e4m3fn)
+    q8 = torch.zeros(requests * rows, heads * dim, dtype=torch.float8_e4m3fn)
     out = attn.decode(q8, meta, kv, rows_per_request=rows)
-    assert out.shape == (rows, heads * dim) and bool((out == 1).all())
-    assert calls == [((rows, heads, dim), rows, 1.0, 3.0, 1)]
+    assert out.shape == (requests * rows, heads * dim) and bool((out == 1).all())
+    assert calls == [((requests * rows, heads, dim), rows, 1.0, 3.0, min_bs)]
 
 
 @pytest.mark.parametrize(
@@ -398,6 +408,10 @@ def test_the_draft_decode_takes_cp_lite_for_one_request_in_its_cp_variant(
             {"draft_loop", "draft_multi"},
             "slot 'draft_multi' serves the draft steps of two or more requests "
             "('multi_request')",
+        ),
+        (
+            {"draft_loop", "multi_request", "draft_embed"},
+            "slot 'draft_embed' runs in slot 'draft_multi''s steps",
         ),
     ],
 )
@@ -415,6 +429,9 @@ class _DraftParts:
 
     def note_engaged(self, entry, bs):
         self.engaged.append((entry, bs))
+
+    def embed(self, token_ids):
+        return self.model.embed_tokens(token_ids)
 
 
 def _stub_model_step(monkeypatch, calls):
@@ -569,6 +586,21 @@ def test_a_multi_request_draft_loop_takes_the_sharded_top1(monkeypatch):
     # the request-major slots of step i, made dense
     assert [c[2] for c in calls if c[0] == "layer"] == [[0, 3, 6, 9], [1, 4, 7, 10]]
     assert io.positions.tolist() == [10, 20, 30, 40]
+
+
+def test_the_draft_embeds_through_the_exchange_where_it_fits():
+    from sgl_nvidia_mega.qwen3_5.draft.parts import Parts
+    from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import MAX_ROWS
+
+    calls = []
+    parts = Parts.__new__(Parts)
+    parts.model = SimpleNamespace(embed_tokens=lambda t: calls.append("sglang") or t)
+    parts.embedx = None
+    parts.embed(torch.zeros(4, dtype=torch.int64))
+    parts.embedx = lambda t: calls.append("exchange") or t
+    parts.embed(torch.zeros(MAX_ROWS, dtype=torch.int64))
+    parts.embed(torch.zeros(MAX_ROWS + 1, dtype=torch.int64))
+    assert calls == ["sglang", "exchange", "sglang"]
 
 
 @pytest.mark.parametrize("requests, split", [(16, True), (32, False)])

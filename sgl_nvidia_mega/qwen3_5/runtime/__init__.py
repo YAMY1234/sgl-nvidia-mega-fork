@@ -68,6 +68,9 @@ DRAFT_SLOTS: tuple[str, ...] = (
     # draft_loop and draft_extend also serve TP8's draft graphs of 2 to 128 requests,
     # and those of two or more take the sharded top-1 (with multi_request)
     "draft_multi",
+    # Their embedding rows are multicast by the rank holding the token, in place of
+    # the vocabulary-parallel embedding's all-reduce.
+    "draft_embed",
     # One long request's steps / extend use CP-lite in graph variants of their own.
     "draft_q1_cp",
     "draft_skv2_cp",
@@ -224,6 +227,10 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'draft_multi' serves the draft steps of two or more "
             "requests ('multi_request')"
+        )
+    if "draft_embed" in SLOTS and "draft_multi" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'draft_embed' runs in slot 'draft_multi''s steps"
         )
     if "draft_skv2" in SLOTS and "draft_extend" not in SLOTS:
         reasons.append(

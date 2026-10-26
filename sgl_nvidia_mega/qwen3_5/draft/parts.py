@@ -27,6 +27,9 @@ SGLANG_READS = {
     "srt/layers/vocab_parallel_embedding.py": (
         "shard_indices",
         "org_vocab_start_index",
+        "org_vocab_end_index",
+        "added_vocab_start_index",
+        "added_vocab_end_index",
     ),
     "srt/models/qwen3_5.py": (
         "layers",
@@ -67,6 +70,8 @@ class Parts:
         # sm103.draft.top1.Top1Exchange: the multi-request steps' sharded top-1 (slot
         # draft_multi)
         self.top1x: Optional[Any] = None
+        # sm103.draft.embed.EmbedExchange: those steps' embedding rows (slot draft_embed)
+        self.embedx: Optional[Any] = None
         # (entry, bs) pairs whose capture logged the engagement line
         self.engaged: set = set()
 
@@ -91,6 +96,8 @@ class Parts:
             parts.mkd = parts._build_mkd()
         if "draft_multi" in slots:
             parts.top1x = parts._build_top1x()
+        if "draft_embed" in slots:
+            parts.embedx = parts._build_embedx()
         logger.info(
             "NVIDIA megakernel: Qwen3.5 MTP draft parts built (slots %s; MoE %s, hop "
             "%s, exchange %s)",
@@ -204,6 +211,36 @@ class Parts:
             cpu_group=b.tp_cpu_group,
             device=self.device,
         )
+
+    def _build_embedx(self):
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import EmbedExchange
+
+        b = self.binding
+        embed = self.model.embed_tokens
+        shard = embed.shard_indices
+        if shard.added_vocab_end_index != shard.added_vocab_start_index:
+            raise RuntimeError(
+                "NVIDIA megakernel: slot draft_embed cannot run: the embedding has "
+                "added vocabulary"
+            )
+        return EmbedExchange(
+            world=b.tp_size,
+            table=embed.weight.data,
+            vocab_start=int(shard.org_vocab_start_index),
+            vocab_local=int(shard.org_vocab_end_index - shard.org_vocab_start_index),
+            group=b.tp_device_group,
+            cpu_group=b.tp_cpu_group,
+            device=self.device,
+        )
+
+    def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """The embedding rows of ``token_ids``: slot draft_embed's exchange where it is
+        built and the rows fit it, else SGLang's vocabulary-parallel embedding."""
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import MAX_ROWS
+
+        if self.embedx is not None and token_ids.shape[0] <= MAX_ROWS:
+            return self.embedx(token_ids)
+        return self.model.embed_tokens(token_ids)
 
     def note_engaged(self, entry: str, bs: int) -> None:
         """Log once per (entry, bs) captured: the engagement line every rank prints."""

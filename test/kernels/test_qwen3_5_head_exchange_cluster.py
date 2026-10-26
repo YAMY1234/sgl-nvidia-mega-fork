@@ -76,6 +76,9 @@ def test_last_cluster_progress_memory_order_and_graph():
     from sgl_nvidia_mega.qwen3_5.sm103.draft.xchg import SRC
 
     device = torch.device("cuda", torch.cuda.current_device())
+    # Property queries/NVRTC do not create a current driver context. Establish it
+    # before jit.load calls cuModuleLoadData, as production tensor inputs do.
+    context_anchor = torch.empty(1, device=device)
     major, minor = torch.cuda.get_device_capability(device)
     stems = ("mkd_fc", "mkd_head", "head_mx8", "mkd_head_partial", "mkd_xchg")
     headers = {stem + ".cuh": (SRC / (stem + ".cu")).read_text() for stem in stems}

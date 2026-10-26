@@ -12,7 +12,12 @@ experts and gated shared expert. At CUDA graph capture it takes the dual-stream 
 alternate stream), otherwise the eager order. With ``defer`` (the boundary takes the
 finalize) it returns SGLang's ``MoeDeferredFinalize`` handoff, otherwise the summed
 rows. Slot ``route`` (``route.py``) runs the deferred routed experts on the router
-front, and slot ``mkm`` (``mkm.py``) runs them in one launch on its outputs. In the
+front, and slot ``mkm`` (``mkm.py``) runs them in one launch on its outputs; past route's
+rows, slot ``route_topk`` (``route.py``) runs them on a materialized routing, or at 17 to
+32 rows slot ``mkm_m32`` in one launch of mkm's 32-token engine, and at 33 to 64 slot
+``mkm_m64`` on route_topk's routing in one launch of its 64-token engine (65 to 128:
+``mkm_m128``, its 128-token engine; 129 to 256 / 257 to 512: ``mkm_m256`` / ``mkm_m512``, its
+wide engines). In the
 dual-stream order of up to 8 rows, slot ``route_shared`` computes the shared expert's
 gate/up in the router front's launch; the alternate stream waits for that launch only and
 runs the rest of the shared expert (numeric).
@@ -69,23 +74,59 @@ SGLANG_MIRRORS = {
 
 
 def build(model, ctx) -> route.Bound:
-    """Slots ``route`` and ``mkm`` for every MoE layer; the result is
-    ``st.bound["moe"]``."""
+    """Slots ``route``, ``mkm``, ``route_topk`` and ``mkm_m32`` for every MoE layer; the
+    result is ``st.bound["moe"]``."""
+    import msgspec
+
     from sgl_nvidia_mega.qwen3_5 import plan
     from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
 
-    if "route" not in SLOTS:
-        return route.Bound(reason="stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
-    rows = plan.widest(ctx.widths, plan.ROUTE_MAX_ROWS)
-    if not rows:
-        return route.Bound(reason=f"no width of {list(ctx.widths)} within its rows")
-    return route.build(
-        model,
-        rows,
-        fused="mkm" in SLOTS,
-        shared="route_shared" in SLOTS,
-        wide="mkm_wide" in SLOTS,
-    )
+    bound = route.Bound(reason="stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
+    if "route" in SLOTS:
+        rows = plan.widest(ctx.widths, plan.ROUTE_MAX_ROWS)
+        if not rows:
+            bound = route.Bound(
+                reason=f"no width of {list(ctx.widths)} within its rows"
+            )
+        else:
+            bound = route.build(
+                model,
+                rows,
+                fused="mkm" in SLOTS,
+                shared="route_shared" in SLOTS,
+                wide="mkm_wide" in SLOTS,
+            )
+    if "route_topk" in SLOTS:
+        reason = route.topk_unsupported(model)
+        if reason:
+            return msgspec.structs.replace(bound, reason=f"route_topk: {reason}")
+        from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+        router.build_topk(torch.cuda.current_device())
+        bound = msgspec.structs.replace(bound, topk=True)
+        if "route_gemm" in SLOTS:
+            router.build(torch.cuda.current_device(), router.MAX_TOKENS)
+            bound = msgspec.structs.replace(bound, gemm=True)
+        m32 = "mkm_m32" in SLOTS and plan.widest(ctx.widths, plan.MKM_M32_MAX_ROWS) > (
+            plan.MKM_WIDE_MAX_ROWS
+        )
+        m64 = "mkm_m64" in SLOTS and plan.widest(ctx.widths, plan.MKM_M64_MAX_ROWS) > (
+            plan.MKM_M32_MAX_ROWS
+        )
+        m128 = "mkm_m128" in SLOTS and plan.widest(
+            ctx.widths, plan.MKM_M128_MAX_ROWS
+        ) > (plan.MKM_M64_MAX_ROWS)
+        m256 = "mkm_m256" in SLOTS and plan.widest(
+            ctx.widths, plan.MKM_M256_MAX_ROWS
+        ) > (plan.MKM_M128_MAX_ROWS)
+        m512 = "mkm_m512" in SLOTS and plan.widest(
+            ctx.widths, plan.MKM_M512_MAX_ROWS
+        ) > (plan.MKM_M256_MAX_ROWS)
+        if m32 or m64 or m128 or m256 or m512:
+            bound = route.build_m32(
+                model, bound, m32=m32, m64=m64, m128=m128, m256=m256, m512=m512
+            )
+    return bound
 
 
 def step(layer, x: torch.Tensor, st, defer: bool):
@@ -186,6 +227,18 @@ def _router_experts(mlp, x, defer: bool, st):
 
     if defer and st.slots.route:
         return route.routed(mlp, x, st.bound["moe"] if st.slots.mkm else None)
+    if defer and st.slots.mkm_m32:
+        return route.routed_m32(mlp, x, st.bound["moe"], gemm=st.slots.route_gemm)
+    if defer and st.slots.mkm_m64:
+        return route.routed_given(mlp, x, st.bound["moe"], "mkm_m64")
+    if defer and st.slots.mkm_m128:
+        return route.routed_given(mlp, x, st.bound["moe"], "mkm_m128")
+    if defer and st.slots.mkm_m256:
+        return route.routed_given(mlp, x, st.bound["moe"], "mkm_m256")
+    if defer and st.slots.mkm_m512:
+        return route.routed_given(mlp, x, st.bound["moe"], "mkm_m512")
+    if defer and st.slots.route_topk:
+        return route.routed_topk(mlp, x, gemm=st.slots.route_gemm)
     router_logits, _ = mlp.gate(x)
     topk_output = mlp.topk(x, router_logits)
     if defer:

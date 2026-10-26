@@ -162,6 +162,31 @@ def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
             {"route", "mkm", "mkm_wide"},
             "slot 'mkm_wide' serves the steps of more than one request ('multi_request')",
         ),
+        ({"mkm_m32"}, "slot 'mkm_m32' takes slot 'route_topk''s rows"),
+        (
+            {"route_topk", "mkm_m32"},
+            "slot 'mkm_m32' serves the steps of more than two requests ('multi_request')",
+        ),
+        ({"mkm_m64"}, "slot 'mkm_m64' runs on slot 'route_topk''s routing"),
+        (
+            {"route_topk", "mkm_m64"},
+            "slot 'mkm_m64' serves the steps of more than four requests ('multi_request')",
+        ),
+        ({"mkm_m128"}, "slot 'mkm_m128' runs on slot 'route_topk''s routing"),
+        (
+            {"route_topk", "mkm_m128"},
+            "slot 'mkm_m128' serves the steps of more than nine requests ('multi_request')",
+        ),
+        ({"mkm_m256"}, "slot 'mkm_m256' runs on slot 'route_topk''s routing"),
+        (
+            {"route_topk", "mkm_m256"},
+            "slot 'mkm_m256' serves the steps of more than 18 requests ('multi_request')",
+        ),
+        ({"mkm_m512"}, "slot 'mkm_m512' runs on slot 'route_topk''s routing"),
+        (
+            {"route_topk", "mkm_m512"},
+            "slot 'mkm_m512' serves the steps of more than 36 requests ('multi_request')",
+        ),
     ],
 )
 def test_a_slot_set_that_cannot_run_is_refused_before_the_load(
@@ -217,7 +242,17 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
         **{**dict.fromkeys(plan.Facts.__struct_fields__, True), "mkm_wide": False}
     )
     assert _on(plan.slots(7, every)) == sorted(
-        set(plan.Slots.__struct_fields__) - {"route_shared"}
+        set(plan.Slots.__struct_fields__)
+        - {
+            "mkm_m32",
+            "mkm_m64",
+            "mkm_m128",
+            "mkm_m256",
+            "mkm_m512",
+            "route_gemm",
+            "route_shared",
+            "route_topk",
+        }
     )
     # Two requests also take every measured low-M launch and the hop's FP8 copy.
     assert _on(plan.slots(14, every)) == [
@@ -238,20 +273,39 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     ]
     # The 28/56-row low-M paths stay stock; GDN core and MKA serve through 224.
     for rows in (28, 56, 112, 224):
-        assert _on(plan.slots(rows, every)) == [
+        expected = [
             "gdn_conv",
             "gdn_core",
             "gdn_pdl",
             "gdn_verify",
             "mka",
+            "route_topk",
         ]
+        if rows <= plan.MKM_M32_MAX_ROWS:
+            expected.append("mkm_m32")
+        if plan.MKM_M32_MAX_ROWS < rows <= plan.MKM_M64_MAX_ROWS:
+            expected.append("mkm_m64")
+        if plan.MKM_M64_MAX_ROWS < rows <= plan.MKM_M128_MAX_ROWS:
+            expected.append("mkm_m128")
+        if plan.MKM_M128_MAX_ROWS < rows <= plan.MKM_M256_MAX_ROWS:
+            expected.append("mkm_m256")
+        if rows <= plan.ROUTE_GEMM_MAX_ROWS:
+            expected.append("route_gemm")
+        assert _on(plan.slots(rows, every)) == sorted(expected)
     for rows in (448, 896):
-        assert _on(plan.slots(rows, every)) == [
+        expected = [
             "gdn_conv",
             "gdn_pdl",
             "gdn_verify",
             "mka",
+            "route_topk",
         ]
+        if rows <= plan.MKM_M512_MAX_ROWS:
+            expected.append("mkm_m512")
+        assert _on(plan.slots(rows, every)) == sorted(expected)
+    assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]
+    assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]
+    assert not plan.slots(28, plan.Facts(route_gemm=True)).route_gemm
     # SGLang offers every multiple of 7 up to MAX_ROWS; every request count is a candidate
     offered = tuple(range(7, plan.MAX_ROWS + 1, 7))
     assert plan.candidates(offered, 7) == offered
@@ -284,6 +338,26 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(14, wide)) == ["mkm", "route"]
     assert _on(plan.slots(28, wide)) == []
     assert _on(plan.slots(14, plan.Facts(route=True, mkm=True))) == ["route"]
+    m32 = plan.Facts(route_topk=True, mkm_m32=True)
+    assert _on(plan.slots(28, m32)) == ["mkm_m32", "route_topk"]
+    assert _on(plan.slots(14, m32)) == ["route_topk"]
+    assert _on(plan.slots(56, m32)) == ["route_topk"]
+    assert _on(plan.slots(28, plan.Facts(mkm_m32=True))) == []
+    m64 = plan.Facts(route_topk=True, mkm_m64=True)
+    assert _on(plan.slots(56, m64)) == ["mkm_m64", "route_topk"]
+    assert _on(plan.slots(28, m64)) == ["route_topk"]
+    assert _on(plan.slots(112, m64)) == ["route_topk"]
+    assert _on(plan.slots(56, plan.Facts(mkm_m64=True))) == []
+    m128 = plan.Facts(route_topk=True, mkm_m128=True)
+    assert _on(plan.slots(112, m128)) == ["mkm_m128", "route_topk"]
+    assert _on(plan.slots(56, m128)) == ["route_topk"]
+    assert _on(plan.slots(224, m128)) == ["route_topk"]
+    assert _on(plan.slots(112, plan.Facts(mkm_m128=True))) == []
+    wide = plan.Facts(route_topk=True, mkm_m256=True, mkm_m512=True)
+    assert _on(plan.slots(224, wide)) == ["mkm_m256", "route_topk"]
+    assert _on(plan.slots(448, wide)) == ["mkm_m512", "route_topk"]
+    assert _on(plan.slots(112, wide)) == ["route_topk"]
+    assert _on(plan.slots(896, wide)) == ["route_topk"]
     # the router front and the hop's mailbox are built for the widest width they serve
     assert plan.widest((7, 14, 28), plan.ROUTE_MAX_ROWS) == 14
     assert plan.widest((7, 14, 28), plan.HOP_MAX_ROWS) == 14
@@ -296,9 +370,15 @@ def test_the_slot_plans_row_bounds_are_the_kernels():
     from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm, router
 
     assert plan.ROUTE_MAX_ROWS == router.MAX_TOKENS
+    assert plan.ROUTE_TOPK_MAX_ROWS == router.TOPK_MAX_ROWS
     assert plan.ROUTE_SHARED_ROWS == router.SHARED_MAX_M
     assert plan.MKM_MAX_ROWS == mkm.MAX_TOKENS
     assert plan.MKM_WIDE_MAX_ROWS == mkm.M16_MAX_TOKENS
+    assert plan.MKM_M32_MAX_ROWS == mkm.M32_MAX_TOKENS
+    assert plan.MKM_M64_MAX_ROWS == mkm.M64_MAX_TOKENS
+    assert plan.MKM_M128_MAX_ROWS == mkm.M128_MAX_TOKENS
+    assert plan.MKM_M256_MAX_ROWS == mkm.M256_MAX_TOKENS
+    assert plan.MKM_M512_MAX_ROWS == mkm.M512_MAX_TOKENS
     assert plan.GDN_PUSH_MAX_ROWS == hop.OPROJ_MAX_M
     assert plan.MKA_MAX_ROWS == mka.MAX_ROWS
     from sgl_nvidia_mega.qwen3_5.attention import mka as mka_step
@@ -311,6 +391,9 @@ def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
     from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
 
     assert spec.numerics(frozenset({"route", "hop"})).kind is NumericsKind.BITWISE
+    tiled_route = spec.numerics(frozenset({"route_topk", "route_gemm"}))
+    assert tiled_route.kind is NumericsKind.TOLERANCE
+    assert dict(tiled_route.tolerances) == spec.NUMERIC_TOLERANCES["route_gemm"]
     claim = spec.numerics(frozenset({"gdn_verify", "hop", "gdn_push"}))
     assert claim.kind is NumericsKind.TOLERANCE
     assert dict(claim.tolerances) == spec.NUMERIC_TOLERANCES["gdn_push"]

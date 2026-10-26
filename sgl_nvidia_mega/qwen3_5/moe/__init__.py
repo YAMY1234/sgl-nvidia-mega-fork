@@ -124,7 +124,14 @@ def build(model, ctx) -> route.Bound:
         ) > (plan.MKM_M256_MAX_ROWS)
         if m32 or m64 or m128 or m256 or m512:
             bound = route.build_m32(
-                model, bound, m32=m32, m64=m64, m128=m128, m256=m256, m512=m512
+                model,
+                bound,
+                m32=m32,
+                m64=m64,
+                m128=m128,
+                m256=m256,
+                m512=m512,
+                wide_bal="mkm_wide_bal" in SLOTS,
             )
     return bound
 

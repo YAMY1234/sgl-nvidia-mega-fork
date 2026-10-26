@@ -201,16 +201,7 @@ def test_mkm_replays_from_a_cuda_graph(layer, m):
     assert all(torch.equal(a, b) for a, b in zip(eager, captured))
 
 
-@pytest.mark.parametrize(
-    "m", [33, 35, 56, 64, 65, 84, 112, 128, 129, 168, 224, 256, 257, 336, 448, 512]
-)
-@pytest.mark.parametrize("shared_route", [False, True])
-def test_mkm_on_route_topks_routing_is_the_trtllm_routed_experts(
-    layer, m, shared_route
-):
-    """Slots mkm_m64 / mkm_m128 / mkm_m256 / mkm_m512: the 64 / 128 / 256 / 512-token engine
-    on route_topk's routing (ids and weights) gives the runner's rows on the logits, bit for
-    bit."""
+def _assert_mkm_on_route_topks_routing(layer, m, shared_route, wide_bal=False):
     if m > mkm.max_tokens(
         layer["inter"], m32=True, m64=True, m128=True, m256=True, m512=True
     ):
@@ -233,11 +224,33 @@ def test_mkm_on_route_topks_routing_is_the_trtllm_routed_experts(
         layer["g1c"],
         layer["g2"],
         routing=(ids, weights),
+        wide_bal=wide_bal,
     )
     want_rows, want_weights = _stock(layer, logits, x_fp4, x_sf)
     assert torch.equal(got_weights.view(torch.int16), want_weights.view(torch.int16))
     differ = (rows.view(torch.int16) != want_rows.view(torch.int16)).any(dim=1)
     assert not differ.any(), f"rows {differ.nonzero().flatten().tolist()} differ"
+
+
+@pytest.mark.parametrize(
+    "m", [33, 35, 56, 64, 65, 84, 112, 128, 129, 168, 224, 256, 257, 336, 448, 512]
+)
+@pytest.mark.parametrize("shared_route", [False, True])
+def test_mkm_on_route_topks_routing_is_the_trtllm_routed_experts(
+    layer, m, shared_route
+):
+    """Slots mkm_m64 / mkm_m128 / mkm_m256 / mkm_m512 give the runner's
+    materialized-routing rows bit for bit."""
+    _assert_mkm_on_route_topks_routing(layer, m, shared_route)
+
+
+@pytest.mark.parametrize("m", [129, 168, 224, 256, 257, 336, 448, 512])
+@pytest.mark.parametrize("shared_route", [False, True])
+def test_wide_engines_balanced_split_is_the_trtllm_routed_experts(
+    layer, m, shared_route
+):
+    """Opt-in BAL changes only assignment: rows stay bitwise stock."""
+    _assert_mkm_on_route_topks_routing(layer, m, shared_route, wide_bal=True)
 
 
 @pytest.mark.parametrize("m", [56, 112, 224, 448])

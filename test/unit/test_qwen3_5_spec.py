@@ -187,6 +187,11 @@ def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
             {"route_topk", "mkm_m512"},
             "slot 'mkm_m512' serves the steps of more than 36 requests ('multi_request')",
         ),
+        (
+            {"mkm_wide_bal"},
+            "slot 'mkm_wide_bal' changes the work split of slot 'mkm_m256' or "
+            "'mkm_m512'",
+        ),
     ],
 )
 def test_a_slot_set_that_cannot_run_is_refused_before_the_load(
@@ -409,8 +414,40 @@ def test_the_validated_moe_schedules_are_shape_closed():
     assert mkm.engine_options(64, plain=True) == ("-DMMA_SFONLY=1",)
     assert [mkm.reserved_sms(32, rows) for rows in (21, 22)] == [0, 32]
     assert [mkm.reserved_sms(64, rows) for rows in (35, 42, 43)] == [32, 16, 0]
-    assert not mkm.onepass_plain(64, 42)
-    assert mkm.onepass_plain(64, 43)
+    assert not mkm.plain_schedule(64, 42)
+    assert mkm.plain_schedule(64, 43)
+
+
+@pytest.mark.parametrize(
+    "rows", [56, 112, 126, 128, 129, 133, 140, 168, 224, 256, 280, 512]
+)
+def test_bal_changes_only_the_wide_engine_schedule(rows):
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm
+
+    engine = mkm.engine_rows(rows)
+    off = mkm.engine_options(engine)
+    on = mkm.engine_options(engine, wide_bal=True)
+    assert on == off + (("-DBAL_SPLIT=1",) if rows > 128 else ())
+    assert mkm.plain_schedule(engine, rows, wide_bal=True) == mkm.plain_schedule(
+        engine, rows
+    )
+    assert mkm.engine_options(engine, plain=True, wide_bal=True) == (
+        mkm.engine_options(engine, plain=True)
+    )
+
+
+@pytest.mark.parametrize(
+    "rows,plain", [(129, False), (210, False), (211, True), (280, True)]
+)
+def test_bal_internal_row_cap_selects_the_static_split(monkeypatch, rows, plain):
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm
+
+    monkeypatch.setattr(mkm, "WIDE_BAL_MAX_ROWS", 210)
+    engine = mkm.engine_rows(rows)
+    assert mkm.plain_schedule(engine, rows, wide_bal=True) is plain
+    assert (
+        "-DBAL_SPLIT=1" in mkm.engine_options(engine, plain, wide_bal=True)
+    ) is not plain
 
 
 def test_a_numeric_slot_turns_the_claim_into_its_tolerances():

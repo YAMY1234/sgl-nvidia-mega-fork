@@ -65,7 +65,7 @@ DRAFT_SLOTS: tuple[str, ...] = (
     "draft_q1",
     "draft_xchg",
     "draft_hop",
-    # numeric: hand deferred MoE rows to the draft hop's fused final norm
+    # numeric: hand deferred MoE rows to a fused final norm
     "draft_fin",
     "draft_front",
     "draft_skv2",
@@ -234,7 +234,7 @@ def slot_reasons() -> list[str]:
         reasons.append(f"{SLOTS_ENV}: slot 'draft_hop' runs on slot 'hop''s mailbox")
     if "draft_fin" in SLOTS and "draft_hop" not in SLOTS:
         reasons.append(
-            f"{SLOTS_ENV}: slot 'draft_fin' runs in slot 'draft_hop''s final norm"
+            f"{SLOTS_ENV}: slot 'draft_fin' extends slot 'draft_hop''s fused final norm"
         )
     if "draft_multi" in SLOTS and "multi_request" not in SLOTS:
         reasons.append(

@@ -141,6 +141,7 @@ class Bound(msgspec.Struct, frozen=True):
         False  # every GDN / attention FP8 output projection takes the launch
     )
     se: bool = False  # every shared expert takes the two launches
+    se_pre: bool = False  # the launches also cover the MoE body's tier-M rows
     push: bool = False  # the output projections' launches also push into the hop
     hop_fp8: bool = False  # the hop also writes the next projection's E4M3 input
     # lowm_se: id(mlp) -> (gate_up rows paired for the SwiGLU, the shared gate zero-padded to 8 rows)
@@ -229,6 +230,17 @@ def build(model, ctx) -> Bound:
         "lowm_out" in SLOTS,
         "lowm_se" in SLOTS,
     )
+    se_rows = plan.LOWM_SE_MAX_ROWS
+    if want_se and {"route", "route_topk"} <= SLOTS:
+        from sglang.srt.runtime_context import get_parallel
+
+        par = get_parallel()
+        tep8_m = (
+            par.tp_size == 8
+            and par.moe_ep_size > 1
+            and {"route", "route_topk"} <= SLOTS
+        )
+        se_rows = plan.lowm_se_pre_rows(par.tp_size, tep8_m) or se_rows
     want_push = want_out and "lowm_push" in SLOTS and "hop" in SLOTS
     want_fp8 = "hop_fp8" in SLOTS and "hop" in SLOTS
     want = want_in or want_out
@@ -310,7 +322,7 @@ def build(model, ctx) -> Bound:
             n, k = gu.shape
             nd, kd = _w8(se.down_proj).shape
             for w in ctx.widths:
-                if w <= plan.LOWM_SE_MAX_ROWS:
+                if w <= se_rows:
                     launches.add((w, k, n, 8, 1, 1, True))
                     if want_fp8 and w <= plan.HOP_MAX_ROWS:
                         launches.add((w, k, n, 8, 0, 1, True))
@@ -334,6 +346,7 @@ def build(model, ctx) -> Bound:
         lowm_in=want_in,
         lowm_out=want_out,
         se=want_se,
+        se_pre=want_se and se_rows > plan.LOWM_SE_MAX_ROWS,
         push=want_push,
         hop_fp8=want_fp8,
         shared=shared,

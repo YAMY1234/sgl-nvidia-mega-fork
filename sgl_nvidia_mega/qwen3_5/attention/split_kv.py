@@ -223,11 +223,11 @@ def cp_reason() -> str:
     return ""
 
 
-def cp_core(attn, q, kv, meta, forward_batch, q_len: int):
-    """CP-lite on one request's ``q_len`` FP8 query rows ``q`` of ``attn`` over the pool
-    ``kv`` at ``meta``'s pages and lengths (this step's rows written): [rows, heads *
-    head_dim] bf16, or None where CP-lite declines (decided by shapes alone, so every
-    rank of the KV group agrees)."""
+def cp_core(attn, q, kv, meta, forward_batch, q_len: int, min_bs: int | None = 1):
+    """CP-lite on requests of ``q_len`` FP8 query rows over the pool ``kv``:
+    [rows, heads * head_dim] bf16, or None where CP-lite declines. ``min_bs`` overrides
+    CP-lite's configured minimum for a host-selected one-request graph; ``None`` keeps
+    the configured gate for a multi-request graph."""
     from sglang.kernels.ops.attention.utils import canonicalize_stride
     from sglang.srt.layers.attention.trtllm_mha_backend import (
         DEFAULT_WORKSPACE_SIZE_MB,
@@ -262,7 +262,7 @@ def cp_core(attn, q, kv, meta, forward_batch, q_len: int):
         workspace,
         attn,
         forward_batch,
-        min_bs=1,
+        min_bs=min_bs,
     )
     return None if o is None else o.view(-1, attn.tp_q_head_num * attn.head_dim)
 

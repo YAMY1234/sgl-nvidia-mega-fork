@@ -402,7 +402,7 @@ def test_the_draft_decode_keeps_cp_lite_for_cp_variants_and_multi_request(
         ({"draft_loop", "draft_hop"}, "slot 'draft_hop' runs on slot 'hop''s mailbox"),
         (
             {"draft_loop", "draft_fin"},
-            "slot 'draft_fin' runs in slot 'draft_hop''s final norm",
+            "slot 'draft_fin' extends slot 'draft_hop''s fused final norm",
         ),
         (
             {"draft_loop", "draft_skv2"},
@@ -533,6 +533,95 @@ def test_the_draft_extends_moe_output_is_reduced_once(
     out = layer.layer(parts, x, None, None, None, None, rows_per_request=7)
     assert log == want
     assert torch.equal(out, x + 100.0 if "fin" in log else 8 * x + x)
+
+
+def test_only_tep8_draft_fin_uses_the_target_mnnvl_workspace(monkeypatch):
+    from sglang.srt.layers import flashinfer_mnnvl_cutedsl
+
+    from sgl_nvidia_mega.qwen3_5.draft import layer
+
+    workspace = SimpleNamespace(supports=lambda rows: rows <= 896)
+    monkeypatch.setattr(flashinfer_mnnvl_cutedsl, "_WORKSPACE", workspace)
+    parts = SimpleNamespace(slots=frozenset({"draft_fin"}))
+
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=8, moe_ep_size=4),
+    )
+    assert layer._mnnvl_workspace(parts, 896) is workspace
+    assert layer._mnnvl_workspace(parts, 897) is None
+    assert layer._mnnvl_workspace(SimpleNamespace(slots=frozenset()), 32) is None
+
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=8, moe_ep_size=1),
+    )
+    assert layer._mnnvl_workspace(parts, 32) is None
+
+
+@pytest.mark.parametrize("deferred", [True, False])
+def test_tep8_draft_fin_uses_the_target_workspace_past_the_hop(monkeypatch, deferred):
+    from sgl_nvidia_mega.qwen3_5.draft import layer
+
+    rows, calls = 32, []
+    x = torch.ones(rows, 4)
+
+    def fused_ar(*, local_contribution, residual, gamma):
+        calls.append("fused ar")
+        return local_contribution + gamma, residual
+
+    def fused_fin(*, residual, gamma, **_):
+        calls.append("fused finalize")
+        return residual + gamma, residual
+
+    workspace = SimpleNamespace(
+        all_reduce_residual_rms_norm=fused_ar,
+        moe_finalize_all_reduce_rms_norm=fused_fin,
+    )
+    monkeypatch.setattr(layer, "_mnnvl_workspace", lambda parts, rows: workspace)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    def mlp(hidden, defer_finalize=False):
+        calls.append("mlp deferred" if defer_finalize else "mlp")
+        if not defer_finalize:
+            return 2 * hidden
+        return SimpleNamespace(
+            routed_output=torch.zeros(1, dtype=torch.bfloat16),
+            expert_weights=torch.zeros(1, dtype=torch.bfloat16),
+            permuted_indices=torch.zeros(1, dtype=torch.int32),
+            gated_shared_output=None,
+        )
+
+    mlp.supports_deferred_finalize = deferred
+    post_norm = SimpleNamespace(gemma_weight=10.0)
+    final_norm = SimpleNamespace(gemma_weight=100.0)
+    parts = SimpleNamespace(
+        layer=SimpleNamespace(
+            input_layernorm=lambda hidden: hidden,
+            post_attention_layernorm=post_norm,
+            mlp=mlp,
+        ),
+        attention=lambda hidden, *args, rows_per_request, o_proj: hidden,
+        hop=None,
+        moe=None,
+        moe_mkm=None,
+        slots=frozenset({"draft_hop", "draft_fin"}),
+        model=SimpleNamespace(norm=final_norm),
+    )
+
+    def stock_all_reduce(_):
+        raise AssertionError("the fused workspace owns both all-reduce points")
+
+    monkeypatch.setattr(
+        "sglang.srt.distributed.tensor_model_parallel_all_reduce", stock_all_reduce
+    )
+    out = layer.layer(parts, x, None, None, None, None, rows_per_request=1)
+    if deferred:
+        assert calls == ["fused ar", "mlp deferred", "fused finalize"]
+        assert torch.equal(out, x + 100.0)
+    else:
+        assert calls == ["fused ar", "mlp", "fused ar"]
+        assert torch.equal(out, 2 * (x + 10.0) + 100.0)
 
 
 class _DraftParts:

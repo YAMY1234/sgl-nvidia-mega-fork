@@ -304,4 +304,4 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
             input_scale=gdn.out_proj.input_scale,
             weight_scale=gdn.out_proj.weight_scale,
         )
-    return _out_proj(gdn.out_proj, x_fp8, x.dtype)
+    return _out_proj(gdn.out_proj, x_fp8, x.dtype, st, opts.lowm_push)

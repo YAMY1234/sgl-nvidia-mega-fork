@@ -311,11 +311,16 @@ def layer_input(hop, layer, hidden, st):
         and plan.fusions._finalize_eligible(plan, st.fb, pending.owed.m)
     ):
         return None
+    from sgl_nvidia_mega.qwen3_5 import lowm
+
     owed, residual = stream.input(hidden)
-    norm, residual = _finalize(
-        hop, "layer input", owed, residual, fused_norm_gamma(plan.norm)
+    scale = lowm.layer_input_fp8_scale(layer, st, owed.m)
+    norm, residual, *fp8 = _finalize(
+        hop, "layer input", owed, residual, fused_norm_gamma(plan.norm), scale
     )
     stream.write(residual)
+    if fp8:
+        lowm.stash_fp8(st, norm, fp8[0])
     return norm
 
 
@@ -360,11 +365,19 @@ def moe_input(hop, layer, hidden, st):
         and takes_moe_input(hop, layer, st, rows)
     ):
         return None
+    from sgl_nvidia_mega.qwen3_5 import lowm
+
     _engage("MoE input", rows)
-    norm, residual = hop.all_reduce_residual_rms_norm(
-        local_contribution=part, residual=residual, gamma=fused_norm_gamma(plan.norm)
+    scale = lowm.moe_input_fp8_scale(layer, st)
+    norm, residual, *fp8 = hop.all_reduce_residual_rms_norm(
+        local_contribution=part,
+        residual=residual,
+        gamma=fused_norm_gamma(plan.norm),
+        **({} if scale is None else {"fp8_scale": scale}),
     )
     stream.write(residual)
+    if fp8:
+        lowm.stash_fp8(st, norm, fp8[0])
     return norm
 
 
@@ -412,7 +425,7 @@ def _takes(hop, owed) -> bool:
     )
 
 
-def _finalize(hop, point, owed, residual, gamma):
+def _finalize(hop, point, owed, residual, gamma, fp8_scale=None):
     _engage(point, owed.m)
     return hop.moe_finalize_all_reduce_rms_norm(
         routed_output=owed.routed_output,
@@ -421,6 +434,7 @@ def _finalize(hop, point, owed, residual, gamma):
         gated_shared_output=owed.gated_shared_output,
         residual=residual,
         gamma=gamma,
+        **({} if fp8_scale is None else {"fp8_scale": fp8_scale}),
     )
 
 

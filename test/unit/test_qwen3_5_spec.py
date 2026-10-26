@@ -198,6 +198,11 @@ def test_the_slot_plan_covers_one_request_of_7_rows():
     shared = dict(route=True, route_shared=True)
     assert plan.plan((7,), plan.Facts(**shared)) == {7: plan.Slots(**shared)}
     assert not plan.slots(7, plan.Facts(route_shared=True)).route_shared
+    # lowm_se replaces route_shared's shared stage where both could run.
+    assert _on(plan.slots(7, plan.Facts(**shared, lowm_se=True))) == [
+        "lowm_se",
+        "route",
+    ]
     with pytest.raises(ValueError):
         plan.slots(plan.MAX_ROWS + 1, plan.Facts())
 
@@ -211,19 +216,27 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     every = plan.Facts(
         **{**dict.fromkeys(plan.Facts.__struct_fields__, True), "mkm_wide": False}
     )
-    assert _on(plan.slots(7, every)) == sorted(plan.Slots.__struct_fields__)
-    # two requests: also MKA's wide entries and their push into the hop
+    assert _on(plan.slots(7, every)) == sorted(
+        set(plan.Slots.__struct_fields__) - {"route_shared"}
+    )
+    # Two requests also take every measured low-M launch and the hop's FP8 copy.
     assert _on(plan.slots(14, every)) == [
         "gdn_conv",
         "gdn_core",
         "gdn_pdl",
         "gdn_verify",
         "hop",
+        "hop_fp8",
+        "lowm_in",
+        "lowm_oproj",
+        "lowm_outproj",
+        "lowm_push",
+        "lowm_se",
         "mka",
         "mka_push",
         "route",
     ]
-    # The one-launch GDN core and MKA front serve through 224 rows.
+    # The 28/56-row low-M paths stay stock; GDN core and MKA serve through 224.
     for rows in (28, 56, 112, 224):
         assert _on(plan.slots(rows, every)) == [
             "gdn_conv",

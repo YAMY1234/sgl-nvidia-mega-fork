@@ -163,6 +163,9 @@ class Options(msgspec.Struct, frozen=True):
     conv_rows: bool = (
         False  # the hoisted conv writing each channel's window row once (slot gdn_conv)
     )
+    lowm_push: bool = (
+        False  # out_proj's low-M launch pushes into the hop (slot lowm_push)
+    )
 
 
 STOCK = Options(views=False, block_n=256, block_v=64, num_warps=1, norm_fp8=False)
@@ -274,7 +277,15 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
         logger.info(
             "NVIDIA megakernel: Qwen3.5 slot gdn_verify runs at %d rows", x.shape[0]
         )
-    qkvz, ba = gdn._forward_input_proj(x)
+    from sgl_nvidia_mega.qwen3_5 import lowm
+
+    x8 = lowm.take_fp8(st, x) if st.slots.hop_fp8 else None
+    if st.slots.lowm_in:
+        qkvz, ba = lowm.in_proj(gdn, x, x8)
+    elif x8 is not None:
+        qkvz, ba = lowm.in_proj_fp8(gdn, x, x8)
+    else:
+        qkvz, ba = gdn._forward_input_proj(x)
     split = (
         qwen3_5_gdn_prefill_projection_views
         if opts.views
@@ -312,7 +323,7 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
                 input_scale=gdn.out_proj.input_scale,
                 weight_scale=gdn.out_proj.weight_scale,
             )
-        return _out_proj(gdn.out_proj, x, core.dtype)
+        return _out_proj(gdn.out_proj, x, core.dtype, st, opts.lowm_push)
     z_shape = z.shape
     core = gdn.norm(core, z if opts.views else z.reshape(-1, z.shape[-1]))
     core = core.reshape(z_shape)
@@ -320,10 +331,19 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
     return gdn.out_proj(core)[0]
 
 
-def _out_proj(out_proj, fp8: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+def _out_proj(
+    out_proj, fp8: torch.Tensor, dtype: torch.dtype, st=None, push: bool = False
+) -> torch.Tensor:
     """``RowParallelLinear.forward`` of the FP8 ``out_proj`` on its pre-quantized input:
     ModelOpt's FlashInfer BMM with the static input scale as the activation scale (what
-    its own quantization returns), the TP-partial output in SGLang's symmetric pool."""
+    its own quantization returns), the TP-partial output in SGLang's symmetric pool; with
+    slot lowm_out (``Slots.lowm_outproj``) the low-M launch instead (numeric), pushing into the hop with
+    ``push`` (slot lowm_push)."""
+    if st is not None and st.slots.lowm_outproj:
+        from sgl_nvidia_mega.qwen3_5 import lowm
+
+        hop = st.bound["boundary"].hop if push else None
+        return lowm.row_parallel(out_proj, fp8, dtype, "out_proj", hop)
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
     )
@@ -416,7 +436,7 @@ def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
             input_scale=gdn.out_proj.input_scale,
             weight_scale=gdn.out_proj.weight_scale,
         )
-    return _out_proj(gdn.out_proj, x, qkv.dtype)
+    return _out_proj(gdn.out_proj, x, qkv.dtype, st, opts.lowm_push)
 
 
 def _core(attn, mixed_qkv, a, b, st, opts):

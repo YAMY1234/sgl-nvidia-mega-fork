@@ -162,6 +162,11 @@ def step(layer, x, st):
         ):
             opts = msgspec.structs.replace(opts, push=True)
             verify.engaged("gdn_push", x.shape[0])
+        # slot lowm_push: out_proj's low-M launch pushes its rows into the hop instead
+        elif st.slots.lowm_push and hop.takes_moe_input(
+            st.bound["boundary"].hop, layer, st, x.shape[0]
+        ):
+            opts = msgspec.structs.replace(opts, lowm_push=True)
         if st.slots.gdn_front:
             from sgl_nvidia_mega.qwen3_5.gdn import front
 

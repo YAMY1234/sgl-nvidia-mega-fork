@@ -53,6 +53,8 @@ EXTEND_MKD_HEAD = os.environ.get("SGLANG_PERFDRAFT_EXTEND_MKD_HEAD", "0") == "1"
 # FC in their weight-prefetch window, then all CTAs continue the head.
 HEAD_PARTIAL = os.environ.get("SGLANG_Q35FLY_DRAFT_HEAD_PARTIAL", "0") == "1"
 HEAD_EXCHANGE = os.environ.get("SGLANG_Q35FLY_DRAFT_HEAD_EXCHANGE", "0") == "1"
+# Independent HP2 grid experiment; the original head allocation stays unchanged.
+HEAD_EXCHANGE_GRID120 = os.environ.get("SGLANG_Q35FLY_DRAFT_HEAD_EXCHANGE_GRID120", "0") == "1"
 
 # Memo rows built per launch at construction
 _MEMO_BLOCK = 4096
@@ -293,8 +295,19 @@ class MkdBoundary:
             if self.head_part is None or not memo:
                 raise RuntimeError("HP2 requires an installed MKD head and memo candidates")
             self._head_exchange_ctas = self.head_part.numel() // CLUSTER * CLUSTER
+            self._head_exchange_grid120_available = HEAD_EXCHANGE_GRID120 or any(
+                v.get("SGLANG_Q35FLY_DRAFT_HEAD_EXCHANGE_GRID120") == "1"
+                for v in head_partial_variants.values()
+            )
+            self._head_exchange_grids = (self._head_exchange_ctas,)
+            if self._head_exchange_grid120_available:
+                if 120 > min(self.head_part.numel(), (self.lm_head_weight.shape[0] + 7) // 8):
+                    raise ValueError("HP2 grid120 requires at least 120 head parts and 960 vocabulary rows")
+                if self._head_exchange_ctas != 120:
+                    self._head_exchange_grids += (120,)
             self._head_exchange_done = torch.zeros(1, dtype=torch.int32, device=dev)
-            prepare(dev.index, self.world, self.head_pad, False, self._head_exchange_ctas)
+            for ctas in self._head_exchange_grids:
+                prepare(dev.index, self.world, self.head_pad, False, ctas)
         # extend_fc: the draft extend's exchange writes fc_buf for the next draft's first
         # step. input_seq counts calls that produce a draft input; fc_buf_key is the
         # input_seq whose extend wrote fc_buf.
@@ -473,6 +486,17 @@ class MkdBoundary:
         )
         return self._head_exchange_available and enabled
 
+    @property
+    def _head_exchange_capture_ctas(self) -> int:
+        # Called only by head/extend construction, never by captured graph replay.
+        if not self._head_exchange_grid120_available:
+            return self._head_exchange_ctas
+        enabled = (
+            os.environ.get("SGLANG_Q35FLY_DRAFT_HEAD_EXCHANGE_GRID120", "0") == "1"
+            if self._head_partial_ab else HEAD_EXCHANGE_GRID120
+        )
+        return 120 if enabled else self._head_exchange_ctas
+
     def _partial_ctas(self) -> int:
         """SMs left to the side-stream hidden partial on a hidden rank's step that sends
         one; 0 keeps one partial CTA per SM, queued behind the head."""
@@ -492,7 +516,7 @@ class MkdBoundary:
         ctas = self.head_part.numel() - self._partial_ctas()
         self.head_part_cur = self.head_part[:ctas]
         if self.fuse_head_exchange:
-            self.head_part_cur = self.head_part[:self._head_exchange_ctas]
+            self.head_part_cur = self.head_part[:self._head_exchange_capture_ctas]
             self._head_exchange_input = (x, self.step % 2 == 1,
                                          self.is_hidden_rank and not self.last_step)
             self.head_used = True
@@ -559,8 +583,9 @@ class MkdBoundary:
         if self._head_exchange_available:
             from sgl_nvidia_mega.qwen3_5.sm103.draft.head_exchange import prepare
 
-            prepare(self.lm_head_weight.device.index, self.world, self.head_pad,
-                    True, self._head_exchange_ctas)
+            for ctas in self._head_exchange_grids:
+                prepare(self.lm_head_weight.device.index, self.world, self.head_pad,
+                        True, ctas)
 
     def head_follows(self) -> bool:
         """Whether the draft head is the next launch after this step's final norm (an
@@ -742,7 +767,7 @@ class MkdBoundary:
         x = hidden_states.to(torch.bfloat16).contiguous()
         if self.fuse_head_exchange:
             logits = torch.empty(1, self.lm_head_weight.shape[0], dtype=torch.bfloat16, device=x.device)
-            self.head_part_cur = self.head_part[:self._head_exchange_ctas]
+            self.head_part_cur = self.head_part[:self._head_exchange_capture_ctas]
             self._head_exchange_input = (x, False, self.is_hidden_rank)
             self.head_used = True
             return logits

@@ -413,7 +413,7 @@ def take_fp8(st, x: torch.Tensor):
 def layer_input_fp8_scale(layer, st, rows: int):
     """The static input scale of ``layer``'s mixer projection that reads the layer input in this step (slot
     hop_fp8), or None where none would read an E4M3 copy (gdn_front's and MKA's fused entries quantize
-    in their own launch)."""
+    in their own launch, except slot gdn_trt_front, which reads it)."""
     from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
 
     from sgl_nvidia_mega.qwen3_5.attention import mka
@@ -421,7 +421,9 @@ def layer_input_fp8_scale(layer, st, rows: int):
     if not st.slots.hop_fp8:
         return None
     if isinstance(layer, Qwen3_5LinearDecoderLayer):
-        if not st.slots.gdn_verify or st.slots.gdn_front:
+        if not st.slots.gdn_verify:
+            return None
+        if st.slots.gdn_front and not st.slots.gdn_trt_front:
             return None
         return layer.linear_attn.in_proj_qkvz.input_scale
     if st.slots.mka and rows <= mka.FUSED_MAX_ROWS:

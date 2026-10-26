@@ -154,6 +154,68 @@ def test_hop_matches_flashinfer_fusion(rank, pair):
         torch.cuda.synchronize()
 
 
+def test_finalize_reads_routing_after_the_wait_and_identity_rows(rank, pair):
+    """The finalize reads routing after its PDL wait; registered identity maps need
+    no load. Both cases match the fusion with a late rank and freshly written routing."""
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop as H
+
+    fusion, hop = pair
+    world = ps.get_tp_group().world_size
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    identity = torch.arange(MAX_M * TOP_K, dtype=torch.int32, device=device)
+    H.register_identity_rows(identity)
+    scale = torch.tensor([0.05], device=device)
+    with torch.inference_mode():
+        for i, m in enumerate((1, 2, 5, 7, 15)):
+            for ident in (False, True):
+                x = _operands(m, device, rank, seed=400 + i)
+                if ident:
+                    x["permuted"] = identity[: m * TOP_K].view(m, TOP_K)
+                want = _run(fusion, "finalize", x)
+                # the routing rewritten by the launch right before (as the MoE writes it)
+                w = x["expert_weights"].clone()
+                x["expert_weights"].zero_()
+                x["expert_weights"].copy_(w)
+                if i % (world + 1) == rank:
+                    torch.cuda._sleep(1_000_000)
+                got = _run(hop, "finalize", x, fp8_scale=scale)
+                _same(got[:2], want)
+        torch.cuda.synchronize()
+
+
+def test_identity_rows_registry_keeps_its_buffers(rank):
+    """A registered identity row map stays allocated after its caller drops it."""
+    import gc
+
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop as H
+
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    n = MAX_M * TOP_K
+    perm = torch.arange(n, dtype=torch.int32, device=device).flip(0).contiguous()
+    rows = torch.arange(n, dtype=torch.int32, device=device)
+    H.register_identity_rows(rows)
+    ptr = rows.data_ptr()
+    del rows
+    gc.collect()
+    later = [torch.empty_like(perm) for _ in range(8)]
+    reused = any(t.data_ptr() == ptr for t in later)
+    alive = any(
+        block.get("address") == ptr and block["state"] == "active_allocated"
+        for segment in torch.cuda.memory_snapshot()
+        for block in segment["blocks"]
+    )
+    if not reused and not alive:
+        pytest.skip(f"the allocator did not reuse or retain identity buffer {ptr:#x}")
+    for tensor in later:
+        tensor.copy_(perm)
+        identity = (
+            tensor.is_contiguous()
+            and H._IDENTITY_ROWS.get(tensor.data_ptr(), 0) >= tensor.numel()
+        )
+        assert not identity
+    torch.cuda.synchronize()
+
+
 def test_hop_replays_from_a_cuda_graph(rank, pair):
     fusion, hop = pair
     device = torch.device(f"cuda:{torch.cuda.current_device()}")

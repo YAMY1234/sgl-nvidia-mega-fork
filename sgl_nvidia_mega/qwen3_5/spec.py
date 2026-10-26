@@ -124,9 +124,21 @@ NUMERIC_TOLERANCES = {
         "gdn_front.in_proj_ba.rel_l2_vs_stock": 1.05,
         "gdn_front.in_proj_ba.max_abs_vs_stock": 2.0,
     },
+    "gdn_trt_front": {
+        "gdn_trt_front.in_proj_qkvz.rel_l2_vs_stock": 1.05,
+        "gdn_trt_front.in_proj_qkvz.max_abs_vs_stock": 2.0,
+        "gdn_trt_front.in_proj_ba.rel_l2_vs_stock": 1.05,
+        "gdn_trt_front.in_proj_ba.max_abs_vs_stock": 2.0,
+    },
     "route_shared": {
         "route_shared.gate_up.rel_l2_vs_stock": 1.05,
         "route_shared.gate_up.max_abs_vs_stock": 2.0,
+    },
+    # The hidden, norm, FP8 and NVFP4 paths are bitwise; only the router partial's
+    # FP32 reduction order changes. Its RMS error stayed within 1.05x stock against
+    # FP64 on the same quantized operands (the TP8 GDN and attention tests).
+    "route_lin": {
+        "route_lin.router_logits.rms_vs_fp64_relative_to_stock": 1.05,
     },
     # SKV2 against SGLang's TRT-LLM MHA decode (test_skv2_is_within_twice_sglangs_error)
     "skv2": {"skv2.attention.rel_l2_vs_stock": 2.0},

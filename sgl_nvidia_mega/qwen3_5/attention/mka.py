@@ -65,6 +65,7 @@ SGLANG_READS = {
     ),
     "srt/layers/dp_attention.py": ("is_allocation_symmetric",),
     "srt/runtime_context.py": ("get_parallel",),
+    "srt/layers/layer_boundary/fusions/norm.py": ("fused_norm_gamma",),
     "srt/model_executor/forward_batch_info.py": ("out_cache_loc",),
     "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "kv",
@@ -130,8 +131,11 @@ def pool_reasons(kv) -> list[str]:
     return []
 
 
-def pack(layer) -> None:
-    """Pack ``layer``'s qkv (+ gate) and o_proj weights for the kernels (at build)."""
+def pack(layer, route_lin: bool = False) -> str:
+    """Pack ``layer``'s qkv (+ gate) and o_proj weights at build.
+
+    Returns why its router-before-all-reduce weights cannot be packed, when requested.
+    """
     from sgl_nvidia_mega.qwen3_5.sm103.attention import mka as kernels
 
     kernels.build(layer.qkv_proj.weight.device)
@@ -139,6 +143,52 @@ def pack(layer) -> None:
         kernels.pack_qkv(layer.qkv_proj.weight.t(), layer.num_heads),
         kernels.pack_o(layer.o_proj.weight.t()),
     )
+    return _pack_route_lin(layer) if route_lin else ""
+
+
+# Slot route_lin (numeric): layer id -> router-before-all-reduce weights on this TP8 rank.
+RL_WEIGHTS: dict = {}
+
+
+def _pack_route_lin(layer) -> str:
+    import torch
+    import torch.distributed as dist
+    from sglang.srt.layers.layer_boundary.fusions.norm import fused_norm_gamma
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.qwen3_5.sm103.hop import RL_WORLD, pack_router_lin
+
+    group = get_parallel().tp_group
+    mlp = getattr(layer, "mlp", None)
+    if group.world_size != RL_WORLD:
+        return f"TP {group.world_size} (serves TP {RL_WORLD})"
+    if layer.num_heads != 4:
+        return f"{layer.num_heads} query heads a rank (serves 4)"
+    boundary = getattr(layer, "ffn_boundary", None)
+    norm = getattr(getattr(boundary, "plan", None), "norm", None)
+    gamma = fused_norm_gamma(norm) if norm is not None else None
+    layer_id = getattr(layer, "layer_id", None)
+    if (
+        mlp is None
+        or getattr(mlp, "gate", None) is None
+        or gamma is None
+        or layer_id != layer.attn.layer_id
+        or getattr(mlp, "layer_id", layer_id) != layer_id
+    ):
+        return "no router or fusible FFN-input norm"
+    try:
+        with torch.no_grad():
+            RL_WEIGHTS[layer.attn.layer_id] = pack_router_lin(
+                mlp.gate.weight,
+                gamma,
+                layer.o_proj.weight.t(),
+                layer.o_proj.input_scale,
+                layer.o_proj.weight_scale,
+                dist.get_rank(group.device_group),
+            )
+    except ValueError as error:
+        return str(error)
+    return ""
 
 
 def step(layer, x, st):
@@ -201,6 +251,23 @@ def step(layer, x, st):
     ):
         out = torch.empty((m, layer.hidden_size), dtype=torch.bfloat16, device=x.device)
     hop = _push_hop(layer, st, m) if st.slots.mka_push else None
+    h0 = _route_lin_h0(hop, layer, m, st)
+    if h0 is not None:
+        # Slot route_lin: the router partial rides the o_proj push.
+        kernels.epilogue_rl(
+            attn=o,
+            gate=gate,
+            w_packed=w_o,
+            sx=layer.o_proj.input_scale,
+            sw=layer.o_proj.weight_scale,
+            out=out,
+            site=hop.site,
+            rl_args=hop.rl_push_args(RL_WEIGHTS[attn.layer_id], h0),
+        )
+        hop.mark_pushed_rl(out)
+        # the router launch does not wait on the epilogue: keep its output's memory out of reuse for the whole step
+        st.scratch.setdefault("rlin.keep", []).append(out)
+        return out
     kernels.epilogue(
         attn=o,
         gate=gate,
@@ -214,6 +281,21 @@ def step(layer, x, st):
     if hop is not None:
         hop.mark_pushed(out)
     return out
+
+
+def _route_lin_h0(hop, layer, rows: int, st):
+    """The layer's residual input when its router partial can ride the o_proj push (as gdn/verify.py's); else None."""
+    if (
+        not st.slots.route_lin
+        or hop is None
+        or hop.rl is None
+        or layer.attn.layer_id not in RL_WEIGHTS
+    ):
+        return None
+    lid, h0 = st.scratch.get("rlin.h0", (None, None))
+    if lid != layer.layer_id or h0 is None or tuple(h0.shape) != (rows, 4096):
+        return None
+    return h0
 
 
 def _front_step(layer, x, st):

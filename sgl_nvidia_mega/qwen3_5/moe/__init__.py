@@ -62,6 +62,7 @@ SGLANG_READS = {
     ),
     "kernels/ops/elementwise/elementwise.py": ("fused_gate_sigmoid_mul_add",),
     "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
+    "srt/runtime_context.py": ("get_parallel", '"tp_size"', '"moe_ep_size"'),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code

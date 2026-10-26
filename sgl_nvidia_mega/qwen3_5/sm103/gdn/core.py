@@ -9,6 +9,10 @@ orders, the same BF16 rounding points).
 It launches as a programmatic dependent: the checkpoint rows, ring cursors and static parameters
 load before ``griddepcontrol.wait``, every activation (q / k / v, z, a, b) after it. With
 ``early_dependents`` the next launch may start at once (it must wait before reading the output).
+The testable ``early_hist`` variant can also hold committed history ahead of the wait;
+production keeps ordinary history loads. Flat stores compute the ring entries and FP8
+outputs first and predicate only their stores, then store update vectors after the
+output; the arithmetic is unchanged.
 """
 
 from __future__ import annotations
@@ -24,6 +28,11 @@ from sgl_nvidia_mega.common import jit
 
 SOURCE = Path(__file__).parent / "src" / "core.cu"
 THREADS, K, V, RING, MAX_ROWS_PER_REQUEST = 128, 128, 128, 16, 8
+# Validated production policy: ordinary history loads, flat stores, and the early
+# dependent release only over the measured 35-56-row window.
+EARLY = False
+RELEASE_MIN_ROWS, RELEASE_MAX_ROWS = 35, 56
+FLAT = True
 
 
 class Params(ctypes.Structure):
@@ -81,6 +90,8 @@ def _kernel(
     prof: bool = False,
     warps: int = 4,
     min_blocks: int = 1,
+    early_hist: bool = False,
+    flat: bool = False,
 ) -> jit.Kernel:
     major, minor = torch.cuda.get_device_capability(device_index)
     defines = dict(
@@ -94,6 +105,10 @@ def _kernel(
         NW=warps,
         MINB=min_blocks,
     )
+    if early_hist:
+        defines["EARLY_HIST"] = 1
+    if flat:
+        defines["FLAT_STORES"] = 1
     source = "".join(f"#define {k} {v}\n" for k, v in defines.items())
     cubin = jit.compile_source(
         source + SOURCE.read_text(),
@@ -118,6 +133,19 @@ def build(device_index: int, rows: int, hk: int, hv: int, norm_f32: bool) -> Non
                 trigger,
                 False,
                 min_blocks=min_blocks,
+                flat=FLAT,
+            )
+        if EARLY:
+            _kernel(
+                device_index,
+                rows,
+                hk,
+                hv,
+                norm_f32,
+                trigger,
+                False,
+                early_hist=True,
+                flat=FLAT,
             )
 
 
@@ -166,6 +194,8 @@ def core(
     _profile: Optional[torch.Tensor] = None,
     warps: int = 4,
     min_blocks: Optional[int] = None,
+    early_hist: Optional[bool] = None,
+    flat: Optional[bool] = None,
 ) -> torch.Tensor:
     """Write the gated RMSNorm of the verify output as FP8 into ``out`` [rows, HV * V].
 
@@ -174,7 +204,9 @@ def core(
     row-strided views with one row stride; ``checkpoint`` [slots, HV, V, K] BF16; the ring
     [slots, HV | H, 16, V | K] (low parts optional) with cursors by ``replay_indices``; the first
     ``state_indices.numel()`` requests of ``rows_per_request`` rows each. ``o_out`` [rows, HV, V]
-    BF16 also receives the replay output (checks only)."""
+    BF16 also receives the replay output (checks only). ``early_hist`` (default ``EARLY``) loads the
+    committed history before the PDL wait when the grid runs one CTA an SM (same bits); ``flat``
+    (default ``FLAT``) predicates the stores (same bits)."""
     rows, T = qkv.shape[0], rows_per_request
     n = rows // T
     HV = checkpoint.shape[1]
@@ -262,6 +294,10 @@ def core(
         o_out=0 if o_out is None else o_out.data_ptr(),
         prof=0 if _profile is None else _profile.data_ptr(),
     )
+    min_blocks = (
+        _min_blocks(qkv.device.index, n * HV) if min_blocks is None else min_blocks
+    )
+    early_hist = (EARLY if early_hist is None else early_hist) and min_blocks == 1
     kernel = _kernel(
         qkv.device.index,
         T,
@@ -272,7 +308,9 @@ def core(
         o_out is not None,
         _profile is not None,
         warps,
-        _min_blocks(qkv.device.index, n * HV) if min_blocks is None else min_blocks,
+        min_blocks,
+        early_hist,
+        FLAT if flat is None else flat,
     )
     jit.launch(
         kernel, (n * HV, 1, 1), [p], torch.cuda.current_stream(qkv.device).cuda_stream

@@ -18,7 +18,9 @@ up to 224 rows, and ``hop`` (the boundary's fused all-reduce points on the decod
 widths where FlashInfer's low-latency kernels, which it equals bit for bit, run.
 ``gdn_push`` (numeric: out_proj as the hop's push GEMM, on gdn_verify's FP8 norm) runs up
 to 8 rows. ``gdn_front`` (numeric: the GDN projections and conv in one launch, then
-gdn_pdl's verify) covers one request of 7 rows, ``route_shared`` (numeric: the shared
+gdn_pdl's verify) covers one request of 7 rows; ``gdn_trt_front`` replaces its projection
+front through four requests. ``route_lin`` (numeric) starts the next router before the
+current hidden all-reduce at exactly one request. ``route_shared`` (numeric: the shared
 expert's gate/up in route's launch) up to 8 rows. ``skv2`` runs the full attention's core
 of one request through the split-KV attention of SGLang branch
 nvidia/qwen35-agentx-gb300, ``mka`` the fused attention prologue and epilogue around it
@@ -44,7 +46,9 @@ REQUESTS = tuple(range(1, 129))
 MULTI_REQUEST_TP = (8,)
 # the name that requests them in the slot list
 MULTI_REQUEST = "multi_request"
-GDN_FRONT_ROWS = 7  # the rows slot gdn_front's front is built for
+GDN_FRONT_ROWS = 7  # the one-request custom front's fixed width
+GDN_TRT_FRONT_MAX_ROWS = 28  # TensorRT-LLM's front, through four requests
+
 # Each slot's widest step: its launcher's bound (sm103/moe/router.py MAX_TOKENS,
 # sm103/moe/mkm.py MAX_TOKENS, sm103/hop OPROJ_MAX_M, sm103/attention/mka.py), and for
 # hop the rows up to which FlashInfer's MNNVL CuTe DSL fusion runs the one-shot
@@ -107,11 +111,15 @@ class Slots(msgspec.Struct, frozen=True):
     gdn_push: bool = False
     # the projections and the conv in one launch (gdn/front.py; numeric)
     gdn_front: bool = False
+    # TensorRT-LLM's front replaces the custom front through four requests (numeric)
+    gdn_trt_front: bool = False
     # the shared expert's gate/up in the router launch (moe/route.py; numeric)
     route_shared: bool = False
     skv2: bool = False  # the full attention's core through SKV2 (attention/split_kv.py)
     mka: bool = False  # the fused attention prologue and epilogue (attention/mka.py)
     mka_push: bool = False  # the epilogue pushes its rows into the hop
+    # the next router runs before the mixer's hidden all-reduce (numeric)
+    route_lin: bool = False
     # the input projections on the low-M launch (lowm.py; numeric)
     lowm_in: bool = False
     lowm_outproj: bool = False  # GDN out_proj on the low-M launch (lowm.py; numeric)
@@ -146,6 +154,7 @@ class Facts(msgspec.Struct, frozen=True):
     hop: bool = False  # the decode hop, built for the widest step it covers
     gdn_push: bool = False  # out_proj packed for the push GEMM on every GDN layer
     gdn_front: bool = False  # in_proj_qkvz packed for the front on every GDN layer
+    gdn_trt_front: bool = False  # TensorRT-LLM's front built for every GDN layer
     route_shared: bool = (
         False  # the router front with the shared stage, every MoE layer
     )
@@ -153,6 +162,7 @@ class Facts(msgspec.Struct, frozen=True):
     mka: bool = False  # the fused prologue and epilogue for every full-attention layer
     mka_wide: bool = False  # with its wide entries (four query heads a rank)
     mka_push: bool = False  # with the epilogue's push into the hop
+    route_lin: bool = False  # the router-before-all-reduce path built for every layer
     lowm_in: bool = False  # the low-M input projections built for every layer
     lowm_out: bool = False  # the low-M output projections built for every layer
     lowm_se: bool = False  # the low-M shared expert built for every MoE layer
@@ -168,13 +178,28 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
     hop = facts.hop and rows <= HOP_MAX_ROWS
     mka = facts.mka and rows <= (MKA_WIDE_MAX_ROWS if facts.mka_wide else MKA_MAX_ROWS)
     lowm_se = facts.lowm_se and rows <= LOWM_SE_MAX_ROWS
+    mkm = (
+        route
+        and facts.mkm
+        and rows <= (MKM_WIDE_MAX_ROWS if facts.mkm_wide else MKM_MAX_ROWS)
+    )
+    gdn_front_base = facts.gdn_verify and facts.gdn_pdl and facts.gdn_front
+    gdn_trt_front = (
+        gdn_front_base
+        and facts.gdn_trt_front
+        and rows % GDN_FRONT_ROWS == 0
+        and rows <= GDN_TRT_FRONT_MAX_ROWS
+    )
+    # At one request lowm_se replaces both route_shared's shared stage and
+    # SGLang's shared-expert tail.
+    route_shared = (
+        route and facts.route_shared and rows <= ROUTE_SHARED_ROWS and not lowm_se
+    )
     return Slots(
         route=route,
         route_topk=route_topk,
         route_gemm=route_topk and facts.route_gemm and rows <= ROUTE_GEMM_MAX_ROWS,
-        mkm=route
-        and facts.mkm
-        and rows <= (MKM_WIDE_MAX_ROWS if facts.mkm_wide else MKM_MAX_ROWS),
+        mkm=mkm,
         mkm_m32=route_topk
         and facts.mkm_m32
         and MKM_WIDE_MAX_ROWS < rows <= MKM_M32_MAX_ROWS,
@@ -199,20 +224,19 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         and hop
         and facts.gdn_push
         and rows <= GDN_PUSH_MAX_ROWS,
-        gdn_front=facts.gdn_verify
-        and facts.gdn_pdl
-        and facts.gdn_front
-        and rows == GDN_FRONT_ROWS,
-        # At one request lowm_se replaces both route_shared's shared stage and
-        # SGLang's shared-expert tail.
-        route_shared=route
-        and facts.route_shared
-        and rows <= ROUTE_SHARED_ROWS
-        and not lowm_se,
+        gdn_front=gdn_front_base and (rows == GDN_FRONT_ROWS or gdn_trt_front),
+        gdn_trt_front=gdn_trt_front,
+        route_shared=route_shared,
         # SKV2 attends one sequence
         skv2=facts.skv2 and rows <= tokens_per_request,
         mka=mka,
         mka_push=mka and facts.mka_push and hop,
+        route_lin=facts.route_lin
+        and rows == GDN_FRONT_ROWS
+        and route
+        and mkm
+        and hop
+        and not route_shared,
         lowm_in=facts.lowm_in and rows <= LOWM_IN_MAX_ROWS,
         lowm_outproj=facts.lowm_out and rows <= LOWM_OUTPROJ_MAX_ROWS,
         lowm_oproj=facts.lowm_out and rows <= LOWM_OPROJ_MAX_ROWS,

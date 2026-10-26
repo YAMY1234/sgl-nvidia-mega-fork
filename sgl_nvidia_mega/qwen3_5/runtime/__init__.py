@@ -36,7 +36,9 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "hop",
     "gdn_push",
     "gdn_front",
+    "gdn_trt_front",
     "route_shared",
+    "route_lin",
     "skv2",
     "mka",
     "mka_push",
@@ -210,6 +212,11 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_front' runs slot 'gdn_pdl''s dependent verify"
         )
+    if "gdn_trt_front" in SLOTS and not {"gdn_front", "gdn_core"} <= SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'gdn_trt_front' replaces slot 'gdn_front' in front "
+            "of slot 'gdn_core'"
+        )
     if "gdn_core" in SLOTS and "gdn_verify" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_core' runs slot 'gdn_verify''s step in one launch"
@@ -263,6 +270,27 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'mka_push' pushes slot 'mka''s epilogue into slot "
             "'hop''s mailbox"
+        )
+    if (
+        "route_lin" in SLOTS
+        and not {
+            "route",
+            "mkm",
+            "hop",
+            "gdn_push",
+            "mka",
+            "mka_push",
+        }
+        <= SLOTS
+    ):
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'route_lin' runs the router before the all-reduce "
+            "through slots 'route', 'mkm', 'hop', 'gdn_push', 'mka' and 'mka_push'"
+        )
+    if "route_lin" in SLOTS and "route_shared" in SLOTS and "lowm_se" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'route_lin' needs 'lowm_se' to replace "
+            "'route_shared' at one request"
         )
     return reasons
 
@@ -345,11 +373,16 @@ def build(model, ctx):
         hop=bound["boundary"].hop is not None,
         gdn_push=bool(bound["gdn"].packed),
         gdn_front=bool(bound["gdn"].front),
+        gdn_trt_front=bound["gdn"].gdn_trt_front,
         route_shared=bound["moe"].shared,
         skv2=bound["attention"].skv2,
         mka=bound["attention"].mka,
         mka_wide=bound["attention"].mka_wide,
         mka_push=bound["attention"].mka_push,
+        route_lin=bool(bound["gdn"].rlin)
+        and bound["attention"].route_lin
+        and bound["boundary"].hop is not None
+        and bound["boundary"].hop.rl is not None,
         lowm_in=bound["lowm"].lowm_in,
         lowm_out=bound["lowm"].lowm_out,
         lowm_se=bound["lowm"].se,

@@ -244,6 +244,7 @@ __device__ __forceinline__ void mka_prologue_kernel(const ProParams p) {
   if (!needs_norm && !is_gate) kvs = __ldg(p.v_scale);
 
   pdl_wait();
+  // Keep this release after the wait: q35mka_gate reads x (the hop's output) before its own wait.
   if (kEarlyTrigger) pdl_trigger();
   const float inv_sx = div_full(1.0f, sx);
   const float alpha = __fmul_rn(sx, sw);
@@ -834,6 +835,168 @@ __device__ __forceinline__ void mka_epilogue_wide_kernel(const EpiParams p) {
 extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_prologue(const q35mka::ProParams p) {
   q35mka::mka_prologue_kernel<true>(p);
 }
+namespace q35mka {
+// ---------------------------------------------------------------- slot route_lin: router before the all-reduce
+// The attention layers' form of sm103/hop/src/rlin.cu (numeric): after the o_proj epilogue of a TP8 B1
+// step, 16 CTAs compute this rank's router partial
+// (A W_o,r * sx * sw on the gated FP8 o_proj input, plus A[:, K_r] on the layer's residual input) and push it, fp32,
+// into the hop's router mailbox; the MoE input's consume_rl sums the partials into the logits. The epilogue CTAs are
+// unchanged.
+struct RlArgs {  // = q35rl::RlArgs (sm103/hop/src/rlin.cu)
+  void* rmc;
+  void* ruc;
+  const uint4* rw;
+  const uint16_t* h0;
+  int k0;
+  uint16_t* logits;
+  uint8_t* x_fp4;
+  uint8_t* x_sf;
+  const float* gs;
+  unsigned long long* trace;
+};
+constexpr int kRlExperts = 512, kRlCoreK = 1024, kRlSliceK = 512, kRlSteps = 12, kRlCtas = 16;
+constexpr uint32_t kRlSent = 0x80000000u;
+struct RlSmem {
+  uint32_t xb[8][(kRlCoreK + kRlSliceK) / 2 + 4];
+};
+__device__ __forceinline__ void rl_mma_bf16(float (&d)[4], const uint4& a, uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+      "{%0,%1,%2,%3};"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint32_t rl_e4m3x2_bf16x2(uint16_t v) {
+  float lo, hi;
+  asm("{\n\t.reg .b32 h2;\n\t.reg .b16 l, h;\n\t"
+      "cvt.rn.f16x2.e4m3x2 h2, %2;\n\t"
+      "mov.b32 {l, h}, h2;\n\t"
+      "cvt.f32.f16 %0, l;\n\t"
+      "cvt.f32.f16 %1, h;\n\t}"
+      : "=f"(lo), "=f"(hi)
+      : "h"(v));
+  __nv_bfloat162 b = __floats2bfloat162_rn(lo, hi);
+  return *reinterpret_cast<uint32_t*>(&b);
+}
+__device__ __forceinline__ void rl_mc_st_v4f(float* mc, float a, float b, float c, float d) {
+  asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%0], {%1,%2,%3,%4};" ::"l"(mc), "f"(a), "f"(b), "f"(c), "f"(d)
+               : "memory");
+}
+
+// Router partial rows [32c, 32c + 32); K is the gated FP8 o_proj input (1024),
+// then h0[K_r] (512).
+__device__ __forceinline__ uint2 rl_ld_cg2(const void* p) {
+  uint2 v;
+  asm volatile("ld.global.cg.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ uint4 rl_ld_cg4(const void* p) {
+  uint4 v;
+  asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ void mka_epilogue_rl_router(const EpiParams& p, const RlArgs& r, float (&red)[8][32][8],
+                                                       RlSmem& sm) {
+  const int c = blockIdx.x;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t = lane & 3;
+  uint4 a[kRlSteps][2];
+  {
+    const uint4* wb = r.rw + ((size_t)c * 8 + warp) * (kRlSteps * 2 * 32) + lane;
+#pragma unroll
+    for (int st = 0; st < kRlSteps; ++st)
+#pragma unroll
+      for (int mt = 0; mt < 2; ++mt) a[st][mt] = ldg_nc_v4(wb + (st * 2 + mt) * 32);
+  }
+  const float sx = __ldg(p.sx);
+  pdl_trigger();
+  const float inv_sx = div_full(1.0f, sx);
+  const int m = p.m;
+  // stage: 8 rows x 256 quads of the gated input (attn * sigmoid(gate) -> static e4m3, the epilogue's rounding), then
+  // 8 rows x 64 chunks of 8 bf16 of h0's slice; every load goes out before any is used
+  uint2 ao[8], ag[8];
+  uint4 hv[2];
+#pragma unroll
+  for (int u = 0; u < 8; ++u) {
+    const int q = tid + u * 256, row = q >> 8, col = (q & 255) * 4;
+    ao[u] = make_uint2(0u, 0u);
+    ag[u] = make_uint2(0u, 0u);
+    if (row < m) {
+      ao[u] = rl_ld_cg2(p.attn + (size_t)row * kRlCoreK + col);
+      ag[u] = rl_ld_cg2(p.gate + (size_t)row * kRlCoreK + col);
+    }
+  }
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int q = tid + u * 256, row = q >> 6, chk = q & 63;
+    hv[u] = row < m ? rl_ld_cg4(r.h0 + (size_t)row * 4096 + r.k0 + chk * 8) : make_uint4(0u, 0u, 0u, 0u);
+  }
+#pragma unroll
+  for (int u = 0; u < 8; ++u) {
+    const int q = tid + u * 256, row = q >> 8, col = (q & 255) * 4;
+    const uint32_t f8 = row < m ? gate_quant4_r(ao[u], ag[u], inv_sx) : 0u;
+    sm.xb[row][col / 2] = rl_e4m3x2_bf16x2((uint16_t)(f8 & 0xFFFFu));
+    sm.xb[row][col / 2 + 1] = rl_e4m3x2_bf16x2((uint16_t)(f8 >> 16));
+  }
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int q = tid + u * 256, row = q >> 6, chk = q & 63;
+    sm.xb[row][kRlCoreK / 2 + chk * 4 + 0] = hv[u].x;
+    sm.xb[row][kRlCoreK / 2 + chk * 4 + 1] = hv[u].y;
+    sm.xb[row][kRlCoreK / 2 + chk * 4 + 2] = hv[u].z;
+    sm.xb[row][kRlCoreK / 2 + chk * 4 + 3] = hv[u].w;
+  }
+  __syncthreads();
+  float ch[2][4][4];
+#pragma unroll
+  for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) ch[mt][k][e] = 0.f;
+#pragma unroll
+  for (int st = 0; st < kRlSteps; ++st) {
+    const int kk = (warp * kRlSteps + st) * 16;
+    const uint32_t b0 = sm.xb[g][kk / 2 + t];
+    const uint32_t b1 = sm.xb[g][kk / 2 + 4 + t];
+    rl_mma_bf16(ch[0][st & 3], a[st][0], b0, b1);
+    rl_mma_bf16(ch[1][st & 3], a[st][1], b0, b1);
+  }
+  {
+    float4* dst = reinterpret_cast<float4*>(&red[warp][lane][0]);
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+      float s4[4];
+#pragma unroll
+      for (int e = 0; e < 4; ++e)
+        s4[e] = __fadd_rn(__fadd_rn(ch[mt][0][e], ch[mt][1][e]), __fadd_rn(ch[mt][2][e], ch[mt][3][e]));
+      dst[mt] = make_float4(s4[0], s4[1], s4[2], s4[3]);
+    }
+  }
+  __syncthreads();
+  const int tok = tid >> 2, j = tid & 3;
+  if (tok < m) {
+    float v[8];
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+      const int rr = 8 * j + q;
+      const int l = (rr % 8) * 4 + tok / 2;
+      const int e = (rr / 16) * 4 + ((rr % 16) / 8) * 2 + (tok % 2);
+      float x = red[0][l][e];
+#pragma unroll
+      for (int w = 1; w < 8; ++w) x = __fadd_rn(x, red[w][l][e]);
+      v[q] = __float_as_uint(x) == kRlSent ? 0.f : x;
+    }
+    const q35hop::Site& s = p.site;
+    const uint32_t stage = q35hop::stage_peek(s);
+    float* dst = static_cast<float*>(r.rmc) +
+                 (((size_t)stage * s.world + s.rank) * s.m_cap + tok) * kRlExperts + c * 32 + 8 * j;
+    rl_mc_st_v4f(dst, v[0], v[1], v[2], v[3]);
+    rl_mc_st_v4f(dst + 4, v[4], v[5], v[6], v[7]);
+  }
+}
+}  // namespace q35mka
+
 extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_prologue_late(const q35mka::ProParams p) {
   q35mka::mka_prologue_kernel<false>(p);
 }
@@ -842,6 +1005,13 @@ extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_gate(co
 }
 extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_epilogue_q4(const q35mka::EpiParams p) {
   q35mka::mka_epilogue_kernel<4, true>(p);
+}
+// The router partial runs immediately after q35mka_epilogue_q4 (16 CTAs, no cluster).
+extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_rl_router(const q35mka::EpiParams p,
+                                                                               const q35mka::RlArgs r) {
+  __shared__ __align__(16) float red[8][32][8];
+  __shared__ __align__(16) q35mka::RlSmem sm;
+  q35mka::mka_epilogue_rl_router(p, r, red, sm);
 }
 extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_epilogue_q4_late(const q35mka::EpiParams p) {
   q35mka::mka_epilogue_kernel<4, false>(p);

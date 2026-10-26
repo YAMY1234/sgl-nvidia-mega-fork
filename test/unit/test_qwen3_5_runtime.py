@@ -205,6 +205,12 @@ def test_the_draft_loop_routes_q1_by_kv_length_as_2_2(
     built = draft.SPEC.build("lm", SimpleNamespace(context_len=4096), _draft_ctx())
     variants = built.graph_variants["draft_loop"]
     assert variants.capture_labels == ("q1_stock", "q1_long")
+    # past max_batch_size every batch takes q1_stock, so SGLang captures one graph there
+    assert variants.max_batch_size == 1
+    long = SimpleNamespace(attention_kv_len_lower_bound=10**6, seq_lens_cpu=None)
+    for bs in range(variants.max_batch_size + 1, 129):
+        long.batch_size = bs
+        assert variants.select(long) == "q1_stock"
     batch = SimpleNamespace(
         batch_size=batch_size,
         attention_kv_len_lower_bound=lower_bound,
@@ -245,6 +251,11 @@ def test_the_draft_extend_takes_the_split_kv_variants_with_slot_draft_skv2(
             {"draft_loop", "draft_skv2"},
             "slot 'draft_skv2' runs inside entry 'draft_extend'",
         ),
+        (
+            {"draft_loop", "draft_multi"},
+            "slot 'draft_multi' serves the draft steps of two or more requests "
+            "('multi_request')",
+        ),
     ],
 )
 def test_the_draft_slots_name_what_they_need(monkeypatch, slots, want):
@@ -256,7 +267,7 @@ class _DraftParts:
     """Parts with no slot built: the stock model step."""
 
     def __init__(self, slots=frozenset(), tp_size=8):
-        self.slots, self.mkd, self.engaged = slots, None, []
+        self.slots, self.mkd, self.top1x, self.engaged = slots, None, None, []
         self.binding = SimpleNamespace(tp_size=tp_size)
 
     def note_engaged(self, entry, bs):
@@ -334,6 +345,8 @@ def test_the_draft_loop_writes_each_steps_token_and_restores_the_positions(
         (8, {"multi_request"}, (1, 2)),
         (8, set(), (1,)),
         (4, {"multi_request"}, (1,)),
+        (8, {"multi_request", "draft_multi"}, tuple(range(1, 129))),
+        (4, {"multi_request", "draft_multi"}, (1,)),
     ],
 )
 def test_the_draft_loop_serves_two_requests_at_tp8_on_request(
@@ -342,8 +355,93 @@ def test_the_draft_loop_serves_two_requests_at_tp8_on_request(
     from sgl_nvidia_mega.qwen3_5.draft.loop import DraftLoop
 
     monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
-    loop = DraftLoop(_DraftParts(tp_size=tp_size), num_steps=4)
-    assert tuple(bs for bs in (1, 2, 4) if loop.step_for(bs) == loop.step) == served
+    loop = DraftLoop(_DraftParts(slots=frozenset(slots), tp_size=tp_size), num_steps=4)
+    sizes = tuple(range(1, 130))
+    assert tuple(bs for bs in sizes if loop.step_for(bs) == loop.step) == served
+
+
+@pytest.mark.parametrize(
+    "tp_size, slots, built, served",
+    [
+        (8, {"multi_request", "draft_multi"}, True, tuple(range(1, 129))),
+        (8, {"multi_request", "draft_multi"}, False, (1,)),
+        (4, {"multi_request", "draft_multi"}, True, (1,)),
+        (8, {"draft_multi"}, True, (1,)),
+    ],
+)
+def test_the_draft_extend_serves_more_requests_with_draft_multi(
+    monkeypatch, tp_size, slots, built, served
+):
+    from sgl_nvidia_mega.qwen3_5.draft.extend import DraftExtend
+
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
+    parts = _DraftParts(slots=frozenset(slots), tp_size=tp_size)
+    parts.top1x = object() if built else None
+    extend = DraftExtend(parts, tokens_per_request=7)
+    sizes = tuple(range(1, 130))
+    assert tuple(bs for bs in sizes if extend.step_for(bs) == extend.step) == served
+
+
+def test_a_multi_request_draft_loop_takes_the_sharded_top1(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.draft import layer
+    from sgl_nvidia_mega.qwen3_5.draft.loop import DraftLoop
+
+    calls = []
+    _stub_model_step(monkeypatch, calls)
+
+    def top1_into(
+        parts, hidden, tokens, column, *, nan_key, positions, mrope_positions
+    ):
+        calls.append(("top1x", column, nan_key))
+        tokens[:, column] = hidden[:, 0].to(torch.int64) % 1000
+        positions.add_(1)
+
+    monkeypatch.setattr(layer, "top1_into", top1_into)
+    parts = _DraftParts(slots=frozenset({"draft_multi"}))
+    parts.top1x = object()
+    loop = DraftLoop(parts, num_steps=3)
+    io = SimpleNamespace(
+        num_requests=4,
+        num_steps=3,
+        topk_index=torch.tensor([[1], [2], [3], [4]]),
+        hidden_states=torch.tensor([[1.0], [2.0], [3.0], [4.0]]),
+        positions=torch.tensor([10, 20, 30, 40]),
+        mrope_positions=None,
+        out_cache_loc=torch.arange(12),
+        steps=("m0", "m1"),
+        kv="kv",
+        draft_tokens_out=torch.full((4, 3), -1, dtype=torch.int64),
+    )
+    loop.step(io)
+    assert parts.engaged == [("draft_loop", 4)]
+    assert [c[0] for c in calls if c[0] in ("top1", "top1x")] == ["top1x", "top1x"]
+    # each step embeds the column the previous exchange wrote
+    assert [c[1] for c in calls if c[0] == "fc"] == [[1, 2, 3, 4], [20, 30, 40, 50]]
+    assert io.draft_tokens_out.tolist() == [
+        [1, 20, 210],
+        [2, 30, 310],
+        [3, 40, 410],
+        [4, 50, 510],
+    ]
+    # the request-major slots of step i, made dense
+    assert [c[2] for c in calls if c[0] == "layer"] == [[0, 3, 6, 9], [1, 4, 7, 10]]
+    assert io.positions.tolist() == [10, 20, 30, 40]
+
+
+@pytest.mark.parametrize("requests, split", [(16, True), (32, False)])
+def test_the_split_fc_takes_the_draft_steps_up_to_its_widest_batch(
+    monkeypatch, requests, split
+):
+    from sgl_nvidia_mega.qwen3_5.draft.loop import DraftLoop
+
+    calls = []
+    _stub_model_step(monkeypatch, calls)
+    parts = _DraftParts(slots=frozenset({"draft_multi"}))
+    parts.model = SimpleNamespace(embed_tokens=lambda t: t)
+    parts.mkd = SimpleNamespace(split_fc=lambda e, h: calls.append(("split",)) or h)
+    loop = DraftLoop(parts, num_steps=2)
+    loop._fc(torch.zeros(requests, dtype=torch.int64), torch.zeros(requests, 1))
+    assert [c[0] for c in calls] == (["split"] if split else ["fc"])
 
 
 @pytest.mark.parametrize("split_fc", [False, True])

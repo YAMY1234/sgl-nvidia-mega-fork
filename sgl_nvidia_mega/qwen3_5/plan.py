@@ -21,7 +21,11 @@ of one request through the split-KV attention of SGLang branch
 nvidia/qwen35-agentx-gb300, ``mka`` the fused attention prologue and epilogue around it
 (up to 8 rows; with four query heads a rank, its wide entries up to 14 rows and past
 them its front path, bit for bit SGLang's, at every width), and ``mka_push`` (with
-``hop``) has the epilogue push its rows into the hop.
+``hop``) has the epilogue push its rows into the hop. ``lowm_in`` / ``lowm_out`` (numeric) run the static FP8 input / output projections on a
+low-M warp-MMA launch with the weights loaded before the dependency wait, up to each one's
+measured rows (``LOWM_*_MAX_ROWS``), and with ``lowm_push`` (with ``hop``) push their rows into the hop;
+``lowm_se`` (numeric) the shared expert in two such launches. ``hop_fp8`` (with ``hop``) has the hop
+also write the next projection's static FP8 input, which it then reads without a quantize kernel.
 """
 
 from __future__ import annotations
@@ -53,6 +57,14 @@ ROUTE_SHARED_ROWS = 8
 MKA_MAX_ROWS = 8
 # with four query heads a rank: the wide entries, then the front path (attention/mka.py)
 MKA_WIDE_MAX_ROWS = MAX_ROWS
+# slots lowm / lowm_se: the rows up to which each low-M launch measured faster than SGLang's quantize +
+# cuBLAS path on GB300 (results/trt-1022/l6): the input projections (in_proj_qkvz + in_proj_ba, qkv_proj),
+# the output projections (out_proj, o_proj) and the shared expert. The wider 28/
+# 56-row launches regressed the target step, so they stay on SGLang's stock path.
+LOWM_IN_MAX_ROWS = 14
+LOWM_OUTPROJ_MAX_ROWS = 14
+LOWM_OPROJ_MAX_ROWS = 14
+LOWM_SE_MAX_ROWS = 14
 
 
 class Slots(msgspec.Struct, frozen=True):
@@ -78,6 +90,15 @@ class Slots(msgspec.Struct, frozen=True):
     skv2: bool = False  # the full attention's core through SKV2 (attention/split_kv.py)
     mka: bool = False  # the fused attention prologue and epilogue (attention/mka.py)
     mka_push: bool = False  # the epilogue pushes its rows into the hop
+    # the input projections on the low-M launch (lowm.py; numeric)
+    lowm_in: bool = False
+    lowm_outproj: bool = False  # GDN out_proj on the low-M launch (lowm.py; numeric)
+    lowm_oproj: bool = False  # attention o_proj on the low-M launch (lowm.py; numeric)
+    lowm_se: bool = False  # the shared expert in two low-M launches (lowm.py; numeric)
+    # the low-M output projections push their rows into the hop (lowm.py; numeric)
+    lowm_push: bool = False
+    # the hop also writes the next projection's static FP8 input (lowm.py; bitwise)
+    hop_fp8: bool = False
 
 
 class Facts(msgspec.Struct, frozen=True):
@@ -101,6 +122,11 @@ class Facts(msgspec.Struct, frozen=True):
     mka: bool = False  # the fused prologue and epilogue for every full-attention layer
     mka_wide: bool = False  # with its wide entries (four query heads a rank)
     mka_push: bool = False  # with the epilogue's push into the hop
+    lowm_in: bool = False  # the low-M input projections built for every layer
+    lowm_out: bool = False  # the low-M output projections built for every layer
+    lowm_se: bool = False  # the low-M shared expert built for every MoE layer
+    lowm_push: bool = False  # with the output projections' push into the hop
+    hop_fp8: bool = False  # the hop's FP8 copy of the norm for the next projection
 
 
 def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> Slots:
@@ -109,6 +135,7 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
     route = facts.route and rows <= ROUTE_MAX_ROWS
     hop = facts.hop and rows <= HOP_MAX_ROWS
     mka = facts.mka and rows <= (MKA_WIDE_MAX_ROWS if facts.mka_wide else MKA_MAX_ROWS)
+    lowm_se = facts.lowm_se and rows <= LOWM_SE_MAX_ROWS
     return Slots(
         route=route,
         mkm=route
@@ -127,11 +154,25 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         and facts.gdn_pdl
         and facts.gdn_front
         and rows == GDN_FRONT_ROWS,
-        route_shared=route and facts.route_shared and rows <= ROUTE_SHARED_ROWS,
+        # At one request lowm_se replaces both route_shared's shared stage and
+        # SGLang's shared-expert tail.
+        route_shared=route
+        and facts.route_shared
+        and rows <= ROUTE_SHARED_ROWS
+        and not lowm_se,
         # SKV2 attends one sequence
         skv2=facts.skv2 and rows <= tokens_per_request,
         mka=mka,
         mka_push=mka and facts.mka_push and hop,
+        lowm_in=facts.lowm_in and rows <= LOWM_IN_MAX_ROWS,
+        lowm_outproj=facts.lowm_out and rows <= LOWM_OUTPROJ_MAX_ROWS,
+        lowm_oproj=facts.lowm_out and rows <= LOWM_OPROJ_MAX_ROWS,
+        lowm_se=lowm_se,
+        lowm_push=facts.lowm_out
+        and facts.lowm_push
+        and hop
+        and rows <= max(LOWM_OUTPROJ_MAX_ROWS, LOWM_OPROJ_MAX_ROWS),
+        hop_fp8=hop and facts.hop_fp8 and rows <= HOP_MAX_ROWS,
     )
 
 

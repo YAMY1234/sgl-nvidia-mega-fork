@@ -24,6 +24,7 @@ than the draft hop.
 
 from __future__ import annotations
 
+import importlib
 import logging
 from functools import partial
 
@@ -127,9 +128,10 @@ def _mnnvl_workspace(parts, rows: int):
     parallel = get_parallel()
     if parallel.tp_size != 8 or parallel.moe_ep_size <= 1:
         return None
-    from sglang.srt.layers import flashinfer_mnnvl_cutedsl
-
-    workspace = flashinfer_mnnvl_cutedsl._WORKSPACE
+    # Read the live module global after the target initialized its workspace.
+    workspace = importlib.import_module(
+        "sglang.srt.layers.flashinfer_mnnvl_cutedsl"
+    )._WORKSPACE
     return workspace if workspace is not None and workspace.supports(rows) else None
 
 

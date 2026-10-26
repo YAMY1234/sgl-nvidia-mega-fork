@@ -37,6 +37,7 @@ SGLANG_READS = {
         "SPECULATIVE_DECODING",
         "MULTI_NODE_TP",
         "KV_OFFLOAD",
+        "PD_DISAGGREGATION",
         "MegakernelSpec",
         "Numerics",
         "NumericsKind",
@@ -61,6 +62,7 @@ SGLANG_READS = {
         "enable_linear_replayssm_spec",
         "mamba_ssm_dtype",
         "startup_weight_load_mode",
+        "disaggregation_mode",
     ),
     "srt/configs/qwen3_5.py": ("text_config",),
     "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
@@ -129,6 +131,15 @@ NUMERIC_TOLERANCES = {
         "gdn_trt_front.in_proj_qkvz.max_abs_vs_stock": 2.0,
         "gdn_trt_front.in_proj_ba.rel_l2_vs_stock": 1.05,
         "gdn_trt_front.in_proj_ba.max_abs_vs_stock": 2.0,
+    },
+    # The fused ReplaySSM, gated norm and FP8 output against gdn_verify on the same
+    # inputs (test_core_is_gdn_verify_numerically).
+    "gdn_core": {
+        "gdn_core.replay.rel_l2_vs_gdn_verify": 2e-3,
+        "gdn_core.norm_fp8.rel_l2_vs_gdn_verify": 2e-2,
+        "gdn_core.ring_d.rel_l2_vs_gdn_verify": 5e-3,
+        "gdn_core.ring_k.rel_l2_vs_gdn_verify": 1e-5,
+        "gdn_core.ring_g.max_abs_vs_gdn_verify": 1e-5,
     },
     "route_shared": {
         "route_shared.gate_up.rel_l2_vs_stock": 1.05,
@@ -213,9 +224,23 @@ def binding_reasons() -> list[str]:
     return []
 
 
+def pd_reasons(cfg) -> list[str]:
+    """Why this PD role has no covered step ([] on the decode side)."""
+    if (cfg.disaggregation_mode or "null") == "prefill":
+        return [
+            "a PD prefill server runs no covered step; enable it on the decode side"
+        ]
+    return []
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     runtime.apply_expert_parallel(cfg.ep_size or 1)
-    return text_config_reasons(hf_config) + binding_reasons() + runtime.slot_reasons()
+    return (
+        text_config_reasons(hf_config)
+        + binding_reasons()
+        + runtime.slot_reasons()
+        + pd_reasons(cfg)
+    )
 
 
 def _build(model, hf_config, ctx):
@@ -236,6 +261,8 @@ SPEC = MegakernelSpec(
             Feature.KV_OFFLOAD,
             # TEP (MoE TP x EP): the slots in runtime.EP_STOCK_SLOTS stay off
             Feature.EXPERT_PARALLEL,
+            # The decode side of PD; pd_reasons refuses the prefill side.
+            Feature.PD_DISAGGREGATION,
         }
     ),
     numerics=NUMERICS,

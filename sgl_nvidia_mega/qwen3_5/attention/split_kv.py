@@ -80,9 +80,12 @@ SGLANG_READS = {
 # SGLang aa3e34aa routes KV access through kv_layers. This slot already reads
 # the same caches through EagleBinding; its FP8 target-verify math is unchanged.
 SGLANG_MIRRORS = {
+    # Stock, SGLang aa3e34aa, and the SGLang follow-up's CP-lite dispatch; the metadata
+    # this module mirrors is unchanged by the dispatch around the fixed-q-length call.
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend.forward_extend": (
         "8e36076dafabff66",
         "1445b85387928caf",
+        "d7e7c1fe125739e6",
     ),
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._should_use_fused_fp8_path": "e0b14791d523a019",
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._fused_fp8_qkv_kv_cache": (

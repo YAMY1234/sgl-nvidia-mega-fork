@@ -68,6 +68,8 @@ SGLANG_READS = {
         "act_fn",
         "_enable_silu_fp4_quant_fusion",
         "_silu_fp4_quant_fused",
+        "_silu_fp8_quant_fusion",
+        "_down_takes_static_fp8",
     ),
     "srt/models/qwen3_5.py": ("layers", "start_layer", "end_layer", "mlp"),
     "srt/layers/moe/topk.py": (
@@ -95,7 +97,6 @@ SGLANG_READS = {
         # TEP8 body: the routed op's deferred-finalize output
         "_make_deferred_finalize_output",
         "_make_deferred_finalize_output(top_k)",
-        "_make_deferred_finalize_output(materialized_routing)",
     ),
     "srt/layers/moe/utils.py": (
         "get_moe_runner_backend",
@@ -114,6 +115,7 @@ SGLANG_READS = {
         '"weight_scale"',
     ),
     "srt/layers/activation.py": ("SiluAndMul",),
+    "kernels/ops/quantization/fp8_kernel.py": ("silu_and_mul_static_quant_fp8",),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
@@ -121,7 +123,7 @@ SGLANG_READS = {
 SGLANG_MIRRORS = {
     "srt/layers/moe/fused_moe_triton/layer.py:FusedMoE.forward_deferred_finalize": "af4b474cbaf33493",
     "srt/layers/moe/fused_moe_triton/layer.py:FusedMoE._dispatch_with_pre_quant": "dcdefc28cf643081",
-    "srt/models/qwen2_moe.py:Qwen2MoeMLP.forward": "6091ffb613568a10",
+    "srt/models/qwen2_moe.py:Qwen2MoeMLP.forward": "bb4c9fb2d7994e97",
 }
 
 
@@ -388,6 +390,17 @@ def shared_expert_tail(expert, gate_up: torch.Tensor) -> torch.Tensor:
     if expert._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
         x, _ = expert.down_proj(expert._silu_fp4_quant_fused(gate_up))
         return x
+    if expert._silu_fp8_quant_fusion is None:
+        expert._silu_fp8_quant_fusion = expert._down_takes_static_fp8()
+    if expert._silu_fp8_quant_fusion and gate_up.dtype == torch.bfloat16:
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            silu_and_mul_static_quant_fp8,
+        )
+
+        x, _ = expert.down_proj(
+            silu_and_mul_static_quant_fp8(gate_up, expert.down_proj.input_scale)
+        )
+        return x
     x = expert.act_fn(gate_up)
     x, _ = expert.down_proj(x)
     return x
@@ -489,9 +502,7 @@ def _pre_body(mlp, width, x_fp4, x_sf):
 
     experts = mlp.experts
     result = body.run(width, experts, x_fp4, x_sf.view(torch.float8_e4m3fn))
-    deferred = _make_deferred_finalize_output(
-        result, top_k=router.TOP_K, materialized_routing=True
-    )
+    deferred = _make_deferred_finalize_output(result, top_k=router.TOP_K)
     return experts.dispatcher.combine(
         combine_input=StandardCombineInput(hidden_states=deferred)
     )

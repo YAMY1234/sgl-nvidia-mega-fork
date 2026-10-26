@@ -38,7 +38,6 @@ def _layer(layer_id, *, engram=None, mxfp8=True):
     )
 
 
-
 @pytest.fixture
 def fake():
     calls = []
@@ -63,7 +62,6 @@ def fake():
         yield m
 
 
-
 def _deferred(rows, *, replicated=False):
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         FlashInferTrtllmDeferredFinalizeOutput,
@@ -74,7 +72,6 @@ def _deferred(rows, *, replicated=False):
         torch.ones(rows * 6, HIDDEN), torch.ones(rows, 6), torch.zeros(rows, 6), 6
     )
     return MoEOutput(routed, torch.ones(rows, HIDDEN), None, 1.0, replicated)
-
 
 
 def _hop_boundary(fake, rows, **kw):
@@ -89,7 +86,6 @@ def _hop_boundary(fake, rows, **kw):
     norm = SimpleNamespace(weight=torch.ones(HIDDEN), variance_epsilon=1e-6)
     b._ffn_next[0] = SimpleNamespace(norm=norm)
     return b, layers, triplet, norm
-
 
 
 @pytest.mark.parametrize(
@@ -159,8 +155,7 @@ def test_two_shot_runs_both_posts_and_builds_sglangs_next_input(fake, receiver, 
     else:
         q, sf = hop.moe_post.call_args.kwargs["mxfp8_out"]
         assert q.shape == (rows, HIDDEN) and sf.numel() == 160 * 128
-        assert st.hc.input.swizzled.data is q
-
+        assert st.hc.input.pair.data is q
 
 
 @pytest.mark.parametrize("receiver", ["closed", "unfusable", "normed", "mxfp8"])
@@ -209,7 +204,7 @@ def test_two_shot_norm_wide_hands_on_its_input_past_sglangs_caps(
     if receiver == "mxfp8":
         q, sf = hop.moe_post.call_args.kwargs["mxfp8_out"]
         assert q.shape == (rows, HIDDEN) and sf.numel() == hop.scale_bytes(rows)
-        assert st.hc.input.swizzled.data is q
+        assert st.hc.input.pair.data is q
     elif wide:
         assert "mxfp8_out" not in hop.moe_post.call_args.kwargs
         assert isinstance(st.hc.input, mhc.HcNormed) and st.hc.input.rows is normed
@@ -217,7 +212,6 @@ def test_two_shot_norm_wide_hands_on_its_input_past_sglangs_caps(
         hop.moe_post.assert_not_called()
         assert st.hc.input is None
     assert ("MoE post (" in caplog.text) is wide
-
 
 
 def test_two_shot_norm_wide_requires_two_shot(monkeypatch):

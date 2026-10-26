@@ -50,10 +50,11 @@ OPT_IN_SLOTS: tuple[str, ...] = (
 # when requested in the same variable: covering them costs the one-request step about
 # 0.3% at TP8
 OPT_IN_COVERAGE: tuple[str, ...] = ("multi_request",)
-# Graph variants of a built slot, requested in the same variable: no width of their own.
+# Graph or build variants of a slot, requested in the same variable: no width of their
+# own. BAL stays opt-in because its serving evidence covers TP8 only.
 # skv2_cp: one long request past the measured crossover runs CP-lite in place of SKV2,
 # in a graph variant of its own (attention/route.py)
-OPT_IN_VARIANTS: tuple[str, ...] = ("skv2_cp",)
+OPT_IN_VARIANTS: tuple[str, ...] = ("skv2_cp", "mkm_wide_bal")
 # The MTP draft's EAGLE entries and kernel groups (qwen3_5/draft), requested in the same
 # variable; the draft spec's build reads them, the target's ignores them
 DRAFT_ENTRIES: tuple[str, ...] = ("draft_loop", "draft_extend")
@@ -83,6 +84,7 @@ EP_STOCK_SLOTS = frozenset(
         "mkm_m128",
         "mkm_m256",
         "mkm_m512",
+        "mkm_wide_bal",
         "draft_moe",
     }
 )
@@ -176,6 +178,18 @@ def slot_reasons() -> list[str]:
                 f"{SLOTS_ENV}: slot '{name}' serves the steps of more than {more} requests "
                 "('multi_request')"
             )
+    if (
+        "mkm_wide_bal" in SLOTS
+        and not {
+            "mkm_m256",
+            "mkm_m512",
+        }
+        & SLOTS
+    ):
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'mkm_wide_bal' changes the work split of slot "
+            "'mkm_m256' or 'mkm_m512'"
+        )
     if "route_shared" in SLOTS and "route" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'route_shared' runs in slot 'route''s launch"

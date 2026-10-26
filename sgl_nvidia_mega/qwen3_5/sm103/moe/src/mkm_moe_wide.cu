@@ -263,6 +263,9 @@ static_assert(DRAIN_SMEM == 0, "x's shared memory holds the next item's rows whi
 #ifndef FC2_PF_LEAD  // issue the FC2 prefetch when the producer reaches FC1 stage kFc1Stages - FC2_PF_LEAD
 #define FC2_PF_LEAD 4
 #endif
+#ifndef BAL_SPLIT  // 1: the units past each CTA's own first expert are dealt to balance the CTAs (see the work items)
+#define BAL_SPLIT 0
+#endif
 
 struct Params {
   const uint16_t* logits;    // [M, 512] bf16 router logits (router_gemm_quant output)
@@ -925,6 +928,80 @@ q35_mkm_moe_wide(const __grid_constant__ CUtensorMap tm13, const __grid_constant
     }
     named_bar(4, 224);
     if (warp == 0) {
+#if BAL_SPLIT
+      // Work items, balanced: expert cta's row group 0 first when it has tokens (its stream started before the
+      // routing was read); every other unit (row group 0 of experts G, G + 1, ... with tokens, then the further row
+      // groups in expert order) is unit r of one list, dealt first to the CTAs whose expert c has no tokens (in CTA
+      // order), then round robin from CTA 0: the busiest CTA runs ceil(units / G), not up to 512 / G.
+      int ni = 0;
+      if (s.cnt[cta] > 0) {
+        if (lane == 0) {
+          s.item_e[0] = cta;
+          s.item_g[0] = 0;
+        }
+        ni = 1;
+      }
+      int Z = 0, zrank = 0;  // CTAs whose expert c has no tokens, and those before this one
+      for (int c0 = 0; c0 < G; c0 += 32) {
+        const uint32_t zm = __ballot_sync(0xffffffffu, c0 + lane < G && s.cnt[c0 + lane] == 0);
+        Z += __popc(zm);
+        zrank += __popc(cta >= c0 + 32 ? zm : zm & ((1u << (cta > c0 ? cta - c0 : 0)) - 1u));
+      }
+      int xe[16], xsum = 0, asum = 0;
+      uint32_t amask = 0;  // experts 16 lane + j >= G with tokens (row group 0 in the list)
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        const int e = 16 * lane + j, n = s.cnt[e];
+        if (e >= G && n > 0) {
+          amask |= 1u << j;
+          ++asum;
+        }
+        xe[j] = n > kRows ? (n - 1) / kRows : 0;
+        xsum += xe[j];
+      }
+      int ainc = asum, xinc = xsum;
+#pragma unroll
+      for (int d = 1; d < 32; d <<= 1) {
+        const int ua = __shfl_up_sync(0xffffffffu, ainc, d), ux = __shfl_up_sync(0xffffffffu, xinc, d);
+        ainc += lane >= d ? ua : 0;
+        xinc += lane >= d ? ux : 0;
+      }
+      const int A2 = __shfl_sync(0xffffffffu, ainc, 31), R = A2 + __shfl_sync(0xffffffffu, xinc, 31);
+      auto take = [&](int r) {  // append unit r of the list (warp-uniform r)
+        const bool first = r < A2;
+        const int o = first ? r : r - A2;
+        const int owner = __ffs(__ballot_sync(0xffffffffu, (first ? ainc : xinc) > o)) - 1;
+        int e = 0, grp = 0;
+        if (lane == owner) {
+          int left = o - (first ? ainc - asum : xinc - xsum);
+#pragma unroll
+          for (int j = 0; j < 16; ++j) {
+            if (first) {
+              if ((amask >> j) & 1u) {
+                if (left == 0) e = 16 * lane + j;
+                --left;
+              }
+            } else {
+              if (left >= 0 && left < xe[j]) {
+                e = 16 * lane + j;
+                grp = left + 1;
+              }
+              left -= xe[j];
+            }
+          }
+        }
+        e = __shfl_sync(0xffffffffu, e, owner);
+        grp = __shfl_sync(0xffffffffu, grp, owner);
+        if (ni >= kMaxItems) __trap();
+        if (lane == 0) {
+          s.item_e[ni] = e;
+          s.item_g[ni] = grp;
+        }
+        ++ni;
+      };
+      if (s.cnt[cta] == 0 && zrank < R) take(zrank);
+      for (int r = Z + cta; r < R; r += G) take(r);
+#else
       // Work items: own experts cta, cta + G, ... that have tokens (row group 0), then this CTA's further row groups:
       // the o-th one over all experts (expert order, then group) is CTA G - 1 - o % G's
       int ni = 0;
@@ -974,6 +1051,7 @@ q35_mkm_moe_wide(const __grid_constant__ CUtensorMap tm13, const __grid_constant
         }
         ++ni;
       }
+#endif
       __syncwarp();
       if (lane == 0) {
         s.nitems = ni;

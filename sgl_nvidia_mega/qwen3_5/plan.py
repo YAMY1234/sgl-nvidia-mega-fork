@@ -8,8 +8,10 @@ target verify of 1 to 128 requests (``REQUESTS``: every decode graph batch size 
 captures up to 128); a width of more than one request is covered only where a slot runs.
 ``route`` (the router GEMM and the routed experts' NVFP4 input in one launch) runs up to
 16 rows, ``mkm`` (on its outputs, the top-10 and both expert GEMMs in one launch) up to
-7, and with ``mkm_wide`` (its 16-token engine) up to 16. ``gdn_verify`` (the GatedDeltaNet verify chain with its launch choices changed) covers
-every width, and ``hop`` (the boundary's fused all-reduce points on the decode hop) the
+7, and with ``mkm_wide`` (its 16-token engine) up to 16. ``gdn_verify`` (the
+GatedDeltaNet verify chain with its launch choices changed) covers every width, with
+``gdn_core`` (numeric: its ReplaySSM verify, gated norm and FP8 output in one launch)
+up to 224 rows, and ``hop`` (the boundary's fused all-reduce points on the decode hop) the
 widths where FlashInfer's low-latency kernels, which it equals bit for bit, run.
 ``gdn_push`` (numeric: out_proj as the hop's push GEMM, on gdn_verify's FP8 norm) runs up
 to 8 rows. ``gdn_front`` (numeric: the GDN projections and conv in one launch, then
@@ -41,6 +43,7 @@ GDN_FRONT_ROWS = 7  # the rows slot gdn_front's front is built for
 # hop the rows up to which FlashInfer's MNNVL CuTe DSL fusion runs the one-shot
 # all-reduce the hop equals bit for bit (its finalize runs one-shot up to 23 rows)
 ROUTE_MAX_ROWS = 16
+GDN_CORE_MAX_ROWS = 224  # and gdn_core's launch
 MKM_MAX_ROWS = 7
 MKM_WIDE_MAX_ROWS = 16
 HOP_MAX_ROWS = 15
@@ -61,6 +64,10 @@ class Slots(msgspec.Struct, frozen=True):
     )
     gdn_verify: bool = False  # the GDN verify chain's launch choices (gdn/verify.py)
     gdn_pdl: bool = False  # its ReplaySSM verify launched dependent on the conv
+    # its ReplaySSM verify, gated norm and FP8 output in one launch (sm103/gdn/core.py)
+    gdn_core: bool = False
+    # its conv with every x row loaded first and each window row in one store (gdn/conv.py; bitwise)
+    gdn_conv: bool = False
     hop: bool = False  # the boundary's fused all-reduce points (boundary/hop.py)
     # out_proj pushes its partial into the hop from its GEMM (gdn/verify.py; numeric)
     gdn_push: bool = False
@@ -82,6 +89,8 @@ class Facts(msgspec.Struct, frozen=True):
     mkm_wide: bool = False  # with their 16-token engine
     gdn_verify: bool = False  # the GDN verify slot built for every GDN layer
     gdn_pdl: bool = False  # with its dependent verify launch
+    gdn_core: bool = False  # with the one-launch verify core
+    gdn_conv: bool = False  # with the hoisted conv writing each window row once
     hop: bool = False  # the decode hop, built for the widest step it covers
     gdn_push: bool = False  # out_proj packed for the push GEMM on every GDN layer
     gdn_front: bool = False  # in_proj_qkvz packed for the front on every GDN layer
@@ -107,6 +116,8 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         and rows <= (MKM_WIDE_MAX_ROWS if facts.mkm_wide else MKM_MAX_ROWS),
         gdn_verify=facts.gdn_verify,
         gdn_pdl=facts.gdn_verify and facts.gdn_pdl,
+        gdn_core=facts.gdn_verify and facts.gdn_core and rows <= GDN_CORE_MAX_ROWS,
+        gdn_conv=facts.gdn_verify and facts.gdn_conv,
         hop=hop,
         gdn_push=facts.gdn_verify
         and hop

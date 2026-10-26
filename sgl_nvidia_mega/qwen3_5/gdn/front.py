@@ -231,6 +231,19 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
         ring_indices=st.fb.req_pool_indices[:1],
         pad_slot=meta.pad_slot_id,
     )
+    if opts.core:
+        from sgl_nvidia_mega.qwen3_5.gdn.verify import _fused
+
+        # b / a in the front's b8 / a8 order
+        return _fused(
+            gdn,
+            conv,
+            projected[:, CONV_CHANNELS:].view(ROWS, attn.num_v_heads, attn.head_v_dim),
+            ba[:, 8:],
+            ba[:, :8],
+            st,
+            opts,
+        )
     query, key, value = torch.split(conv, [attn.q_dim, attn.k_dim, attn.v_dim], dim=-1)
     H, K = attn.num_k_heads, attn.head_k_dim
     HV, V = attn.num_v_heads, attn.head_v_dim

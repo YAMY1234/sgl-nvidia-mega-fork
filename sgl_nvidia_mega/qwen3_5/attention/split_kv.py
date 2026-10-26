@@ -16,11 +16,14 @@ K / V rows and quantizes Q in one ``fused_fp8_qkv_kv_cache``, then runs ``core``
 ``core`` takes an FP8 Q whose K / V rows are written (slot ``mka``'s prologue writes
 them itself) and runs SKV2 where the step takes split-KV attention (``route``),
 SGLang's attention otherwise. It reads the page table, the KV lengths and the pool from
-the forward's view (``Step.view``).
+the forward's view (``Step.view``). With slot ``skv2_cp``, a step of one request past
+the measured crossover runs CP-lite (``cp_core``) instead of SKV2.
 """
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import logging
 
 import torch
@@ -65,6 +68,11 @@ SGLANG_READS = {
     ),
     "srt/model_executor/forward_batch_info.py": ("out_cache_loc",),
     "srt/environ.py": ("envs", "SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR"),
+    "srt/layers/attention/trtllm_mha_backend.py": (
+        "DEFAULT_WORKSPACE_SIZE_MB",
+        '"trtllm_mha_zero_workspace"',
+    ),
+    "srt/runtime_context.py": ("get_buffer",),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
@@ -162,17 +170,101 @@ def core(attn, q, st):
     step are written: [rows, heads * head_dim] in bf16."""
     from sgl_nvidia_mega.qwen3_5.attention import route
 
-    split = route.split_kv(route.VERIFY, st.fb)
-    if (split, q.shape[0]) not in _ENGAGED:
-        _ENGAGED.add((split, q.shape[0]))
-        logger.info(
-            "NVIDIA megakernel: Qwen3.5 slot skv2 runs at %d rows (%s)",
-            q.shape[0],
-            "SKV2" if split else "SGLang's attention below the split-KV length",
-        )
-    if not split:
+    label = route.label(route.verify_variants(), st.fb)
+    if (label, q.shape[0]) not in _ENGAGED:
+        _ENGAGED.add((label, q.shape[0]))
+        if label == route.SPLIT_KV_CP:
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 slot skv2_cp runs at %d rows (CP-lite from "
+                "%d tokens of KV)",
+                q.shape[0],
+                route.cp_min_length("verify"),
+            )
+        else:
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 slot skv2 runs at %d rows (%s)",
+                q.shape[0],
+                "SKV2"
+                if label == route.SPLIT_KV_LONG
+                else "SGLang's attention below the split-KV length",
+            )
+    if label == route.SPLIT_KV_STOCK:
         return attn(q, None, None, st.fb)
+    if label == route.SPLIT_KV_CP:
+        o = cp_core(attn, q, st.view.kv, st.view.attn, st.fb, ROWS)
+        if o is not None:
+            return o
     return skv2(attn, q, st.view.kv, st.view.attn)
+
+
+def cp_lite():
+    """SGLang's process CP-lite (q35_cp_lite.CpLite, built by its TRT-LLM MHA backend
+    when a CP graph variant is requested) when it can serve one request
+    (``attend(min_bs=)``), else None."""
+    try:
+        module = importlib.import_module("sglang.srt.layers.attention.q35_cp_lite")
+    except ImportError:
+        return None
+    if "min_bs" not in inspect.signature(module.CpLite.attend).parameters:
+        return None
+    return module.CpLite._instance
+
+
+def cp_reason() -> str:
+    """Why the CP graph variants cannot run ("" when they can)."""
+    try:
+        module = importlib.import_module("sglang.srt.layers.attention.q35_cp_lite")
+    except ImportError:
+        return "this SGLang has no CP-lite (q35_cp_lite)"
+    if "min_bs" not in inspect.signature(module.CpLite.attend).parameters:
+        return "this SGLang's CP-lite serves no single request (attend has no min_bs)"
+    if module.CpLite._instance is None:
+        return "SGLang's attention backend did not build CP-lite"
+    return ""
+
+
+def cp_core(attn, q, kv, meta, forward_batch, q_len: int):
+    """CP-lite on one request's ``q_len`` FP8 query rows ``q`` of ``attn`` over the pool
+    ``kv`` at ``meta``'s pages and lengths (this step's rows written): [rows, heads *
+    head_dim] bf16, or None where CP-lite declines (decided by shapes alone, so every
+    rank of the KV group agrees)."""
+    from sglang.kernels.ops.attention.utils import canonicalize_stride
+    from sglang.srt.layers.attention.trtllm_mha_backend import (
+        DEFAULT_WORKSPACE_SIZE_MB,
+    )
+    from sglang.srt.runtime_context import get_buffer
+
+    cp = cp_lite()
+    if cp is None:
+        return None
+    i = kv.layer_ids.index(attn.layer_id)
+    # the pool's NHD rows as HND pages, as TRT-LLM MHA hands them to CP-lite
+    caches = tuple(
+        canonicalize_stride(
+            buf.view(-1, PAGE_SIZE, heads, attn.head_dim).permute(0, 2, 1, 3)
+        )
+        for buf, heads in ((kv.k[i], attn.tp_k_head_num), (kv.v[i], attn.tp_v_head_num))
+    )
+    workspace = get_buffer(
+        "trtllm_mha_zero_workspace",
+        lambda: torch.zeros(
+            DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024, dtype=torch.uint8, device=q.device
+        ),
+    )
+    o = cp.attend(
+        q.reshape(-1, attn.tp_q_head_num, attn.head_dim),
+        caches,
+        meta.page_table,
+        meta.cache_seqlens,
+        q_len,
+        float(1.0 * kv.k_scale[i] * attn.scaling),
+        float(kv.v_scale[i]),
+        workspace,
+        attn,
+        forward_batch,
+        min_bs=1,
+    )
+    return None if o is None else o.view(-1, attn.tp_q_head_num * attn.head_dim)
 
 
 def skv2(attn, q, kv, meta):

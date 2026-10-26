@@ -24,6 +24,12 @@ and the NVFP4 input as the runner's quantizer does; the runner then serves the
 materialized routing (FlashInfer's routed MoE), which skips its own top-k kernel. The
 logits are SGLang's, so the step's output is the stock one's.
 
+Under TEP8, route_topk or route-big also writes the routing tables of the runner's
+trtllm-gen MoE body, which then runs on them (``body.py``) in place of the runner's routed
+op and its routing kernel.
+The body's FC2 rows equal the op's bit for bit, and under expert parallelism a slot outside
+the rank's experts gets permuted index -1 as there.
+
 Slot ``mkm_m32`` takes route_topk's place at 17 to 32 rows: slot mkm's 32-token engine runs
 the top-10, FC1, SwiGLU, the NVFP4 requantization and FC2 in one launch on the router
 GEMM's logits and the NVFP4 input (with route_gemm the router front's tiles give both;
@@ -74,17 +80,29 @@ SGLANG_READS = {
         "run_moe_core",
         "run_moe_core(dispatch_output)",
         "quant_method",
+        "moe_runner_config",
     ),
     "srt/layers/moe/token_dispatcher/standard.py": (
         "dispatch(hidden_states)",
         "dispatch(topk_output)",
         "combine(combine_input)",
         "hidden_states_scale",
+        "StandardCombineInput",
     ),
     "srt/layers/moe/moe_runner/flashinfer_trtllm.py": (
         "flashinfer_trtllm_deferred_finalize_context",
         "trtllm_padded_hidden_size",
+        # TEP8 body: the routed op's deferred-finalize output
+        "_make_deferred_finalize_output",
+        "_make_deferred_finalize_output(top_k)",
+        "_make_deferred_finalize_output(materialized_routing)",
     ),
+    "srt/layers/moe/utils.py": (
+        "get_moe_runner_backend",
+        "is_flashinfer_trtllm",
+        "is_flashinfer_trtllm_routed",
+    ),
+    "srt/layers/moe/moe_runner/base.py": ("activation", "is_gated"),
     "srt/layers/quantization/modelopt_quant.py": (
         '"w13_input_scale_quant"',
         "quant_config",
@@ -135,11 +153,16 @@ class Bound(msgspec.Struct, frozen=True):
     # A caller-specific upper bound for the 16-token engine. The draft uses 12 so
     # its alternate-stream shared expert can overlap rows 13-16 with the 32-token engine.
     m16_max_rows: int = 16
+    pre: bool = False  # TEP8's body on route_topk/route-big routing tables
     reason: str = ""  # why a requested slot is not built
 
 
 def build(
-    model, max_rows: int, fused: bool, shared: bool = False, wide: bool = False
+    model,
+    max_rows: int,
+    fused: bool,
+    shared: bool = False,
+    wide: bool = False,
 ) -> Bound:
     """The router front for every MoE layer, compiled for 1..max_rows rows, with
     ``fused`` slot mkm's kernel and weight maps (with ``wide`` its 16-token engine too,
@@ -294,6 +317,39 @@ def topk_unsupported(model) -> str:
     return ""
 
 
+def pre_unsupported(model) -> str:
+    """Why TEP8's routed body cannot serve ("" when it can)."""
+    from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+    try:
+        from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+        from flashinfer.fused_moe.shared.inputs import (  # noqa: F401
+            MoeRunnerInputs,
+            alloc_trtllm_moe_output,
+        )
+        from flashinfer.tllm_enums import RoutingInputMode  # noqa: F401
+    except ImportError as e:
+        return f"FlashInfer without the MoE body entry ({e})"
+    module = get_trtllm_moe_sm100_module()
+    if not hasattr(module, "MoERunner") or not hasattr(module, "DABodyRunner"):
+        return "FlashInfer without the MoE body entry (MoERunner / DABodyRunner)"
+    backend = get_moe_runner_backend()
+    if not (backend.is_flashinfer_trtllm() or backend.is_flashinfer_trtllm_routed()):
+        return f"MoE runner backend {backend}"
+    m = model.model
+    for i in range(m.start_layer, m.end_layer):
+        experts = m.layers[i].mlp.experts
+        cfg = experts.moe_runner_config
+        if cfg.activation != "silu" or not cfg.is_gated:
+            return f"layer {i}: activation {cfg.activation} (gated {cfg.is_gated})"
+        for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
+            if getattr(experts, name, None) is not None:
+                return f"layer {i}: {name}"
+        if getattr(experts, "trtllm_padded_hidden_size", None) is not None:
+            return f"layer {i}: padded hidden size"
+    return ""
+
+
 def shared_unsupported(mlp) -> str:
     """Why the router front cannot compute ``mlp``'s shared gate/up ("" when it can):
     a static per-tensor FP8 projection of at most 512 rows, then SiLU-and-mul."""
@@ -337,15 +393,28 @@ def shared_expert_tail(expert, gate_up: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def routed(mlp, x: torch.Tensor, fused: Bound | None = None, shared: bool = False):
+def routed(
+    mlp,
+    x: torch.Tensor,
+    fused: Bound | None = None,
+    shared: bool = False,
+    pre_topk: bool = False,
+):
     """``FusedMoE.forward_deferred_finalize`` of ``mlp``'s routed experts on ``x``
     [rows, hidden], with the router front's logits and quantized input (``fused``: on
-    slot mkm's kernel). With ``shared`` (at most 8 rows) the router launch also computes
-    the shared expert's gate/up: returns (routed, gate_up, the event recorded on the
-    current stream right after that launch)."""
+    slot mkm's kernel). With ``pre_topk``, a routing-only launch writes TEP8's body
+    tables. With ``shared`` (at most 8 rows) the
+    router launch also computes the shared expert's gate/up: returns (routed, gate_up, the
+    event recorded on the current stream right after that launch)."""
     from sgl_nvidia_mega.qwen3_5.sm103.moe import router
 
     experts = mlp.experts
+    width = tables = None
+    if pre_topk:
+        from sgl_nvidia_mega.qwen3_5.moe import body
+
+        width = body.width(experts, x)
+        tables = width.tables
     for slot in ("route" if fused is None else "mkm",) + (
         ("route_shared",) if shared else ()
     ):
@@ -354,6 +423,12 @@ def routed(mlp, x: torch.Tensor, fused: Bound | None = None, shared: bool = Fals
             logger.info(
                 "NVIDIA megakernel: Qwen3.5 slot %s runs at %d rows", slot, x.shape[0]
             )
+    if pre_topk and ("tep8_body", x.shape[0]) not in _ENGAGED:
+        _ENGAGED.add(("tep8_body", x.shape[0]))
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 TEP8 routed body runs at %d rows",
+            x.shape[0],
+        )
     if shared:
         gu = mlp.shared_expert.gate_up_proj
         logits, x_fp4, x_sf, gate_up = router.router_gemm_quant_shared(
@@ -368,9 +443,22 @@ def routed(mlp, x: torch.Tensor, fused: Bound | None = None, shared: bool = Fals
         ready.record()
         out = _routed_experts(mlp, x, fused, logits, x_fp4, x_sf)
         return out, gate_up, ready
-    logits, x_fp4, x_sf = router.router_gemm_quant(
-        x, mlp.gate.weight, experts.w13_input_scale_quant.reshape(1)
-    )
+    scale = experts.w13_input_scale_quant.reshape(1)
+    if pre_topk:
+        from sgl_nvidia_mega.qwen3_5 import plan
+
+        rows = x.shape[0]
+        if ("pre_tier", rows) not in _ENGAGED:
+            _ENGAGED.add(("pre_tier", rows))
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 MoE front tier %s at %d rows: slot route's front, then route_topk's tables",
+                plan.moe_front_tier(rows),
+                rows,
+            )
+        logits, x_fp4, x_sf = router.router_gemm_quant(x, mlp.gate.weight, scale)
+        router.route_topk_quant(logits, x, scale, quantize=False, tables=tables)
+        return _pre_body(mlp, width, x_fp4, x_sf)
+    logits, x_fp4, x_sf = router.router_gemm_quant(x, mlp.gate.weight, scale)
     return _routed_experts(mlp, x, fused, logits, x_fp4, x_sf)
 
 
@@ -387,6 +475,26 @@ def routed_lin(mlp, x: torch.Tensor, fused: Bound, logits, x_fp4, x_sf):
             x.shape[0],
         )
     return _routed_experts(mlp, x, fused, logits, x_fp4, x_sf)
+
+
+def _pre_body(mlp, width, x_fp4, x_sf):
+    """TEP8's MoE body on ``width``'s tables, as a deferred-finalize output."""
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        _make_deferred_finalize_output,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    from sgl_nvidia_mega.qwen3_5.moe import body
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    experts = mlp.experts
+    result = body.run(width, experts, x_fp4, x_sf.view(torch.float8_e4m3fn))
+    deferred = _make_deferred_finalize_output(
+        result, top_k=router.TOP_K, materialized_routing=True
+    )
+    return experts.dispatcher.combine(
+        combine_input=StandardCombineInput(hidden_states=deferred)
+    )
 
 
 def _routed_experts(mlp, x, fused, logits, x_fp4, x_sf):
@@ -422,32 +530,89 @@ def _routed_experts(mlp, x, fused, logits, x_fp4, x_sf):
     return experts.dispatcher.combine(combine_input=combine_input)
 
 
-def routed_topk(mlp, x: torch.Tensor, gemm: bool = False):
+def routed_topk(mlp, x: torch.Tensor, gemm: bool = False, pre: bool = False):
     """``FusedMoE.forward_deferred_finalize`` of ``mlp``'s routed experts on ``x``
     [rows, hidden] with SGLang's router GEMM, then slot route_topk's launch (the top-10
     and the NVFP4 input), and the runner on the materialized routing. With ``gemm``
     (slot route_gemm, numeric) the router front's GEMM and quantizer in 16-row tiles
-    stand in for SGLang's router GEMM, and route_topk's launch only routes."""
+    stand in for SGLang's router GEMM, and route_topk's launch only routes. With ``pre``,
+    TEP8's internal front also writes the MoE body's routing tables and the body runs on
+    them (``body.py``) in place of the runner's routed op."""
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         flashinfer_trtllm_deferred_finalize_context,
     )
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
+    from sgl_nvidia_mega.qwen3_5 import plan
     from sgl_nvidia_mega.qwen3_5.sm103.moe import router
 
     if ("route_topk", x.shape[0]) not in _ENGAGED:
         _ENGAGED.add(("route_topk", x.shape[0]))
         logger.info(
-            "NVIDIA megakernel: Qwen3.5 slot route_topk runs at %d rows", x.shape[0]
+            "NVIDIA megakernel: Qwen3.5 slot route_topk runs at %d rows",
+            x.shape[0],
+        )
+    if pre and ("tep8_body", x.shape[0]) not in _ENGAGED:
+        _ENGAGED.add(("tep8_body", x.shape[0]))
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 TEP8 routed body runs at %d rows",
+            x.shape[0],
         )
     experts = mlp.experts
     scale = experts.w13_input_scale_quant.reshape(1)
+    width = tables = None
+    if pre:
+        from sgl_nvidia_mega.qwen3_5.moe import body
+
+        width = body.width(experts, x)
+        tables = width.tables
     if gemm:
         logits, x_fp4, x_sf = router.router_gemm_quant_tiled(x, mlp.gate.weight, scale)
-        ids, weights, _, _ = router.route_topk_quant(logits, x, scale, quantize=False)
+        ids, weights, _, _ = router.route_topk_quant(
+            logits, x, scale, quantize=False, tables=tables
+        )
+    elif pre and x.shape[0] >= plan.ROUTE_BIG_MIN_ROWS:
+        rows = x.shape[0]
+        if ("route_big", rows) not in _ENGAGED:
+            _ENGAGED.add(("route_big", rows))
+            cl, _, words = router.big_shape(rows)
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 MoE front tier %s at %d rows: "
+                "route-big C%d%s",
+                plan.moe_front_tier(rows),
+                rows,
+                cl,
+                "W" if words > 1 else "",
+            )
+        logits, _ = mlp.gate(x)
+        ids, weights, x_fp4, x_sf = router.route_big_quant(
+            logits,
+            x,
+            scale,
+            tables,
+            ctas=(
+                plan.ROUTE_BIG_WIDE_CTAS
+                if rows >= plan.ROUTE_BIG_WIDE_MIN_ROWS
+                else None
+            ),
+        )
     else:
         logits, _ = mlp.gate(x)
-        ids, weights, x_fp4, x_sf = router.route_topk_quant(logits, x, scale)
+        ids, weights, x_fp4, x_sf = router.route_topk_quant(
+            logits, x, scale, tables=tables
+        )
+    if pre:
+        rows = x.shape[0]
+        if rows < plan.ROUTE_BIG_MIN_ROWS and ("pre_tier", rows) not in _ENGAGED:
+            _ENGAGED.add(("pre_tier", rows))
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 MoE front tier %s at %d rows: "
+                "route_topk tables%s",
+                plan.moe_front_tier(rows),
+                rows,
+                " (route_gemm front)" if gemm else "",
+            )
+        return _pre_body(mlp, width, x_fp4, x_sf)
     topk_output = StandardTopKOutput(
         topk_weights=weights, topk_ids=ids, router_logits=logits
     )

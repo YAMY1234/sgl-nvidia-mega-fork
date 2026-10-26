@@ -355,10 +355,13 @@ def build(model, ctx):
         "attention": attention.build(model, pctx),
         "lowm": lowm.build(model, pctx),
     }
+    parallel = get_parallel()
+    tep8_moe = bound["moe"].pre and parallel.tp_size == 8 and parallel.moe_ep_size > 1
     facts = slot_plan.Facts(
         route=bound["moe"].route,
         route_topk=bound["moe"].topk,
         route_gemm=bound["moe"].gemm,
+        tep8_moe=tep8_moe,
         mkm=bool(bound["moe"].mkm),
         mkm_wide=bound["moe"].mkm_wide,
         mkm_m32=bool(bound["moe"].m32) and "mkm_m32" in SLOTS,
@@ -386,6 +389,7 @@ def build(model, ctx):
         lowm_in=bound["lowm"].lowm_in,
         lowm_out=bound["lowm"].lowm_out,
         lowm_se=bound["lowm"].se,
+        lowm_se_pre=bound["lowm"].se_pre,
         lowm_push=bound["lowm"].push,
         hop_fp8=bound["lowm"].hop_fp8,
     )

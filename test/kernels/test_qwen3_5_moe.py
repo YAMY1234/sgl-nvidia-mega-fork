@@ -17,7 +17,14 @@ replayed from a CUDA graph:
 - the router front with the shared gate/up stage (slot route_shared, numeric): its
   logits and NVFP4 input bit for bit the plain launch's, and its gate/up rows against
   fp64 on SGLang's static FP8 quantization of the rows, at most 1.05 x the mean relative
-  L2 and 2 x the max abs error of FlashInfer's FP8 BMM, at 1-8 rows; graph replay."""
+  L2 and 2 x the max abs error of FlashInfer's FP8 BMM, at 1-8 rows and the TP8 / TP16
+  widths (256 / 128 rows); graph replay;
+- the TEP8 routed path: the routing tables route_topk and route-big write for a rank's
+  window of local experts, and the trtllm-gen MoE body on them against FlashInfer's op
+  as SGLang calls it (on
+  route_topk's materialized routing, from the logits up to 16 rows) at TP8 and at TEP16
+  (MoE TP2 x EP8: 64 local experts, intermediate 512 a rank, ranks 0 and 5): the weights,
+  the slots routed outside the rank (-1) and every local slot's FC2 row bit for bit."""
 
 import pytest
 import torch
@@ -43,15 +50,15 @@ def _gpu_ready() -> bool:
 pytestmark = pytest.mark.skipif(not _gpu_ready(), reason="needs an SM100-family GPU")
 
 
-def _experts(g, rows, cols, std):
-    """NVFP4 experts [E, rows, cols]: gaussian weights with row and block spread,
+def _experts(g, rows, cols, std, n=E):
+    """NVFP4 experts [n, rows, cols]: gaussian weights with row and block spread,
     quantized by FlashInfer with a global scale per expert."""
     from flashinfer import fp4_quantize
 
-    packed = torch.empty(E, rows, cols // 2, dtype=torch.uint8, device="cuda")
-    sf = torch.empty(E, rows, cols // 16, dtype=torch.uint8, device="cuda")
-    scale = torch.empty(E, dtype=torch.float32, device="cuda")
-    for e in range(E):
+    packed = torch.empty(n, rows, cols // 2, dtype=torch.uint8, device="cuda")
+    sf = torch.empty(n, rows, cols // 16, dtype=torch.uint8, device="cuda")
+    scale = torch.empty(n, dtype=torch.float32, device="cuda")
+    for e in range(n):
         rs = torch.exp(torch.randn(rows, 1, device="cuda", generator=g) * 0.5)
         cs = torch.exp(torch.randn(1, cols // 16, device="cuda", generator=g) * 0.5)
         w = torch.randn(rows, cols, device="cuda", generator=g) * std
@@ -425,9 +432,11 @@ def test_router_gemm_quant_shared_replays_from_a_cuda_graph():
 # ---------------------------------------------------------------- slot route_topk
 
 
-def _routed_stock(layer, routing, x_fp4, x_sf):
+def _routed_stock(layer, routing, x_fp4, x_sf, tune=None, offset=0, raw=False):
     """``_stock`` on a materialized routing (ids int32, weights bf16 [M, 10]): the
-    runner's routed path (FlashInfer's routed MoE, as SGLang calls it)."""
+    runner's routed path (FlashInfer's routed MoE, as SGLang calls it; ``tune`` its
+    tune_max_num_tokens, SGLang's next power of 2); for the local experts from ``offset``
+    of a layer with ``count`` of them, with ``raw`` FlashInfer's three outputs."""
     from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import ActivationType
 
@@ -455,15 +464,17 @@ def _routed_stock(layer, routing, x_fp4, x_sf):
         n_group=0,
         topk_group=0,
         intermediate_size=layer["inter"],
-        local_expert_offset=0,
-        local_num_experts=E,
+        local_expert_offset=offset,
+        local_num_experts=layer.get("count", E),
         routed_scaling_factor=None,
         routing_method_type=1,
         do_finalize=False,
         activation_type=ActivationType.Swiglu,
-        tune_max_num_tokens=max(8, m),
+        tune_max_num_tokens=tune or max(8, m),
         enable_pdl=True,
     )[:3]
+    if raw:
+        return rows, weights, permuted
     return rows[permuted.reshape(-1).long()[: m * TOP_K]], weights
 
 
@@ -511,7 +522,367 @@ def test_route_topk_replays_from_a_cuda_graph():
     assert all(torch.equal(a, b) for a, b in zip(eager, captured))
 
 
-@pytest.mark.parametrize("m", [17, 21, 28, 35, 49, 56])
+# -------------------------------------------------------- TEP8 routed-body primitives
+
+
+def _tables_ref(ids, tile, window=(0, E)):
+    """routingIndicesCluster's tables for top-10 ids [M, 10] and tile_n over the local
+    experts ``window`` (first, count): per-local-expert counts, each one's first padded row
+    (its CTA offset * tile), the CTA -> local expert and CTA -> row-limit maps of the live
+    CTAs, and their count."""
+    lo, count = window
+    local = ids.flatten().long() - lo
+    local = local[(local >= 0) & (local < count)]
+    counts = torch.bincount(local, minlength=count)
+    ctas = (counts + tile - 1) // tile
+    offset = torch.cumsum(ctas, 0) - ctas
+    live = int(ctas.sum())
+    expert = torch.repeat_interleave(torch.arange(count, device=ids.device), ctas)
+    first = torch.repeat_interleave(offset, ctas)
+    cta = torch.arange(live, device=ids.device)
+    limit = torch.minimum(
+        (cta + 1) * tile, first * tile + torch.repeat_interleave(counts, ctas)
+    )
+    return counts, offset * tile, expert, limit, live
+
+
+def _check_tables(tables, window, token_order=False):
+    """``tables`` (written for its ids) against ``_tables_ref``: counts, CTA maps, live
+    count, each local slot in its expert's rows once (in token order with
+    ``token_order``), mapping back to its token, -1 for every other slot and padding row."""
+    m, tile = tables.m, tables.tile
+    lo, count = window
+    counts, first, expert, limit, live = _tables_ref(tables.ids, tile, window)
+    assert tables.live_ctas.item() == live
+    assert tables.total_padded.item() == live * tile
+    assert torch.equal(tables.tokens_per_expert[:count], counts.int())
+    assert torch.equal(tables.cta_expert[:live], expert.int())
+    assert torch.equal(tables.cta_row_limit[:live], limit.int())
+    flat = tables.ids.flatten().long() - lo
+    on = (flat >= 0) & (flat < count)
+    pos = tables.expanded_to_permuted.long()
+    assert (pos[~on] == -1).all()
+    flat, pos = flat[on], pos[on]
+    assert ((pos >= first[flat]) & (pos < first[flat] + counts[flat])).all()
+    assert torch.unique(pos).numel() == pos.numel()
+    token = (torch.arange(m * TOP_K, device=pos.device) // TOP_K)[on]
+    assert torch.equal(tables.permuted_to_token[pos].long(), token)
+    if token_order:  # an expert's rows ascend with the token (the single-block routing)
+        rank = pos - first[flat]
+        same = flat[:, None] == flat[None, :]
+        before = same & (token[None, :] < token[:, None])
+        assert torch.equal(rank, before.sum(1))
+    rows = torch.zeros(live * tile, dtype=torch.bool, device=pos.device)
+    rows[pos] = True
+    assert (tables.permuted_to_token[: live * tile][~rows] == -1).all()
+
+
+@pytest.mark.parametrize("window", [(0, E), (0, 64), (320, 64)], ids=str)
+@pytest.mark.parametrize("tile", [8, 16, 32])
+@pytest.mark.parametrize("m", [7, 14, 17, 28, 56, 112, 224])
+def test_route_topk_writes_the_moe_bodys_routing_tables(m, tile, window):
+    """With tables, route_topk routes as without them and writes
+    the trtllm-gen tables of its top-10 for tile_n over the local experts ``window`` (all
+    512, or TEP16's 64 of ranks 0 and 5), a second launch alike (the counter resets); each
+    expert's rows are its own, in any order (atomics, as stock)."""
+    if window[1] < E and m > 28:
+        pytest.skip("the expert-parallel steps are up to four requests")
+    logits, x, scale = _topk_inputs(m, seed=700 + m + tile)
+    router.build_topk(x.device.index)
+    want = router.route_topk_quant(logits, x, scale)
+    tables = router.RouteTables(m, tile, x.device, *window)
+    for _ in range(2):
+        got = router.route_topk_quant(logits, x, scale, tables=tables)
+        torch.cuda.synchronize()
+        for a, b in zip(got, want):
+            assert torch.equal(a, b)
+        assert got[0].data_ptr() == tables.ids.data_ptr()
+        assert tables.counter.item() == 0
+        _check_tables(tables, window)
+
+
+def _experts_of(layer, rank=0):
+    """The FusedMoE attributes moe/body.py reads, from the layer fixture (EP rank
+    ``rank`` of a layer with ``count`` local experts)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        num_experts=E,
+        num_local_experts=layer.get("count", E),
+        moe_ep_rank=rank,
+        top_k=TOP_K,
+        intermediate_size_per_partition=layer["inter"],
+        w13_weight=layer["w13"],
+        w13_weight_scale=layer["w13_sf"],
+        w2_weight=layer["w2"],
+        w2_weight_scale=layer["w2_sf"],
+        g1_scale_c=layer["g1c"],
+        g1_alphas=layer["g1"],
+        g2_alphas=layer["g2"],
+        moe_runner_config=SimpleNamespace(activation="silu", is_gated=True),
+    )
+
+
+@pytest.mark.parametrize("tuned", [True, False], ids=["tuned", "default"])
+@pytest.mark.parametrize("m", [17, 28, 56, 112, 224])
+def test_moe_body_on_route_topks_tables_is_the_routed_op(layer, m, tuned, monkeypatch):
+    """The MoE body (FlashInfer's DA entry, the routed op's tactic: the
+    autotuner's, or without one FlashInfer's default) on the tables route_topk's launch
+    writes gives the routed op's FC2 rows and weights, row for row by expanded index, bit
+    for bit; replayed from a CUDA graph too."""
+    from flashinfer.autotuner import AutoTuner, autotune
+    from sglang.srt.utils import next_power_of_2
+
+    from sgl_nvidia_mega.qwen3_5.moe import body
+
+    logits, x, scale = _topk_inputs(m, seed=1300 + m)
+    router.build_topk(x.device.index)
+    ids, weights, x_fp4, x_sf = router.route_topk_quant(logits, x, scale)
+    tune = next_power_of_2(m)
+    if tuned:
+        with autotune(True):
+            _routed_stock(layer, (ids, weights), x_fp4, x_sf, tune)
+    else:  # no tactic for the routed op or the body: both run FlashInfer's default
+        monkeypatch.setattr(
+            AutoTuner, "choose_one", lambda self, op, runners, *a, **k: (runners[0], -1)
+        )
+    want_rows, want_w = _routed_stock(layer, (ids, weights), x_fp4, x_sf, tune)
+    experts = _experts_of(layer)
+    body._WIDTHS.clear()
+    width = body.width(experts, x)
+    assert (width.tactic == [-1, -1]) != tuned
+
+    def step():
+        got = router.route_topk_quant(logits, x, scale, tables=width.tables)
+        rows, w, permuted = body.run(
+            width, experts, got[2], got[3].view(torch.float8_e4m3fn)
+        )[:3]
+        return rows[permuted.reshape(-1).long()], w
+
+    got_rows, got_w = step()
+    torch.cuda.synchronize()
+    assert torch.equal(got_w.view(torch.int16), want_w.view(torch.int16))
+    assert torch.equal(got_rows.view(torch.int16), want_rows.view(torch.int16))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = step()
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured[0].view(torch.int16), want_rows.view(torch.int16))
+    body._WIDTHS.clear()
+
+
+# ------------------------------------------------------ body under expert parallelism
+
+TEP16_EXPERTS, TEP16_INTER = (
+    64,
+    512,
+)  # MoE TP2 x EP8: local experts and intermediate a rank
+
+
+@pytest.fixture(scope="module")
+def ep_layer():
+    """One TEP16 Qwen3.5 MoE layer's local experts (64, intermediate 512 a rank) on the
+    trtllm-gen weight layout, as SGLang loads them; any rank's window holds them."""
+    return _local_layer(TEP16_EXPERTS, TEP16_INTER, 13)
+
+
+def _local_layer(n, inter, seed):
+    """A layer's ``n`` local experts (intermediate ``inter`` a rank) on the trtllm-gen
+    weight layout, as SGLang loads them."""
+    from sglang.srt.layers.quantization.utils import (
+        prepare_static_weights_for_trtllm_fp4_moe,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    w13, sf13, s13 = _experts(g, 2 * inter, H, 0.02, n)
+    w2, sf2, s2 = _experts(g, H, inter, 0.02, n)
+    w13, sf13, w2, sf2 = prepare_static_weights_for_trtllm_fp4_moe(
+        w13, w2, sf13, sf2, H, inter, n, is_gated=True
+    )
+    g1 = (1.0 / (X_SCALE * s13)).float()
+    return {
+        "w13": w13,
+        "w13_sf": sf13.view(torch.float8_e4m3fn).reshape(n, 2 * inter, H // 16),
+        "w2": w2,
+        "w2_sf": sf2.view(torch.float8_e4m3fn).reshape(n, H, inter // 16),
+        "g1": g1,
+        "g1c": (g1 / H_SCALE).float(),
+        "g2": (H_SCALE / s2).float(),
+        "inter": inter,
+        "count": n,
+    }
+
+
+def _stock_ep(layer, logits, x_fp4, x_sf, offset):
+    """FlashInfer's op from the logits as SGLang calls it at up to 16 rows (deferred
+    finalize) for the local experts from ``offset``: (FC2 rows, weights, expanded ->
+    permuted index, -1 for a slot routed elsewhere)."""
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+    from flashinfer.fused_moe.core import ActivationType
+    from sglang.srt.layers.moe.utils import RoutingMethodType
+    from sglang.srt.utils import next_power_of_2
+
+    return trtllm_fp4_block_scale_moe(
+        routing_logits=logits,
+        routing_bias=None,
+        hidden_states=x_fp4,
+        hidden_states_scale=x_sf.view(torch.float8_e4m3fn),
+        gemm1_weights=layer["w13"],
+        gemm1_weights_scale=layer["w13_sf"],
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=layer["w2"],
+        gemm2_weights_scale=layer["w2_sf"],
+        gemm2_bias=None,
+        output1_scale_scalar=layer["g1c"],
+        output1_scale_gate_scalar=layer["g1"],
+        output2_scale_scalar=layer["g2"],
+        per_token_scale=None,
+        num_experts=E,
+        top_k=TOP_K,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=layer["inter"],
+        local_expert_offset=offset,
+        local_num_experts=layer.get("count", E),
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.RenormalizeNaive,
+        do_finalize=False,
+        activation_type=ActivationType.Swiglu,
+        tune_max_num_tokens=next_power_of_2(logits.shape[0]),
+        enable_pdl=True,
+    )[:3]
+
+
+def _same_moe(got, want, m):
+    """Two deferred-finalize outputs (FC2 rows, weights, expanded -> permuted) agree: the
+    weights bit for bit, the same slots routed outside the rank (-1), and every local
+    slot's FC2 row bit for bit. Returns the two permutations."""
+    rows, w, perm = got[:3]
+    want_rows, want_w, want_perm = want[:3]
+    perm = perm.reshape(-1)[: m * TOP_K].long()
+    want_perm = want_perm.reshape(-1)[: m * TOP_K].long()
+    assert torch.equal(w.view(torch.int16), want_w.view(torch.int16))
+    assert torch.equal(perm < 0, want_perm < 0)
+    on = want_perm >= 0
+    assert torch.equal(
+        rows[perm[on]].view(torch.int16), want_rows[want_perm[on]].view(torch.int16)
+    )
+    return perm, want_perm
+
+
+def _ep_router_inputs(m, seed, kind, window):
+    """Rows, router weights and the routed input scale; ``kind`` "local" lifts the
+    window's experts by ~1 sd of a logit (about half the slots local), "same" sends every
+    token to the window's first 10 experts (several CTAs an expert past 8 rows), "ties"
+    gives every third expert the same top logit (the lowest ids win, past a warp of
+    candidates)."""
+    lo, count = window
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(m, H, device="cuda", generator=g)
+    x[0, :32] = 0
+    w = torch.randn(E, H, device="cuda", generator=g) * 0.02
+    mean = x.mean(0)
+    up = mean / mean.pow(2).sum()  # x_t . up ~ 1 for every token t
+    if kind == "local":
+        w[lo : lo + count] += 1.5 * up
+    elif kind == "same":
+        w[lo : lo + TOP_K] += 12.0 * up
+    elif kind == "ties":
+        w[::3] = w[1] + 3.0 * up
+    return (
+        x.to(torch.bfloat16),
+        w.to(torch.bfloat16),
+        torch.tensor([X_SCALE], device="cuda"),
+    )
+
+
+EP_CASES = [  # (layout, rank): TP8 (all 512 experts local) and TEP16 ranks 0 and 5
+    ("tp8", 0),
+    ("tep16", 0),
+    ("tep16", 5),
+]
+
+
+def _ep_case(request, layout, rank):
+    layer = request.getfixturevalue("ep_layer" if layout == "tep16" else "tp8_layer")
+    count = layer.get("count", E)
+    return layer, (rank * count, count)
+
+
+@pytest.fixture(scope="module")
+def tp8_layer():
+    """The TP8 layer of the ``layer`` fixture (intermediate 128 a rank, 512 experts)."""
+    from sglang.srt.layers.quantization.utils import (
+        prepare_static_weights_for_trtllm_fp4_moe,
+    )
+
+    inter = 128
+    g = torch.Generator(device="cuda").manual_seed(11)
+    w13, sf13, s13 = _experts(g, 2 * inter, H, 0.02)
+    w2, sf2, s2 = _experts(g, H, inter, 0.02)
+    w13, sf13, w2, sf2 = prepare_static_weights_for_trtllm_fp4_moe(
+        w13, w2, sf13, sf2, H, inter, E, is_gated=True
+    )
+    g1 = (1.0 / (X_SCALE * s13)).float()
+    return {
+        "w13": w13,
+        "w13_sf": sf13.view(torch.float8_e4m3fn).reshape(E, 2 * inter, H // 16),
+        "w2": w2,
+        "w2_sf": sf2.view(torch.float8_e4m3fn).reshape(E, H, inter // 16),
+        "g1": g1,
+        "g1c": (g1 / H_SCALE).float(),
+        "g2": (H_SCALE / s2).float(),
+        "inter": inter,
+    }
+
+
+@pytest.mark.parametrize("kind", ["random", "local", "same"])
+@pytest.mark.parametrize("m", [7, 14, 28])
+@pytest.mark.parametrize("layout,rank", EP_CASES)
+def test_moe_body_on_route_topks_ep_tables_is_the_routed_op(
+    request, layout, rank, m, kind
+):
+    """For a rank's local experts, the MoE body on route_topk's
+    tables is FlashInfer's routed op on route_topk's routing (the runner's path past 16
+    rows) and its op from the logits: weights, the slots routed elsewhere (-1) and every
+    local slot's FC2 row bit for bit; replayed from a CUDA graph too."""
+    from sgl_nvidia_mega.qwen3_5.moe import body
+
+    layer, window = _ep_case(request, layout, rank)
+    x, w, scale = _ep_router_inputs(m, 3000 + 31 * m + rank, kind, window)
+    logits = torch.nn.functional.linear(x, w)
+    router.build_topk(x.device.index)
+    ids, wts, x_fp4, x_sf = router.route_topk_quant(logits, x, scale)
+    experts = _experts_of(layer, rank)
+    body._WIDTHS.clear()
+    width = body.width(experts, x)
+
+    def step():
+        got = router.route_topk_quant(logits, x, scale, tables=width.tables)
+        return body.run(width, experts, got[2], got[3].view(torch.float8_e4m3fn))[:3]
+
+    got = step()
+    torch.cuda.synchronize()
+    _check_tables(width.tables, window)
+    routed = _routed_stock(layer, (ids, wts), x_fp4, x_sf, None, window[0], raw=True)
+    _same_moe(got, routed, m)
+    _same_moe(got, _stock_ep(layer, logits, x_fp4, x_sf, window[0]), m)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = step()
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        _same_moe(captured, routed, m)
+    body._WIDTHS.clear()
+
+
+@pytest.mark.parametrize("m", [17, 21, 28, 32])
 def test_router_front_tiles_are_its_16_row_launches(m):
     """Slot route_gemm (numeric past 16 rows): the router front over 16-row token tiles in
     one launch equals the 16-row launch on each tile, bit for bit; its NVFP4 input is the
@@ -536,3 +907,233 @@ def test_router_front_tiles_are_its_16_row_launches(m):
     only = router.route_topk_quant(logits, x, scale, quantize=False)
     assert only[2] is None and only[3] is None
     assert torch.equal(routed[0], only[0]) and torch.equal(routed[1], only[1])
+
+
+# ------------------------------------------- routed body at TEP8's wide request counts
+
+TEP8_EXPERTS, TEP8_INTER = (
+    128,
+    512,
+)  # MoE TP2 x EP4: local experts and intermediate a rank
+TEP8_ROWS = [231, 448, 896]  # 33, 64 and 128 requests of 7 verify rows
+# route_big's TEP8 tiers L1 / L2: 5, 16, 32, 33, 64 and 128 requests
+TEP8_BIG_ROWS = [35, 112, 224, 231, 448, 518, 672, 784, 896]
+
+
+@pytest.fixture(scope="module")
+def tep8_layer():
+    """One TEP8 Qwen3.5 MoE layer's local experts (128, intermediate 512 a rank)."""
+    return _local_layer(TEP8_EXPERTS, TEP8_INTER, 17)
+
+
+@pytest.mark.parametrize(
+    "window", [(0, TEP8_EXPERTS), (384, TEP8_EXPERTS), (0, E)], ids=str
+)
+@pytest.mark.parametrize("tile", [8, 32, 128])
+@pytest.mark.parametrize("m", TEP8_ROWS)
+def test_route_topk_writes_the_tep8_routing_tables(m, tile, window):
+    """At TEP8's widths, route_topk with tables routes as without
+    them and writes the tables of the rank's 128 local experts (ranks 0 and 3; all 512)
+    for tile_n, a second launch alike."""
+    logits, x, scale = _topk_inputs(m, seed=4100 + m + tile)
+    router.build_topk(x.device.index)
+    want = router.route_topk_quant(logits, x, scale)
+    tables = router.RouteTables(m, tile, x.device, *window)
+    for _ in range(2):
+        got = router.route_topk_quant(logits, x, scale, tables=tables)
+        torch.cuda.synchronize()
+        for a, b in zip(got, want):
+            assert torch.equal(a, b)
+        assert tables.counter.item() == 0
+        _check_tables(tables, window)
+
+
+@pytest.mark.parametrize("tuned", [True, False], ids=["tuned", "default"])
+@pytest.mark.parametrize("kind", ["random", "local", "same"])
+@pytest.mark.parametrize("m", TEP8_ROWS)
+@pytest.mark.parametrize("rank", [0, 3])
+def test_moe_body_on_route_topks_tep8_tables_is_the_routed_op(
+    tep8_layer, rank, m, kind, tuned, monkeypatch
+):
+    """At TEP8's widths, the MoE body on route_topk's tables for a rank's
+    128 local experts is FlashInfer's routed op on route_topk's routing (the runner's
+    path there; the autotuner's tactic or FlashInfer's default for both): weights, the
+    slots routed elsewhere (-1) and every local slot's FC2 row bit for bit; replayed from
+    a CUDA graph too."""
+    from flashinfer.autotuner import AutoTuner, autotune
+    from sglang.srt.utils import next_power_of_2
+
+    from sgl_nvidia_mega.qwen3_5.moe import body
+
+    window = (rank * TEP8_EXPERTS, TEP8_EXPERTS)
+    x, w, scale = _ep_router_inputs(m, 5000 + 31 * m + rank, kind, window)
+    logits = torch.nn.functional.linear(x, w)
+    router.build_topk(x.device.index)
+    ids, wts, x_fp4, x_sf = router.route_topk_quant(logits, x, scale)
+    tune = next_power_of_2(m)
+    if tuned:
+        with autotune(True):
+            _routed_stock(tep8_layer, (ids, wts), x_fp4, x_sf, tune, window[0])
+    else:  # no tactic for the routed op or the body: both run FlashInfer's default
+        monkeypatch.setattr(
+            AutoTuner, "choose_one", lambda self, op, runners, *a, **k: (runners[0], -1)
+        )
+    routed = _routed_stock(
+        tep8_layer, (ids, wts), x_fp4, x_sf, tune, window[0], raw=True
+    )
+    experts = _experts_of(tep8_layer, rank)
+    body._WIDTHS.clear()
+    width = body.width(experts, x)
+    assert (width.tactic == [-1, -1]) != tuned
+
+    def step():
+        got = router.route_topk_quant(logits, x, scale, tables=width.tables)
+        return body.run(width, experts, got[2], got[3].view(torch.float8_e4m3fn))[:3]
+
+    got = step()
+    torch.cuda.synchronize()
+    _check_tables(width.tables, window)
+    _same_moe(got, routed, m)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = step()
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        _same_moe(captured, routed, m)
+    body._WIDTHS.clear()
+
+
+@pytest.mark.parametrize(
+    "window", [(0, TEP8_EXPERTS), (384, TEP8_EXPERTS), (0, E)], ids=str
+)
+@pytest.mark.parametrize("tile", [8, 32, 128])
+@pytest.mark.parametrize("m", [35, 112, 168, 224, 231, 252, 259, 448, 512, 518, 896])
+def test_route_big_is_route_topk_with_its_tables_in_token_order(m, tile, window):
+    """Route-big's launch (one routing cluster of 8 / 16 CTAs, the rest
+    quantizing) gives route_topk's top-10 and NVFP4 input bit for bit and the same routing
+    tables, an expert's rows in token order; a second launch on the same tables alike; and from
+    a CUDA graph."""
+    logits, x, scale = _topk_inputs(m, seed=4300 + m + tile)
+    router.build_topk(x.device.index)
+    router.build_big(x.device.index, window[1])
+    want = router.route_topk_quant(logits, x, scale)
+    tables = router.RouteTables(m, tile, x.device, *window)
+    for _ in range(2):
+        got = router.route_big_quant(logits, x, scale, tables)
+        torch.cuda.synchronize()
+        for a, b in zip(got, want):
+            assert torch.equal(a, b)
+        _check_tables(tables, window, token_order=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = router.route_big_quant(logits, x, scale, tables)
+    tables.expanded_to_permuted.fill_(7)
+    tables.permuted_to_token.fill_(7)
+    graph.replay()
+    torch.cuda.synchronize()
+    for a, b in zip(captured, want):
+        assert torch.equal(a, b)
+    _check_tables(tables, window, token_order=True)
+
+
+@pytest.mark.parametrize("window", [(0, TEP8_EXPERTS), (384, TEP8_EXPERTS)], ids=str)
+@pytest.mark.parametrize("tile", [32, 64])
+@pytest.mark.parametrize("ctas", [32, 64])
+@pytest.mark.parametrize("m", [672, 679, 728, 784, 840, 896])
+def test_route_big_wide_launches_are_route_topk(m, ctas, tile, window):
+    """Both validated L2 launch widths reproduce route_topk and its padded tables."""
+    logits, x, scale = _topk_inputs(m, seed=7100 + m + ctas + tile)
+    router.build_topk(x.device.index)
+    router.build_big(x.device.index, window[1])
+    want = router.route_topk_quant(logits, x, scale)
+    tables = router.RouteTables(m, tile, x.device, *window)
+    got = router.route_big_quant(logits, x, scale, tables, ctas=ctas)
+    torch.cuda.synchronize()
+    for actual, expected in zip(got, want):
+        assert torch.equal(actual, expected)
+    _check_tables(tables, window, token_order=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = router.route_big_quant(logits, x, scale, tables, ctas=ctas)
+    tables.expanded_to_permuted.fill_(7)
+    tables.permuted_to_token.fill_(7)
+    graph.replay()
+    torch.cuda.synchronize()
+    for actual, expected in zip(captured, want):
+        assert torch.equal(actual, expected)
+    _check_tables(tables, window, token_order=True)
+
+
+@pytest.mark.parametrize("kind", ["random", "local", "same"])
+@pytest.mark.parametrize("m", TEP8_BIG_ROWS)
+@pytest.mark.parametrize("rank", [0, 3])
+def test_moe_body_on_route_bigs_tep8_tables_is_the_routed_op(tep8_layer, rank, m, kind):
+    """The MoE body on route_big's tables (a rank's 128 local experts) is
+    FlashInfer's routed op on route_topk's routing: weights, the slots routed elsewhere (-1) and
+    every local slot's FC2 row bit for bit; replayed from a CUDA graph too."""
+    from sgl_nvidia_mega.qwen3_5.moe import body
+
+    window = (rank * TEP8_EXPERTS, TEP8_EXPERTS)
+    x, w, scale = _ep_router_inputs(m, 5200 + 31 * m + rank, kind, window)
+    logits = torch.nn.functional.linear(x, w)
+    router.build_topk(x.device.index)
+    router.build_big(x.device.index, TEP8_EXPERTS)
+    ids, wts, x_fp4, x_sf = router.route_topk_quant(logits, x, scale)
+    routed = _routed_stock(
+        tep8_layer, (ids, wts), x_fp4, x_sf, None, window[0], raw=True
+    )
+    experts = _experts_of(tep8_layer, rank)
+    body._WIDTHS.clear()
+    width = body.width(experts, x)
+
+    def step():
+        got = router.route_big_quant(logits, x, scale, width.tables)
+        return body.run(width, experts, got[2], got[3].view(torch.float8_e4m3fn))[:3]
+
+    got = step()
+    torch.cuda.synchronize()
+    _check_tables(width.tables, window, token_order=True)
+    _same_moe(got, routed, m)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = step()
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        _same_moe(captured, routed, m)
+    body._WIDTHS.clear()
+
+
+def test_moe_body_widths_share_their_buffers(tep8_layer):
+    """TEP8's widths run their bodies on views of one set of buffers (the widest asked
+    for first, as SGLang captures its graphs), each still the routed op's, alternately."""
+    from sgl_nvidia_mega.qwen3_5.moe import body
+
+    window = (TEP8_EXPERTS, TEP8_EXPERTS)
+    router.build_topk(torch.cuda.current_device())
+    experts = _experts_of(tep8_layer, 1)
+    body._WIDTHS.clear()
+    body._SHARED.clear()
+    cases = []
+    for m in (896, 231):
+        x, w, scale = _ep_router_inputs(m, 6000 + m, "local", window)
+        logits = torch.nn.functional.linear(x, w)
+        ids, wts, x_fp4, x_sf = router.route_topk_quant(logits, x, scale)
+        want = _routed_stock(
+            tep8_layer, (ids, wts), x_fp4, x_sf, None, window[0], raw=True
+        )
+        cases.append((m, x, logits, scale, body.width(experts, x), want))
+    for _ in range(2):
+        for m, x, logits, scale, width, want in cases:
+            got = router.route_topk_quant(logits, x, scale, tables=width.tables)
+            got = body.run(width, experts, got[2], got[3].view(torch.float8_e4m3fn))[:3]
+            torch.cuda.synchronize()
+            _same_moe(got, want, m)
+    wide, narrow = cases[0][4].workspace, cases[1][4].workspace
+    for a, b in zip(
+        wide, narrow
+    ):  # the narrow width's buffers that fit are the wide one's
+        if b.numel() and b.shape[0] <= a.shape[0]:
+            assert a.data_ptr() == b.data_ptr()
+    body._WIDTHS.clear()

@@ -10,6 +10,10 @@
 // other 7 warps quantize the row (router_front.cu's quantize_block). Launched as a programmatic dependent; it waits
 // before reading anything and releases its dependents at once (they read its outputs after their own wait).
 //
+// With routing tables the last CTA to finish its token also writes the trtllm-gen MoE body's routing
+// tables for tile_n and the rank's window of local experts (what its routingIndicesCluster kernel writes, which the body
+// then skips; route_tables.cuh), rows of one expert in the order of shared-memory atomics, as there.
+//
 // Built with NVRTC.
 
 #include <cooperative_groups.h>
@@ -21,13 +25,14 @@ typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef int int32_t;
 typedef unsigned int uint32_t;
-#ifndef INFINITY
-#define INFINITY __int_as_float(0x7f800000)
-#endif
+
+#include "route_tables.cuh"
 
 namespace q35_route_topk {
 
-constexpr uint32_t kHidden = 4096, kExperts = 512, kTopK = 10, kThreads = 256, kSfVec = 16;
+using namespace q35_route_tables;
+
+constexpr uint32_t kHidden = 4096, kSfVec = 16;
 constexpr uint32_t kBlocksPerRow = kHidden / kSfVec;  // 256
 
 struct Params {
@@ -38,7 +43,20 @@ struct Params {
   uint16_t* topk_weights;       // [M, 10] bf16
   uint8_t* x_fp4;               // [M, 2048]
   uint8_t* x_sf;                // [M, 256]
+  // routing tables (null counter: none); the counter is 0 between launches, the last CTA resets it
+  Tables tables;
+  int32_t num_tokens;  // M
 };
+
+// The routing tables from every token's top-10 (in global memory, visible to this CTA), by the whole CTA.
+constexpr uint32_t kMaxRows = 896;  // router.py TOPK_MAX_ROWS
+__device__ __forceinline__ void write_tables(const Params& p) {
+  __shared__ uint16_t s_local[kMaxRows * kTopK];
+  __shared__ int32_t s_count[kExperts], s_next[kExperts], s_warp[kThreads / 32];
+  const uint32_t n = static_cast<uint32_t>(p.num_tokens) * kTopK;
+  for (uint32_t i = threadIdx.x; i < n; i += kThreads) s_local[i] = local_slot(__ldcg(p.topk_ids + i), p.tables);
+  q35_route_tables::write_tables<false>(p.tables, n, s_local, s_count, s_next, s_warp);
+}
 
 // ---- the NVFP4 quantizer (router_front.cu)
 __device__ __forceinline__ float bf16_lo(uint32_t v) { return __uint_as_float(v << 16); }
@@ -107,136 +125,22 @@ __device__ __forceinline__ void quantize_block(const uint4& a, const uint4& b, f
   packed.y = cvt_e2m1x8(hi);
 }
 
-// ---- the routing (mkm_moe_m16.cu): key = bf16 order above 65535 - expert (higher score first, smaller expert on ties)
-__device__ __forceinline__ uint32_t topk_key(uint32_t bits, uint32_t expert) {
-  const uint32_t twiddled = bits ^ ((bits & 0x8000u) ? 0xFFFFu : 0x8000u);
-  return (twiddled << 16) | (65535u - expert);
-}
-__device__ __forceinline__ void topk_unkey(uint32_t key, uint32_t& bits, uint32_t& expert) {
-  expert = 65535u - (key & 0xFFFFu);
-  const uint32_t twiddled = key >> 16;
-  bits = twiddled ^ ((twiddled & 0x8000u) ? 0x8000u : 0xFFFFu);
-}
-__device__ __forceinline__ uint32_t max16(const uint32_t (&k)[16]) {
-  const uint32_t a = max(max(max(k[0], k[1]), max(k[2], k[3])), max(max(k[4], k[5]), max(k[6], k[7])));
-  const uint32_t b = max(max(max(k[8], k[9]), max(k[10], k[11])), max(max(k[12], k[13]), max(k[14], k[15])));
-  return max(a, b);
-}
-__device__ __forceinline__ uint32_t warp_max_u32(uint32_t v) {
-  uint32_t r;
-  asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(v));
-  return r;
-}
-__device__ __forceinline__ uint32_t warp_sum_u32(uint32_t v) {
-  uint32_t r;
-  asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(v));
-  return r;
-}
-__device__ __forceinline__ uint32_t warp_topk_of_lanes(uint32_t v, uint32_t lane) {
-  uint32_t mine = 0;
-#pragma unroll
-  for (uint32_t k = 0; k < kTopK; ++k) {
-    const uint32_t top = warp_max_u32(v);
-    v = v == top ? 0u : v;
-    mine = lane == k ? top : mine;
-  }
-  return mine;
-}
-// Top-10 keys of 512 (16 per lane), lane k holding the k-th largest (keys unique and nonzero).
-__device__ __forceinline__ uint32_t warp_top10_redux(uint32_t (&keys)[16], uint32_t lane, uint32_t* s_cand) {
-  uint32_t v = max16(keys);
-  uint32_t bound = 0;
-#pragma unroll
-  for (uint32_t k = 0; k < kTopK; ++k) {
-    bound = warp_max_u32(v);
-    v = v == bound ? 0u : v;
-  }
-  uint32_t count = 0;
-#pragma unroll
-  for (uint32_t i = 0; i < 16; ++i) count += keys[i] >= bound;
-  const uint32_t total = warp_sum_u32(count);
-  if (total <= 32) {
-    uint32_t offset = count;
-#pragma unroll
-    for (uint32_t d = 1; d < 32; d <<= 1) {
-      const uint32_t up = __shfl_up_sync(0xffffffffu, offset, d);
-      offset += lane >= d ? up : 0u;
-    }
-    offset -= count;
-#pragma unroll
-    for (uint32_t i = 0; i < 16; ++i) {
-      if (keys[i] >= bound) s_cand[offset++] = keys[i];
-    }
-    __syncwarp();
-    const uint32_t cand = lane < total ? s_cand[lane] : 0u;
-    __syncwarp();
-    return warp_topk_of_lanes(cand, lane);
-  }
-  uint32_t mine = 0;
-#pragma unroll 1
-  for (uint32_t k = 0; k < kTopK; ++k) {
-    const uint32_t top = warp_max_u32(max16(keys));
-#pragma unroll
-    for (uint32_t i = 0; i < 16; ++i) keys[i] = keys[i] == top ? 0u : keys[i];
-    mine = lane == k ? top : mine;
-  }
-  return mine;
-}
-// FlashInfer calcSoftmax (bf16 scores) as built with -use_fast_math.
-__device__ __forceinline__ float fast_expf(float x) {
-  float y;
-  asm("{\n .reg .f32 t;\n mul.ftz.f32 t, %1, 0f3FB8AA3B;\n ex2.approx.ftz.f32 %0, t;\n}" : "=f"(y) : "f"(x));
-  return y;
-}
-__device__ __forceinline__ float fast_div(float a, float b) {
-  float y;
-  asm("div.full.ftz.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b));
-  return y;
-}
-__device__ __forceinline__ uint16_t softmax_topk(uint16_t score_bits, uint32_t lane) {
-  namespace cg = cooperative_groups;
-  const auto warp = cg::tiled_partition<32>(cg::this_thread_block());
-  const float si = __uint_as_float((uint32_t)score_bits << 16);
-  float max_score = -INFINITY;
-  if (lane < kTopK) max_score = si >= max_score ? si : max_score;
-  max_score = cg::reduce(warp, max_score, cg::greater<float>());
-  float sum_score = 0.f, new_score = 0.f;
-  if (lane < kTopK) {
-    new_score = fast_expf(__fsub_rn(si, max_score));
-    sum_score = __fadd_rn(sum_score, new_score);
-  }
-  sum_score = cg::reduce(warp, sum_score, cg::plus<float>());
-  uint16_t out = score_bits;
-  if (lane < kTopK) {
-    const __nv_bfloat16 b = __float2bfloat16_rn(fast_div(new_score, sum_score));
-    out = *reinterpret_cast<const uint16_t*>(&b);
-  }
-  return out;
-}
-
 __device__ __forceinline__ void route_topk_quant(const Params& p) {
   __shared__ __align__(16) uint32_t s_cand[32];
+  __shared__ int32_t s_last;
   const uint32_t t = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   asm volatile("griddepcontrol.wait;" ::: "memory");
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   if (warp == 0) {
     const uint4* src = reinterpret_cast<const uint4*>(p.logits + static_cast<size_t>(t) * kExperts + lane * 16);
-    const uint4 v0 = src[0], v1 = src[1];
-    uint32_t keys[16];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const uint32_t w = i < 4 ? (&v0.x)[i] : (&v1.x)[i - 4];
-      keys[2 * i] = topk_key(w & 0xFFFFu, lane * 16 + 2 * i);
-      keys[2 * i + 1] = topk_key(w >> 16, lane * 16 + 2 * i + 1);
-    }
-    const uint32_t key = warp_top10_redux(keys, lane, s_cand);
-    uint32_t bits, expert;
-    topk_unkey(key, bits, expert);
-    const uint16_t wbits = softmax_topk(static_cast<uint16_t>(bits), lane);
+    uint32_t expert;
+    uint16_t wbits;
+    route_row(src[0], src[1], lane, s_cand, expert, wbits);
     if (lane < kTopK) {
       p.topk_ids[t * kTopK + lane] = static_cast<int32_t>(expert);
       p.topk_weights[t * kTopK + lane] = wbits;
     }
+    if (p.tables.counter != nullptr) __threadfence();
   } else if (p.x_fp4 != nullptr) {  // null: the router front already quantized the rows
     const float gs = p.global_scale[0];
     const __nv_bfloat16* row = p.x + static_cast<size_t>(t) * kHidden;
@@ -249,6 +153,14 @@ __device__ __forceinline__ void route_topk_quant(const Params& p) {
       p.x_sf[static_cast<size_t>(t) * kBlocksPerRow + blk] = static_cast<uint8_t>(sf);
     }
   }
+  if (p.tables.counter == nullptr) return;
+  __syncthreads();
+  if (threadIdx.x == 0) s_last = atomicAdd(p.tables.counter, 1) == p.num_tokens - 1;
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  write_tables(p);
+  if (threadIdx.x == 0) *p.tables.counter = 0;
 }
 
 }  // namespace q35_route_topk

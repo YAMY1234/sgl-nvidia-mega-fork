@@ -74,9 +74,9 @@ SGLANG_MIRRORS = {
 
 
 def build(model, ctx) -> route.Bound:
-    """Slots ``route``, ``mkm``, ``route_topk`` and ``mkm_m32`` for every MoE layer; the
-    result is ``st.bound["moe"]``."""
+    """Build the requested MoE slots and TEP8's internal routed-body plan."""
     import msgspec
+    from sglang.srt.runtime_context import get_parallel
 
     from sgl_nvidia_mega.qwen3_5 import plan
     from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
@@ -133,6 +133,21 @@ def build(model, ctx) -> route.Bound:
                 m512=m512,
                 wide_bal="mkm_wide_bal" in SLOTS,
             )
+        parallel = get_parallel()
+        tep8_moe = bound.route and parallel.tp_size == 8 and parallel.moe_ep_size > 1
+        if tep8_moe:
+            reason = route.pre_unsupported(model)
+            if reason:
+                return msgspec.structs.replace(bound, reason=f"TEP8 MoE body: {reason}")
+            bound = msgspec.structs.replace(bound, pre=True)
+            if (
+                plan.widest(ctx.widths, plan.ROUTE_BIG_MAX_ROWS)
+                >= plan.ROUTE_BIG_MIN_ROWS
+            ):
+                mlp = model.model.layers[model.model.start_layer].mlp
+                router.build_big(
+                    torch.cuda.current_device(), mlp.experts.num_local_experts
+                )
     return bound
 
 
@@ -239,7 +254,12 @@ def _router_experts(mlp, x, defer: bool, st):
         if rl is not None and rl[0] == mlp.layer_id and st.slots.mkm:
             # Slot route_lin produced the logits and NVFP4 input in the preceding hop.
             return route.routed_lin(mlp, x, st.bound["moe"], *rl[1:])
-        return route.routed(mlp, x, st.bound["moe"] if st.slots.mkm else None)
+        return route.routed(
+            mlp,
+            x,
+            st.bound["moe"] if st.slots.mkm else None,
+            pre_topk=st.slots.route_pre_topk,
+        )
     if defer and st.slots.mkm_m32:
         return route.routed_m32(mlp, x, st.bound["moe"], gemm=st.slots.route_gemm)
     if defer and st.slots.mkm_m64:
@@ -251,7 +271,9 @@ def _router_experts(mlp, x, defer: bool, st):
     if defer and st.slots.mkm_m512:
         return route.routed_given(mlp, x, st.bound["moe"], "mkm_m512")
     if defer and st.slots.route_topk:
-        return route.routed_topk(mlp, x, gemm=st.slots.route_gemm)
+        return route.routed_topk(
+            mlp, x, gemm=st.slots.route_gemm, pre=st.slots.route_pre
+        )
     router_logits, _ = mlp.gate(x)
     topk_output = mlp.topk(x, router_logits)
     if defer:

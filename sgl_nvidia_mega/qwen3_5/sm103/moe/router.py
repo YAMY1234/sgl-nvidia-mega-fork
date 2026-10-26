@@ -3,8 +3,9 @@
 """The router GEMM and the NVFP4 quantization of its input in one launch, for the
 trtllm MoE runner, which routes from the logits itself (``src/router_front.cu``).
 
-The logits equal SGLang's cuBLAS router GEMM bit for bit, and the quantization equals
-the runner's own NVFP4 input quantizer (16-element blocks, e4m3 scales, linear layout).
+The logits stay within one BF16 ULP of SGLang's cuBLAS router GEMM, and the
+quantization equals the runner's own NVFP4 input quantizer (16-element blocks, e4m3
+scales, linear layout).
 ``router_gemm_quant_shared`` also computes the shared expert's static-FP8 gate/up
 projection of up to 8 rows in the same launch (SGLANG_Q35MF_ROUTE_SHARED on SGLang branch
 nvidia/qwen35-agentx-gb300); it sums in another order than the FP8 linear's GEMM
@@ -32,6 +33,9 @@ _SH_ROW_BYTES = (
 _SH_PART_BYTES = 4 * 16 * 8 * 4  # fp32 [kShSplits 4][16][8]
 SHARED_MAX_M, SHARED_MAX_N = 8, CTAS * 8  # 8 shared rows a CTA
 MODE_QUANT = 1
+# The validated plain-launch schedule uses four K chains, one per warp, summed in
+# chain order. The shared-stage launch keeps two chains for its larger footprint.
+KSPLIT = 4
 
 
 def max_m_bucket(m: int) -> int:
@@ -39,11 +43,11 @@ def max_m_bucket(m: int) -> int:
     return 1 if m <= 1 else 8 if m <= 8 else 16
 
 
-def shared_bytes(max_m: int, shared: bool = False) -> int:
+def shared_bytes(max_m: int, shared: bool = False, ksplit: int = 2) -> int:
     """GemvSmem<max_m, shared>::kBytes: 8 weight rows, max_m input rows, the fp32 partials
-    and two mbarriers; with the shared stage also 8 FP8 weight rows, max_m FP8 input rows,
-    its partials and a third mbarrier."""
-    plain = 8 * _ROW_BYTES + max_m * _ROW_BYTES + _PART_BYTES
+    (``ksplit`` chains) and two mbarriers; with the shared stage also 8 FP8 weight rows,
+    max_m FP8 input rows, its partials and a third mbarrier."""
+    plain = 8 * _ROW_BYTES + max_m * _ROW_BYTES + _PART_BYTES * ksplit // 2
     if not shared:
         return plain + 16
     return plain + (8 + max_m) * _SH_ROW_BYTES + _SH_PART_BYTES + 24
@@ -85,23 +89,24 @@ class Params(ctypes.Structure):
 
 
 @cache
-def _cubin(device_index: int, max_m: int) -> bytes:
+def _cubin(device_index: int, max_m: int, ksplit: int = 2) -> bytes:
     major, minor = torch.cuda.get_device_capability(device_index)
     return jit.compile_source(
         SOURCE.read_text(),
         f"q35_router_front_m{max_m}",
         f"sm_{major}{minor}a",
-        ("-std=c++17", "-default-device", f"-DQ35_ROUTER_MAX_M={max_m}"),
+        ("-std=c++17", "-default-device", f"-DQ35_ROUTER_MAX_M={max_m}")
+        + ((f"-DQ35_ROUTER_KSPLIT={ksplit}",) if ksplit != 2 else ()),
     )
 
 
 @cache
 def _kernel(device_index: int, max_m: int) -> jit.Kernel:
     return jit.load(
-        _cubin(device_index, max_m),
+        _cubin(device_index, max_m, KSPLIT),
         "q35_router_gemm_quant",
         (THREADS, 1, 1),
-        shared_bytes(max_m),
+        shared_bytes(max_m, ksplit=KSPLIT),
     )
 
 

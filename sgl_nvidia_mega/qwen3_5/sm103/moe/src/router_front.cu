@@ -685,7 +685,14 @@ SGL_DEVICE void topk_and_tables(const Params& p, uint32_t* s_mask, int16_t* s_ti
 // Per CTA: kExpertsPerCta experts as the n8 tile, tokens as the m16 tile (rows
 // >= M repeat token 0); warp 0 runs the chain of the first half, warp 1 the
 // second, operands from shared memory.
-inline constexpr uint32_t kSplitK = kHidden / 2;
+// Q35_ROUTER_KSPLIT > 2 (numeric): K split into that many chains, one per warp 0 .. KSPLIT - 1, their fp32 partials
+// added in split order (another order than cuBLAS's); the CTAs of the token rows quantize after the chains at 8.
+#ifndef Q35_ROUTER_KSPLIT
+#define Q35_ROUTER_KSPLIT 2
+#endif
+inline constexpr uint32_t kKSplit = Q35_ROUTER_KSPLIT;
+static_assert(kKSplit == 2 || kKSplit == 4 || kKSplit == 8, "router K splits");
+inline constexpr uint32_t kSplitK = kHidden / kKSplit;
 inline constexpr uint32_t kChainSteps = kSplitK / 16;
 // Shared-memory rows are padded by 16 B so the 8 rows of an ldmatrix hit distinct banks.
 inline constexpr uint32_t kRowBytes = kHidden * 2 + 16;
@@ -700,8 +707,8 @@ template <uint32_t kMaxM, bool kShared = false>
 struct GemvSmem {
   static constexpr uint32_t kW = 0;
   static constexpr uint32_t kX = kW + kExpertsPerCta * kRowBytes;
-  static constexpr uint32_t kPart = kX + kMaxM * kRowBytes;  // fp32 [2][16][kExpertsPerCta]
-  static constexpr uint32_t kShW = kPart + 2 * 16 * kExpertsPerCta * 4;
+  static constexpr uint32_t kPart = kX + kMaxM * kRowBytes;  // fp32 [kKSplit][16][kExpertsPerCta]
+  static constexpr uint32_t kShW = kPart + kKSplit * 16 * kExpertsPerCta * 4;
   static constexpr uint32_t kXq = kShW + (kShared ? 8 * kShRowBytes : 0);
   static constexpr uint32_t kShPart = kXq + (kShared ? kMaxM * kShRowBytes : 0);  // fp32 [kShSplits][16][8]
   static constexpr uint32_t kBarW = kShPart + (kShared ? kShSplits * 16 * 8 * 4 : 0);
@@ -972,7 +979,7 @@ SGL_DEVICE void router_front_kernel(const Params& p) {
     }
   }
 
-  if (warp < 2) {
+  if (warp < kKSplit) {
     mbar_wait(bar_w, 0);
     mbar_wait(bar_x, 0);
     trace_stamp<kTrace>(p, tb + 2);
@@ -980,10 +987,10 @@ SGL_DEVICE void router_front_kernel(const Params& p) {
   } else if (has_sh) {
     shared_gate_up<kMaxM>(p, M, smem, bar_w, bar_x);
   } else if ((p.mode & kModeQuant) && blockIdx.x < M) {
-    // CTA b < M quantizes token row b while warps 0 and 1 run the GEMV chains.
+    // CTA b < M quantizes token row b while warps 0 .. kKSplit - 1 run the GEMV chains.
     mbar_wait(bar_x, 0);
     const uint8_t* row = smem + L::kX + blockIdx.x * kRowBytes;
-    for (uint32_t blk = threadIdx.x - 64; blk < kBlocksPerRow; blk += kThreads - 64) {
+    for (uint32_t blk = threadIdx.x - 32 * kKSplit; blk < kBlocksPerRow; blk += kThreads - 32 * kKSplit) {
       const uint4* src = reinterpret_cast<const uint4*>(row + blk * kSfVec * 2);
       uint32_t sf;
       uint2 packed;
@@ -997,9 +1004,22 @@ SGL_DEVICE void router_front_kernel(const Params& p) {
   if (threadIdx.x < M * kExpertsPerCta) {
     const uint32_t m = threadIdx.x / kExpertsPerCta;
     const uint32_t e = threadIdx.x % kExpertsPerCta;
-    const float lo = s_part[m * kExpertsPerCta + e];
-    const float hi = s_part[(16 + m) * kExpertsPerCta + e];
-    p.logits[(t0 + m) * kExperts + expert0 + e] = __float2bfloat16_rn(__fadd_rn(lo, hi));
+    float acc = s_part[m * kExpertsPerCta + e];
+#pragma unroll
+    for (uint32_t k = 1; k < kKSplit; ++k) acc = __fadd_rn(acc, s_part[(k * 16 + m) * kExpertsPerCta + e]);
+    p.logits[(t0 + m) * kExperts + expert0 + e] = __float2bfloat16_rn(acc);
+  }
+  if (kKSplit == 8 && !kShared && (p.mode & kModeQuant) && blockIdx.x < M) {
+    // every warp ran a GEMV chain: CTA b < M quantizes token row b now
+    const uint8_t* row = smem + L::kX + blockIdx.x * kRowBytes;
+    for (uint32_t blk = threadIdx.x; blk < kBlocksPerRow; blk += kThreads) {
+      const uint4* src = reinterpret_cast<const uint4*>(row + blk * kSfVec * 2);
+      uint32_t sf;
+      uint2 packed;
+      quantize_block(src[0], src[1], p.global_scale[0], sf, packed);
+      *reinterpret_cast<uint2*>(p.x_fp4 + static_cast<size_t>(t0 + blockIdx.x) * (kHidden / 2) + blk * 8) = packed;
+      p.x_sf[static_cast<size_t>(t0 + blockIdx.x) * kBlocksPerRow + blk] = static_cast<uint8_t>(sf);
+    }
   }
   if (has_sh && threadIdx.x < M * 8) {
     const uint32_t m = threadIdx.x / 8;
@@ -1045,7 +1065,7 @@ extern "C" __global__ __launch_bounds__(sglang::qwen_router_front::kThreads, 1) 
   sglang::qwen_router_front::router_front_kernel<Q35_ROUTER_MAX_M, true, false, false>(p);
 }
 
-#if Q35_ROUTER_MAX_M <= 8
+#if Q35_ROUTER_MAX_M <= 8 && Q35_ROUTER_KSPLIT == 2
 // The same plus the shared expert's static-FP8 gate/up projection of the rows (sh_* in Params)
 // in the same launch: CTA c computes its 8 rows while warps 0 and 1 run the router GEMV.
 extern "C" __global__ __launch_bounds__(sglang::qwen_router_front::kThreads, 1) void q35_router_gemm_quant_shared(

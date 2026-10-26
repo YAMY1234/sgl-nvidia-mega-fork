@@ -63,6 +63,8 @@ DRAFT_SLOTS: tuple[str, ...] = (
     "draft_q1",
     "draft_xchg",
     "draft_hop",
+    # numeric: hand deferred MoE rows to the draft hop's fused final norm
+    "draft_fin",
     "draft_front",
     "draft_skv2",
     # draft_loop and draft_extend also serve TP8's draft graphs of 2 to 128 requests,
@@ -223,6 +225,10 @@ def slot_reasons() -> list[str]:
             reasons.append(f"{SLOTS_ENV}: slot {name!r} runs inside entry 'draft_loop'")
     if "draft_hop" in SLOTS and "hop" not in SLOTS:
         reasons.append(f"{SLOTS_ENV}: slot 'draft_hop' runs on slot 'hop''s mailbox")
+    if "draft_fin" in SLOTS and "draft_hop" not in SLOTS:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'draft_fin' runs in slot 'draft_hop''s final norm"
+        )
     if "draft_multi" in SLOTS and "multi_request" not in SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'draft_multi' serves the draft steps of two or more "

@@ -15,14 +15,18 @@
   and their arg-max (``torch.argmax``'s choice, as SGLang's top-1).
 
 Stock: the ops SGLang's draft runs for these rows, in its order. Slot ``draft_moe``
-replaces the MoE, slot ``draft_hop`` the two all-reduce points and ``o_proj``.
+replaces the MoE, slot ``draft_hop`` the two all-reduce points and ``o_proj``; slot
+``draft_fin`` (numeric) hands a deferred MoE finalize to the hop's final norm launch.
 """
 
 from __future__ import annotations
 
+import logging
 from functools import partial
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -43,6 +47,17 @@ SGLANG_READS = {
         "tensor_model_parallel_all_reduce",
         "tensor_model_parallel_all_gather",
     ),
+    "srt/models/qwen2_moe.py": ("supports_deferred_finalize",),
+    "srt/layers/layer_boundary/fusions/moe_finalize.py": (
+        "MoeDeferredFinalize",
+        "routed_output",
+        "expert_weights",
+        "permuted_indices",
+        "gated_shared_output",
+        "m",
+        "complete",
+    ),
+    "srt/layers/layernorm.py": ('"gemma_weight"',),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
@@ -108,9 +123,18 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
             else None
         ),
     )
+    # Compatible NVFP4 draft experts reuse the target MoE engines from two rows.
+    mkm = (
+        parts.moe_mkm
+        if parts.moe_mkm is not None and parts.moe_mkm.takes(rows, rows_per_request)
+        else None
+    )
     moe = (
         parts.moe
-        if rows_per_request == 1 and parts.moe is not None and parts.moe.ready(rows)
+        if mkm is None
+        and rows_per_request == 1
+        and parts.moe is not None
+        and parts.moe.ready(rows)
         else None
     )
     if hop is not None:
@@ -130,7 +154,42 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         moe_in, residual = lay.post_attention_layernorm(
             tensor_model_parallel_all_reduce(attn_out), residual
         )
-    moe_out = moe(moe_in) if moe is not None else lay.mlp(moe_in)
+    fin_hop = hop if hop is not None else extend_hop
+    fin = fin_hop is not None and moe is None and "draft_fin" in parts.slots
+    if fin and not lay.mlp.supports_deferred_finalize:
+        _note_fin(
+            rows, "SGLang's: the experts do not defer their finalize", hop is None
+        )
+        fin = False
+    if fin:
+        owed = (
+            mkm(lay, moe_in)
+            if mkm is not None
+            else lay.mlp(moe_in, defer_finalize=True)
+        )
+        if _hop_takes(fin_hop.hop, owed):
+            _note_fin(rows, "in the final norm's hop (slot draft_fin)", hop is None)
+            out, _ = fin_hop.hop.moe_finalize_all_reduce_rms_norm(
+                routed_output=owed.routed_output,
+                expert_weights=owed.expert_weights,
+                permuted_indices=owed.permuted_indices,
+                gated_shared_output=owed.gated_shared_output,
+                residual=residual,
+                gamma=parts.model.norm.gemma_weight,
+            )
+            return out
+        _note_fin(
+            rows, "SGLang's: the hop does not read this deferred output", hop is None
+        )
+        moe_out = owed.complete()
+        if hop is None and mkm is None:
+            # SGLang's deferred finish already applies its configured reduction.
+            out, _ = parts.model.norm(moe_out, residual)
+            return out
+    elif mkm is not None:
+        moe_out = mkm(lay, moe_in).complete()
+    else:
+        moe_out = moe(moe_in) if moe is not None else lay.mlp(moe_in)
     if hop is not None:
         out, _ = hop.final_norm(
             moe_out,
@@ -143,6 +202,33 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         return out
     out, _ = parts.model.norm(tensor_model_parallel_all_reduce(moe_out), residual)
     return out
+
+
+_FIN_NOTED: set[tuple[bool, int]] = set()
+
+
+def _note_fin(rows: int, where: str, extend: bool = False) -> None:
+    """Log once per captured row count where slot ``draft_fin`` finalized the MoE."""
+    if torch.cuda.is_current_stream_capturing() and (extend, rows) not in _FIN_NOTED:
+        _FIN_NOTED.add((extend, rows))
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 MTP draft %s of %d rows: MoE finalize %s",
+            "extend" if extend else "step",
+            rows,
+            where,
+        )
+
+
+def _hop_takes(hop, owed) -> bool:
+    """Whether the hop's finalize reads this deferred MoE output as SGLang wrote it."""
+    shared = owed.gated_shared_output
+    return (
+        hop.supports(owed.m)
+        and owed.routed_output.dtype == torch.bfloat16
+        and owed.expert_weights.dtype == torch.bfloat16
+        and owed.permuted_indices.dtype == torch.int32
+        and (shared is None or shared.dtype == torch.bfloat16)
+    )
 
 
 def top1(parts, hidden):

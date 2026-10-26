@@ -26,6 +26,17 @@ KEY = "SGLANG_Q35FLY_DRAFT_HEAD_EXCHANGE"
 COUNT = 17  # prime to the three epoch slots and the four-arm pattern
 
 
+def _snapshot(t):
+    # Singleton token slices can retain stride=NUM_STEPS under preserve_format.
+    # Force packed storage so the later dtype view can compare every raw byte.
+    return t.clone(memory_format=torch.contiguous_format)
+
+
+def _fixture_vocab(head_ctas):
+    # The existing MXFP8 head requires at least eight vocabulary rows per CTA.
+    return max(base.VOCAB, ((8 * head_ctas + 255) // 256) * 256)
+
+
 @pytest.fixture(scope="module")
 def hp2_boundary(ranks):
     """One process group and one multicast boundary for both arithmetic cases."""
@@ -39,6 +50,9 @@ def hp2_boundary(ranks):
         patch.setattr(boundary_mod, "HEAD_EXCHANGE", False)
         patch.setattr(kernels, "PARTIAL_ROWS4", True)
         patch.setattr(kernels, "XCHG_SPLIT_SEND", True)
+        sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        head_ctas = boundary_mod._HEAD_CTAS_PER_SM * sms
+        patch.setattr(base, "VOCAB", _fixture_vocab(head_ctas))
         mkd, _ = base.boundary.__wrapped__(ranks)
         yield mkd
 
@@ -79,7 +93,7 @@ def test_mixed_graph_exact_with_skew_and_epoch_wrap(ranks, hp2_boundary, mxfp8):
             logits = mkd.head(hidden)
             probability, token = mkd.finish_step(
                 logits, positions, tokens, step, step + 1, mrope)
-            out.append(tuple(t.clone() for t in (
+            out.append(tuple(_snapshot(t) for t in (
                 logits, token, probability, mkd.own_partial, mkd.fc_buf,
                 positions, mrope, tokens[:, step + 1])))
         # An A arm near the graph end can leave a side-stream partial pending.

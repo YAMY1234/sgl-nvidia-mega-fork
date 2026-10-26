@@ -1601,6 +1601,95 @@ def test_the_split_kv_variants_select_on_host_state_only():
     assert route.VERIFY.select(batch()) == "split_kv_stock"
 
 
+def test_slot_skv2_cp_adds_a_cp_variant_from_its_kv_length(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5.attention import route
+
+    def batch(bs=1, bound=None):
+        return SimpleNamespace(
+            batch_size=bs, attention_kv_len_lower_bound=bound, seq_lens_cpu=None
+        )
+
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2"}))
+    assert route.verify_variants() is route.VERIFY
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2", "skv2_cp"}))
+    variants = route.verify_variants()
+    crossover = route.CP_MIN_KV["verify"]
+    assert variants.capture_labels == ("split_kv_stock", "split_kv_long", "split_kv_cp")
+    assert (variants.min_length, variants.cp_min_length) == (8192, crossover)
+    assert variants.max_batch_size == 1
+    assert [
+        variants.select(batch(bound=n)) for n in (8191, 8192, crossover - 1, crossover)
+    ] == [
+        "split_kv_stock",
+        "split_kv_long",
+        "split_kv_long",
+        "split_kv_cp",
+    ]
+    assert variants.select(batch(bs=2, bound=10**6)) == "split_kv_stock"
+    # slot draft_skv2_cp is not requested
+    assert route.extend_variants() is route.EXTEND
+    assert route.CP_MIN_KV == {
+        "verify": 139264,
+        "draft": 184320,
+        "extend": 245760,
+    }
+
+
+@pytest.mark.parametrize("served", [True, False])
+def test_the_skv2_cp_slot_runs_cp_lite_for_one_request_in_its_variant(
+    monkeypatch, served
+):
+    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2", "skv2_cp"}))
+    log = _log()
+    attn, st = _skv2_setup(log)
+    q8 = torch.zeros(7, 1024, dtype=torch.float8_e4m3fn)
+    log.known["q8"] = q8
+    out = torch.ones(7, 4, 256, dtype=torch.bfloat16)
+    calls = []
+
+    class CpLite:
+        def attend(
+            self, q, kv, pages, lens, q_len, bmm1, bmm2, ws, layer, fb, min_bs=None
+        ):
+            calls.append(
+                (
+                    tuple(q.shape),
+                    tuple(kv[0].shape),
+                    kv[0].stride(),
+                    pages is st.view.attn.page_table,
+                    lens is st.view.attn.cache_seqlens,
+                    q_len,
+                    bmm1,
+                    bmm2,
+                    layer is attn,
+                    fb is st.fb,
+                    min_bs,
+                )
+            )
+            return out if served else None
+
+    monkeypatch.setattr(split_kv, "cp_lite", CpLite)
+    with (
+        _skv2_kernels(log, label="split_kv_cp"),
+        patch("sglang.srt.runtime_context.get_buffer", lambda name, make: None),
+    ):
+        o = split_kv.core(attn, q8, st)
+    # the request's 7 rows on the view's pool pages, as SKV2 takes them, at one request
+    assert calls == [
+        ((7, 4, 256), (3, 1, 64, 256), (16384, 16384, 256, 1), True, True, 7)
+        + (0.75 * 0.0625, 0.5, True, True, 1)
+    ]
+    if served:
+        assert o.shape == (7, 1024) and bool((o == 1).all()) and len(log) == 0
+    else:
+        # CP-lite declines by shape: SKV2 runs as in the long variant
+        assert log[-1][0] == "skv2"
+
+
 @pytest.mark.parametrize(
     "kw, want",
     [
@@ -1964,7 +2053,14 @@ def test_the_mka_slot_is_built_with_its_weights_packed_for_every_attention_layer
     monkeypatch.setattr(mka, "unsupported", lambda l: why.get(id(l), ""))
     monkeypatch.setattr(mka, "pack", packed.append)
     ctx = SimpleNamespace(tokens_per_request=7)
+    for made in layers[1:]:
+        made.num_heads = 8
+    # TP4's eight query heads a rank: the narrow kernels only
     assert attention.build(model, ctx) == attention.Bound(mka=True)
+    packed.clear()
+    for made in layers[1:]:
+        made.num_heads = 4
+    assert attention.build(model, ctx) == attention.Bound(mka=True, mka_wide=True)
     assert packed == layers[1:]
     # a layer the slot cannot serve leaves the slot unbuilt, packs nothing more
     why[id(layers[2])] = "no attention output gate"

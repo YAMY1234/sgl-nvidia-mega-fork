@@ -31,10 +31,14 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "mka",
     "mka_push",
 )
-# Steps of more than one request (TP8's decode graphs of batch sizes 2 and 4), covered only
+# Steps of more than one request (TP8's decode graphs of batch sizes 2 to 128), covered only
 # when requested in the same variable: covering them costs the one-request step about
 # 0.3% at TP8
 OPT_IN_COVERAGE: tuple[str, ...] = ("multi_request",)
+# Graph variants of a built slot, requested in the same variable: no width of their own.
+# skv2_cp: one long request past the measured crossover runs CP-lite in place of SKV2,
+# in a graph variant of its own (attention/route.py)
+OPT_IN_VARIANTS: tuple[str, ...] = ("skv2_cp",)
 # The MTP draft's EAGLE entries and kernel groups (qwen3_5/draft), requested in the same
 # variable; the draft spec's build reads them, the target's ignores them
 DRAFT_ENTRIES: tuple[str, ...] = ("draft_loop", "draft_extend")
@@ -48,6 +52,9 @@ DRAFT_SLOTS: tuple[str, ...] = (
     # draft_loop and draft_extend also serve TP8's draft graphs of 2 to 128 requests,
     # and those of two or more take the sharded top-1 (with multi_request)
     "draft_multi",
+    # One long request's steps / extend use CP-lite in graph variants of their own.
+    "draft_q1_cp",
+    "draft_skv2_cp",
 )
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 # These slots run all 512 experts themselves. Under expert parallelism, keep the
@@ -85,6 +92,7 @@ def slot_reasons() -> list[str]:
         *SHIPPED_SLOTS,
         *OPT_IN_SLOTS,
         *OPT_IN_COVERAGE,
+        *OPT_IN_VARIANTS,
         *DRAFT_ENTRIES,
         *DRAFT_SLOTS,
     )
@@ -124,7 +132,7 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_pdl' launches slot 'gdn_verify''s verify"
         )
-    for name in sorted(SLOTS & set(DRAFT_SLOTS) - {"draft_skv2"}):
+    for name in sorted(SLOTS & set(DRAFT_SLOTS) - {"draft_skv2", "draft_skv2_cp"}):
         if "draft_loop" not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {name!r} runs inside entry 'draft_loop'")
     if "draft_hop" in SLOTS and "hop" not in SLOTS:
@@ -138,6 +146,16 @@ def slot_reasons() -> list[str]:
         reasons.append(
             f"{SLOTS_ENV}: slot 'draft_skv2' runs inside entry 'draft_extend'"
         )
+    for name, base in (
+        ("skv2_cp", "skv2"),
+        ("draft_q1_cp", "draft_q1"),
+        ("draft_skv2_cp", "draft_skv2"),
+    ):
+        if name in SLOTS and base not in SLOTS:
+            reasons.append(
+                f"{SLOTS_ENV}: slot {name!r} takes slot {base!r}'s long-KV graph "
+                "variant's place from its length up"
+            )
     if "mka_push" in SLOTS and not {"mka", "hop"} <= SLOTS:
         reasons.append(
             f"{SLOTS_ENV}: slot 'mka_push' pushes slot 'mka''s epilogue into slot "
@@ -217,6 +235,7 @@ def build(model, ctx):
         route_shared=bound["moe"].shared,
         skv2=bound["attention"].skv2,
         mka=bound["attention"].mka,
+        mka_wide=bound["attention"].mka_wide,
         mka_push=bound["attention"].mka_push,
     )
     covered = slot_plan.covered(pctx.widths, facts, pctx.tokens_per_request)
@@ -229,7 +248,13 @@ def build(model, ctx):
     )
     built = msgspec.structs.asdict(facts)
     # every package's build agrees across ranks, so this raises on every rank alike
-    target_slots = SLOTS - set(DRAFT_ENTRIES) - set(DRAFT_SLOTS) - set(OPT_IN_COVERAGE)
+    target_slots = (
+        SLOTS
+        - set(DRAFT_ENTRIES)
+        - set(DRAFT_SLOTS)
+        - set(OPT_IN_COVERAGE)
+        - set(OPT_IN_VARIANTS)
+    )
     # mkm's 16-token engine has nothing to serve where no covered step is wider than 7 rows
     vacuous = (
         {"mkm_wide"}

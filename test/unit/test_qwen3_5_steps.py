@@ -1362,6 +1362,34 @@ def test_the_trt_gdn_front_prepares_on_the_first_gdn_layers_pools():
     )
 
 
+def test_the_trt_gdn_front_stops_at_the_request_window_capacity(monkeypatch):
+    """A small max-running-requests pool does not prepare impossible widths."""
+    from sgl_nvidia_mega.qwen3_5.sm103 import trt_lowm
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    compiled = []
+    monkeypatch.setattr(trt_front, "_SPECS", {})
+    monkeypatch.setattr(
+        trt_front,
+        "spec",
+        lambda act, qkvz, ba, conv_weight, conv_state, windows, requests: (
+            act,
+            requests,
+        ),
+    )
+    monkeypatch.setattr(trt_lowm, "prepare", compiled.append)
+    windows = SimpleNamespace(shape=(2, 7, 1536, 3))
+    trt_front.prepare(2560, 16, "weight", "state", windows)
+
+    assert compiled == [("fp8", 1), ("quant", 1), ("fp8", 2), ("quant", 2)]
+    assert set(trt_front._SPECS) == {
+        ("fp8", 2560, 1),
+        ("quant", 2560, 1),
+        ("fp8", 2560, 2),
+        ("quant", 2560, 2),
+    }
+
+
 @pytest.mark.parametrize(
     "qkvz, ba, d, requests, tactic_fp8, tactic_quant",
     [

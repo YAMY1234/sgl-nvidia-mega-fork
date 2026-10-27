@@ -586,6 +586,31 @@ def test_the_mkm_slot_names_what_a_layer_lacks():
     assert mkm.unsupported(mlp).startswith("an expert activation")
 
 
+def test_route_topk_checks_only_materialized_routing_under_expert_parallelism(
+    monkeypatch,
+):
+    from sgl_nvidia_mega.qwen3_5.moe import mkm, route
+
+    experts = SimpleNamespace(num_experts=512, num_local_experts=128)
+    mlp = SimpleNamespace(experts=experts)
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            start_layer=0, end_layer=1, layers=[SimpleNamespace(mlp=mlp)]
+        )
+    )
+    checked = []
+    monkeypatch.setattr(route, "unsupported", lambda _: "")
+    monkeypatch.setattr(
+        mkm, "routing_unsupported", lambda _: checked.append("routing") or ""
+    )
+    monkeypatch.setattr(
+        mkm, "unsupported", lambda _: pytest.fail("full-expert engine checked under EP")
+    )
+
+    assert route.topk_unsupported(model) == ""
+    assert checked == ["routing"]
+
+
 def test_the_draft_mkm_uses_the_complete_slot_schema(monkeypatch):
     """Draft widths leave unrelated target slots off instead of omitting them."""
     from sgl_nvidia_mega.qwen3_5.draft.moe_mkm import DraftMkm

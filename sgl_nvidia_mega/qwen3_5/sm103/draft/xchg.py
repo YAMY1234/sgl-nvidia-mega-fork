@@ -207,10 +207,11 @@ def _compile(
 @cache
 def _xchg_kernels(device_index: int, world: int) -> dict[str, jit.Kernel]:
     cubin = _compile(device_index, "mkd_xchg", (f"MKD_WORLD={world}",))
-    return {
-        name: jit.load(cubin, name, (XCHG_THREADS, 1, 1), 0)
-        for name in ("mkd_xchg_memo", "mkd_xchg_emb", "mkd_xchg_memo_split")
-    }
+    names = ("mkd_xchg_memo", "mkd_xchg_emb", "mkd_xchg_memo_split")
+    # Always prepare the supported entry before capture, including later AB arms.
+    if world == 8:
+        names += ("mkd_xchg_memo_split_terminal",)
+    return {name: jit.load(cubin, name, (XCHG_THREADS, 1, 1), 0) for name in names}
 
 
 @cache
@@ -379,14 +380,16 @@ def mkd_xchg(
     partial_flag: Optional[torch.Tensor] = None,
     scan_part: Optional[torch.Tensor] = None,
     head_part: Optional[torch.Tensor] = None,
-) -> None:
+    terminal_restore: bool = False,
+) -> bool:
     """Shard argmax + multicast exchange + selection for one draft token (2.2's
     ``mkd_xchg``, same arguments). ``cand`` holds bf16 embedding rows or fp32 memo rows of
     the local shard (memo selects the kernel); the winner's row lands in ``out_cand`` and
     the hidden-slice partials in ``out_partials``, or with memo rows and ``fc_out`` the
     next step's fc output. ``token_only`` exchanges the keys alone; ``partial_flag`` makes
     a hidden rank wait for the side-stream partial; ``scan_part`` splits large shard
-    scans; ``head_part`` (the head's per-CTA maxima) replaces the scan."""
+    scans; ``head_part`` (the head's per-CTA maxima) replaces the scan. Return whether
+    the terminal entry actually restored coordinates for the complete loop caller."""
     memo = cand.dtype == torch.float32
     device = logits.device
     v = int(logits.shape[-1])
@@ -481,17 +484,25 @@ def mkd_xchg(
         pf_bytes=pf_bytes,
     )
     kernels = _xchg_kernels(device.index, world)
+    restored = bool(
+        terminal_restore and world == 8 and memo and XCHG_SPLIT_SEND
+        and token_only and draft_column == 5 and nan_key == NAN_KEY_SPLIT_ARGMAX
+        and pos is not None and tokens is not None
+    )
+    name = (
+        ("mkd_xchg_memo_split" if XCHG_SPLIT_SEND else "mkd_xchg_memo")
+        if memo else "mkd_xchg_emb"
+    )
+    if restored:
+        name = "mkd_xchg_memo_split_terminal"
     _launch(
-        kernels[
-            ("mkd_xchg_memo_split" if XCHG_SPLIT_SEND else "mkd_xchg_memo")
-            if memo
-            else "mkd_xchg_emb"
-        ],
+        kernels[name],
         CHUNKS,
         p,
         device,
         pdl=True,
     )
+    return restored
 
 
 # ---------------------------------------------------------------- fc of an exchanged input

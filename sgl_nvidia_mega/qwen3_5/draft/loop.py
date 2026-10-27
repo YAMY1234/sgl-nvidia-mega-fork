@@ -114,8 +114,9 @@ class DraftLoop:
             io.out_cache_loc[: n * k].view(n, k).t().contiguous() if n > 1 else None
         )
         positions, mrope = io.positions, io.mrope_positions
+        restored = False
         if parts.mkd is not None and io.num_requests == SERVED_BS:
-            self._mkd_steps(io, steps)
+            restored = self._mkd_steps(io, steps)
         elif parts.top1x is not None and io.num_requests in MULTI_LOOP_BS:
             self._multi_steps(io, steps)
         else:
@@ -127,9 +128,10 @@ class DraftLoop:
                 positions.add_(1)
                 if mrope is not None:
                     mrope.add_(1)
-        positions.sub_(steps)
-        if mrope is not None:
-            mrope.sub_(steps)
+        if not restored:
+            positions.sub_(steps)
+            if mrope is not None:
+                mrope.sub_(steps)
 
     def _fc_path(self, rows: int) -> str:
         from sgl_nvidia_mega.qwen3_5.draft.xchg import FC_SPLIT_MAX_TOKENS
@@ -186,11 +188,12 @@ class DraftLoop:
             )
             token = tokens[:, i + 1]
 
-    def _mkd_steps(self, io, steps: int) -> None:
+    def _mkd_steps(self, io, steps: int) -> bool:
         """The steps with slot draft_xchg, in 2.2's order: fc from the exchange, the
         layer, the hidden half of the next fc on a side stream, the shard head, the
         exchange (token, positions and the next fc)."""
         mkd = self.parts.mkd
+        restored = False
         for i in range(steps):
             mkd.begin_step(i, io.num_requests)
             hidden = self._model_step(io, i, mkd.fc())
@@ -203,5 +206,8 @@ class DraftLoop:
                 i,
                 i + 1,
                 io.mrope_positions,
+                terminal_restore=io.num_steps == self.num_steps == 6 and steps == 5 and i == 4,
             )
+            restored = mkd.terminal_restored
         mkd.end()
+        return restored

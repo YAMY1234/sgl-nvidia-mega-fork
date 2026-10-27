@@ -119,7 +119,7 @@ struct MkdXchgParams {
  * [c * H / kChunks, ...) of the candidate and partial rows. Every CTA redoes the shard
  * argmax (a few tens of KB from L2) so no CTA waits for another before sending.
  */
-template <int kH, int kWorld, bool kMemo, int kChunks, int kThreads, bool kUsePDL, bool kSplitSend = false>
+template <int kH, int kWorld, bool kMemo, int kChunks, int kThreads, bool kUsePDL, bool kSplitSend = false, bool kTerminalRestore = false>
 SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
   using namespace device;
   using vec_t = AlignedVector<bf16_t, 8>;
@@ -131,6 +131,7 @@ SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
   constexpr int kRec = 2 + kCandWords + kPartWords;
   constexpr int kWarps = kThreads / 32;
   static_assert(kH % (kChunks * 2) == 0);
+  static_assert(!kTerminalRestore || (kWorld == 8 && kMemo && kSplitSend));
 
   __shared__ uint32_t s_v[kWarps];
   __shared__ int32_t s_i[kWarps];
@@ -160,7 +161,7 @@ SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
   }
   PDLWaitPrimary<kUsePDL>();
   // The fc launch behind us only prefetches static weights before its own wait.
-  PDLTriggerSecondary<kUsePDL>();
+  if constexpr (!kTerminalRestore) PDLTriggerSecondary<kUsePDL>();
   const uint64_t t_wait = mkd_xchg::now_ns();
   // Read the epoch now, publish it after the scan: the load overlaps the logits loads.
   uint32_t epoch = 0;
@@ -425,10 +426,11 @@ SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
       p.topk_index[0] = gid;
       p.topk_p[0] = 1.0f;
       if (p.draft_tokens != nullptr) p.draft_tokens[p.draft_column] = gid;
-      if (p.positions != nullptr) p.positions[0] = p.positions[0] + 1;
+      const int64_t delta = kTerminalRestore ? int64_t{1} - static_cast<int64_t>(p.draft_column) : int64_t{1};
+      if (p.positions != nullptr) p.positions[0] = p.positions[0] + delta;
       if (p.mrope != nullptr) {
 #pragma unroll
-        for (int d = 0; d < 3; ++d) p.mrope[d * p.mrope_stride] += 1;
+        for (int d = 0; d < 3; ++d) p.mrope[d * p.mrope_stride] += delta;
       }
     }
   }
@@ -490,3 +492,11 @@ extern "C" __global__ void __launch_bounds__(1024) mkd_xchg_emb(const MkdXchgPar
 extern "C" __global__ void __launch_bounds__(1024) mkd_xchg_memo_split(const MkdXchgParams __grid_constant__ p) {
   sglang::mkd_xchg_kernel<4096, MKD_WORLD, true, 16, 1024, true, true>(p);
 }
+
+#if MKD_WORLD == 8
+// Only the complete six-token B1 draft loop's last exchange. Incoming PDL wait
+// remains; no early release. Normal enclosing graph completion drains all CTAs.
+extern "C" __global__ void __launch_bounds__(1024) mkd_xchg_memo_split_terminal(const MkdXchgParams __grid_constant__ p) {
+  sglang::mkd_xchg_kernel<4096, MKD_WORLD, true, 16, 1024, true, true, true>(p);
+}
+#endif

@@ -478,6 +478,7 @@ class MkdBoundary:
         """A draft step of ``num_rows`` rows starts (the draft loop forwards steps
         0 .. num_steps - 2); with extend fc, step 0's fc is ``fc_buf``."""
         self.num_rows = num_rows
+        self.terminal_restored = False
         self.armed = num_rows == 1
         self.step = step
         self.last_step = step == self.num_steps - 2
@@ -523,6 +524,8 @@ class MkdBoundary:
         positions: torch.Tensor,
         draft_column: int,
         mrope_positions: Optional[torch.Tensor],
+        *,
+        terminal_restore: bool = False,
     ) -> None:
         """The step-boundary exchange: the token into ``topk_index`` / ``topk_p`` and
         ``draft_tokens[:, draft_column]``, positions (and M-RoPE positions) + 1, and unless
@@ -532,7 +535,13 @@ class MkdBoundary:
             if self.partial_pending and not self.last_step
             else None
         )
-        kernels.mkd_xchg(
+        restore = bool(
+            terminal_restore and self.num_rows == 1 and self.world == 8
+            and self.num_steps == 6 and self.step == 4 and draft_column == 5
+            and self.last_step and self.memo
+            and os.environ.get("SGLANG_Q35FLY_DRAFT_TERMINAL_RESTORE", "0") == "1"
+        )
+        self.terminal_restored = kernels.mkd_xchg(
             local_logits,
             self.cand,
             self.hot_ids,
@@ -556,6 +565,7 @@ class MkdBoundary:
             partial_flag=partial_flag,
             scan_part=self.scan_part,
             head_part=self.head_part_cur if self.head_used else None,
+            terminal_restore=restore,
         )
         self.head_used = False
         self.pending = not self.last_step
@@ -570,6 +580,8 @@ class MkdBoundary:
         step: int,
         draft_column: int,
         mrope_positions: Optional[torch.Tensor] = None,
+        *,
+        terminal_restore: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """(topk_p, topk_index) of an armed step from its shard-local logits, through the
         exchange (DraftVocabExchange.finish_step on the one-launch boundary)."""
@@ -587,6 +599,7 @@ class MkdBoundary:
             positions,
             draft_column,
             mrope_positions,
+            terminal_restore=terminal_restore,
         )
         self.armed = False
         return topk_p, topk_index

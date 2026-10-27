@@ -236,7 +236,7 @@ def test_replayssm_verify_is_sglangs(pdl, gate, bs):
     g = torch.Generator(device="cuda").manual_seed(
         3 + int(pdl) + 2 * int(gate) + 10 * bs
     )
-    ring_len, slots = 16, 9
+    ring_len, slots = 16, SLOTS
     tokens = bs * DRAFT
 
     def rand(*shape, dtype=torch.bfloat16):

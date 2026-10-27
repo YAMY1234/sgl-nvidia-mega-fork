@@ -86,6 +86,7 @@ SGLANG_MIRRORS = {
         "8e36076dafabff66",
         "1445b85387928caf",
         "d7e7c1fe125739e6",
+        "066a1e0aa5bd6e5c",
     ),
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._should_use_fused_fp8_path": "e0b14791d523a019",
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._fused_fp8_qkv_kv_cache": (

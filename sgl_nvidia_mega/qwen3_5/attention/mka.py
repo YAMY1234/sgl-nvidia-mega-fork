@@ -67,6 +67,7 @@ SGLANG_READS = {
     "srt/runtime_context.py": ("get_parallel",),
     "srt/layers/layer_boundary/fusions/norm.py": ("fused_norm_gamma",),
     "srt/model_executor/forward_batch_info.py": ("out_cache_loc",),
+    "srt/layers/attention/q35_cp_lite.py": ("CpLite",),
     "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "kv",
         "layer_ids",
@@ -304,6 +305,7 @@ def _front_step(layer, x, st):
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
     )
+    from sglang.srt.layers.attention.q35_cp_lite import CpLite
     from sglang.srt.layers.dp_attention import is_allocation_symmetric
     from sglang.srt.layers.quantization.fp8_utils import flashinfer_bmm_fp8
     from sglang.srt.runtime_context import get_parallel
@@ -362,8 +364,15 @@ def _front_step(layer, x, st):
         k_scale=k_scale,
         v_scale=v_scale,
     )
+    gate = gate.reshape(m, width)
+    cp_lite = CpLite._instance
+    oq = None
+    if cp_lite is not None:
+        oq = torch.empty((m, width), dtype=torch.float8_e4m3fn, device=x.device)
+        cp_lite.offer_gate_epilogue(gate, layer.o_proj.input_scale, oq)
     o = attn(q.reshape(m, width), None, None, st.fb).reshape(m, width)
-    oq = gate_quant(o.contiguous(), gate.reshape(m, width), layer.o_proj.input_scale)
+    if cp_lite is None or not cp_lite.take_gate_epilogue():
+        oq = gate_quant(o.contiguous(), gate, layer.o_proj.input_scale)
     if st.slots.lowm_oproj:
         # slot lowm_out: o_proj on the low-M launch, pushing into the hop with lowm_push
         hop = None

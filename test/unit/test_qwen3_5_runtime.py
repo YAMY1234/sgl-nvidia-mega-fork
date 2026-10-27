@@ -295,6 +295,47 @@ def test_an_explicit_policy_controls_the_draft_entries(monkeypatch):
     assert runtime.build(model, target_ctx).summary() == "slots none (stock)"
 
 
+def test_unavailable_draft_moe_is_dropped_and_runs_stock_mlp(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.draft import attention, layer
+    from sgl_nvidia_mega.qwen3_5.draft.moe import DraftMoe
+    from sgl_nvidia_mega.qwen3_5.draft.parts import Parts
+
+    calls = []
+
+    def mlp(hidden):
+        calls.append("stock mlp")
+        return hidden
+
+    decoder = SimpleNamespace(
+        input_layernorm=lambda hidden: hidden,
+        post_attention_layernorm=lambda hidden, residual: (hidden, residual),
+        mlp=mlp,
+    )
+    norm = lambda hidden, residual: (hidden, residual)
+    model = SimpleNamespace(layers=[decoder], start_layer=0, end_layer=1, norm=norm)
+    draft = SimpleNamespace(
+        lm=SimpleNamespace(model=model),
+        binding="binding",
+        slots=frozenset({"draft_moe"}),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        attention, "Attention", lambda _: lambda hidden, *a, **k: hidden
+    )
+    monkeypatch.setattr(DraftMoe, "build", classmethod(lambda cls, mlp, device: None))
+    monkeypatch.setattr(
+        "sglang.srt.distributed.tensor_model_parallel_all_reduce", lambda hidden: hidden
+    )
+
+    parts = Parts.build(draft)
+    assert parts.moe is None and "draft_moe" not in parts.slots
+    x = torch.ones(1, 4)
+    assert torch.equal(
+        layer.layer(parts, x, None, None, None, None, rows_per_request=1), x
+    )
+    assert calls == ["stock mlp"]
+
+
 @pytest.mark.parametrize(
     "batch_size, lower_bound, seq_lens, want",
     [

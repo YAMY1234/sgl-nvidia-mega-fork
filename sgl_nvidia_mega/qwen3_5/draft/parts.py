@@ -92,6 +92,8 @@ class Parts:
         slots = parts.slots
         if "draft_moe" in slots:
             parts.moe = parts._build_moe()
+            if parts.moe is None:
+                slots = parts.slots = slots - {"draft_moe"}
         if "draft_hop" in slots:
             parts.hop = parts._build_hop()
         if "draft_xchg" in slots:
@@ -127,13 +129,7 @@ class Parts:
     def _build_moe(self):
         from sgl_nvidia_mega.qwen3_5.draft.moe import DraftMoe
 
-        moe = DraftMoe.build(self.layer.mlp, self.device.index)
-        if moe is None:
-            raise RuntimeError(
-                "NVIDIA megakernel: slot draft_moe cannot run: "
-                f"{getattr(DraftMoe, 'last_reason', 'see the log')}"
-            )
-        return moe
+        return DraftMoe.build(self.layer.mlp, self.device.index)
 
     def _build_hop(self):
         from sgl_nvidia_mega.qwen3_5.draft.hop import GEMV_O_PROJ, DraftHop

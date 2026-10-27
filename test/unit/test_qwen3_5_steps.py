@@ -586,6 +586,17 @@ def test_the_mkm_slot_names_what_a_layer_lacks():
     assert mkm.unsupported(mlp).startswith("an expert activation")
 
 
+def test_the_draft_mkm_uses_the_complete_slot_schema(monkeypatch):
+    """Draft widths leave unrelated target slots off instead of omitting them."""
+    from sgl_nvidia_mega.qwen3_5.draft.moe_mkm import DraftMkm
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    slots = DraftMkm(bound="bound", wide=False).state(7).slots
+    assert isinstance(slots, plan.Slots)
+    assert slots.route and slots.mkm
+    assert not slots.route_lin and not slots.route_pre_topk
+
+
 def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch):
     from sgl_nvidia_mega.qwen3_5.moe import route
 

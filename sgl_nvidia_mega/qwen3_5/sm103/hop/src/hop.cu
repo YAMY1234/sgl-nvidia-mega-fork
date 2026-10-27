@@ -188,6 +188,10 @@ __device__ __forceinline__ void oproj_push_kernel(const OprojArgs& o) {
       for (int b = 0; b < 2; ++b) a[st][b] = ldg_nc_v4(wb + (st * 2 + b) * 32);
   }
   const float alpha = __fmul_rn(*o.sx, *o.sw);
+  uint32_t weight_dep = __float_as_uint(alpha);
+#pragma unroll
+  for (int st = 0; st < S; ++st) weight_dep ^= a[st][0].x ^ a[st][1].x;
+  pin_before_wait(weight_dep, reinterpret_cast<uint64_t>(o.w));
   pdl_wait();
   const int m = o.m;
   const bool tok_ok = g < m;

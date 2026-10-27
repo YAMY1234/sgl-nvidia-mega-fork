@@ -77,6 +77,20 @@ def test_an_explicit_empty_policy_keeps_every_slot_off(monkeypatch):
     assert runtime._requested_slots() == frozenset()
 
 
+def test_runtime_only_slots_are_accepted_but_not_built_by_the_plugin(monkeypatch):
+    requested = frozenset({"gdn_commit", "sharded_gumbel"})
+    monkeypatch.setattr(runtime, "SLOTS", requested)
+    assert runtime.slot_reasons() == []
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    ctx = SimpleNamespace(
+        widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
+    )
+    assert runtime.build(model, ctx).summary() == "slots none (stock)"
+
+
 def test_only_target_verify_steps_of_built_widths_are_covered():
     built = _verify()
     ids = torch.zeros(7, dtype=torch.int64)

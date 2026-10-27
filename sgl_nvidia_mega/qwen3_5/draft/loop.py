@@ -106,7 +106,18 @@ class DraftLoop:
         )
         steps = io.num_steps - 1
         tokens = io.draft_tokens_out
-        tokens[:, :1].copy_(io.topk_index)
+        mkd = parts.mkd
+        initial_topk = (
+            io.topk_index
+            if mkd is not None and n == SERVED_BS
+            and io.num_steps == self.num_steps == 6
+            and mkd.can_copy_initial_token(
+                io.topk_index, tokens, io.positions, io.mrope_positions
+            )
+            else None
+        )
+        if initial_topk is None:
+            tokens[:, :1].copy_(io.topk_index)
         # request-major slots: every step's rows of several requests made dense in one copy,
         # for the front and the FP8 KV write
         n, k = io.num_requests, io.num_steps
@@ -115,7 +126,7 @@ class DraftLoop:
         )
         positions, mrope = io.positions, io.mrope_positions
         if parts.mkd is not None and io.num_requests == SERVED_BS:
-            self._mkd_steps(io, steps)
+            self._mkd_steps(io, steps, initial_topk=initial_topk)
         elif parts.top1x is not None and io.num_requests in MULTI_LOOP_BS:
             self._multi_steps(io, steps)
         else:
@@ -186,7 +197,7 @@ class DraftLoop:
             )
             token = tokens[:, i + 1]
 
-    def _mkd_steps(self, io, steps: int) -> None:
+    def _mkd_steps(self, io, steps: int, *, initial_topk=None) -> None:
         """The steps with slot draft_xchg, in 2.2's order: fc from the exchange, the
         layer, the hidden half of the next fc on a side stream, the shard head, the
         exchange (token, positions and the next fc)."""
@@ -203,5 +214,6 @@ class DraftLoop:
                 i,
                 i + 1,
                 io.mrope_positions,
+                initial_topk=initial_topk if i == 0 else None,
             )
         mkd.end()

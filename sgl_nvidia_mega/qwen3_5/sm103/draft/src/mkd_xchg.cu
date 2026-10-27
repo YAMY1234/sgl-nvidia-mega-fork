@@ -490,3 +490,14 @@ extern "C" __global__ void __launch_bounds__(1024) mkd_xchg_emb(const MkdXchgPar
 extern "C" __global__ void __launch_bounds__(1024) mkd_xchg_memo_split(const MkdXchgParams __grid_constant__ p) {
   sglang::mkd_xchg_kernel<4096, MKD_WORLD, true, 16, 1024, true, true>(p);
 }
+
+// Q35FLY: first B1 loop exchange only. The initial token is not the argmax
+// produced by this exchange. Keep the original body/ABI and all mailbox writes;
+// column zero is published by ordinary graph completion, not the epoch flag.
+#if MKD_WORLD == 8
+extern "C" __global__ void __launch_bounds__(1024) mkd_xchg_memo_split_initial(
+    const MkdXchgParams __grid_constant__ p, const int64_t* initial_topk) {
+  sglang::mkd_xchg_kernel<4096, MKD_WORLD, true, 16, 1024, true, true>(p);
+  if (blockIdx.x == 0 && threadIdx.x == 0) p.draft_tokens[0] = initial_topk[0];
+}
+#endif

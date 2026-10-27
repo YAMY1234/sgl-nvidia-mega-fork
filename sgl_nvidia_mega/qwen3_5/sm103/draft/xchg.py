@@ -24,6 +24,7 @@ add unused shared memory, ``smem_pad``, and run beside a narrower hidden partial
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import struct
 from functools import cache
@@ -44,6 +45,34 @@ CHUNKS = 16
 XCHG_THREADS = 1024
 # Rotating epoch slots of the exchange buffer (mkd_xchg::kSlots)
 SLOTS = 3
+INITIAL_TOKEN_COPY_ENV = "SGLANG_Q35FLY_DRAFT_INITIAL_TOKEN_COPY"
+
+
+def initial_token_copy_requested() -> bool:
+    """Prepare any requested capture arm; dispatch reads the live flag separately."""
+    variants = json.loads(os.environ.get("Q35MF_AB_VARIANTS") or "{}")
+    return os.environ.get(INITIAL_TOKEN_COPY_ENV, "0") == "1" or any(
+        arm.get(INITIAL_TOKEN_COPY_ENV) == "1" for arm in variants.values()
+    )
+
+
+def initial_token_binding(source, tokens, *other_outputs) -> bool:
+    """Narrow B1 binding; reject even disjoint views of shared backing storage."""
+    if (
+        source is None or tokens is None
+        or tuple(source.shape) != (1, 1) or tuple(tokens.shape) != (1, 6)
+        or source.dtype != torch.int64 or tokens.dtype != torch.int64
+        or not source.is_cuda or source.device != tokens.device
+        or not source.is_contiguous() or not tokens.is_contiguous()
+    ):
+        return False
+    src, dst = source.untyped_storage().data_ptr(), tokens.untyped_storage().data_ptr()
+    if src == dst:
+        return False
+    return all(
+        t is None or t.untyped_storage().data_ptr() not in (src, dst)
+        for t in other_outputs
+    )
 # fc output rows per CTA held in shared memory by mkd_fc_sum (2.2 mkd_draft_fc.MAX_ROWS)
 FC_MAX_ROWS = 27
 MEMO_BLOCK_ROWS = 8  # embedding rows a mkd_fc_memo CTA normalizes at once (kB)
@@ -214,6 +243,13 @@ def _xchg_kernels(device_index: int, world: int) -> dict[str, jit.Kernel]:
 
 
 @cache
+def initial_token_copy_kernel(device_index: int) -> jit.Kernel:
+    """Opt-in prepare outside capture; the old entry loader stays unchanged."""
+    cubin = _compile(device_index, "mkd_xchg", ("MKD_WORLD=8",))
+    return jit.load(cubin, "mkd_xchg_memo_split_initial", (XCHG_THREADS, 1, 1), 0)
+
+
+@cache
 def _fc_kernels(device_index: int, world: int) -> dict[str, jit.Kernel]:
     cubin = _compile(
         device_index, "mkd_fc", (f"MKD_WORLD={world}", f"MKD_FC_MAX_ROWS={FC_MAX_ROWS}")
@@ -379,6 +415,7 @@ def mkd_xchg(
     partial_flag: Optional[torch.Tensor] = None,
     scan_part: Optional[torch.Tensor] = None,
     head_part: Optional[torch.Tensor] = None,
+    initial_topk: Optional[torch.Tensor] = None,
 ) -> None:
     """Shard argmax + multicast exchange + selection for one draft token (2.2's
     ``mkd_xchg``, same arguments). ``cand`` holds bf16 embedding rows or fp32 memo rows of
@@ -480,6 +517,22 @@ def mkd_xchg(
         pf=jit.null_or_pointer(prefetch).value,
         pf_bytes=pf_bytes,
     )
+    if initial_topk is not None:
+        if not (
+            world == 8 and memo and XCHG_SPLIT_SEND and not token_only
+            and draft_column == 1 and fc_out is not None
+            and initial_token_binding(
+                initial_topk, tokens, topk_index, topk_p, pos, mrope,
+                fc_out, epoch_done, out_cand, out_partials, own_partial,
+            )
+        ):
+            raise ValueError("initial token copy requires the admitted first B1 split-memo exchange")
+        jit.launch(
+            initial_token_copy_kernel(device.index), (CHUNKS, 1, 1),
+            [p, jit.pointer(initial_topk)],
+            torch.cuda.current_stream(device).cuda_stream,
+        )
+        return
     kernels = _xchg_kernels(device.index, world)
     _launch(
         kernels[

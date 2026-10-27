@@ -284,6 +284,12 @@ class MkdBoundary:
             torch.empty(MAX_ROWS, 1, dtype=torch.float32, device=dev)
             for _ in range(num_steps)
         ]
+        self.initial_token_copy_ready = (
+            world == 8 and num_steps == 6 and memo and self.extend_fc
+            and kernels.XCHG_SPLIT_SEND and kernels.initial_token_copy_requested()
+        )
+        if self.initial_token_copy_ready:
+            kernels.initial_token_copy_kernel(dev.index)
         logger.info(
             "MKD draft boundary active (tp=%d, %s candidates, %.1f MB exchange buffer; "
             "split fc of %d extend rows: %s partial, %s); sources %s.",
@@ -474,6 +480,21 @@ class MkdBoundary:
 
     # ---------------------------------------------------------------- per step
 
+    def can_copy_initial_token(self, source, tokens, positions, mrope) -> bool:
+        """Decide before the loop omits its copy; only capture-time flag reads."""
+        return (
+            self.initial_token_copy_ready
+            and self.world == 8 and self.num_steps == 6 and self.memo and self.extend_fc
+            and kernels.XCHG_SPLIT_SEND
+            and os.environ.get(kernels.INITIAL_TOKEN_COPY_ENV, "0") == "1"
+            and kernels.initial_token_binding(
+                source, tokens, *self.topk_index, *self.topk_p, positions, mrope,
+                self.fc_buf, self.epoch_done, self.out_cand, self.out_partials,
+                self.own_partial, self.partial_sync, self.scan_part, self.head_part,
+                self._buf,
+            )
+        )
+
     def begin_step(self, step: int, num_rows: int) -> None:
         """A draft step of ``num_rows`` rows starts (the draft loop forwards steps
         0 .. num_steps - 2); with extend fc, step 0's fc is ``fc_buf``."""
@@ -523,6 +544,7 @@ class MkdBoundary:
         positions: torch.Tensor,
         draft_column: int,
         mrope_positions: Optional[torch.Tensor],
+        initial_topk: Optional[torch.Tensor] = None,
     ) -> None:
         """The step-boundary exchange: the token into ``topk_index`` / ``topk_p`` and
         ``draft_tokens[:, draft_column]``, positions (and M-RoPE positions) + 1, and unless
@@ -556,6 +578,7 @@ class MkdBoundary:
             partial_flag=partial_flag,
             scan_part=self.scan_part,
             head_part=self.head_part_cur if self.head_used else None,
+            initial_topk=initial_topk,
         )
         self.head_used = False
         self.pending = not self.last_step
@@ -570,6 +593,7 @@ class MkdBoundary:
         step: int,
         draft_column: int,
         mrope_positions: Optional[torch.Tensor] = None,
+        initial_topk: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """(topk_p, topk_index) of an armed step from its shard-local logits, through the
         exchange (DraftVocabExchange.finish_step on the one-launch boundary)."""
@@ -579,6 +603,11 @@ class MkdBoundary:
             raise RuntimeError(
                 "MKD draft boundary: only armed (one-row) steps take the exchange"
             )
+        if initial_topk is not None and not (
+            step == 0 and draft_column == 1 and self.num_steps == 6
+            and self.initial_token_copy_ready
+        ):
+            raise ValueError("initial token copy is only admitted for loop step zero / column one")
         self.exchange(
             local_logits,
             topk_index,
@@ -587,6 +616,7 @@ class MkdBoundary:
             positions,
             draft_column,
             mrope_positions,
+            initial_topk=initial_topk,
         )
         self.armed = False
         return topk_p, topk_index

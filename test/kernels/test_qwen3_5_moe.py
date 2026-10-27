@@ -3,8 +3,9 @@
 """The MoE package's kernels on one SM100-family GPU (GB300), bit for bit, eager and
 replayed from a CUDA graph:
 - the router front (slot route): router_gemm_quant's logits against the cuBLAS router
-  GEMM SGLang runs (ReplicatedLinear, bf16), and its NVFP4 input against the trtllm
-  runner's quantizer (flashinfer.fp4_quantize, linear scale layout), at 1-16 rows;
+  GEMM SGLang runs (ReplicatedLinear, bf16), within eight BF16 representable steps,
+  and its NVFP4 input against the trtllm runner's quantizer
+  (flashinfer.fp4_quantize, linear scale layout), at 1-16 rows;
 - the fused routed experts (slot mkm), against FlashInfer's trtllm-gen NVFP4 MoE as
   SGLang serves Qwen3.5 at TP8 and TP4 (intermediate 128 / 256 a rank; routing from the
   logits, RenormalizeNaive, deferred finalize): each token's 10 expert rows and their
@@ -15,10 +16,11 @@ replayed from a CUDA graph:
   rows (the wide engines, on route_topk's routing), also with every token routed to the
   same experts; graph replay of each;
 - the router front with the shared gate/up stage (slot route_shared, numeric): its
-  logits and NVFP4 input bit for bit the plain launch's, and its gate/up rows against
-  fp64 on SGLang's static FP8 quantization of the rows, at most 1.05 x the mean relative
-  L2 and 2 x the max abs error of FlashInfer's FP8 BMM, at 1-8 rows and the TP8 / TP16
-  widths (256 / 128 rows); graph replay;
+  logits against cuBLAS within eight BF16 representable steps, its NVFP4 input bit for
+  bit the plain launch's, and its gate/up rows against fp64 on SGLang's static FP8
+  quantization of the rows, at most 1.05 x the mean relative L2 and 2 x the max abs
+  error of FlashInfer's FP8 BMM, at 1-8 rows and the TP8 / TP16 widths (256 / 128 rows);
+  graph replay;
 - the TEP8 routed path: the routing tables route_topk and route-big write for a rank's
   window of local experts, and the trtllm-gen MoE body on them against FlashInfer's op
   as SGLang calls it (on
@@ -34,6 +36,7 @@ from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm, router
 E, H, TOP_K = mkm.EXPERTS, mkm.HIDDEN, mkm.TOP_K
 X_SCALE = 448.0 * 6.0 / 12.0  # the static input scale of the routed experts
 H_SCALE = 30.0 / (448.0 * 6.0)  # the static FC2 input scale
+ROUTER_BF16_ULPS = 8  # R11's validated four-chain reduction versus cuBLAS's order
 
 
 def _gpu_ready() -> bool:
@@ -348,7 +351,7 @@ def test_router_gemm_quant_is_the_stock_router_gemm_and_quantizer(m):
     x, w, scale = _router_inputs(m, seed=m)
     got = router.router_gemm_quant(x, w, scale)
     want = _router_stock(x, w, scale)
-    assert _bf16_ulps(got[0], want[0]) <= 1
+    assert _bf16_ulps(got[0], want[0]) <= ROUTER_BF16_ULPS
     for name, a, b in zip(("x_fp4", "x_sf"), got[1:], want[1:]):
         assert torch.equal(a.view(torch.uint8), b.reshape(a.shape).view(torch.uint8)), (
             name
@@ -392,10 +395,12 @@ def test_router_gemm_quant_shared_holds_its_gate_up_to_fp64(m):
         *routed, gate_up = router.router_gemm_quant_shared(
             x, w, scale, sh_w, sh_in, sh_ws
         )
-        for name, a, b in zip(
-            ("logits", "x_fp4", "x_sf"), routed, router.router_gemm_quant(x, w, scale)
-        ):
-            assert torch.equal(a, b), name
+        want = _router_stock(x, w, scale)
+        assert _bf16_ulps(routed[0], want[0]) <= ROUTER_BF16_ULPS
+        for name, a, b in zip(("x_fp4", "x_sf"), routed[1:], want[1:]):
+            assert torch.equal(
+                a.view(torch.uint8), b.reshape(a.shape).view(torch.uint8)
+            ), name
         xq, _ = static_quant_fp8(x, sh_in, repeat_scale=False)
         ref = (xq.double() @ sh_w.double().t()) * (sh_in.double() * sh_ws.double())
         stock = flashinfer_bmm_fp8(xq, sh_w.t(), sh_in, sh_ws, torch.bfloat16)
@@ -886,7 +891,8 @@ def test_moe_body_on_route_topks_ep_tables_is_the_routed_op(
 def test_router_front_tiles_are_its_16_row_launches(m):
     """Slot route_gemm (numeric past 16 rows): the router front over 16-row token tiles in
     one launch equals the 16-row launch on each tile, bit for bit; its NVFP4 input is the
-    runner's quantizer's; its logits stay within a bf16 ulp of cuBLAS's GEMM; and
+    runner's quantizer's; its logits stay within eight BF16 representable steps of
+    cuBLAS's GEMM; and
     route_topk's routing-only launch routes as its quantizing launch."""
     from flashinfer import fp4_quantize
 
@@ -900,9 +906,8 @@ def test_router_front_tiles_are_its_16_row_launches(m):
     q, q_sf = fp4_quantize(x, scale, 16, False, False)
     assert torch.equal(x_fp4, q.view(torch.uint8).reshape(m, -1))
     assert torch.equal(x_sf, q_sf.view(torch.uint8).reshape(m, -1))
-    stock = torch.nn.functional.linear(x, w).float()
-    ulp = stock.abs().clamp_min(1e-30) * 2.0**-7
-    assert ((logits.float() - stock).abs() <= ulp).all()
+    stock = torch.nn.functional.linear(x, w)
+    assert _bf16_ulps(logits, stock) <= ROUTER_BF16_ULPS
     routed = router.route_topk_quant(logits, x, scale)
     only = router.route_topk_quant(logits, x, scale, quantize=False)
     assert only[2] is None and only[3] is None

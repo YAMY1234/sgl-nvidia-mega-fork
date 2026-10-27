@@ -73,10 +73,12 @@ def spec(
 
 
 def prepare(qkvz: int, ba: int, conv_weight, conv_state, windows) -> None:
-    """Compile both activation forms for 1..MAX_REQUESTS requests on these layouts (not inside a graph capture)."""
+    """Compile both activation forms through the request-window pool's capacity,
+    capped at ``MAX_REQUESTS`` (not inside a graph capture)."""
     from sgl_nvidia_mega.qwen3_5.sm103 import trt_lowm
 
-    for requests in range(1, MAX_REQUESTS + 1):
+    max_requests = min(MAX_REQUESTS, int(windows.shape[0]))
+    for requests in range(1, max_requests + 1):
         for act in MODES:
             s = spec(act, qkvz, ba, conv_weight, conv_state, windows, requests)
             trt_lowm.prepare(s)

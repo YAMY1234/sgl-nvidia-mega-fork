@@ -91,6 +91,19 @@ def test_runtime_only_slots_are_accepted_but_not_built_by_the_plugin(monkeypatch
     assert runtime.build(model, ctx).summary() == "slots none (stock)"
 
 
+def test_multi_request_coverage_has_no_kernel_build_result(monkeypatch):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"multi_request"}))
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    ctx = SimpleNamespace(
+        widths=(7, 14), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
+    )
+
+    built = runtime.build(model, ctx)
+    assert built.widths == (7,)
+
+
 def test_only_target_verify_steps_of_built_widths_are_covered():
     built = _verify()
     ids = torch.zeros(7, dtype=torch.int64)

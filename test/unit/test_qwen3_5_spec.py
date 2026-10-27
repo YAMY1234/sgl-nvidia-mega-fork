@@ -180,6 +180,7 @@ def test_an_sglang_without_the_eagle_forward_view_is_refused(monkeypatch):
             "slot 'route_lin' needs 'lowm_se' to replace 'route_shared'",
         ),
         ({"route_shared"}, "slot 'route_shared' runs in slot 'route''s launch"),
+        ({"hop_mid"}, "slot 'hop_mid' widens slot 'hop'"),
         ({"route", "mkm_wide"}, "slot 'mkm_wide' is slot 'mkm''s 16-token engine"),
         (
             {"route", "mkm", "mkm_wide"},
@@ -331,8 +332,10 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     three = plan.slots(21, every)
     assert three.lowm_se
     assert three.gdn_front and three.gdn_trt_front
+    assert three.hop and three.hop_fp8 and three.mka_push
     assert not (three.lowm_in or three.lowm_outproj or three.lowm_oproj)
-    # The 28/56-row low-M paths stay stock; GDN core and MKA serve through 224.
+    # The 28/56-row low-M projection paths stay stock; hop_mid's one-shot path and
+    # FP8 copy also serve 28 rows, while GDN core and MKA serve through 224.
     for rows in (28, 56, 112, 224):
         expected = [
             "gdn_conv",
@@ -354,6 +357,8 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
             expected.append("mkm_m256")
         if rows <= plan.ROUTE_GEMM_MAX_ROWS:
             expected.append("route_gemm")
+        if rows <= plan.HOP_MID_MAX_ROWS:
+            expected.extend(("hop", "hop_fp8", "mka_push"))
         assert _on(plan.slots(rows, every)) == sorted(expected)
     for rows in (448, 896):
         expected = [
@@ -369,6 +374,13 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]
     assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]
     assert not plan.slots(28, plan.Facts(route_gemm=True)).route_gemm
+    mid = plan.Facts(hop=True, hop_mid=True)
+    assert _on(plan.slots(28, mid)) == ["hop"]
+    assert _on(plan.slots(56, mid)) == []
+    assert _on(plan.slots(28, plan.Facts(hop=True, hop_mid=True, hop_fp8=True))) == [
+        "hop",
+        "hop_fp8",
+    ]
     # TEP8's routed-body plan is internal: S1/S2 use route plus a routing-only
     # top-k launch, M uses the low-M shared expert, and L uses route-big. It
     # supersedes the all-expert MKM engines and the numeric tiled router front.

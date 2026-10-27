@@ -243,6 +243,7 @@ def build(model, ctx) -> Bound:
         se_rows = plan.lowm_se_pre_rows(par.tp_size, tep8_m) or se_rows
     want_push = want_out and "lowm_push" in SLOTS and "hop" in SLOTS
     want_fp8 = "hop_fp8" in SLOTS and "hop" in SLOTS
+    fp8_rows = plan.HOP_MID_MAX_ROWS if "hop_mid" in SLOTS else plan.HOP_MAX_ROWS
     want = want_in or want_out
     if not (want or want_se or want_fp8):
         return Bound(reason="stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
@@ -324,7 +325,7 @@ def build(model, ctx) -> Bound:
             for w in ctx.widths:
                 if w <= se_rows:
                     launches.add((w, k, n, 8, 1, 1, True))
-                    if want_fp8 and w <= plan.HOP_MAX_ROWS:
+                    if want_fp8 and w <= fp8_rows:
                         launches.add((w, k, n, 8, 0, 1, True))
                     launches.add((w, kd, nd, 0, 0, 2, False))
     for w, k, n8, n16, act, epi8, f32 in sorted(launches):

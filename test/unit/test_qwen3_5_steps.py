@@ -2244,8 +2244,10 @@ def test_the_mka_slot_runs_the_prologue_the_attention_and_the_epilogue(skv2):
     assert out.shape == (7, 4096) and out.dtype == torch.bfloat16
 
 
-@pytest.mark.parametrize("consumed", [False, True])
-def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(consumed):
+@pytest.mark.parametrize(
+    ("batch_size", "consumed"), [(16, None), (32, False), (32, True)]
+)
+def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(batch_size, consumed):
     from sglang.srt.layers.attention.q35_cp_lite import CpLite
     from sglang.srt.layers.quantization import fp8_utils
 
@@ -2269,6 +2271,7 @@ def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(consumed):
     layer.qkv_proj = _Callable(lambda _: (qkv, None), **vars(qkv_linear))
     attn._fn = lambda *args, **kwargs: attention_out
     st.fb.out_cache_loc = torch.zeros(rows, dtype=torch.int64)
+    st.fb.batch_size = batch_size
     st.positions = torch.zeros(3, rows, dtype=torch.int64)
     st.slots = plan.Slots(mka=True, lowm_oproj=True)
     st.scratch = {}
@@ -2305,6 +2308,12 @@ def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(consumed):
         out = mka.step(layer, x, st)
 
     assert out is result
+    if batch_size <= 16:
+        assert [call[0] for call in calls] == ["gate_quant", "o_proj"]
+        assert calls[0][1].data_ptr() == attention_out.data_ptr()
+        assert calls[1][2] is fallback
+        return
+
     assert calls[0][0] == "offer"
     offered_gate = calls[0][1]
     assert offered_gate.shape == gate.shape

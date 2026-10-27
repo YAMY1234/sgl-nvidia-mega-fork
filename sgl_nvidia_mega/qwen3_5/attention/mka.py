@@ -365,12 +365,13 @@ def _front_step(layer, x, st):
     )
     gate = gate.reshape(m, width)
     cp_lite = CpLite._instance
+    use_cp_gate_epilogue = cp_lite is not None and st.fb.batch_size > 16
     oq = None
-    if cp_lite is not None:
+    if use_cp_gate_epilogue:
         oq = torch.empty((m, width), dtype=torch.float8_e4m3fn, device=x.device)
         cp_lite.offer_gate_epilogue(gate, layer.o_proj.input_scale, oq)
     o = attn(q.reshape(m, width), None, None, st.fb).reshape(m, width)
-    if cp_lite is None or not cp_lite.take_gate_epilogue():
+    if not use_cp_gate_epilogue or not cp_lite.take_gate_epilogue():
         oq = gate_quant(o.contiguous(), gate, layer.o_proj.input_scale)
     if st.slots.lowm_oproj:
         # slot lowm_out: o_proj on the low-M launch, pushing into the hop with lowm_push

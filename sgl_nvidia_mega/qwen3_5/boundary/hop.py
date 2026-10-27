@@ -140,6 +140,7 @@ class Bound(msgspec.Struct, frozen=True):
     """The boundary package's build result (``st.bound["boundary"]``)."""
 
     hop: Optional[object] = None  # sm103.hop.Hop for every covered width, or None
+    mid: bool = False  # its one-shot mailbox serves past 15 rows (slot hop_mid)
     reason: str = ""  # why there is no hop
 
 
@@ -157,8 +158,12 @@ def build(model, ctx) -> Bound:
 
     if "hop" not in runtime.SLOTS:
         return Bound(reason="slot off")
-    # the widest step the hop covers: its mailbox's rows
-    rows = plan.widest(ctx.widths, plan.HOP_MAX_ROWS)
+    # The widest step the one-shot mailbox covers. hop_mid extends it through four
+    # requests; without the opt-in, the shipped bitwise bound stays unchanged.
+    max_rows = (
+        plan.HOP_MID_MAX_ROWS if "hop_mid" in runtime.SLOTS else plan.HOP_MAX_ROWS
+    )
+    rows = plan.widest(ctx.widths, max_rows)
     if not rows:
         return Bound(reason=f"no width of {list(ctx.widths)} within its rows")
     m = model.model
@@ -178,7 +183,7 @@ def build(model, ctx) -> Bound:
     )
     global _ACTIVE
     _ACTIVE = hop
-    return Bound(hop=hop)
+    return Bound(hop=hop, mid=rows > plan.HOP_MAX_ROWS)
 
 
 def active() -> Optional[object]:

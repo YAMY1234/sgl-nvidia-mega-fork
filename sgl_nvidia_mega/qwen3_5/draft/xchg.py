@@ -350,6 +350,8 @@ class MkdBoundary:
         self.head_part = None
         self.head_part_cur = None
         self.head_used = False
+        # An opt-in draft-only MXFP8 copy can replace the BF16 LM-head shard.
+        self.head_mx8 = None
         if not enabled:
             return
         head = self.lm_head_weight
@@ -399,16 +401,32 @@ class MkdBoundary:
         self.head_part_cur = self.head_part[:ctas]
         # Alternate the row walk per draft step: the next step re-reads first what is still in L2
         # (T1: -1.9 to -2.4 us per call on the TP8 shard).
-        kernels.mkd_draft_head(
-            x,
-            self.lm_head_weight,
-            logits,
-            self.head_part_cur,
-            reverse=self.step % 2 == 1,
-            smem_pad=self.head_pad,
-        )
+        if self.head_mx8 is not None:
+            self.head_mx8.mkd_head(
+                x,
+                logits,
+                self.head_part_cur,
+                reverse=self.step % 2 == 1,
+                smem_pad=self.head_pad,
+            )
+        else:
+            kernels.mkd_draft_head(
+                x,
+                self.lm_head_weight,
+                logits,
+                self.head_part_cur,
+                reverse=self.step % 2 == 1,
+                smem_pad=self.head_pad,
+            )
         self.head_used = True
         return logits
+
+    def set_head_mx8(self, head_mx8) -> None:
+        """Make the one-row head read ``head_mx8``'s draft-only MXFP8 copy."""
+        if self.head_part is None:
+            return
+        head_mx8.prepare_mkd(self.head_pad)
+        self.head_mx8 = head_mx8
 
     def head_follows(self) -> bool:
         """Whether the draft head is the next launch after this step's final norm (an
@@ -607,20 +625,30 @@ class MkdBoundary:
             1, self.lm_head_weight.shape[0], dtype=torch.bfloat16, device=x.device
         )
         self.head_part_cur = self.head_part[: self.head_part.numel() - partial_ctas]
-        kernels.mkd_draft_head(
-            x,
-            self.lm_head_weight,
-            logits,
-            self.head_part_cur,
-            reverse=False,
-            smem_pad=self.head_pad,
-        )
+        if self.head_mx8 is not None:
+            self.head_mx8.mkd_head(
+                x,
+                logits,
+                self.head_part_cur,
+                reverse=False,
+                smem_pad=self.head_pad,
+            )
+        else:
+            kernels.mkd_draft_head(
+                x,
+                self.lm_head_weight,
+                logits,
+                self.head_part_cur,
+                reverse=False,
+                smem_pad=self.head_pad,
+            )
         self.head_used = True
         if torch.cuda.is_current_stream_capturing() and not self._extend_head_noted:
             self._extend_head_noted = True
             logger.info(
-                "NVIDIA megakernel: MKD draft extend uses the BF16 step head on "
+                "NVIDIA megakernel: MKD draft extend uses the %s step head on "
                 "%d CTAs, %s",
+                "MXFP8" if self.head_mx8 is not None else "BF16",
                 self.head_part_cur.numel(),
                 f"hidden partial on {partial_ctas} SMs of the side stream"
                 if self.is_hidden_rank

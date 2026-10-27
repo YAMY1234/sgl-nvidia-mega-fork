@@ -12,7 +12,6 @@ from typing import Any, Optional
 import torch
 
 logger = logging.getLogger(__name__)
-
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     "srt/models/qwen3_5_mtp.py": (
@@ -76,6 +75,8 @@ class Parts:
         self.engaged: set = set()
         # draft.moe_mkm.DraftMkm: compatible quantized draft experts on the target path
         self.moe_mkm: Optional[Any] = None
+        # sm103.draft.head_mx8.DraftHeadMx8 (slot draft_head_mxfp8)
+        self.head_mx8: Optional[Any] = None
 
     @classmethod
     def build(cls, draft) -> Parts:
@@ -108,6 +109,8 @@ class Parts:
                 logger.info(
                     "NVIDIA megakernel: draft MoE target path unavailable (%s)", why
                 )
+        if "draft_head_mxfp8" in slots:
+            parts.head_mx8 = parts._build_head_mx8()
         logger.info(
             "NVIDIA megakernel: Qwen3.5 MTP draft parts built (slots %s; MoE %s, hop "
             "%s, exchange %s)",
@@ -248,6 +251,26 @@ class Parts:
             cpu_group=b.tp_cpu_group,
             device=self.device,
         )
+
+    def _build_head_mx8(self):
+        """Build the draft-only MXFP8 copy of this rank's LM-head shard."""
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.head_mx8 import DraftHeadMx8
+
+        head = DraftHeadMx8(
+            self.lm.lm_head.weight.data,
+            max_rows=16,
+            gemv="cute",
+        )
+        if self.mkd is not None:
+            self.mkd.set_head_mx8(head)
+        logger.info(
+            "NVIDIA megakernel: MXFP8 draft head active on TP rank %d: %s; "
+            "MKD one-row head %s",
+            self.binding.tp_rank,
+            head.describe(),
+            "MXFP8" if self.mkd is not None and self.mkd.head_mx8 is head else "none",
+        )
+        return head
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         """The embedding rows of ``token_ids``: slot draft_embed's exchange where it is

@@ -33,6 +33,8 @@ SHIPPED_SLOTS: tuple[str, ...] = (
     "draft_extend",
     "draft_multi",
     "draft_embed",
+    # Draft-only MXFP8 LM head. This is numeric and remains explicitly opt-in.
+    "draft_head_mxfp8",
 )
 OPT_IN_SLOTS: tuple[str, ...] = (
     "route",

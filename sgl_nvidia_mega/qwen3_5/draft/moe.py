@@ -5,7 +5,8 @@
 # nvidia/qwen35-agentx-gb300.
 """The MTP draft layer's MoE as one launch per token (``sm103/draft/moe.py``): router
 GEMV + softmax top-k, the routed experts and the gated shared expert, from the bf16
-weights SGLang loaded for the draft's ``Qwen2MoeSparseMoeBlock``.
+weights SGLang loaded for the draft's ``Qwen2MoeSparseMoeBlock``. An explicitly
+quantized draft may retain a BF16 twin for this one- and two-token path.
 
 ``DraftMoe(x)`` returns this rank's unreduced output (routed and gated shared summed),
 whose TP sum the draft boundary completes. Against SGLang's stock draft MoE only the
@@ -44,6 +45,10 @@ SGLANG_READS = {
         '"w13_weight"',
         '"w2_weight"',
     ),
+    "srt/layers/quantization/qwen3_5_mtp_nvfp4.py": (
+        '"draft_bf16_w13"',
+        '"draft_bf16_w2"',
+    ),
     "srt/layers/moe/topk.py": (
         "topk_config",
         "top_k",
@@ -78,6 +83,15 @@ def _router_reason(mlp) -> Optional[str]:
     return None
 
 
+def draft_bf16_twin(experts) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Return the optional BF16 expert twin retained by the draft quantizer."""
+    w13 = getattr(experts, "draft_bf16_w13", None)
+    w2 = getattr(experts, "draft_bf16_w2", None)
+    if isinstance(w13, torch.Tensor) and isinstance(w2, torch.Tensor):
+        return w13, w2
+    return None
+
+
 def unsupported_reason(mlp) -> Optional[str]:
     """Why the single launch cannot serve this block (None when it can): the checks of
     SingleTokenDraftMoe._unsupported_reason and _router_unsupported_reason."""
@@ -89,13 +103,24 @@ def unsupported_reason(mlp) -> Optional[str]:
         return "no separate shared expert"
     # The kernel reads W13 as [gate rows | up rows] in checkpoint order.
     method = experts.quant_method
-    if not isinstance(method, UnquantizedFusedMoEMethod):
+    raw_twin = (
+        getattr(experts, "draft_bf16_w13", None),
+        getattr(experts, "draft_bf16_w2", None),
+    )
+    if (raw_twin[0] is None) != (raw_twin[1] is None):
+        return "incomplete BF16 expert twin"
+    twin = draft_bf16_twin(experts)
+    if raw_twin[0] is not None and twin is None:
+        return "BF16 expert twin is not tensors"
+    if twin is None and not isinstance(method, UnquantizedFusedMoEMethod):
         return f"expert weights handled by {type(method).__name__}"
-    if method.use_flashinfer_trtllm_moe or method.w13_swiglu_interleaved:
+    if twin is None and (
+        method.use_flashinfer_trtllm_moe or method.w13_swiglu_interleaved
+    ):
         return "expert weights in a kernel-specific layout"
     if get_parallel().moe_ep_size != 1:
         return "expert parallelism"
-    w13, w2 = experts.w13_weight, experts.w2_weight
+    w13, w2 = twin or (experts.w13_weight, experts.w2_weight)
     ws13, ws2 = shared.gate_up_proj.weight, shared.down_proj.weight
     hidden, inter = w13.shape[-1], w2.shape[-1]
     tensors = (w13, w2, ws13, ws2, mlp.shared_expert_gate.weight)
@@ -125,11 +150,24 @@ class DraftMoe:
 
     MAX_TOKENS = 2
 
-    def __init__(self, mlp, device: torch.device):
+    def __init__(
+        self,
+        mlp,
+        device: torch.device,
+        expert_weights: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
         self.mlp = mlp
+        self.w13, self.w2 = (
+            expert_weights
+            or draft_bf16_twin(mlp.experts)
+            or (
+                mlp.experts.w13_weight,
+                mlp.experts.w2_weight,
+            )
+        )
         num_experts = mlp.gate.weight.shape[0]
         topk = mlp.topk.topk_config.top_k
-        inter = mlp.experts.w2_weight.shape[-1]
+        inter = self.w2.shape[-1]
         self.scratch = kernels.draft_moe_fused_scratch(num_experts, topk, inter, device)
         self.topk_weights = torch.empty(1, topk, dtype=torch.float32, device=device)
         self.topk_ids = torch.empty(1, topk, dtype=torch.int32, device=device)
@@ -139,13 +177,17 @@ class DraftMoe:
         """The block's single-launch MoE, compiled and checked to fit this device, or
         None (logged) when it cannot serve the block."""
         reason = unsupported_reason(mlp)
+        expert_weights = draft_bf16_twin(mlp.experts)
         if reason is None:
-            w13 = mlp.experts.w13_weight
+            w13, w2 = expert_weights or (
+                mlp.experts.w13_weight,
+                mlp.experts.w2_weight,
+            )
             reason = "; ".join(
                 kernels.build(
                     device_index,
                     hidden=w13.shape[-1],
-                    inter=mlp.experts.w2_weight.shape[-1],
+                    inter=w2.shape[-1],
                     experts=mlp.gate.weight.shape[0],
                     topk=mlp.topk.topk_config.top_k,
                 )
@@ -157,8 +199,12 @@ class DraftMoe:
                 reason,
             )
             return None
-        logger.info("Single-launch draft MoE active for layer %d.", mlp.layer_id)
-        return cls(mlp, torch.device("cuda", device_index))
+        logger.info(
+            "Single-launch draft MoE active for layer %d%s.",
+            mlp.layer_id,
+            " from the retained BF16 expert twin" if expert_weights is not None else "",
+        )
+        return cls(mlp, torch.device("cuda", device_index), expert_weights)
 
     def ready(self, num_tokens: int) -> bool:
         """Whether it runs a batch of this many tokens."""
@@ -177,8 +223,8 @@ class DraftMoe:
             kernels.draft_moe_fused(
                 hidden_states[m : m + 1],
                 mlp.gate.weight,
-                mlp.experts.w13_weight,
-                mlp.experts.w2_weight,
+                self.w13,
+                self.w2,
                 mlp.shared_expert.gate_up_proj.weight,
                 mlp.shared_expert.down_proj.weight,
                 mlp.shared_expert_gate.weight.view(-1),

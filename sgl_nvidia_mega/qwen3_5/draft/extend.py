@@ -97,8 +97,7 @@ class DraftExtend:
                     local, selected, io.topk_index_out, io.topk_p_out, mkd_head=True
                 )
                 return
-            lm = parts.lm
-            local = lm.logits_processor._compute_lm_head(selected, lm.lm_head, None)
+            local = layer.lm_head(parts, selected, "draft_extend")
             mkd.exchange_extend(local, selected, io.topk_index_out, io.topk_p_out)
         else:
             io.topk_index_out.copy_(layer.top1(parts, selected).view(-1, 1))
@@ -128,5 +127,6 @@ class DraftExtend:
             io.topk_index_out,
             0,
             nan_key=NAN_KEY_TORCH_ARGMAX,
+            site="draft_extend",
             topk_p=io.topk_p_out,
         )

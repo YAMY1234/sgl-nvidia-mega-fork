@@ -183,12 +183,18 @@ struct HeadMx8Params {
  * kK / (32 * kSliceBlocks) warps (gridDim.x <= ceil(n / 8)). kMkd (kM == 1): mkd_head's PDL
  * points and per-CTA packed maxima; else TRT-LLM's (trigger once the activation is staged).
  */
-template <int kK, int kSliceBlocks, int kM, bool kMkd, bool kKeys = false>
+template <int kK, int kSliceBlocks, int kM, bool kMkd, bool kKeys = false, bool kGroupBulk = false>
 SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
   using namespace device;
   using namespace head_mx8;
   constexpr int kTokenTiles = (kM + kTokens - 1) / kTokens;
   using L = Layout<kK, kSliceBlocks, kTokenTiles>;
+  // Optional prepacked groups: eight padded weight rows followed by their scales.
+  // Four groups still occupy exactly the original W/S prefix; kPart onward is unchanged.
+  constexpr int kGroupW = kGroupRows * L::kRowStride;
+  constexpr int kGroupBytes = kGroupW + kGroupRows * L::kScaleRow;
+  static_assert(!kGroupBulk || (kK == 4096 && kMkd && kM == 1 && !kKeys));
+  static_assert(4 * kGroupBytes == L::kPart && kGroupBytes % 128 == 0);
   static_assert(kM >= 1 && kM <= 2 * kTokens && (!kMkd || kM == 1) && !(kMkd && kKeys));
   __shared__ unsigned long long s_keys[2 * kTokens];
   static_assert(kSliceBlocks == 8, "one 8-byte scale load per weight row and warp");
@@ -218,27 +224,42 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
     return p.reverse ? num_groups - 1 - gg : gg;
   };
   // the issuing threads: lanes 0..15 of warp 0 (TRT-LLM's), or lane 0 of warps 0..15
-  const bool issuer = HEAD_MX8_TMA_WARPS ? (lane == 0 && warp < kRows) : warp == 0;
+  const bool issuer = kGroupBulk ? (lane == 0 && (warp == 0 || warp == 8))
+                               : (HEAD_MX8_TMA_WARPS ? (lane == 0 && warp < kRows) : warp == 0);
   // tile `tile` (local groups 2 tile, 2 tile + 1) into `slot`: one weight row (row r of the
   // tile: the issuing lane or warp) and its scale row each; rows past n re-read row n - 1
   // (their outputs are not stored)
   auto issue_tile = [&](int slot, int tile) {
-    constexpr uint32_t kRowBytes = kK + L::kScaleRow;
-    const int r = HEAD_MX8_TMA_WARPS ? warp : lane;
-    if (r == 0 && (HEAD_MX8_TMA_WARPS || lane == 0)) {
-      const int groups = min(my_groups - 2 * tile, 2);
-      ptx::mbar_arrive_expect_tx(&mbar[slot], static_cast<uint32_t>(groups * kGroupRows) * kRowBytes);
-    }
-    if (r < kRows) {
-      const int local = 2 * tile + r / kGroupRows;
+    if constexpr (kGroupBulk) {
+      if (warp == 0) {
+        const int groups = min(my_groups - 2 * tile, 2);
+        ptx::mbar_arrive_expect_tx(&mbar[slot], static_cast<uint32_t>(groups * kGroupBytes));
+      }
+      const int group = warp / 8;
+      const int local = 2 * tile + group;
       if (local < my_groups) {
-        const int row = min(group_of(local) * kGroupRows + r % kGroupRows, n - 1);
-        bulk_g2s(s_w + (slot * kRows + r) * L::kRowStride, p.w + static_cast<int64_t>(row) * kK, kK, &mbar[slot]);
-        bulk_g2s(
-            s_s + (slot * kRows + r) * L::kScaleRow,
-            p.s + static_cast<int64_t>(row) * L::kScaleRow,
-            L::kScaleRow,
-            &mbar[slot]);
+        bulk_g2s(smem + (slot * 2 + group) * kGroupBytes,
+                 p.w + static_cast<int64_t>(group_of(local)) * kGroupBytes,
+                 kGroupBytes, &mbar[slot]);
+      }
+    } else {
+      constexpr uint32_t kRowBytes = kK + L::kScaleRow;
+      const int r = HEAD_MX8_TMA_WARPS ? warp : lane;
+      if (r == 0 && (HEAD_MX8_TMA_WARPS || lane == 0)) {
+        const int groups = min(my_groups - 2 * tile, 2);
+        ptx::mbar_arrive_expect_tx(&mbar[slot], static_cast<uint32_t>(groups * kGroupRows) * kRowBytes);
+      }
+      if (r < kRows) {
+        const int local = 2 * tile + r / kGroupRows;
+        if (local < my_groups) {
+          const int row = min(group_of(local) * kGroupRows + r % kGroupRows, n - 1);
+          bulk_g2s(s_w + (slot * kRows + r) * L::kRowStride, p.w + static_cast<int64_t>(row) * kK, kK, &mbar[slot]);
+          bulk_g2s(
+              s_s + (slot * kRows + r) * L::kScaleRow,
+              p.s + static_cast<int64_t>(row) * L::kScaleRow,
+              L::kScaleRow,
+              &mbar[slot]);
+        }
       }
     }
   };
@@ -329,12 +350,14 @@ SGL_DEVICE void head_mx8_kernel(const HeadMx8Params& p) {
     const int slot = i % 2;
     mbar_wait(&mbar[slot], static_cast<uint32_t>((i / 2) % 2));
     // weight rows g and g + 8 of the tile, this warp's slice: 8 bytes of block b at 32 b + 8q
-    const uint8_t* w_lo = s_w + (slot * kRows + g) * L::kRowStride + warp * kSliceBlocks * kBlock + 8 * q;
-    const uint8_t* w_hi = w_lo + kGroupRows * L::kRowStride;
+    const uint8_t* w_lo = (kGroupBulk ? smem + slot * 2 * kGroupBytes + g * L::kRowStride
+                                    : s_w + (slot * kRows + g) * L::kRowStride) + warp * kSliceBlocks * kBlock + 8 * q;
+    const uint8_t* w_hi = w_lo + (kGroupBulk ? kGroupBytes : kGroupRows * L::kRowStride);
     // the 8 scale bytes of this warp's slice, rows g and g + 8: one 8-byte load each
-    const uint8_t* sc_row = s_s + (slot * kRows + g) * L::kScaleRow + warp * kSliceBlocks;
+    const uint8_t* sc_row = (kGroupBulk ? smem + slot * 2 * kGroupBytes + kGroupW + g * L::kScaleRow
+                                      : s_s + (slot * kRows + g) * L::kScaleRow) + warp * kSliceBlocks;
     const uint2 sc_lo = *reinterpret_cast<const uint2*>(sc_row);
-    const uint2 sc_hi = *reinterpret_cast<const uint2*>(sc_row + kGroupRows * L::kScaleRow);
+    const uint2 sc_hi = *reinterpret_cast<const uint2*>(sc_row + (kGroupBulk ? kGroupBytes : kGroupRows * L::kScaleRow));
     float acc[kTokenTiles][4];
 #pragma unroll
     for (int t = 0; t < kTokenTiles; ++t) {
@@ -481,3 +504,7 @@ HEAD_MX8_KEYS(13)
 HEAD_MX8_KEYS(14)
 HEAD_MX8_KEYS(15)
 HEAD_MX8_KEYS(16)
+
+extern "C" __global__ void __launch_bounds__(16 * 32, 1) mkd_head_mx8_group_bulk(const HeadMx8Params __grid_constant__ p) {
+  sglang::head_mx8_kernel<4096, 8, 1, true, false, true>(p);
+}

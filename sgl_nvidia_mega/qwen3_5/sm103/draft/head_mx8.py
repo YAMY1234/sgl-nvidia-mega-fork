@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import logging
+import os
 from functools import cache
 from pathlib import Path
 from typing import Tuple
@@ -40,6 +42,29 @@ MAX_ROWS = 16
 THREADS = 16 * 32
 # Rows of the head quantized per step of the one-time conversion (bounds its FP32 scratch).
 _QUANT_ROWS = 4096
+GROUP_BULK_ENV = "SGLANG_Q35FLY_DRAFT_HEAD_GROUP_BULK"
+GROUP_BYTES = 8 * (HIDDEN + 32) + 8 * (HIDDEN // 32)
+
+
+def _group_bulk_requested() -> bool:
+    """Prepare every requested capture arm; selection itself reads the current flag."""
+    variants = json.loads(os.environ.get("Q35MF_AB_VARIANTS") or "{}")
+    return os.environ.get(GROUP_BULK_ENV, "0") == "1" or any(
+        arm.get(GROUP_BULK_ENV) == "1" for arm in variants.values()
+    )
+
+
+def pack_mxfp8_groups(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Copy original bytes into [group][eight padded W rows, eight scale rows]."""
+    if tuple(values.shape) != (31040, HIDDEN) or tuple(scales.shape) != (31040, HIDDEN // 32):
+        raise ValueError("MXFP8 group bulk requires the original [31040, 4096] shard")
+    groups = 31040 // 8
+    packed = torch.zeros((groups, GROUP_BYTES), dtype=torch.uint8, device=values.device)
+    packed[:, :8 * (HIDDEN + 32)].view(groups, 8, HIDDEN + 32)[:, :, :HIDDEN].copy_(
+        values.view(torch.uint8).view(groups, 8, HIDDEN)
+    )
+    packed[:, 8 * (HIDDEN + 32):].copy_(scales.view(groups, 8 * (HIDDEN // 32)))
+    return packed
 
 
 def quantize_mxfp8_rows(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -211,10 +236,11 @@ def _launch(
     vocab_start: int = 0,
     vocab_size: int = 0,
     nan_key: int = 0,
+    packed=None,
 ) -> None:
     p = HeadMx8Params(
         x=x.data_ptr(),
-        w=values.data_ptr(),
+        w=values.data_ptr() if packed is None else packed.data_ptr(),
         s=scales.data_ptr(),
         logits=0 if logits is None else logits.data_ptr(),
         part=0 if part is None else part.data_ptr(),
@@ -333,6 +359,9 @@ class DraftHeadMx8:
             self._gemv(x[:m], out[:m])
         torch.cuda.synchronize(dev)
         self._keys_ready = False
+        self._group_bulk_eligible = False
+        self._group_bulk = None
+        self._group_bulk_kernel = None
 
     def supports(self, rows: int) -> bool:
         return 0 < rows <= self.max_rows
@@ -407,13 +436,25 @@ class DraftHeadMx8:
                    nan_key=nan_key)
         self.note(f"{site} (keys)", m)
 
-    def prepare_mkd(self, smem_pad: int) -> None:
+    def prepare_mkd(self, smem_pad: int, *, world: int | None = None) -> None:
         """Load and run once the MKD head kernel for ``smem_pad`` (before capture)."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("prepare the MXFP8 MKD head before graph capture")
         dev = self.values.device
         x = torch.zeros(1, self.k, dtype=torch.bfloat16, device=dev)
         logits = torch.empty(1, self.n, dtype=torch.bfloat16, device=dev)
         part = torch.empty(self.ctas, dtype=torch.int32, device=dev)
         mkd_head_mx8(x, self.values, self.scales, logits, part, smem_pad=smem_pad)
+        self._group_bulk_eligible = world == 8 and self.n == 31040 and self.k == HIDDEN
+        if self._group_bulk_eligible and _group_bulk_requested():
+            self._group_bulk = pack_mxfp8_groups(self.values, self.scales)
+            self._group_bulk_kernel = _kernel(
+                dev.index, "mkd_head_mx8_group_bulk", max(smem_bytes(1), smem_pad)
+            )
+            _launch(self._group_bulk_kernel, self.ctas, x, self.values, self.scales,
+                    logits, part, False, packed=self._group_bulk)
+            logger.info("MXFP8 group bulk prepared: shard [%d, %d], %d extra bytes, entry %s",
+                        self.n, self.k, self._group_bulk.numel(), "mkd_head_mx8_group_bulk")
         torch.cuda.synchronize(dev)
 
     def mkd_head(
@@ -428,6 +469,14 @@ class DraftHeadMx8:
         """``xchg.mkd_draft_head``'s outputs from the MXFP8 copy (``x`` [1, 4096] bf16)."""
         if not 0 < part.numel() <= -(-self.n // 8):
             raise ValueError(f"MXFP8 MKD head: {part.numel()} CTAs for {self.n} rows")
+        if (self._group_bulk_eligible and tuple(x.shape) == (1, HIDDEN)
+                and os.environ.get(GROUP_BULK_ENV, "0") == "1"):
+            if self._group_bulk is None:
+                raise RuntimeError("MXFP8 group bulk was not prepared before capture")
+            _launch(self._group_bulk_kernel, part.numel(), x, self.values, self.scales,
+                    logits, part, reverse, packed=self._group_bulk)
+            self.note("draft_loop MKD head group bulk", 1)
+            return
         mkd_head_mx8(
             x,
             self.values,

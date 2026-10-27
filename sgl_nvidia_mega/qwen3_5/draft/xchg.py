@@ -464,7 +464,7 @@ class MkdBoundary:
         lm_head shard (``mkd_head_mx8``: the same logits rounding and per-CTA maxima)."""
         if self.head_part is None:
             return
-        head_mx8.prepare_mkd(self.head_pad)
+        head_mx8.prepare_mkd(self.head_pad, world=self.world)
         self.head_mx8 = head_mx8
 
     def head_follows(self) -> bool:

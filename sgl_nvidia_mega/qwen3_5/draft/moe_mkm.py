@@ -118,7 +118,7 @@ class DraftMkm:
                 [k for k, v in on.items() if v],
             )
         return SimpleNamespace(
-            slots=SimpleNamespace(**on), bound={"moe": self.bound}, scratch={}
+            slots=plan.Slots(**on), bound={"moe": self.bound}, scratch={}
         )
 
     def __call__(self, layer, x: torch.Tensor):

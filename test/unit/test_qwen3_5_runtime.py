@@ -859,6 +859,47 @@ def test_a_multi_request_draft_loop_takes_the_sharded_top1(monkeypatch):
     assert io.positions.tolist() == [10, 20, 30, 40]
 
 
+def test_top1_into_automatically_folds_keys_for_the_mxfp8_head():
+    from sgl_nvidia_mega.qwen3_5.draft import layer
+
+    calls = []
+
+    class Head:
+        @staticmethod
+        def supports(rows):
+            return rows == 2
+
+        @staticmethod
+        def fold_keys(hidden, keys, **kwargs):
+            calls.append(("fold", hidden.shape[0], keys, kwargs))
+
+    class Exchange:
+        keys = "keys"
+        vocab_start = 17
+        vocab_size = 99
+
+        @staticmethod
+        def exchange_keys(rows, tokens, column, **kwargs):
+            calls.append(("exchange", rows, column, kwargs))
+
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("the MXFP8 path must not materialize logits")
+
+    parts = SimpleNamespace(head_mx8=Head(), top1x=Exchange())
+    layer.top1_into(
+        parts,
+        torch.zeros(2, 4),
+        torch.zeros(2, 3, dtype=torch.int64),
+        1,
+        nan_key=123,
+        positions=torch.zeros(2, dtype=torch.int64),
+    )
+    assert [call[0] for call in calls] == ["fold", "exchange"]
+    assert calls[0][3]["vocab_start"] == 17
+    assert calls[0][3]["vocab_size"] == 99
+    assert calls[1][3]["nan_key"] == 123
+
+
 def test_the_draft_embeds_through_the_exchange_where_it_fits():
     from sgl_nvidia_mega.qwen3_5.draft.parts import Parts
     from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import MAX_ROWS

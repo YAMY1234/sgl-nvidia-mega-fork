@@ -17,6 +17,8 @@ SM100-family GPUs (GB300) with NVLink multicast, against torch on the same input
 - the sharded top-1 of slot draft_multi (``sm103/draft/top1``) picks, for 1-16 rows, the
   argmax of the all-gathered logits under both NaN rules (ties to the lowest id, -0.0 as
   +0.0), writes the token column, 1.0 and positions + 1, and replays from a CUDA graph;
+  the opt-in MXFP8 head's direct folded-key path produces the same outputs without
+  materializing its shard logits;
 - the embedding exchange of slot draft_embed (``sm103/draft/embed``) gives, for 1-128 rows,
   the rows of SGLang's vocabulary-parallel embedding (masked lookup + all-reduce) bit for
   bit, -0.0 entries included, and replays from a CUDA graph.
@@ -612,6 +614,82 @@ def test_sharded_top1_replays_from_a_cuda_graph(ranks, top1x):
                 assert torch.equal(tokens[:, col], want)
             assert (positions == NUM_STEPS - 1).all()
             dist.barrier(group=cpu_group)
+
+
+V_FOLDED = 2048
+
+
+@pytest.fixture(scope="module")
+def folded_top1(ranks):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft.head_mx8 import DraftHeadMx8
+    from sgl_nvidia_mega.qwen3_5.sm103.draft.top1 import Top1Exchange
+
+    rank, world, group, cpu_group = ranks
+    full = _randn(world * V_FOLDED, H, g=_gen(4242), scale=0.02)
+    full[2 * V_FOLDED : 3 * V_FOLDED] = full[:V_FOLDED]
+    head = DraftHeadMx8(
+        full[rank * V_FOLDED : (rank + 1) * V_FOLDED].contiguous(),
+        gemv="nvrtc",
+    )
+    head.prepare_keys()
+    exchange = Top1Exchange(
+        world=world,
+        rank=rank,
+        vocab_local=V_FOLDED,
+        vocab_start=rank * V_FOLDED,
+        vocab_size=world * V_FOLDED,
+        group=group,
+        cpu_group=cpu_group,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    return head, exchange
+
+
+def _folded_run(head, exchange, hidden, nan_key, folded):
+    m = hidden.shape[0]
+    tokens = torch.full((m, NUM_STEPS), -1, dtype=torch.int64, device="cuda")
+    topk_p = torch.zeros(m, 1, dtype=torch.float32, device="cuda")
+    positions = torch.arange(m, dtype=torch.int64, device="cuda") * 10
+    mrope = torch.arange(3 * (m + 1), dtype=torch.int64, device="cuda").view(3, -1)
+    outputs = dict(
+        topk_p=topk_p,
+        positions=positions,
+        mrope_positions=mrope[:, :m],
+    )
+    if folded:
+        head.fold_keys(
+            hidden,
+            exchange.keys,
+            vocab_start=exchange.vocab_start,
+            vocab_size=exchange.vocab_size,
+            nan_key=nan_key,
+            site="test",
+        )
+        exchange.exchange_keys(m, tokens, 3, nan_key=nan_key, **outputs)
+    else:
+        exchange(head.logits(hidden, "test"), tokens, 3, nan_key=nan_key, **outputs)
+    torch.cuda.synchronize()
+    return tokens, topk_p, positions, mrope
+
+
+@pytest.mark.parametrize("nan", ["split", "torch"])
+@pytest.mark.parametrize("m", [1, 8, 16])
+def test_mxfp8_head_folded_keys_equal_the_logits_path(ranks, folded_top1, m, nan):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import top1
+
+    _, _, group, cpu_group = ranks
+    head, exchange = folded_top1
+    key = top1.NAN_KEY_SPLIT_ARGMAX if nan == "split" else top1.NAN_KEY_TORCH_ARGMAX
+    with torch.inference_mode():
+        for case in ("random", "nan"):
+            hidden = _randn(m, H, g=_gen(100 * m + (case == "nan")))
+            if case == "nan":
+                hidden[-1, 7] = float("nan")
+            want = _folded_run(head, exchange, hidden, key, False)
+            got = _folded_run(head, exchange, hidden, key, True)
+            assert all(torch.equal(a, b) for a, b in zip(got, want))
+            assert (exchange.keys == 0).all()
+    dist.barrier(group=cpu_group)
 
 
 V_EMBED = 512  # embedding rows a rank holds here

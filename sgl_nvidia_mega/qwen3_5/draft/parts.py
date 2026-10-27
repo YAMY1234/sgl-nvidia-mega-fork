@@ -111,6 +111,8 @@ class Parts:
                 )
         if "draft_head_mxfp8" in slots:
             parts.head_mx8 = parts._build_head_mx8()
+            if parts.top1x is not None:
+                parts.head_mx8.prepare_keys()
         logger.info(
             "NVIDIA megakernel: Qwen3.5 MTP draft parts built (slots %s; MoE %s, hop "
             "%s, exchange %s)",

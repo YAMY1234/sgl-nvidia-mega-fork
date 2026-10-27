@@ -360,6 +360,22 @@ def top1_into(
 ) -> None:
     """Slot draft_multi's top-1 of the final-norm rows ``hidden``: the LM head on this
     rank's vocabulary shard, then the sharded argmax exchange, which writes the tokens
-    into ``tokens[:, column]`` (and ``outputs``: topk_p, positions, mrope_positions)."""
+    into ``tokens[:, column]`` (and ``outputs``: topk_p, positions, mrope_positions).
+    When the opt-in MXFP8 head serves these rows, fold its argmax keys directly and
+    exchange only those keys instead of materializing the shard logits."""
+    head, exchange = parts.head_mx8, parts.top1x
+    if head is not None and head.supports(hidden.shape[0]):
+        head.fold_keys(
+            hidden,
+            exchange.keys,
+            vocab_start=exchange.vocab_start,
+            vocab_size=exchange.vocab_size,
+            nan_key=nan_key,
+            site=f"{site} top1_into",
+        )
+        exchange.exchange_keys(
+            int(hidden.shape[0]), tokens, column, nan_key=nan_key, **outputs
+        )
+        return
     logits = lm_head(parts, hidden, f"{site} top1_into")
-    parts.top1x(logits, tokens, column, nan_key=nan_key, **outputs)
+    exchange(logits, tokens, column, nan_key=nan_key, **outputs)

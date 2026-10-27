@@ -2244,6 +2244,95 @@ def test_the_mka_slot_runs_the_prologue_the_attention_and_the_epilogue(skv2):
     assert out.shape == (7, 4096) and out.dtype == torch.bfloat16
 
 
+@pytest.mark.parametrize("consumed", [False, True])
+def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(consumed):
+    from sglang.srt.layers.attention.q35_cp_lite import CpLite
+    from sglang.srt.layers.quantization import fp8_utils
+
+    from sgl_nvidia_mega.qwen3_5 import lowm
+    from sgl_nvidia_mega.qwen3_5.attention import mka
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import gate_quant as gate_module
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import front
+
+    rows = 21
+    log = _log()
+    attn, st = _skv2_setup(log)
+    layer = _mka_layer(log, attn)
+    x = torch.zeros(rows, 4096, dtype=torch.bfloat16)
+    qkv = torch.zeros(rows, 2560, dtype=torch.bfloat16)
+    q = torch.zeros(rows, 1024, dtype=torch.float8_e4m3fn)
+    gate = torch.zeros(rows, 1024, dtype=torch.bfloat16)
+    attention_out = torch.zeros(rows, 1024, dtype=torch.bfloat16)
+    fallback = torch.zeros(rows, 1024, dtype=torch.float8_e4m3fn)
+    result = torch.zeros(rows, 4096, dtype=torch.bfloat16)
+    qkv_linear = layer.qkv_proj
+    layer.qkv_proj = _Callable(lambda _: (qkv, None), **vars(qkv_linear))
+    attn._fn = lambda *args, **kwargs: attention_out
+    st.fb.out_cache_loc = torch.zeros(rows, dtype=torch.int64)
+    st.positions = torch.zeros(3, rows, dtype=torch.int64)
+    st.slots = plan.Slots(mka=True, lowm_oproj=True)
+    st.scratch = {}
+    calls = []
+
+    class GateEpilogue:
+        def offer_gate_epilogue(self, offered_gate, scale, out):
+            calls.append(("offer", offered_gate, scale, out))
+
+        def take_gate_epilogue(self):
+            calls.append(("take",))
+            return consumed
+
+    def quantize(o, offered_gate, scale):
+        calls.append(("gate_quant", o, offered_gate, scale))
+        return fallback
+
+    def row_parallel(linear, o_proj_input, dtype, what, hop):
+        calls.append(("o_proj", linear, o_proj_input, dtype, what, hop))
+        return result
+
+    with (
+        patch.object(CpLite, "_instance", GateEpilogue()),
+        patch.object(
+            front,
+            "fused_qk_gemma_rmsnorm_rope_gate",
+            return_value=(q, None, gate),
+        ),
+        patch.object(gate_module, "gate_quant", quantize),
+        patch.object(fp8_utils, "flashinfer_bmm_fp8", create=True),
+        patch.object(lowm, "take_fp8", return_value=None),
+        patch.object(lowm, "row_parallel", row_parallel),
+    ):
+        out = mka.step(layer, x, st)
+
+    assert out is result
+    assert calls[0][0] == "offer"
+    offered_gate = calls[0][1]
+    assert offered_gate.shape == gate.shape
+    assert offered_gate.data_ptr() == gate.data_ptr()
+    assert calls[0][2] is layer.o_proj.input_scale
+    offered = calls[0][3]
+    assert tuple(offered.shape) == (rows, 1024)
+    assert offered.dtype == torch.float8_e4m3fn
+    assert calls[1] == ("take",)
+    if consumed:
+        assert [call[0] for call in calls] == ["offer", "take", "o_proj"]
+        assert calls[2][2] is offered
+    else:
+        assert [call[0] for call in calls] == [
+            "offer",
+            "take",
+            "gate_quant",
+            "o_proj",
+        ]
+        quant_input = calls[2][1]
+        assert quant_input.shape == attention_out.shape
+        assert quant_input.data_ptr() == attention_out.data_ptr()
+        quant_gate = calls[2][2]
+        assert quant_gate.shape == gate.shape
+        assert quant_gate.data_ptr() == gate.data_ptr()
+        assert calls[3][2] is fallback
+
+
 @pytest.mark.parametrize("consumes", [False, True])
 def test_the_mka_push_slot_pushes_where_the_moe_input_only_consumes(consumes):
     from sgl_nvidia_mega.qwen3_5.attention import mka

@@ -53,9 +53,10 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "lowm_se",
     "lowm_push",
 )
-# Optional coverage names requested in the same variable. Multi-request coverage is
-# shipped because every covered width keeps its own shape instead of padding.
-OPT_IN_COVERAGE: tuple[str, ...] = ()
+# Coverage names requested in the same variable have no kernel build result of their
+# own. Multi-request coverage is shipped because every covered width keeps its own
+# shape instead of padding.
+OPT_IN_COVERAGE: tuple[str, ...] = ("multi_request",)
 # Graph or build variants of a slot, requested in the same variable: no width of their
 # own. BAL stays opt-in because its serving evidence covers TP8 only.
 # skv2_cp: one long request past the measured crossover runs CP-lite in place of SKV2,

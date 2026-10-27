@@ -14,7 +14,9 @@ fp32 dot-product order differs.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -23,6 +25,15 @@ from sgl_nvidia_mega.qwen3_5.moe.mkm import shared_topk_slots
 from sgl_nvidia_mega.qwen3_5.sm103.draft import moe as kernels
 
 logger = logging.getLogger(__name__)
+DIRECT_ENV = "SGLANG_Q35FLY_DRAFT_MOE_DIRECT"
+
+
+def _direct_requested() -> bool:
+    """Prepare both capture choices when any arm requests the candidate."""
+    variants = json.loads(os.environ.get("Q35MF_AB_VARIANTS") or "{}")
+    return os.environ.get(DIRECT_ENV, "0") == "1" or any(
+        arm.get(DIRECT_ENV) == "1" for arm in variants.values()
+    )
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -202,6 +213,14 @@ class DraftMoe:
         num_experts = mlp.gate.weight.shape[0]
         topk = mlp.topk.topk_config.top_k
         inter = self.w2.shape[-1]
+        self._direct_eligible = (
+            self.w13.shape[-1], inter, num_experts, topk
+        ) == (4096, 128, 512, 10) and kernels.columns(4096, device.index) == 27
+        self._direct_kernel = (
+            kernels.prepare_direct(device.index)
+            if self._direct_eligible and _direct_requested()
+            else None
+        )
         self.scratch = kernels.draft_moe_fused_scratch(num_experts, topk, inter, device)
         self.topk_weights = torch.empty(1, topk, dtype=torch.float32, device=device)
         self.topk_ids = torch.empty(1, topk, dtype=torch.int32, device=device)
@@ -255,6 +274,11 @@ class DraftMoe:
         """[m, H] -> this rank's MoE output [m, H] (m <= MAX_TOKENS), unreduced; the
         tokens run one launch each, in order."""
         mlp = self.mlp
+        direct = None
+        if self._direct_eligible and hidden_states.shape[0] == 1 and os.environ.get(DIRECT_ENV, "0") == "1":
+            direct = self._direct_kernel
+            if direct is None:
+                raise RuntimeError("direct was not prepared before capture")
         out = torch.empty_like(hidden_states)
         for m in range(hidden_states.shape[0]):
             kernels.draft_moe_fused(
@@ -269,5 +293,6 @@ class DraftMoe:
                 self.topk_weights,
                 self.topk_ids,
                 out[m : m + 1],
+                direct_kernel=direct,
             )
         return out

@@ -344,6 +344,11 @@ SGL_DEVICE void draft_moe_fused_kernel(const DraftMoeFusedParams& p) {
   constexpr int kConsumers = 8;
   constexpr int kConsumerThreads = kConsumers * static_cast<int>(kWarpThreads);
   constexpr int kSlots = kTopK + 1;
+#if defined(Q35_DMOE_DIRECT) && Q35_DMOE_DIRECT
+  static_assert(kH == 4096 && kI == 128 && kE == 512 && kTopK == 10 &&
+                kCols == 27 && kStages == 11 && kWindow == 4 && !kTrace,
+                "direct combine is restricted to the original TP8 B1 shape");
+#endif
   constexpr int kRowBytes = kH * static_cast<int>(sizeof(bf16_t));
   constexpr int kStageBytes = 2 * kRowBytes;
   constexpr int kQuarter = kH / 4;
@@ -375,7 +380,9 @@ SGL_DEVICE void draft_moe_fused_kernel(const DraftMoeFusedParams& p) {
   __shared__ uint64_t wsd_bar;
   __shared__ uint64_t sel_bar;
   __shared__ float s_part[kMaxPairs][kConsumers];
+#if !defined(Q35_DMOE_DIRECT) || !Q35_DMOE_DIRECT
   __shared__ float s_d[kSlots][kColsCap];
+#endif
   __shared__ float s_gate_part[4];
   __shared__ float s_v[kE];
   __shared__ float s_w[kTopK];
@@ -801,10 +808,24 @@ SGL_DEVICE void draft_moe_fused_kernel(const DraftMoeFusedParams& p) {
 #pragma unroll
     for (int s = 0; s < kSlots; ++s) d[s] += __shfl_xor_sync(0xffffffffu, d[s], 1);
     if (gl == 0 && jj < ncols) {
+#if defined(Q35_DMOE_DIRECT) && Q35_DMOE_DIRECT
+      // Each 8-lane leader owns one complete column. Preserve the original
+      // slot order and BF16 cutpoints; only the shared-memory handoff is gone.
+      float sum = 0.0f;
+#pragma unroll
+      for (int s = 0; s < kTopK; ++s) sum += draft_moe::round_bf16(d[s] * s_w[s]);
+      const float routed = draft_moe::round_bf16(sum);
+      const float shared = draft_moe::round_bf16(d[kTopK]);
+      float r = s_gate * shared;
+      r += routed;
+      p.out[j0 + jj] = cast<bf16_t>(r);
+#else
 #pragma unroll
       for (int s = 0; s < kSlots; ++s) s_d[s][jj] = d[s];
+#endif
     }
   }
+#if !defined(Q35_DMOE_DIRECT) || !Q35_DMOE_DIRECT
   fz::named_sync(1, kConsumerThreads);
   stamp_after_sync(8);
   auto column = [&](int jj) {
@@ -821,6 +842,7 @@ SGL_DEVICE void draft_moe_fused_kernel(const DraftMoeFusedParams& p) {
     const int jj = static_cast<int>(threadIdx.x);
     p.out[j0 + jj] = column(jj);
   }
+#endif
   if constexpr (kTrace) {
     if (threadIdx.x == 0) {
       trace[15] = clock64();
@@ -837,7 +859,11 @@ SGL_DEVICE void draft_moe_fused_kernel(const DraftMoeFusedParams& p) {
 #endif
 
 extern "C" __global__ void __launch_bounds__(288, 1)
+#if defined(Q35_DMOE_DIRECT) && Q35_DMOE_DIRECT
+    q35_draft_moe_fused_direct(const sglang::DraftMoeFusedParams __grid_constant__ p) {
+#else
     q35_draft_moe_fused(const sglang::DraftMoeFusedParams __grid_constant__ p) {
+#endif
   sglang::draft_moe_fused_kernel<Q35_DMOE_H, Q35_DMOE_I, Q35_DMOE_E, Q35_DMOE_TOPK, Q35_DMOE_COLS, Q35_DMOE_STAGES,
                                  Q35_DMOE_WINDOW, Q35_DMOE_TRACE != 0, true>(p);
 }

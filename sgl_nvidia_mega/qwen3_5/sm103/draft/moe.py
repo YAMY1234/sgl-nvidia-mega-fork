@@ -93,6 +93,7 @@ def _kernel(
     stages: int,
     window: int,
     trace: bool,
+    direct: bool = False,
 ) -> jit.Kernel:
     major, minor = torch.cuda.get_device_capability(device_index)
     defines = (
@@ -107,14 +108,16 @@ def _kernel(
     )
     cubin = jit.compile_source(
         SOURCE.read_text(),
-        f"q35_draft_moe_h{hidden}_i{inter}_e{experts}_k{topk}_c{cols}_s{stages}_w{window}_t{int(trace)}",
+        f"q35_draft_moe_h{hidden}_i{inter}_e{experts}_k{topk}_c{cols}_s{stages}_w{window}_t{int(trace)}"
+        + ("_direct" if direct else ""),
         f"sm_{major}{minor}a",
         # the flags of SGLang's JIT build of this kernel (draft_moe_gemv.py)
-        ("-std=c++17", "-default-device", "--use_fast_math", *defines),
+        ("-std=c++17", "-default-device", "--use_fast_math", *defines)
+        + (("-DQ35_DMOE_DIRECT=1",) if direct else ()),
     )
     return jit.load(
         cubin,
-        "q35_draft_moe_fused",
+        "q35_draft_moe_fused_direct" if direct else "q35_draft_moe_fused",
         (THREADS, 1, 1),
         shared_bytes(hidden, inter, topk, cols, stages),
     )
@@ -188,6 +191,21 @@ def draft_moe_fused_scratch(
     )
 
 
+def prepare_direct(device_index: int) -> jit.Kernel:
+    """Prepare the exact TP8 shape outside capture and retain its residency check."""
+    cols = columns(4096, device_index)
+    if cols != 27:
+        raise ValueError("direct requires the original 152-CTA / 27-column grid")
+    with torch.cuda.device(device_index):
+        kernel = _kernel(device_index, 4096, 128, 512, 10, cols, 11, 4, False, True)
+        reasons = _fit_reasons(
+            kernel, grid=152, experts=512, inter=128, topk=10, stages=11
+        )
+    if reasons:
+        raise RuntimeError("direct cannot launch: " + "; ".join(reasons))
+    return kernel
+
+
 def _check(name: str, t: torch.Tensor, shape: tuple, dtype, device, align: int = 0):
     if (
         tuple(t.shape) != shape
@@ -219,6 +237,7 @@ def draft_moe_fused(
     window: Optional[int] = None,
     hop_site: Optional[torch.Tensor] = None,
     hop_token: int = 0,
+    direct_kernel: Optional[jit.Kernel] = None,
 ) -> torch.Tensor:
     """Router top-k + the routed and gated shared expert of one token in one launch.
 
@@ -254,7 +273,7 @@ def draft_moe_fused(
     if trace is not None:
         _check("trace", trace, (grid * TRACE_SLOTS,), torch.int64, dev)
     window = fused_window(inter) if window is None else window
-    kernel = _kernel(
+    kernel = direct_kernel or _kernel(
         dev.index,
         hidden,
         inter,
@@ -265,6 +284,11 @@ def draft_moe_fused(
         window,
         trace is not None,
     )
+    if direct_kernel is not None and (
+        (hidden, inter, experts, topk, cols, stages, window) != (4096, 128, 512, 10, 27, 11, 4)
+        or trace is not None
+    ):
+        raise ValueError("direct requires H4096/I128/E512/K10, the original grid and no phase trace")
     p = Params(
         x=x.data_ptr(),
         router_w=router_w.data_ptr(),

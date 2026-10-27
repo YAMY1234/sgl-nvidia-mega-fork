@@ -411,7 +411,7 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
 #pragma unroll
     for (int i = 0; i < 2; ++i)
       if (g < p.m) {
-        const auto* x = static_cast<const __nv_bfloat16*>(p.x) + (req * p.m + g) * 4096 + rank * 512 +
+        const auto* x = static_cast<const __nv_bfloat16*>(p.x) + g * 4096 + rank * 512 +
                         (2 * warp + i) * 32 + 4 * t;
         raw[i][0] = *reinterpret_cast<const uint2*>(x);
         raw[i][1] = *reinterpret_cast<const uint2*>(x + 16);

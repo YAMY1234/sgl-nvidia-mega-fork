@@ -703,6 +703,130 @@ SGL_DEVICE void draft_moe_fused_kernel(const DraftMoeFusedParams& p) {
     const int vi = static_cast<int>(threadIdx.x) + i * kConsumerThreads;
     if (vi < kActVecs) av[i] = fz::ld_relaxed_v4(my_acts + 4 * vi);
   }
+#if defined(Q35_DMOE_EARLY0) && Q35_DMOE_EARLY0
+  static_assert(kH == 4096 && kI == 128 && kE == 512 && kTopK == 10 &&
+                kCols == 27 && kStages == 11 && kWindow == 4 && !kTrace,
+                "early0 is restricted to the original TP8 B1 shape");
+  const int grp = warp * 4 + lane / 8;
+  const int gl = lane % 8;
+  const uint32_t tag16_early = tag & 0xffffu;
+  const int n0 = nup;
+  fz::mbar_wait_sleep(&full_bar[n0 % kStages], (n0 / kStages) & 1);
+  const auto* slice0 = reinterpret_cast<const bf16_t*>(ring + (n0 % kStages) * kStageBytes);
+  cvec_t w0[kDownPerLane];
+  const int jr0 = min(grp, ncols - 1);
+#pragma unroll
+  for (int k = 0; k < kDownPerLane; ++k) w0[k].load(slice0 + jr0 * kI, gl + 8 * k);
+
+  // Slot 0 is vi 0..31: warp 0's first vector. Every other av stays live for
+  // the tail. Producer publication and all initial vector loads are unchanged.
+  if (threadIdx.x < kI / 4) {
+    const uint64_t t0 = fz::globaltimer();
+    while ((av[0].x >> 16) != tag16_early || (av[0].y >> 16) != tag16_early ||
+           (av[0].z >> 16) != tag16_early || (av[0].w >> 16) != tag16_early) {
+      fz::check_spin(t0);
+      av[0] = fz::ld_relaxed_v4(my_acts + 4 * threadIdx.x);
+    }
+    uint2 packed;
+    packed.x = (av[0].x & 0xffffu) | (av[0].y << 16);
+    packed.y = (av[0].z & 0xffffu) | (av[0].w << 16);
+    *reinterpret_cast<uint2*>(s_act + 4 * threadIdx.x) = packed;
+  }
+  // All 256 consumers participate. The copy warp returned at its original
+  // branch, and needs no down-consumer arrival to issue the remaining slices.
+  fz::named_sync(1, kConsumerThreads);
+  float d0 = 0.0f;
+#pragma unroll
+  for (int k = 0; k < kDownPerLane; ++k) {
+    cvec_t a;
+    a.load(s_act, gl + 8 * k);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) d0 = fmaf(cast<fp32_t>(w0[k][e]), cast<fp32_t>(a[e]), d0);
+  }
+  d0 += __shfl_xor_sync(0xffffffffu, d0, 4);
+  d0 += __shfl_xor_sync(0xffffffffu, d0, 2);
+  d0 += __shfl_xor_sync(0xffffffffu, d0, 1);
+  if (gl == 0 && grp < ncols) s_d[0][grp] = d0;
+
+  const bf16_t* slices[kSlots];
+  fz::mbar_wait_sleep(&wsd_bar, 0);
+  slices[kTopK] = reinterpret_cast<const bf16_t*>(s_wsd);
+#pragma unroll
+  for (int s = 1; s < kTopK; ++s) {
+    const int n = nup + s;
+    fz::mbar_wait_sleep(&full_bar[n % kStages], (n / kStages) & 1);
+    slices[s] = reinterpret_cast<const bf16_t*>(ring + (n % kStages) * kStageBytes);
+  }
+  cvec_t wpre[kSlots - 1][kDownPerLane];
+#pragma unroll
+  for (int s = 1; s < kSlots; ++s) {
+#pragma unroll
+    for (int k = 0; k < kDownPerLane; ++k) wpre[s - 1][k].load(slices[s] + jr0 * kI, gl + 8 * k);
+  }
+  {
+    const uint64_t t0 = fz::globaltimer();
+    while (true) {
+      bool ready = true;
+#pragma unroll
+      for (int i = 0; i < kActVecsPerThread; ++i) {
+        const int vi = static_cast<int>(threadIdx.x) + i * kConsumerThreads;
+        if (vi < kI / 4 || vi >= kActVecs) continue;
+        const bool ok = (av[i].x >> 16) == tag16 && (av[i].y >> 16) == tag16 &&
+                        (av[i].z >> 16) == tag16 && (av[i].w >> 16) == tag16;
+        if (!ok) {
+          ready = false;
+          av[i] = fz::ld_relaxed_v4(my_acts + 4 * vi);
+        }
+      }
+      if (ready) break;
+      fz::check_spin(t0);
+    }
+#pragma unroll
+    for (int i = 0; i < kActVecsPerThread; ++i) {
+      const int vi = static_cast<int>(threadIdx.x) + i * kConsumerThreads;
+      if (vi >= kI / 4 && vi < kActVecs) {
+        uint2 packed;
+        packed.x = (av[i].x & 0xffffu) | (av[i].y << 16);
+        packed.y = (av[i].z & 0xffffu) | (av[i].w << 16);
+        *reinterpret_cast<uint2*>(s_act + 4 * vi) = packed;
+      }
+    }
+  }
+  if (threadIdx.x == 0) {
+    uint64_t gword = fz::ld_relaxed(my_logits + kE);
+    const uint64_t t0 = fz::globaltimer();
+    while (static_cast<uint32_t>(gword >> 32) != tag) {
+      fz::check_spin(t0);
+      gword = fz::ld_relaxed(my_logits + kE);
+    }
+    s_gate = __uint_as_float(static_cast<uint32_t>(gword));
+  }
+  fz::mbar_wait_sleep(&sel_bar, 0);
+  fz::named_sync(1, kConsumerThreads);
+  float d[kSlots - 1];
+#pragma unroll
+  for (int s = 1; s < kSlots; ++s) {
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kDownPerLane; ++k) {
+      cvec_t a;
+      a.load(s_act + s * kI, gl + 8 * k);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) acc = fmaf(cast<fp32_t>(wpre[s - 1][k][e]), cast<fp32_t>(a[e]), acc);
+    }
+    d[s - 1] = acc;
+  }
+#pragma unroll
+  for (int s = 1; s < kSlots; ++s) d[s - 1] += __shfl_xor_sync(0xffffffffu, d[s - 1], 4);
+#pragma unroll
+  for (int s = 1; s < kSlots; ++s) d[s - 1] += __shfl_xor_sync(0xffffffffu, d[s - 1], 2);
+#pragma unroll
+  for (int s = 1; s < kSlots; ++s) d[s - 1] += __shfl_xor_sync(0xffffffffu, d[s - 1], 1);
+  if (gl == 0 && grp < ncols) {
+#pragma unroll
+    for (int s = 1; s < kSlots; ++s) s_d[s][grp] = d[s - 1];
+  }
+#else
   const int grp = warp * 4 + lane / 8;
   const int gl = lane % 8;
   const bf16_t* slices[kSlots];
@@ -805,6 +929,7 @@ SGL_DEVICE void draft_moe_fused_kernel(const DraftMoeFusedParams& p) {
       for (int s = 0; s < kSlots; ++s) s_d[s][jj] = d[s];
     }
   }
+#endif
   fz::named_sync(1, kConsumerThreads);
   stamp_after_sync(8);
   auto column = [&](int jj) {
@@ -837,7 +962,11 @@ SGL_DEVICE void draft_moe_fused_kernel(const DraftMoeFusedParams& p) {
 #endif
 
 extern "C" __global__ void __launch_bounds__(288, 1)
+#if defined(Q35_DMOE_EARLY0) && Q35_DMOE_EARLY0
+    q35_draft_moe_fused_early0(const sglang::DraftMoeFusedParams __grid_constant__ p) {
+#else
     q35_draft_moe_fused(const sglang::DraftMoeFusedParams __grid_constant__ p) {
+#endif
   sglang::draft_moe_fused_kernel<Q35_DMOE_H, Q35_DMOE_I, Q35_DMOE_E, Q35_DMOE_TOPK, Q35_DMOE_COLS, Q35_DMOE_STAGES,
                                  Q35_DMOE_WINDOW, Q35_DMOE_TRACE != 0, true>(p);
 }

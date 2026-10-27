@@ -33,8 +33,6 @@ SHIPPED_SLOTS: tuple[str, ...] = (
     "draft_extend",
     "draft_multi",
     "draft_embed",
-    # Draft-only MXFP8 LM head. This is numeric and remains explicitly opt-in.
-    "draft_head_mxfp8",
 )
 OPT_IN_SLOTS: tuple[str, ...] = (
     "route",
@@ -67,6 +65,8 @@ OPT_IN_VARIANTS: tuple[str, ...] = ("skv2_cp", "mkm_wide_bal")
 # variable; the draft spec's build reads them, the target's ignores them
 DRAFT_ENTRIES: tuple[str, ...] = ("draft_loop", "draft_extend")
 DRAFT_SLOTS: tuple[str, ...] = (
+    # Draft-only MXFP8 LM head. This is numeric and remains explicitly opt-in.
+    "draft_head_mxfp8",
     "draft_moe",
     "draft_q1",
     "draft_xchg",

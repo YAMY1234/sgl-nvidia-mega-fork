@@ -17,7 +17,8 @@ the same routed-expert arithmetic on route_topk's 17–32 rows. ``gdn_verify`` (
 GatedDeltaNet verify chain with its launch choices changed) covers every width, with
 ``gdn_core`` (numeric: its ReplaySSM verify, gated norm and FP8 output in one launch)
 up to 224 rows, and ``hop`` (the boundary's fused all-reduce points on the decode hop) the
-widths where FlashInfer's low-latency kernels, which it equals bit for bit, run.
+widths where FlashInfer's low-latency kernels, which it equals bit for bit, run, or with
+``hop_mid`` (numeric: its one-shot protocol past FlashInfer's) up to 28 rows.
 ``gdn_push`` (numeric: out_proj as the hop's push GEMM, on gdn_verify's FP8 norm) runs up
 to 8 rows. ``gdn_front`` (numeric: the GDN projections and conv in one launch, then
 gdn_pdl's verify) covers one request of 7 rows; ``gdn_trt_front`` replaces its projection
@@ -69,6 +70,8 @@ MKM_M128_MAX_ROWS = 128
 MKM_M256_MAX_ROWS = 256
 MKM_M512_MAX_ROWS = 512
 HOP_MAX_ROWS = 15
+# With hop_mid (numeric): the one-shot hop up to four requests in place of BT routes.
+HOP_MID_MAX_ROWS = 28
 GDN_PUSH_MAX_ROWS = 8
 # the rows slot route_shared's shared stage fits shared memory for
 ROUTE_SHARED_ROWS = 8
@@ -183,6 +186,7 @@ class Facts(msgspec.Struct, frozen=True):
     gdn_core: bool = False  # with the one-launch verify core
     gdn_conv: bool = False  # with the hoisted conv writing each window row once
     hop: bool = False  # the decode hop, built for the widest step it covers
+    hop_mid: bool = False  # with its one-shot protocol up to HOP_MID_MAX_ROWS
     gdn_push: bool = False  # out_proj packed for the push GEMM on every GDN layer
     gdn_front: bool = False  # in_proj_qkvz packed for the front on every GDN layer
     gdn_trt_front: bool = False  # TensorRT-LLM's front built for every GDN layer
@@ -208,7 +212,7 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
     route = facts.route and rows <= ROUTE_MAX_ROWS
     route_topk = facts.route_topk and not route and rows <= ROUTE_TOPK_MAX_ROWS
     tep8 = facts.tep8_moe
-    hop = facts.hop and rows <= HOP_MAX_ROWS
+    hop = facts.hop and rows <= (HOP_MID_MAX_ROWS if facts.hop_mid else HOP_MAX_ROWS)
     mka = facts.mka and rows <= (MKA_WIDE_MAX_ROWS if facts.mka_wide else MKA_MAX_ROWS)
     mkm = (
         route
@@ -300,7 +304,10 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         and facts.lowm_push
         and hop
         and rows <= max(LOWM_OUTPROJ_MAX_ROWS, LOWM_OPROJ_MAX_ROWS),
-        hop_fp8=hop and facts.hop_fp8 and rows <= HOP_MAX_ROWS,
+        # Wherever the one-shot hop runs, including hop_mid's four-request width.
+        hop_fp8=hop
+        and facts.hop_fp8
+        and rows <= (HOP_MID_MAX_ROWS if facts.hop_mid else HOP_MAX_ROWS),
     )
 
 

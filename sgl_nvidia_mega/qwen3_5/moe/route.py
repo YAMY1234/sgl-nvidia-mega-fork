@@ -307,13 +307,17 @@ def unsupported(mlp) -> str:
 def topk_unsupported(model) -> str:
     """Why slot route_topk cannot serve every MoE layer of ``model`` ("" when it can):
     the router front's gate and input quantizer, and the trtllm-gen weights with a
-    softmax top-10 renormalized over 512 local experts (mkm.unsupported)."""
+    softmax top-10 renormalized over 512 experts. Under expert parallelism only the
+    materialized-routing contract applies; the plugin's full-expert engines do not."""
     from sgl_nvidia_mega.qwen3_5.moe import mkm
 
     m = model.model
     for i in range(m.start_layer, m.end_layer):
         mlp = m.layers[i].mlp
-        reason = unsupported(mlp) or mkm.unsupported(mlp)
+        expert_parallel = mlp.experts.num_local_experts != mlp.experts.num_experts
+        reason = unsupported(mlp) or (
+            mkm.routing_unsupported(mlp) if expert_parallel else mkm.unsupported(mlp)
+        )
         if reason:
             return f"layer {i}: {reason}"
     return ""

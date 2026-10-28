@@ -24,6 +24,7 @@ SGLANG_READS = {
 
 TOPOLOGIES = frozenset({"tp2", "tp4", "tp8", "tep8", "dep8"})
 LEGACY = frozenset({"tp8", "tep8"})
+PREFILL_TOPOLOGIES = frozenset({"p_tp1_pp4"})
 
 # Extend a slot's entry only alongside its topology-specific build/shape checks
 # and correctness evidence. A missing entry supports no topology.
@@ -85,6 +86,8 @@ SLOT_TOPOLOGIES.update(
     gdn_conv=TOPOLOGIES,
     gdn_core=frozenset({"tp2", "tp4", "tp8", "tep8"}),
 )
+SLOT_TOPOLOGIES["gdn_prefill_split_conv"] = PREFILL_TOPOLOGIES
+
 # These names select coverage or SGLang's own runtime policy, not a plugin kernel.
 SLOT_TOPOLOGIES.update(
     multi_request=TOPOLOGIES,

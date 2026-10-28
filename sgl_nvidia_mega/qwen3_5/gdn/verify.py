@@ -11,15 +11,17 @@ so its launches take the choices SGLang fixes. The chain is the backend's
 target-verify arm for the circular ReplaySSM ring (the causal conv update, the strided
 q / k / v split, the ReplaySSM verify), reading the step's GDN metadata and the mamba
 pools from the forward's view (``Step.view.gdn`` and ``.mamba``) and its request slots
-from the forward batch, then the gated norm and ``out_proj``. The choices, all bitwise
-to SGLang's own:
+from the forward batch, then the gated norm and ``out_proj``. This explicitly
+requested numeric slot changes these choices:
 
 - token-major projection views, with a token-major conv output (no split copy);
 - a 128-channel conv tile;
 - the ReplaySSM verify with 32-wide value tiles on 2 warps, on SGLang's kernel
   (``replayssm.py``), and with slot ``gdn_pdl`` launched dependent on the conv;
 - the gated norm writing the static FP8 ``out_proj`` takes (``norm_fp8.py``), which
-  ``out_proj``'s FlashInfer BMM then reads without quantizing it again.
+  ``out_proj``'s FlashInfer BMM then reads without quantizing it again. Its output
+  layout can change the FP32 reduction and BF16 midpoint rounding; the other
+  choices above retain native arithmetic.
 
 Slot ``gdn_push`` (numeric, not bitwise) runs ``out_proj`` on the decode hop's GEMM
 instead, whose epilogue pushes the partial into the hop's mailbox; the MoE input's

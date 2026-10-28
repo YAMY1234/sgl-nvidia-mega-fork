@@ -204,7 +204,7 @@ def test_hoisted_conv_is_sglangs(window_mode, tile, tp, bs):
 
 @pytest.mark.parametrize("tp, bs", TOPOLOGY_BATCHES)
 @pytest.mark.parametrize("views", [False, True])
-def test_norm_fp8_is_sglangs_norm_then_static_quant(views, tp, bs):
+def test_norm_fp8_is_within_v2_numeric_bound(views, tp, bs):
     _norm_fp8_matches_stock(views, tp, bs, int(views) + 10 * bs)
 
 
@@ -235,16 +235,22 @@ def _norm_fp8_matches_stock(views, tp, bs, seed):
     got = rms_norm_gated_fp8(
         core, norm.weight, norm.eps, z, scale, activation=norm.activation
     )
-    assert torch.equal(
-        got.view(torch.uint8).reshape(tokens, -1), want.view(torch.uint8)
+    from sgl_nvidia_mega.qwen3_5.spec import NUMERIC_TOLERANCES
+
+    ref = want.float().reshape(-1)
+    error = torch.linalg.vector_norm(got.float().reshape(-1) - ref)
+    relative = error / torch.linalg.vector_norm(ref)
+    assert (
+        relative.item()
+        <= NUMERIC_TOLERANCES["gdn_verify"]["gdn_verify.norm_fp8.rel_l2_vs_stock"]
     )
 
 
 @pytest.mark.parametrize("views", [False, True])
-def test_norm_fp8_keeps_bf16_rounding_before_quantization(views):
+def test_norm_fp8_bf16_midpoint_stays_within_v2_numeric_bound(views):
     # At row 136/head 32/column 86, seed 320 produces a value at the BF16
     # rounding boundary. Quantizing the adjacent BF16 values gives E4M3 32
-    # versus 36; both Z layouts must keep SGLang's rounding point.
+    # versus 36. Both Z layouts must obey the existing v2 numeric bound.
     _norm_fp8_matches_stock(views, tp=1, bs=32, seed=320)
 
 
@@ -1186,3 +1192,148 @@ def test_trt_front_replays_from_a_cuda_graph_and_never_compiles_in_one():
             trt_lowm.prepare(unprepared)
         with pytest.raises(RuntimeError, match="not prepared"):
             trt_lowm.run(unprepared, out=outs["ba"], x16=o["x"], w_bf16=o["ba_w"])
+
+
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("prefix", [False, True])
+@pytest.mark.parametrize("pad", [False, True])
+def test_prefill_split_conv_matches_native_state_chain(bias, compact, prefix, pad):
+    """P TP1's conv, recurrence and tracked writes on the same native operands."""
+    from types import SimpleNamespace as NS
+
+    from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+    from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm
+    from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
+    from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+        qwen3_5_gdn_prefill_projection_views,
+    )
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
+
+    from sgl_nvidia_mega.qwen3_5.gdn import prefill
+
+    g = torch.Generator(device="cuda").manual_seed(880 + bias + 10 * prefix)
+    h, hv, dim = _heads(1)
+    lengths = [129, 17]
+    tokens = sum(lengths)
+
+    def rand(*shape):
+        return torch.randn(*shape, generator=g, device="cuda").bfloat16()
+
+    projected, ba = rand(tokens, dim + hv * V), rand(tokens, 2 * hv)
+    mixed, z, b, a = qwen3_5_gdn_prefill_projection_views(projected, ba, h, hv, K, V)
+    attn = NS(
+        layer_id=12,
+        q_dim=h * K,
+        k_dim=h * K,
+        v_dim=hv * V,
+        num_q_heads=h,
+        num_k_heads=h,
+        num_v_heads=hv,
+        head_q_dim=K,
+        head_k_dim=K,
+        head_v_dim=V,
+        conv_weights=rand(dim, WIDTH),
+        bias=rand(dim) if bias else None,
+        activation="silu",
+        A_log=torch.rand(hv, device="cuda", generator=g),
+        dt_bias=rand(hv),
+    )
+    norm = RMSNorm(
+        V, eps=1e-6, norm_before_gate=True, device="cuda", dtype=torch.bfloat16
+    )
+    norm.weight.data = rand(V)
+    module = NS(
+        attn=attn,
+        num_k_heads=h,
+        num_v_heads=hv,
+        attn_tp_size=1,
+        head_k_dim=K,
+        head_v_dim=V,
+        norm=norm,
+        _forward_input_proj=lambda _: (projected, ba),
+        out_proj=lambda x: (x, None),
+    )
+    conv = rand(9, dim, WIDTH - 1)
+    ssm = rand(9, hv, V, K) * 0.02
+    indices = torch.tensor([2, -1 if pad else 4], device="cuda", dtype=torch.int32)
+    qsl = torch.tensor([0, 129, tokens], device="cuda", dtype=torch.int32)
+    table = (
+        torch.tensor(
+            [(i, c) for i, n in enumerate(lengths) for c in range((n + 7) // 8)],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        if compact
+        else None
+    )
+    fb = NS(
+        extend_prefix_lens=torch.tensor([8192 if prefix else 0, 0], device="cuda"),
+        extend_seq_lens_cpu=lengths,
+    )
+    if not prefix:
+        ssm[2].zero_()
+    ssm[4].zero_()
+    conv_ref, ssm_ref = conv.clone(), ssm.clone()
+    ix = lambda vals: torch.tensor(vals, device="cuda", dtype=torch.long)
+    view = NS(
+        state=NS(layer_ids=(12,), conv=(conv.unsqueeze(0),), temporal=ssm.unsqueeze(0)),
+        state_indices=indices,
+        query_start_loc=qsl,
+        conv_block_table=table,
+        kernel_id=1,
+        is_graph=False,
+        has_mis=False,
+        has_track=True,
+        track_conv_indices=ix([[126, 127, 128]]),
+        track_conv_dst=ix([6]),
+        track_ssm_h_src=ix([0]),
+        track_ssm_h_dst=ix([7]),
+        track_ssm_final_src=ix([2]),
+        track_ssm_final_dst=ix([8]),
+        track_ssm_recompute_dst=None,
+    )
+    assert not prefill.unsupported(view)
+    # Native tracking runs before convolution overwrites its committed state.
+    conv_ref[view.track_conv_dst] = mixed[view.track_conv_indices].transpose(1, 2)
+    convolved = causal_conv1d_fn(
+        mixed.T,
+        attn.conv_weights,
+        attn.bias,
+        conv_states=conv_ref,
+        has_initial_state=fb.extend_prefix_lens > 0,
+        cache_indices=indices,
+        query_start_loc=qsl,
+        seq_lens_cpu=lengths,
+        **({"block_table": table} if compact else {}),
+    ).T
+    q, k, v = [
+        x.view(1, tokens, heads, d)
+        for x, heads, d in zip(
+            convolved.split([h * K, h * K, hv * V], dim=-1), (h, h, hv), (K, K, V)
+        )
+    ]
+    gate, beta = fused_gdn_gating(attn.A_log, a, b, attn.dt_bias)
+    want, _, history = chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=gate,
+        beta=beta,
+        initial_state=ssm_ref,
+        initial_state_indices=indices,
+        cu_seqlens=qsl,
+        head_first=False,
+        use_qk_l2norm_in_kernel=True,
+        inplace_update=True,
+    )
+    ssm_ref[view.track_ssm_h_dst] = history.squeeze(0)[view.track_ssm_h_src].to(
+        ssm_ref.dtype
+    )
+    ssm_ref[view.track_ssm_final_dst] = ssm_ref[view.track_ssm_final_src]
+    want = norm(want.reshape(-1, V), z).reshape(tokens, -1)
+    got = prefill.step(module, projected, view, fb)
+    live = slice(0, 129) if pad else slice(None)
+    assert torch.equal(got[live], want[live])
+    assert torch.equal(conv, conv_ref)
+    assert torch.equal(ssm, ssm_ref)

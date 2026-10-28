@@ -23,9 +23,6 @@ SHIPPED_SLOTS: tuple[str, ...] = (
     "mkm_m128",
     "mkm_m256",
     "mkm_m512",
-    "gdn_verify",
-    "gdn_pdl",
-    "gdn_conv",
     "hop",
     "hop_fp8",
     "multi_request",
@@ -35,6 +32,12 @@ SHIPPED_SLOTS: tuple[str, ...] = (
     "draft_embed",
 )
 OPT_IN_SLOTS: tuple[str, ...] = (
+    # The fused FP8 norm can select a different reduction layout from BF16.
+    # Keep its verify chain and dependent variants explicitly requested.
+    "gdn_verify",
+    "gdn_pdl",
+    "gdn_conv",
+    "gdn_prefill_split_conv",
     "route",
     "route_gemm",
     "mkm",
@@ -353,6 +356,11 @@ def build(model, ctx):
     from sgl_nvidia_mega.qwen3_5 import plan as slot_plan
     from sgl_nvidia_mega.qwen3_5.runtime import parity
     from sgl_nvidia_mega.qwen3_5.runtime.executor import Qwen35Verify
+
+    if getattr(get_parallel(), "pp_size", 1) == 4:
+        from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+
+        return Qwen35Prefill(model, ctx, "gdn_prefill_split_conv" in SLOTS)
 
     dropped = apply_expert_parallel(get_parallel().moe_ep_size)
     if dropped:

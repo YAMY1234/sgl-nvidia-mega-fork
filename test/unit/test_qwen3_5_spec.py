@@ -90,12 +90,27 @@ def test_the_decode_side_of_pd_is_accepted():
     assert _refusal(disaggregation_mode="decode") == ""
 
 
-def test_the_prefill_side_of_pd_is_refused():
+def test_an_unsupported_prefill_topology_is_refused():
     # SGLang refuses ReplaySSM on a PD prefill server itself
     message = _refusal(
         disaggregation_mode="prefill", enable_linear_replayssm_spec=False
     )
-    assert "a PD prefill server runs no covered step" in message, message
+    assert "PD prefill requires TP1/PP4" in message, message
+
+
+def test_prefill_tp1_pp4_is_admitted_with_the_data_only_binding():
+    assert (
+        _refusal(
+            tp_size=1,
+            nnodes=1,
+            pp_size=4,
+            disaggregation_mode="prefill",
+            enable_linear_replayssm_spec=False,
+            moe_runner_backend="flashinfer_cutedsl",
+            flashinfer_allreduce_fusion_backend=None,
+        )
+        == ""
+    )
 
 
 BREAKABLE = with_phase(
@@ -585,7 +600,10 @@ def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
     assert dict(tiled_route.tolerances) == spec.NUMERIC_TOLERANCES["route_gemm"]
     claim = spec.numerics(frozenset({"gdn_verify", "hop", "gdn_push"}))
     assert claim.kind is NumericsKind.TOLERANCE
-    assert dict(claim.tolerances) == spec.NUMERIC_TOLERANCES["gdn_push"]
+    assert dict(claim.tolerances) == {
+        **spec.NUMERIC_TOLERANCES["gdn_push"],
+        **spec.NUMERIC_TOLERANCES["gdn_verify"],
+    }
     shared = spec.numerics(frozenset({"route", "route_shared"}))
     assert dict(shared.tolerances) == {
         **spec.NUMERIC_TOLERANCES["route"],
@@ -593,11 +611,15 @@ def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
     }
     both = spec.numerics(frozenset({"gdn_verify", "gdn_pdl", "gdn_front", "gdn_push"}))
     assert dict(both.tolerances) == {
+        **spec.NUMERIC_TOLERANCES["gdn_verify"],
         **spec.NUMERIC_TOLERANCES["gdn_push"],
         **spec.NUMERIC_TOLERANCES["gdn_front"],
     }
     core = spec.numerics(frozenset({"gdn_verify", "gdn_core"}))
-    assert dict(core.tolerances) == spec.NUMERIC_TOLERANCES["gdn_core"]
+    assert dict(core.tolerances) == {
+        **spec.NUMERIC_TOLERANCES["gdn_core"],
+        **spec.NUMERIC_TOLERANCES["gdn_verify"],
+    }
     attention = spec.numerics(frozenset({"skv2", "mka", "mka_push", "hop"}))
     assert attention.kind is NumericsKind.TOLERANCE
     assert dict(attention.tolerances) == {

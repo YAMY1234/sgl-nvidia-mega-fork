@@ -56,9 +56,6 @@ def test_the_default_policy_ships_only_bitwise_shape_bounded_paths(monkeypatch):
             "mkm_m128",
             "mkm_m256",
             "mkm_m512",
-            "gdn_verify",
-            "gdn_pdl",
-            "gdn_conv",
             "hop",
             "hop_fp8",
             "multi_request",
@@ -1342,3 +1339,36 @@ def test_gdn_slot_topologies_keep_generic_verify_and_bound_the_core(topology_nam
     assert ("gdn_core" in got) == (topology_name != "dep8")
     if topology_name in {"tp2", "tp4", "dep8"}:
         assert not got & {"gdn_front", "gdn_push"}
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prefill_plan_uses_actual_chunk_rows_and_stock_when_slot_off(enabled):
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), enabled)
+    fb = SimpleNamespace(mm_inputs=None, forward_mode=ForwardMode.EXTEND)
+    step = built.plan(torch.zeros(33, dtype=torch.int64), fb)
+    if enabled:
+        assert step.mode == "prefill" and step.rows == 33
+    else:
+        assert step is None
+    fb.forward_mode = ForwardMode.TARGET_VERIFY
+    assert built.plan(torch.zeros(7, dtype=torch.int64), fb) is None
+
+
+def test_prefill_unsupported_view_returns_the_original_before_state_writes():
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+    from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), True)
+    marker = object()
+    original = lambda *a, **k: marker
+    step = Step(mode="prefill", rows=33, view=SimpleNamespace(kernel_id=0))
+    assert built.forward(step, original, None, None, None) is marker

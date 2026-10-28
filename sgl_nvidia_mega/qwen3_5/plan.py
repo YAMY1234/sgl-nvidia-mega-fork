@@ -46,7 +46,7 @@ MAX_ROWS = 896  # the widest covered step: 128 requests of 7 verify rows (TP8 bs
 REQUESTS = tuple(range(1, 129))
 # the TP sizes whose steps of more than one request are covered when requested (checked at
 # TP8); at the others a covered step is one request
-MULTI_REQUEST_TP = (8,)
+MULTI_REQUEST_TP = (2, 4, 8)
 # the name that requests them in the slot list
 MULTI_REQUEST = "multi_request"
 GDN_FRONT_ROWS = 7  # the one-request custom front's fixed width
@@ -342,12 +342,18 @@ def widest(widths: tuple[int, ...], max_rows: int) -> int:
 
 
 def covered(
-    widths: tuple[int, ...], facts: Facts, tokens_per_request: int
+    widths: tuple[int, ...],
+    facts: Facts,
+    tokens_per_request: int,
+    *,
+    stock: bool = False,
 ) -> tuple[int, ...]:
     """The widths a build covers: one request always (with no slot it runs the stock
     step), more requests only where a slot runs."""
     return tuple(
         w
         for w in widths
-        if w == tokens_per_request or slots(w, facts, tokens_per_request) != Slots()
+        if stock
+        or w == tokens_per_request
+        or slots(w, facts, tokens_per_request) != Slots()
     )

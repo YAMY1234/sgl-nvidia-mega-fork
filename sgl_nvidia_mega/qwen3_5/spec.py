@@ -27,7 +27,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         Requirements,
     )
 
-from sgl_nvidia_mega.qwen3_5 import TEXT_CONFIG, runtime
+from sgl_nvidia_mega.qwen3_5 import TEXT_CONFIG, runtime, topology
 from sgl_nvidia_mega.qwen3_5.plan import MAX_ROWS
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -36,6 +36,7 @@ SGLANG_READS = {
         "Feature",
         "SPECULATIVE_DECODING",
         "MULTI_NODE_TP",
+        "DP_ATTENTION",
         "KV_OFFLOAD",
         "PD_DISAGGREGATION",
         "MegakernelSpec",
@@ -63,6 +64,9 @@ SGLANG_READS = {
         "mamba_ssm_dtype",
         "startup_weight_load_mode",
         "disaggregation_mode",
+        "attn_dp_size",
+        "ep_size",
+        "tp_size",
     ),
     "srt/configs/qwen3_5.py": ("text_config",),
     "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
@@ -77,7 +81,7 @@ API_VERSION = 2
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_103"}),
     # TP8 over the two 4-GPU trays of one NVL72 rack, TP4 on one tray
-    tp_sizes=frozenset({4, 8}),
+    tp_sizes=frozenset({2, 4, 8}),
     dtypes=frozenset({"bfloat16"}),
     # the decode CUDA graphs the covered step is tested with (eager steps too)
     decode_graph_backends=frozenset({"full", "disabled"}),
@@ -88,10 +92,10 @@ REQUIREMENTS = Requirements(
         "speculative_eagle_topk": frozenset({1}),
         # SGLang's EAGLE entries serve a chain without rejection sampling
         "speculative_use_rejection_sampling": frozenset({False}),
-        "moe_a2a_backend": frozenset({"none"}),
+        "moe_a2a_backend": frozenset({"none", "flashinfer"}),
         # the deferred MoE finalize the boundary takes (the measured TP8 setup)
-        "moe_runner_backend": frozenset({"flashinfer_trtllm"}),
-        "flashinfer_allreduce_fusion_backend": frozenset({"cutedsl"}),
+        "moe_runner_backend": frozenset({"flashinfer_trtllm", "flashinfer_cutedsl"}),
+        "flashinfer_allreduce_fusion_backend": frozenset({None, "cutedsl"}),
         "attention_backend": frozenset({"trtllm_mha"}),
         "decode_attention_backend": frozenset({None, "trtllm_mha"}),
         # the Triton GDN verify on the ReplaySSM ring with BF16 checkpoints
@@ -235,10 +239,28 @@ def pd_reasons(cfg) -> list[str]:
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     runtime.apply_expert_parallel(cfg.ep_size or 1)
+    configured = topology.from_config(cfg)
+    topology_reasons = (
+        ["Qwen3.5 DP attention requires DEP8 (TP8, attention DP8, MoE EP8)"]
+        if configured.attn_dp_size > 1 and configured.name != "dep8"
+        else []
+    )
+    if configured.name != "dep8":
+        for name, want in (
+            ("moe_a2a_backend", "none"),
+            ("moe_runner_backend", "flashinfer_trtllm"),
+            ("flashinfer_allreduce_fusion_backend", "cutedsl"),
+        ):
+            value = getattr(cfg, name)
+            if value != want:
+                topology_reasons.append(f"{name} {value!r} is not {want!r}")
     return (
-        text_config_reasons(hf_config)
+        topology_reasons
+        + text_config_reasons(hf_config)
         + binding_reasons()
-        + runtime.slot_reasons()
+        + runtime.slot_reasons(
+            topology.select(runtime.SLOTS, topology.from_config(cfg))
+        )
         + pd_reasons(cfg)
     )
 
@@ -261,6 +283,7 @@ SPEC = MegakernelSpec(
             Feature.KV_OFFLOAD,
             # TEP (MoE TP x EP): the slots in runtime.EP_STOCK_SLOTS stay off
             Feature.EXPERT_PARALLEL,
+            Feature.DP_ATTENTION,
             # The decode side of PD; pd_reasons refuses the prefill side.
             Feature.PD_DISAGGREGATION,
         }

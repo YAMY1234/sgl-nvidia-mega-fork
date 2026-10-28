@@ -30,6 +30,7 @@ from sgl_nvidia_mega.qwen3_5 import (
 @pytest.fixture(autouse=True)
 def registered(monkeypatch):
     monkeypatch.setattr(registry, "_REGISTRY", {})
+    monkeypatch.setattr(runtime, "SLOTS", runtime.SLOTS)
     monkeypatch.delenv(plugin.PARITY_SORT_ENV, raising=False)
     plugin.register()
 
@@ -105,9 +106,9 @@ BREAKABLE = with_phase(
 @pytest.mark.parametrize(
     "kw, want",
     [
-        (dict(tp_size=2, nnodes=1), "tp_size 2"),
+        (dict(tp_size=1, nnodes=1), "tp_size 1"),
         (dict(pp_size=2), "pipeline parallelism is in use"),
-        (dict(enable_dp_attention=True, dp_size=8), "DP attention is in use"),
+        (dict(enable_dp_attention=True, dp_size=4), "DP attention requires DEP8"),
         (dict(kv_cache_dtype="auto"), "kv_cache_dtype 'auto'"),
         (dict(speculative_algorithm=None), "speculative_algorithm None"),
         (dict(speculative_eagle_topk=4), "speculative_eagle_topk 4"),
@@ -228,7 +229,7 @@ def test_a_slot_set_that_cannot_run_is_refused_before_the_load(
 
 
 def test_every_reason_is_listed_at_once():
-    message = _refusal(tp_size=2, nnodes=1, kv_cache_dtype="auto", pp_size=2)
+    message = _refusal(tp_size=1, nnodes=1, kv_cache_dtype="auto", pp_size=2)
     assert message.count("\n  - ") == 3, message
 
 
@@ -447,7 +448,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     # one-request step it is checked at
     assert plan.multi_request(8, frozenset({"multi_request"}))
     assert not plan.multi_request(8, frozenset())
-    assert not plan.multi_request(4, frozenset({"multi_request"}))
+    assert plan.multi_request(4, frozenset({"multi_request"}))
     assert plan.covered((7, 14, 28), every, 7) == (7, 14, 28)
     assert plan.covered((7, 448, 896), every, 7) == (7, 448, 896)
     # one request is always covered, more only where a slot runs
@@ -619,3 +620,31 @@ def test_the_shipped_policy_claims_bitwise_numerics():
     shipped = frozenset(runtime.SHIPPED_SLOTS)
     assert spec.numerics(shipped).kind is NumericsKind.BITWISE
     assert draft.numerics(shipped).kind is NumericsKind.BITWISE
+
+
+@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("pd", ["null", "decode"])
+def test_topology_admission_is_driven_by_plugin_capabilities(tp, pd):
+    assert _refusal(tp_size=tp, nnodes=1, disaggregation_mode=pd) == ""
+
+
+def test_dep8_accepts_the_recipe_stock_moe_and_dp_lm_head():
+    assert (
+        _refusal(
+            disaggregation_mode="decode",
+            enable_dp_attention=True,
+            dp_size=8,
+            ep_size=8,
+            enable_dp_lm_head=True,
+            moe_runner_backend="flashinfer_cutedsl",
+            moe_a2a_backend="flashinfer",
+            flashinfer_allreduce_fusion_backend=None,
+        )
+        == ""
+    )
+
+
+@pytest.mark.parametrize("tp", [2, 4, 8])
+def test_multi_request_is_available_at_every_supported_tp(tp):
+    assert plan.multi_request(tp, frozenset({"multi_request"}))
+    assert not plan.multi_request(tp, frozenset())

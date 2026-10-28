@@ -28,6 +28,8 @@ replayed from a CUDA graph:
   (MoE TP2 x EP8: 64 local experts, intermediate 512 a rank, ranks 0 and 5): the weights,
   the slots routed outside the rank (-1) and every local slot's FC2 row bit for bit."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -432,6 +434,100 @@ def test_router_gemm_quant_shared_replays_from_a_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
     assert all(torch.equal(a, b) for a, b in zip(eager, captured))
+
+
+@pytest.mark.parametrize("m", [1, 7, 8])
+@pytest.mark.parametrize("width", [128, 256])
+def test_shared_swiglu_static_quant_is_sglangs_bytes(m, width):
+    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+    from sglang.srt.layers.activation import SiluAndMul
+
+    from sgl_nvidia_mega.qwen3_5.sm103.moe.shared_act_quant import (
+        silu_and_mul_static_quant_fp8,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(73 + m + width)
+    gate_up = torch.randn(
+        m, 2 * width, device="cuda", dtype=torch.bfloat16, generator=g
+    )
+    # Exercise both saturation edges as well as ordinary activation values.
+    gate_up[0, :4] = torch.tensor(
+        [-80.0, -8.0, 8.0, 80.0], device="cuda", dtype=torch.bfloat16
+    )
+    scale = torch.tensor([0.003], device="cuda")
+    # Keep the reference independent of the fused migration, which runtime-v3
+    # removes: this is the stock BF16 activation boundary followed by its static
+    # per-tensor FP8 quantizer.
+    want, _ = static_quant_fp8(SiluAndMul()(gate_up), scale)
+    got = silu_and_mul_static_quant_fp8(gate_up, scale)
+    assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
+def test_shared_swiglu_static_quant_replays_from_a_cuda_graph():
+    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+    from sglang.srt.layers.activation import SiluAndMul
+
+    from sgl_nvidia_mega.qwen3_5.sm103.moe.shared_act_quant import (
+        build,
+        silu_and_mul_static_quant_fp8,
+    )
+
+    gate_up = torch.randn(8, 512, device="cuda", dtype=torch.bfloat16)
+    scale = torch.tensor([0.003], device="cuda")
+    with pytest.raises(ValueError, match=r"FP32 \[1\]"):
+        silu_and_mul_static_quant_fp8(gate_up, scale.view(1, 1))
+    with pytest.raises(ValueError, match="input device"):
+        silu_and_mul_static_quant_fp8(gate_up, scale.cpu())
+    with pytest.raises(ValueError, match=r"\[rows, 2 \* width\]"):
+        silu_and_mul_static_quant_fp8(gate_up.view(2, 4, 512), scale)
+    build(gate_up.device.index, gate_up.shape[1])
+    expected, _ = static_quant_fp8(SiluAndMul()(gate_up), scale)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = silu_and_mul_static_quant_fp8(gate_up, scale)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(expected.view(torch.uint8), captured.view(torch.uint8))
+
+
+def test_shared_swiglu_static_quant_feeds_modelopt_flashinfer_down_projection():
+    from sglang.srt.layers.activation import SiluAndMul
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    from sgl_nvidia_mega.qwen3_5.sm103.moe.shared_act_quant import (
+        silu_and_mul_static_quant_fp8,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(91)
+    rows, intermediate, hidden = 8, 256, 4096
+    gate_up = (
+        torch.randn(
+            rows,
+            2 * intermediate,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        * 2
+    )
+    weight = (
+        torch.randn(hidden, intermediate, device="cuda", generator=generator) * 0.05
+    ).to(torch.float8_e4m3fn)
+    input_scale = torch.tensor([0.02], device="cuda")
+    layer = SimpleNamespace(
+        use_flashinfer_bmm=True,
+        weight=weight.t(),
+        weight_scale=torch.tensor([0.01], device="cuda"),
+        input_scale=input_scale,
+    )
+    method = object.__new__(ModelOptFp8LinearMethod)
+    method.use_marlin = method.use_sm120_fp8 = False
+
+    expected = method.apply(layer, SiluAndMul()(gate_up))
+    actual = method.apply(layer, silu_and_mul_static_quant_fp8(gate_up, input_scale))
+
+    assert actual.dtype == torch.bfloat16
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
 # ---------------------------------------------------------------- slot route_topk

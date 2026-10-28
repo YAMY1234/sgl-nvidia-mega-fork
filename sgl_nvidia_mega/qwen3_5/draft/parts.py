@@ -90,6 +90,17 @@ class Parts:
         parts = cls(draft, layers[0])
         parts.attention = Attention(parts)
         slots = parts.slots
+        if "draft_fin" in slots:
+            from sgl_nvidia_mega.qwen3_5.draft import finalize
+
+            reason = finalize.enable(parts.layer.mlp)
+            if reason:
+                logger.warning(
+                    "NVIDIA megakernel: slot draft_fin cannot run (%s); "
+                    "SGLang finalizes the draft MoE.",
+                    reason,
+                )
+                slots = parts.slots = slots - {"draft_fin"}
         if "draft_moe" in slots:
             parts.moe = parts._build_moe()
             if parts.moe is None:

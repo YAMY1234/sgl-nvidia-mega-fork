@@ -27,6 +27,38 @@ from sgl_nvidia_mega.qwen3_5.boundary import hop as boundary_hop
 from sgl_nvidia_mega.qwen3_5.runtime import executor
 
 
+class _CudaMeta:
+    """Tensor metadata stand-in for CPU capability-policy tests."""
+
+    def __init__(
+        self,
+        shape,
+        dtype,
+        *,
+        transpose_contiguous=True,
+        contiguous=True,
+        is_cuda=True,
+        device="cuda:0",
+    ):
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        self.transpose_contiguous = transpose_contiguous
+        self.contiguous = contiguous
+        self.is_cuda = is_cuda
+        self.device = torch.device(device)
+
+    def is_contiguous(self):
+        return self.contiguous
+
+    def dim(self):
+        return len(self.shape)
+
+    def t(self):
+        return SimpleNamespace(
+            is_contiguous=lambda: self.transpose_contiguous,
+        )
+
+
 @pytest.fixture(autouse=True)
 def registered(monkeypatch):
     from sglang.srt.kernel_plugins.nvidia import binding as plugin_binding
@@ -313,6 +345,7 @@ class _GateUp:
 
     def __init__(self, log):
         self.log = log
+        self.dtype = torch.bfloat16
 
     def record_stream(self, stream):
         self.log.append(("record_stream", stream.name))
@@ -343,7 +376,6 @@ def test_the_route_shared_slot_starts_the_shared_expert_after_the_router_launch(
             weight=k["sh_w"], input_scale=k["sh_in"], weight_scale=k["sh_ws"]
         ),
         _enable_silu_fp4_quant_fusion=False,
-        _silu_fp8_quant_fusion=False,
         act_fn=log.op("act", "act_out"),
         down_proj=log.op("down_proj", ("down_out", None)),
     )
@@ -438,15 +470,232 @@ def test_the_route_shared_slot_names_what_a_layer_lacks(change, want):
         gate_up_proj=SimpleNamespace(
             quant_method=method,
             bias=change.get("bias"),
-            weight=torch.zeros(rows, 4096, dtype=torch.float8_e4m3fn).t(),
-            input_scale=torch.ones(1),
-            weight_scale=torch.ones(1),
+            weight=_CudaMeta((4096, rows), torch.float8_e4m3fn),
+            input_scale=_CudaMeta((1,), torch.float32),
+            weight_scale=_CudaMeta((1,), torch.float32),
         ),
         act_fn=change.get("act_fn", object.__new__(SiluAndMul)),
+        down_proj=SimpleNamespace(
+            quant_method=method,
+            weight=_CudaMeta((256, 4096), torch.float8_e4m3fn),
+            input_scale=_CudaMeta((1,), torch.float32),
+        ),
     )
     mlp = SimpleNamespace(shared_expert=expert, shared_expert_gate="gate")
     got = route.shared_unsupported(mlp)
     assert (want in got) if want else got == ""
+
+
+def test_route_shared_missing_quant_scales_falls_back_instead_of_raising():
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    expert = qwen2_moe.Qwen2MoeMLP.__new__(qwen2_moe.Qwen2MoeMLP)
+    torch.nn.Module.__init__(expert)
+    expert.__dict__.update(
+        gate_up_proj=SimpleNamespace(
+            quant_method=object(),
+            bias=None,
+            weight=_CudaMeta((4096, 256), torch.bfloat16),
+        ),
+        act_fn=object(),
+        down_proj=object(),
+    )
+
+    reason = route.shared_unsupported(
+        SimpleNamespace(shared_expert=expert, shared_expert_gate="gate")
+    )
+
+    assert "not a static per-tensor FP8 linear" in reason
+
+
+def test_route_shared_owns_the_static_fp8_down_projection_policy():
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    method = object.__new__(ModelOptFp8LinearMethod)
+    method.use_marlin = method.use_sm120_fp8 = False
+    weight = _CudaMeta((256, 4096), torch.float8_e4m3fn)
+    scale = _CudaMeta((1,), torch.float32)
+    expert = SimpleNamespace(
+        down_proj=SimpleNamespace(quant_method=method, weight=weight, input_scale=scale)
+    )
+
+    assert route._down_takes_static_fp8(expert)
+    method.use_marlin = True
+    assert not route._down_takes_static_fp8(expert)
+    method.use_marlin = False
+    method.use_sm120_fp8 = True
+    assert not route._down_takes_static_fp8(expert)
+    method.use_sm120_fp8 = False
+    expert.down_proj.input_scale = _CudaMeta((2,), torch.float32)
+    assert not route._down_takes_static_fp8(expert)
+    expert.down_proj.input_scale = scale
+    expert.down_proj.weight = _CudaMeta((256, 4096), torch.bfloat16)
+    assert not route._down_takes_static_fp8(expert)
+    expert.down_proj = SimpleNamespace(weight=weight, input_scale=scale)
+    assert not route._down_takes_static_fp8(expert)
+
+
+@pytest.mark.parametrize("scale_name", ["input_scale", "weight_scale"])
+@pytest.mark.parametrize(
+    "scale",
+    [
+        _CudaMeta((1,), torch.bfloat16),
+        _CudaMeta((1,), torch.float32, is_cuda=False, device="cpu"),
+        _CudaMeta((1,), torch.float32, contiguous=False),
+        _CudaMeta((2,), torch.float32),
+        _CudaMeta((1,), torch.float32, device="cuda:1"),
+    ],
+    ids=["wrong-dtype", "not-cuda", "non-contiguous", "wrong-shape", "device"],
+)
+def test_route_shared_rejects_invalid_gate_up_scales(scale_name, scale):
+    from sglang.srt.layers.activation import SiluAndMul
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    method = object.__new__(ModelOptFp8LinearMethod)
+    method.use_marlin = method.use_sm120_fp8 = False
+    gate_up = SimpleNamespace(
+        quant_method=method,
+        bias=None,
+        weight=_CudaMeta((4096, 256), torch.float8_e4m3fn),
+        input_scale=_CudaMeta((1,), torch.float32),
+        weight_scale=_CudaMeta((1,), torch.float32),
+    )
+    setattr(gate_up, scale_name, scale)
+    expert = qwen2_moe.Qwen2MoeMLP.__new__(qwen2_moe.Qwen2MoeMLP)
+    torch.nn.Module.__init__(expert)
+    expert.__dict__.update(
+        gate_up_proj=gate_up,
+        act_fn=object.__new__(SiluAndMul),
+        down_proj=SimpleNamespace(
+            quant_method=method,
+            weight=_CudaMeta((256, 4096), torch.float8_e4m3fn),
+            input_scale=_CudaMeta((1,), torch.float32),
+        ),
+    )
+    mlp = SimpleNamespace(shared_expert=expert, shared_expert_gate="gate")
+
+    assert "shared gate/up is not a static per-tensor FP8 linear" in (
+        route.shared_unsupported(mlp)
+    )
+
+
+@pytest.mark.parametrize(
+    "scale",
+    [
+        _CudaMeta((1,), torch.bfloat16),
+        _CudaMeta((1,), torch.float32, is_cuda=False, device="cpu"),
+        _CudaMeta((1,), torch.float32, contiguous=False),
+        _CudaMeta((2,), torch.float32),
+        _CudaMeta((1,), torch.float32, device="cuda:1"),
+    ],
+    ids=["wrong-dtype", "not-cuda", "non-contiguous", "wrong-shape", "device"],
+)
+def test_route_shared_rejects_invalid_down_scale(scale):
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    method = object.__new__(ModelOptFp8LinearMethod)
+    method.use_marlin = method.use_sm120_fp8 = False
+    expert = SimpleNamespace(
+        down_proj=SimpleNamespace(
+            quant_method=method,
+            weight=_CudaMeta((256, 4096), torch.float8_e4m3fn),
+            input_scale=scale,
+        )
+    )
+
+    assert not route._down_takes_static_fp8(expert)
+
+
+@pytest.mark.parametrize(
+    "x",
+    [
+        _CudaMeta((2, 4), torch.bfloat16, is_cuda=False, device="cpu"),
+        _CudaMeta((2, 4), torch.float32),
+        _CudaMeta((4,), torch.bfloat16),
+        _CudaMeta((2, 4), torch.bfloat16, contiguous=False),
+        _CudaMeta((2, 0), torch.bfloat16),
+        _CudaMeta((2, 3), torch.bfloat16),
+    ],
+    ids=["not-cuda", "wrong-dtype", "wrong-rank", "non-contiguous", "empty", "odd"],
+)
+def test_route_shared_act_quant_rejects_invalid_input_metadata(x):
+    from sgl_nvidia_mega.qwen3_5.sm103.moe.shared_act_quant import (
+        silu_and_mul_static_quant_fp8,
+    )
+
+    with pytest.raises(ValueError, match="shared act\\+quant input"):
+        silu_and_mul_static_quant_fp8(x, _CudaMeta((1,), torch.float32))
+
+
+@pytest.mark.parametrize(
+    "scale",
+    [
+        _CudaMeta((1,), torch.float32, is_cuda=False, device="cpu"),
+        _CudaMeta((1,), torch.bfloat16),
+        _CudaMeta((2,), torch.float32),
+        _CudaMeta((1,), torch.float32, contiguous=False),
+        _CudaMeta((1,), torch.float32, device="cuda:1"),
+    ],
+    ids=["not-cuda", "wrong-dtype", "wrong-shape", "non-contiguous", "device"],
+)
+def test_route_shared_act_quant_rejects_invalid_scale_metadata(scale):
+    from sgl_nvidia_mega.qwen3_5.sm103.moe.shared_act_quant import (
+        silu_and_mul_static_quant_fp8,
+    )
+
+    with pytest.raises(ValueError, match="shared act\\+quant scale"):
+        silu_and_mul_static_quant_fp8(
+            _CudaMeta((2, 4), torch.bfloat16),
+            scale,
+        )
+
+
+def test_route_shared_prebuilds_the_plugin_owned_act_quant(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.moe import route
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router, shared_act_quant
+
+    layers = [
+        SimpleNamespace(
+            mlp=SimpleNamespace(
+                shared_expert=SimpleNamespace(
+                    gate_up_proj=SimpleNamespace(weight=torch.empty(4096, columns))
+                )
+            )
+        )
+        for columns in (512, 256, 256)
+    ]
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=len(layers), layers=layers)
+    )
+    calls = []
+    monkeypatch.setattr(route, "unsupported", lambda mlp: "")
+    monkeypatch.setattr(route, "shared_unsupported", lambda mlp: "")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(
+        router,
+        "build",
+        lambda device, rows, shared: calls.append(("router", device, rows, shared)),
+    )
+    monkeypatch.setattr(
+        shared_act_quant,
+        "build",
+        lambda device, columns: calls.append(("tail", device, columns)),
+    )
+
+    bound = route.build(model, 7, fused=False, shared=True)
+
+    assert bound.route and bound.shared
+    assert calls == [
+        ("router", 3, 7, True),
+        ("tail", 3, 256),
+        ("tail", 3, 512),
+    ]
 
 
 @pytest.mark.parametrize("capture", [False, True])

@@ -611,6 +611,22 @@ def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
     }
 
 
+def test_plugin_runtime_slot_declares_its_actual_numerics():
+    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
+
+    from sgl_nvidia_mega.qwen3_5 import draft
+
+    sampled = spec.numerics(frozenset({"sharded_gumbel"}))
+    assert sampled.kind is NumericsKind.TOLERANCE
+    assert dict(sampled.tolerances) == spec.NUMERIC_TOLERANCES["sharded_gumbel"]
+
+    # The deferred producer changes the draft's finalize/reduction order.  It uses
+    # the draft spec's existing final-logit envelope, not a target-model tolerance.
+    finalize = draft.numerics(frozenset({"draft_fin"}))
+    assert finalize.kind is NumericsKind.TOLERANCE
+    assert dict(finalize.tolerances) == {"draft_logits.rel": 2**-7}
+
+
 def test_the_shipped_policy_claims_bitwise_numerics():
     from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
 

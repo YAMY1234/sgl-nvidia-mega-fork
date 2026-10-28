@@ -68,8 +68,6 @@ SGLANG_READS = {
         "act_fn",
         "_enable_silu_fp4_quant_fusion",
         "_silu_fp4_quant_fused",
-        "_silu_fp8_quant_fusion",
-        "_down_takes_static_fp8",
     ),
     "srt/models/qwen3_5.py": ("layers", "start_layer", "end_layer", "mlp"),
     "srt/layers/moe/topk.py": (
@@ -115,7 +113,6 @@ SGLANG_READS = {
         '"weight_scale"',
     ),
     "srt/layers/activation.py": ("SiluAndMul",),
-    "kernels/ops/quantization/fp8_kernel.py": ("silu_and_mul_static_quant_fp8",),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
@@ -123,7 +120,10 @@ SGLANG_READS = {
 SGLANG_MIRRORS = {
     "srt/layers/moe/fused_moe_triton/layer.py:FusedMoE.forward_deferred_finalize": "af4b474cbaf33493",
     "srt/layers/moe/fused_moe_triton/layer.py:FusedMoE._dispatch_with_pre_quant": "dcdefc28cf643081",
-    "srt/models/qwen2_moe.py:Qwen2MoeMLP.forward": "bb4c9fb2d7994e97",
+    "srt/models/qwen2_moe.py:Qwen2MoeMLP.forward": (
+        "bb4c9fb2d7994e97",  # runtime v2: temporary core shared-act fast path
+        "6091ffb613568a10",  # runtime v3: the policy and kernel live in this slot
+    ),
 }
 
 
@@ -187,6 +187,13 @@ def build(
                 return Bound(reason=f"route_shared: layer {i}: {reason}")
     device = torch.cuda.current_device()
     router.build(device, max_rows, shared=shared)
+    if shared:
+        from sgl_nvidia_mega.qwen3_5.sm103.moe import shared_act_quant
+
+        for columns in sorted(
+            {int(mlp.shared_expert.gate_up_proj.weight.shape[1]) for mlp in layers}
+        ):
+            shared_act_quant.build(device, columns)
     if not fused:
         return Bound(route=True, shared=shared)
     for i, mlp in zip(range(m.start_layer, m.end_layer), layers):
@@ -369,23 +376,40 @@ def shared_unsupported(mlp) -> str:
     if not isinstance(expert, Qwen2MoeMLP) or mlp.shared_expert_gate is None:
         return "no gated Qwen2MoeMLP shared expert"
     gu = expert.gate_up_proj
-    method = gu.quant_method
+    method = getattr(gu, "quant_method", None)
+    weight = getattr(gu, "weight", None)
+    input_scale = getattr(gu, "input_scale", None)
+    weight_scale = getattr(gu, "weight_scale", None)
     if (
         not isinstance(method, ModelOptFp8LinearMethod)
         or method.use_marlin
         or method.use_sm120_fp8
-        or gu.bias is not None
-        or gu.weight.dtype != torch.float8_e4m3fn
-        or gu.weight.shape[0] != router.HIDDEN
-        or gu.weight.shape[1] % 8
-        or gu.weight.shape[1] > router.SHARED_MAX_N
-        or not gu.weight.t().is_contiguous()
-        or gu.input_scale.numel() != 1
-        or gu.weight_scale.numel() != 1
+        or getattr(gu, "bias", None) is not None
+        or weight is None
+        or not weight.is_cuda
+        or weight.dtype != torch.float8_e4m3fn
+        or weight.shape[0] != router.HIDDEN
+        or weight.shape[1] % 8
+        or weight.shape[1] > router.SHARED_MAX_N
+        or not weight.t().is_contiguous()
+        or input_scale is None
+        or not input_scale.is_cuda
+        or input_scale.device != weight.device
+        or input_scale.dtype != torch.float32
+        or tuple(input_scale.shape) != (1,)
+        or not input_scale.is_contiguous()
+        or weight_scale is None
+        or not weight_scale.is_cuda
+        or weight_scale.device != weight.device
+        or weight_scale.dtype != torch.float32
+        or tuple(weight_scale.shape) != (1,)
+        or not weight_scale.is_contiguous()
     ):
         return "the shared gate/up is not a static per-tensor FP8 linear of <= 512 rows"
     if not isinstance(expert.act_fn, SiluAndMul):
         return f"shared expert activation {type(expert.act_fn).__name__}"
+    if not _down_takes_static_fp8(expert):
+        return "the shared down projection does not accept static per-tensor FP8"
     return ""
 
 
@@ -394,20 +418,55 @@ def shared_expert_tail(expert, gate_up: torch.Tensor) -> torch.Tensor:
     if expert._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
         x, _ = expert.down_proj(expert._silu_fp4_quant_fused(gate_up))
         return x
-    if expert._silu_fp8_quant_fusion is None:
-        expert._silu_fp8_quant_fusion = expert._down_takes_static_fp8()
-    if expert._silu_fp8_quant_fusion and gate_up.dtype == torch.bfloat16:
-        from sglang.kernels.ops.quantization.fp8_kernel import (
+    if _down_takes_static_fp8(expert) and gate_up.dtype == torch.bfloat16:
+        from sgl_nvidia_mega.qwen3_5.sm103.moe.shared_act_quant import (
             silu_and_mul_static_quant_fp8,
         )
 
-        x, _ = expert.down_proj(
-            silu_and_mul_static_quant_fp8(gate_up, expert.down_proj.input_scale)
-        )
+        quantized = silu_and_mul_static_quant_fp8(gate_up, expert.down_proj.input_scale)
+        key = ("route_shared_act_quant", gate_up.shape[0])
+        if key not in _ENGAGED:
+            _ENGAGED.add(key)
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 slot route_shared shared_act_quant "
+                "runs at %d rows",
+                gate_up.shape[0],
+            )
+        x, _ = expert.down_proj(quantized)
         return x
     x = expert.act_fn(gate_up)
     x, _ = expert.down_proj(x)
     return x
+
+
+def _down_takes_static_fp8(expert) -> bool:
+    """Whether this shared expert's down projection accepts static E4M3 input.
+
+    This is the Qwen3.5 slot policy that runtime-v2 temporarily placed on
+    ``Qwen2MoeMLP``.  Keeping it beside the plugin-owned activation kernel lets
+    runtime-v3 restore the stock model class without leaving a private attribute
+    dependency here.
+    """
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    down = expert.down_proj
+    method = getattr(down, "quant_method", None)
+    weight = getattr(down, "weight", None)
+    scale = getattr(down, "input_scale", None)
+    return (
+        isinstance(method, ModelOptFp8LinearMethod)
+        and not method.use_marlin
+        and not method.use_sm120_fp8
+        and weight is not None
+        and weight.is_cuda
+        and weight.dtype == torch.float8_e4m3fn
+        and scale is not None
+        and scale.is_cuda
+        and scale.device == weight.device
+        and scale.dtype == torch.float32
+        and tuple(scale.shape) == (1,)
+        and scale.is_contiguous()
+    )
 
 
 def routed(

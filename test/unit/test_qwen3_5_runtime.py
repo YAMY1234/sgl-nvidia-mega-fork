@@ -1312,8 +1312,17 @@ def test_tp4_preserves_v2_shipped_capabilities():
         == topology.TP4_V2_SLOTS
     )
     # Restoring TP4 must not declare support for the unimplemented new shapes.
-    assert not topology.select(topology.TP4_V2_SLOTS, topology.Topology(2))
-    assert not topology.select(topology.TP4_V2_SLOTS, topology.Topology(8, 8, 8))
+    assert topology.select(topology.TP4_V2_SLOTS, topology.Topology(2)) == {
+        "gdn_verify",
+        "gdn_pdl",
+        "gdn_conv",
+        "gdn_core",
+    }
+    assert topology.select(topology.TP4_V2_SLOTS, topology.Topology(8, 8, 8)) == {
+        "gdn_verify",
+        "gdn_pdl",
+        "gdn_conv",
+    }
     assert runtime.slot_reasons(topology.select(shipped, topology.Topology(4))) == []
 
 

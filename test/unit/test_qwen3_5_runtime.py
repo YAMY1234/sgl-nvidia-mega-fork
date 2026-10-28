@@ -14,7 +14,7 @@ from sgl_nvidia_mega import plugin
 from sgl_nvidia_mega.qwen3_5 import (
     runtime,
 )
-from sgl_nvidia_mega.qwen3_5.runtime import executor, parity
+from sgl_nvidia_mega.qwen3_5.runtime import executor, hooks, parity
 from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
 
 
@@ -194,13 +194,24 @@ def test_hook_slots_are_accepted_but_build_no_verify_width(monkeypatch):
     monkeypatch.setattr(runtime, "SLOTS", requested)
     assert runtime.slot_reasons() == []
 
+    factory = object()
+    calls = []
+    monkeypatch.setattr(
+        hooks,
+        "build",
+        lambda model, binding: calls.append((model, binding)) or factory,
+    )
+
     model = SimpleNamespace(
         model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
     )
     ctx = SimpleNamespace(
         widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
     )
-    assert runtime.build(model, ctx).summary() == "slots none (stock)"
+    built = runtime.build(model, ctx)
+    assert built.summary() == "slots none (stock)"
+    assert built.speculative_runtime_hooks is factory
+    assert calls == [(model, "EagleBinding")]
 
 
 def test_draft_fin_owns_the_exact_bf16_finalize_policy():

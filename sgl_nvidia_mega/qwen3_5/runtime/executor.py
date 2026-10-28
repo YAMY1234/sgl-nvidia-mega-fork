@@ -111,6 +111,7 @@ class Qwen35Verify:
         binding=None,
         summary: str = "",
         parity=None,
+        speculative_runtime_hooks=None,
     ):
         from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
 
@@ -119,6 +120,9 @@ class Qwen35Verify:
         self.binding = binding  # SGLang's EagleBinding (BuildContext.binding)
         self._summary = summary
         self.parity = parity  # runtime.parity.Parity under the test-only switch
+        # A factory over SGLang's stock strategy, or None.  The binding reads this
+        # optional BuiltMegakernel member once when it wires speculative verify.
+        self.speculative_runtime_hooks = speculative_runtime_hooks
         # the attention graph variants per SGLang runner ("target_verify"), which it
         # captures once it takes a megakernel's (attention/route.py)
         self.graph_variants = (

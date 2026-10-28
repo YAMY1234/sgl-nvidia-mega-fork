@@ -53,6 +53,7 @@ def build(model, ctx, *, hf_config=None):
     import torch
 
     from sgl_nvidia_mega.qwen3_5.runtime import PackageContext, parity
+    from sgl_nvidia_mega.qwen3_8.runtime import engaged
     from sgl_nvidia_mega.qwen3_8 import attention, gdn
     from sgl_nvidia_mega.qwen3_8 import plan as slot_plan
     from sgl_nvidia_mega.qwen3_8.runtime.executor import Qwen38Verify
@@ -112,6 +113,11 @@ def build(model, ctx, *, hf_config=None):
         if parity.ENABLED
         else None
     )
+    counts = (
+        engaged.Engaged(widths, OPT_IN_SLOTS, torch.cuda.current_device())
+        if engaged.ENABLED
+        else None
+    )
     on = sorted(name for name, ok in msgspec.structs.asdict(facts).items() if ok)
     return Qwen38Verify(
         model,
@@ -121,4 +127,5 @@ def build(model, ctx, *, hf_config=None):
         binding=ctx.binding,
         summary=f"slots {on or 'none (stock)'}",
         parity=checker,
+        engaged=counts,
     )

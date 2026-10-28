@@ -39,6 +39,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 
 from sgl_nvidia_mega.qwen3_5.runtime import embedding
 from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
+from sgl_nvidia_mega.qwen3_8.runtime import engaged as engaged_counts
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -145,6 +146,7 @@ class Qwen38Verify:
         binding=None,
         summary: str = "",
         parity=None,
+        engaged=None,
     ):
         from sglang.srt.models.qwen4_exp import Qwen4ExpLinearDecoderLayer
         from sgl_nvidia_mega.qwen3_8.gdn import step as gdn_step
@@ -155,6 +157,7 @@ class Qwen38Verify:
         self.binding = binding  # SGLang's generic MegakernelBinding
         self._summary = summary
         self.parity = parity  # qwen3_5.runtime.parity.Parity under the test-only switch
+        self.engaged = engaged  # runtime.engaged.Engaged under its test-only switch
         m = lm.model
         self.mixers = {
             i: (gdn_step if any(s.gdn_verify or s.gdn_mk
@@ -180,6 +183,8 @@ class Qwen38Verify:
         An argument this executor does not know also leaves the step to SGLang."""
         if self.parity is not None:
             self.parity.flush()
+        if self.engaged is not None and not forward_batch.forward_mode.is_target_verify():
+            self.engaged.flush()
         if kwargs or get_embedding or pp_proxy_tensors is not None:
             return None
         if not forward_batch.forward_mode.is_target_verify():
@@ -216,6 +221,9 @@ class Qwen38Verify:
             binding=self.binding,
             view=step.view,
         )
+        if self.engaged is not None:
+            st.scratch[engaged_counts.SCRATCH_KEY] = (self.engaged, step.rows)
+            self.engaged.add(step.rows, "step")
         hidden = self._language_model(st, embedding.embed(st))
         out = lm.logits_processor(input_ids, hidden, lm.lm_head, forward_batch, None)
         out.hidden_states = st.model.last_hc_hidden_states

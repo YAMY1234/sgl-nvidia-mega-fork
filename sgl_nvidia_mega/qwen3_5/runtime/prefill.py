@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import logging
 
+import torch
 from sglang.kernels.plugin_kernels.nvidia.spec import Step
 
 from sgl_nvidia_mega.qwen3_5.gdn import prefill as gdn_prefill
+from sgl_nvidia_mega.qwen3_5.runtime import parity
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,12 @@ SGLANG_READS = {
         "is_extend_without_speculative",
         "mrope_positions",
         "mm_inputs",
+        "tensors",
+    ),
+    "srt/layers/logits_processor.py": (
+        "next_token_logits",
+        "hidden_states",
+        "last_hidden_states",
     ),
 }
 
@@ -73,6 +81,7 @@ class Qwen35Prefill:
 
         self.lm = model
         self.enabled = enabled
+        self.parity = PrefillParity() if parity.ENABLED else None
         # Widths describe decode-graph installation; P uses the ordinary eager
         # forward wrapper and plans its actual chunk rows independently.
         self.widths = (ctx.tokens_per_request,)
@@ -105,7 +114,7 @@ class Qwen35Prefill:
         **kwargs,
     ):
         if (
-            not self.enabled
+            (not self.enabled and self.parity is None)
             or kwargs
             or get_embedding
             or forward_batch.mm_inputs
@@ -134,6 +143,25 @@ class Qwen35Prefill:
                 pp_proxy_tensors=pp_proxy_tensors,
                 **kwargs,
             )
+        if self.parity is not None:
+            stock = lambda: original(
+                input_ids,
+                positions,
+                forward_batch,
+                get_embedding=get_embedding,
+                pp_proxy_tensors=pp_proxy_tensors,
+                **kwargs,
+            )
+            candidate = (
+                (
+                    lambda: self._forward(
+                        step.view, input_ids, positions, forward_batch, pp_proxy_tensors
+                    )
+                )
+                if self.enabled
+                else stock
+            )
+            return self.parity.run(step.rows, step.view, stock, candidate)
         if not self._engaged:
             logger.info(
                 "NVIDIA megakernel: Qwen3.5 slot gdn_prefill_split_conv runs at %d rows",
@@ -197,3 +225,71 @@ class Qwen35Prefill:
             fb,
             aux if lm.capture_aux_hidden_states and len(aux) else None,
         )
+
+
+class PrefillParity:
+    """Test only: restore every state destination before the second forward.
+
+    Unlike verify, prefill updates committed SSM state as well as conv history.
+    PP inputs stay fixed for the local comparison; each PP rank checks its output.
+    """
+
+    @staticmethod
+    def _outputs(out):
+        if isinstance(out, torch.Tensor):
+            return {"tensor": out.clone()}
+        tensors = getattr(out, "tensors", None)
+        if tensors is None:
+            tensors = {
+                name: getattr(out, name, None)
+                for name in ("next_token_logits", "hidden_states", "last_hidden_states")
+            }
+        return {
+            name: value.clone()
+            for name, value in tensors.items()
+            if isinstance(value, torch.Tensor)
+        }
+
+    @staticmethod
+    def _indices(view, names):
+        rows = [view.state_indices.to(torch.long)]
+        if view.has_track:
+            rows += [
+                value.to(torch.long)
+                for name in names
+                if (value := getattr(view, name)) is not None
+            ]
+        indices = torch.cat(rows)
+        return indices[indices >= 0].unique()
+
+    def run(self, rows, view, original, candidate):
+        ci = self._indices(view, ("track_conv_dst",))
+        si = self._indices(
+            view, ("track_ssm_h_dst", "track_ssm_final_dst", "track_ssm_recompute_dst")
+        )
+        pools = [*((value, ci) for value in view.state.conv), (view.state.temporal, si)]
+        before = [value[:, indices].clone() for value, indices in pools]
+        want = self._outputs(original())
+        state_want = [value[:, indices].clone() for value, indices in pools]
+        for (value, indices), saved in zip(pools, before):
+            value[:, indices] = saved
+        got = candidate()
+        outputs = self._outputs(got)
+        assert outputs.keys() == want.keys()
+        output_differ = sum(int(parity.differing(outputs[n], want[n])) for n in want)
+        state_differ = sum(
+            int(parity.differing(value[:, indices], saved))
+            for (value, indices), saved in zip(pools, state_want)
+        )
+        logger.info(
+            "NVIDIA megakernel prefill parity rows=%d output_differ=%d "
+            "state_differ=%d outputs_compared=%d state_compared=%d",
+            rows,
+            output_differ,
+            state_differ,
+            sum(value.numel() for value in want.values()),
+            sum(value.numel() for value in state_want),
+        )
+        if output_differ or state_differ:
+            raise RuntimeError("GDN prefill output/state differs from stock")
+        return got

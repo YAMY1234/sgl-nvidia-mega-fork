@@ -1242,6 +1242,19 @@ def test_slot_topology_declarations_are_complete_and_fail_closed():
     )
 
 
+@pytest.mark.parametrize("tp,rows", [(2, 7), (2, 42), (2, 70), (4, 7), (8, 7)])
+def test_router_only_slots_cover_aggregate_and_pd_widths(tp, rows):
+    from sgl_nvidia_mega.qwen3_5 import plan, topology
+
+    requested = frozenset({"route", "route_topk", "route_gemm"})
+    assert topology.select(requested, topology.Topology(tp)) == requested
+    slots = plan.slots(rows, plan.Facts(route=True, route_topk=True, route_gemm=True))
+    assert slots.route == (rows <= 16)
+    assert slots.route_topk == (rows > 16)
+    assert not slots.mkm and not slots.mkm_m32 and not slots.mkm_m64
+    assert not topology.select(requested, topology.Topology(8, 8, 8))
+
+
 def test_unsupported_specialization_does_not_disable_a_supported_slot(monkeypatch):
     from sgl_nvidia_mega.qwen3_5 import topology
 

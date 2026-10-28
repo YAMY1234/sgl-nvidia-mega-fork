@@ -71,6 +71,13 @@ SLOT_TOPOLOGIES.update(
     gdn_commit=TOPOLOGIES,
     sharded_gumbel=TOPOLOGIES,
 )
+# Router-only fronts leave expert GEMMs with the stock TRTLLM runner. Their
+# 4096-hidden / 512-expert routing does not depend on TP's intermediate width.
+SLOT_TOPOLOGIES.update(
+    route=frozenset({"tp2", "tp4", "tp8", "tep8"}),
+    route_topk=frozenset({"tp2", "tp4", "tp8", "tep8"}),
+    route_gemm=frozenset({"tp2", "tp4", "tp8", "tep8"}),
+)
 
 
 class Topology(msgspec.Struct, frozen=True):

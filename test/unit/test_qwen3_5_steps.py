@@ -2681,6 +2681,35 @@ def test_tp2_mka_keeps_the_stock_projection_weights(monkeypatch):
     assert mka.pack(layer) == ""
 
 
+@pytest.mark.parametrize("missing", ["mka", "skv2"])
+def test_an_unavailable_attention_slot_keeps_the_independent_slot(monkeypatch, missing):
+    """A head shape or projection format rejected by one slot must not disable
+    the other's attention path."""
+    from sgl_nvidia_mega.qwen3_5.attention import mka, split_kv
+
+    layer = qwen3_5.Qwen3_5AttentionDecoderLayer.__new__(
+        qwen3_5.Qwen3_5AttentionDecoderLayer
+    )
+    torch.nn.Module.__init__(layer)
+    layer.attn = SimpleNamespace()
+    model = SimpleNamespace(
+        is_mrope_enabled=True,
+        model=SimpleNamespace(start_layer=0, end_layer=1, layers=[layer]),
+    )
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"mka", "skv2"}))
+    monkeypatch.setattr(
+        mka, "unsupported", lambda _: "projection format" if missing == "mka" else ""
+    )
+    monkeypatch.setattr(
+        split_kv, "unsupported", lambda *_: "head shape" if missing == "skv2" else ""
+    )
+    monkeypatch.setattr(mka, "pack", lambda *a, **k: "")
+    bound = attention.build(model, SimpleNamespace(tokens_per_request=7))
+    assert bound.mka is (missing != "mka")
+    assert bound.skv2 is (missing != "skv2")
+    assert bound.reason
+
+
 class _Exit:
     def __init__(self, log, defer):
         self.log, self.defer_moe_finalize = log, defer

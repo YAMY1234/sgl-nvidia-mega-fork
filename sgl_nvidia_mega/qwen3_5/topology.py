@@ -71,6 +71,12 @@ SLOT_TOPOLOGIES.update(
     gdn_commit=TOPOLOGIES,
     sharded_gumbel=TOPOLOGIES,
 )
+# ATTN: the generic front uses stock projection GEMMs on TP2 and DEP8.
+SLOT_TOPOLOGIES.update(
+    mka=TOPOLOGIES,
+    skv2=frozenset({"tp4", "tp8", "tep8"}),
+    skv2_cp=frozenset({"tp4", "tp8", "tep8"}),
+)
 
 
 class Topology(msgspec.Struct, frozen=True):

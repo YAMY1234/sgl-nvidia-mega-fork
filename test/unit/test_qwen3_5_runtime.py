@@ -20,8 +20,13 @@ from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
 
 @pytest.fixture(autouse=True)
 def registered(monkeypatch):
+    from sglang.srt.kernel_plugins.nvidia import binding as plugin_binding
+
     monkeypatch.setattr(registry, "_REGISTRY", {})
     monkeypatch.delenv(plugin.PARITY_SORT_ENV, raising=False)
+    monkeypatch.setattr(
+        plugin_binding, "megakernel_agree", lambda *args, **kwargs: None
+    )
     plugin.register()
     # the target and draft builds read moe_ep_size (expert parallelism); no process groups here
     monkeypatch.setattr(
@@ -75,6 +80,113 @@ def test_the_default_policy_ships_only_bitwise_shape_bounded_paths(monkeypatch):
 def test_an_explicit_empty_policy_keeps_every_slot_off(monkeypatch):
     monkeypatch.setenv(runtime.SLOTS_ENV, "")
     assert runtime._requested_slots() == frozenset()
+
+
+def test_cp_slots_build_the_plugin_state_before_validation(monkeypatch):
+    from sglang.srt.kernel_plugins.nvidia import binding as plugin_binding
+
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    built = object()
+    calls = []
+    agreements = []
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"draft_q1_cp"}))
+    monkeypatch.setattr(
+        plugin_binding,
+        "megakernel_agree",
+        lambda value, *, what: agreements.append((value, what)),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(
+        CpLite,
+        "maybe_create",
+        lambda binding, device: calls.append((binding, device)) or built,
+    )
+
+    binding = SimpleNamespace(page_size=64, tp_size=8)
+    runtime.build_cp_lite(binding)
+
+    assert agreements == [
+        (("draft_q1_cp",), "Qwen3.5 CP slots requested"),
+        ((64, 8), "Qwen3.5 CP page size and TP size"),
+    ]
+    assert calls == [(binding, torch.device("cuda", 3))]
+
+
+def test_cp_slots_refuse_an_incompatible_page_or_topology(monkeypatch):
+    from sglang.srt.kernel_plugins.nvidia import binding as plugin_binding
+
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2_cp"}))
+    monkeypatch.setattr(
+        plugin_binding, "megakernel_agree", lambda *args, **kwargs: None
+    )
+    with pytest.raises(RuntimeError, match="page size 64"):
+        runtime.build_cp_lite(SimpleNamespace(page_size=32, tp_size=8))
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(CpLite, "maybe_create", lambda binding, device: None)
+    with pytest.raises(RuntimeError, match="Q/KV-head topology"):
+        runtime.build_cp_lite(SimpleNamespace(page_size=64, tp_size=8))
+
+
+@pytest.mark.parametrize(
+    "tp, rank, want",
+    [(4, 3, (3, 4, 2, 8)), (8, 7, (7, 8, 4, 4))],
+)
+def test_cp_state_uses_the_pinned_qwen35_head_topology(monkeypatch, tp, rank, want):
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    calls = []
+    group = object()
+    binding = SimpleNamespace(
+        tp_size=tp,
+        tp_rank=rank,
+        tp_device_group=group,
+    )
+    monkeypatch.setattr(CpLite, "_instance", None)
+    monkeypatch.setattr(
+        CpLite,
+        "__init__",
+        lambda self, got_group, got_rank, got_tp, cp, hq, device: calls.append(
+            (got_group, got_rank, got_tp, cp, hq, device)
+        ),
+    )
+
+    made = CpLite.maybe_create(binding, torch.device("cuda", 0))
+
+    assert isinstance(made, CpLite)
+    assert calls == [(group, *want, torch.device("cuda", 0))]
+
+
+def test_requested_cp_state_does_not_restore_a_device_length_gate():
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    cp = CpLite.__new__(CpLite)
+    cp.min_kv = {}
+    cp.gate_max = False
+
+    assert [cp._gate_thr(batch) for batch in (2, 4, 16)] == [None, None, None]
+
+
+def test_cp_gate_epilogue_offer_is_consumed_once():
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    cp = CpLite.__new__(CpLite)
+    cp._gate_epilogue = None
+    cp._gate_epilogue_done = False
+    gate, scale, out = object(), object(), object()
+
+    cp.offer_gate_epilogue(gate, scale, out)
+    assert cp._gate_epilogue == (gate, scale, out)
+    assert not cp.take_gate_epilogue()
+    assert cp._gate_epilogue is None
+
+    cp.offer_gate_epilogue(gate, scale, out)
+    cp._gate_epilogue_done = True
+    assert cp.take_gate_epilogue()
+    assert not cp.take_gate_epilogue()
 
 
 def test_runtime_only_slots_are_accepted_but_not_built_by_the_plugin(monkeypatch):
@@ -233,6 +345,7 @@ def test_slot_skv2_cp_builds_as_a_graph_variant_of_slot_skv2(monkeypatch):
     from sgl_nvidia_mega.qwen3_5.attention import split_kv
 
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2", "skv2_cp"}))
+    monkeypatch.setattr(runtime, "build_cp_lite", lambda binding: None)
     monkeypatch.setattr(split_kv, "cp_reason", lambda: "")
     model = SimpleNamespace(
         model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
@@ -399,6 +512,7 @@ def test_the_cp_slots_offer_the_draft_runners_a_cp_variant(monkeypatch):
 
     slots = {"draft_loop", "draft_q1", "draft_q1_cp", "draft_extend", "draft_skv2"}
     monkeypatch.setattr(runtime, "SLOTS", frozenset(slots | {"draft_skv2_cp"}))
+    monkeypatch.setattr(runtime, "build_cp_lite", lambda binding: None)
     assert runtime.slot_reasons() == []
     built = draft.SPEC.build("lm", SimpleNamespace(context_len=4096), _draft_ctx())
     loop = built.graph_variants["draft_loop"]

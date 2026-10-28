@@ -418,8 +418,8 @@ class DraftExtendSplitKV:
 class DraftCP:
     """Slots draft_q1_cp / draft_skv2_cp: in the draft loop's ``Q1_CP`` and the draft
     extend's ``SPLIT_KV_CP`` graph variants (one request past its measured crossover),
-    the decode of the request's rows as CP-lite, which then serves one request
-    (SGLang's q35_cp_lite through ``attention.split_kv.cp_core``'s call). Slot
+    the decode of the request's rows as the plugin's CP-lite, which then serves one
+    request through ``attention.split_kv.cp_core``. Slot
     draft_multi also preserves CP-lite on multi-request graphs where SGLang built it;
     CP-lite's own shape gate decides whether it runs."""
 

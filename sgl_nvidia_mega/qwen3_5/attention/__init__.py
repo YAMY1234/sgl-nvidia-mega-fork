@@ -137,9 +137,9 @@ def step(layer, x, st):
         q, k, v, gate = layer._prepare_qkv_gate(
             positions=st.positions, hidden_states=x, forward_batch=st.fb
         )
-    if st.slots.skv2:
-        from sgl_nvidia_mega.qwen3_5.attention import split_kv
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
 
+    if st.slots.skv2 or split_kv.cp_multi(q.shape[0]):
         o = split_kv.attend(layer.attn, q, k, v, st)
     else:
         o = layer.attn(q, k, v, st.fb)

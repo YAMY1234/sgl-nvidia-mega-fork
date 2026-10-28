@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # the KV-length graph variants of the draft loop (2.2's graph_variants.Q1_STOCK /
 # Q1_LONG): trtllm-gen below Q1_MIN_LENGTH, SKV2-Q1 from it (2.2's
-# SGLANG_Q35MF_MKA_Q1_MIN_LENGTH default, which its TP8 serving configuration keeps)
+# the source branch's default Q1 threshold, which its TP8 serving configuration keeps)
 Q1_STOCK, Q1_LONG = "q1_stock", "q1_long"
 Q1_MIN_LENGTH = 16384
 # slot draft_q1_cp: one request past attention.route.CP_MIN_KV["draft"] runs its steps'

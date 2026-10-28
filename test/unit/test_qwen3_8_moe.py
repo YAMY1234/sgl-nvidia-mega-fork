@@ -102,3 +102,69 @@ def test_native_single_row_decode_communicator_is_preserved():
     hidden = OwedOutput(Contribution(torch.empty(1, 2560, dtype=torch.bfloat16), None))
     assert ffn(layer, hidden, st) == "native"
     layer._run_ffn_stage.assert_called_once_with(hidden, st.fb)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("shared_slot", [False, True])
+@pytest.mark.parametrize("defer", [False, True])
+def test_engaged_marks_only_dispatched_moe_slots(fused, shared_slot, defer):
+    from sgl_nvidia_mega.qwen3_8.moe import step as module
+    from sgl_nvidia_mega.qwen3_8.runtime import engaged
+    from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
+        MoeDeferredFinalize,
+    )
+
+    x = torch.empty(4, 2560, dtype=torch.bfloat16)
+    shared = torch.empty_like(x)
+    routed = torch.empty_like(x)
+    raw = object()
+    events = []
+    mlp = NS(
+        alt_stream=None,
+        shared_expert=object(),
+        shared_expert_gate=NS(weight=torch.empty(1, 2560, dtype=torch.bfloat16)),
+        _forward_shared_experts=Mock(return_value=shared),
+        _gate_shared_output_out_of_place=Mock(return_value=shared),
+    )
+    st = NS(
+        slots=plan.Slots(route=True, mkm=fused, route_shared=shared_slot),
+        bound={"moe": NS(mkm={0: object()})},
+        scratch={},
+    )
+
+    def producer(*args):
+        events.append("producer")
+        return raw
+
+    def shared_producer(*args):
+        return producer(), object()
+
+    def experts(*args, **kwargs):
+        events.append("experts")
+        assert kwargs["fused"] is fused
+        return routed
+
+    def mark(state, slot):
+        assert state is st
+        assert "producer" in events
+        if slot == "mkm":
+            assert "experts" in events
+        events.append(slot)
+
+    with (
+        patch.object(module.route, "produce", side_effect=producer),
+        patch.object(module.route, "produce_shared", side_effect=shared_producer),
+        patch.object(module.route, "shared_expert_tail", return_value=shared),
+        patch.object(module.route, "routed", side_effect=experts),
+        patch.object(engaged, "mark", side_effect=mark),
+        patch("sglang.kernels.ops.elementwise.elementwise.fused_gate_sigmoid_mul_add"),
+        patch.object(MoeDeferredFinalize, "from_flashinfer", return_value="deferred"),
+    ):
+        result = module.step(NS(mlp=mlp), x, st, defer=defer)
+    assert events.count("route") == 1
+    assert events.count("route_shared") == int(shared_slot)
+    assert events.count("mkm") == int(fused)
+    if defer:
+        assert result == "deferred"
+    else:
+        assert result.shape == (4, 2560)

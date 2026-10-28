@@ -5,6 +5,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import pytest
+import torch
 from sgl_nvidia_mega.qwen3_8 import runtime
 from sgl_nvidia_mega.qwen3_8.moe.route import Bound
 from sgl_nvidia_mega.qwen3_5.runtime import parity
@@ -29,6 +30,7 @@ def test_requested_gdn_and_moe_survive_build_and_plan(gdn_slot):
         norm=NS(activation="sigmoid", group_size=None, norm_before_gate=True),
         out_proj=NS(reduce_results=False, input_is_parallel=True, bias=None),
         attn_tp_size=4,
+        _fused_in_proj_weight=torch.empty(4120, 2560, dtype=torch.bfloat16),
         attn=NS(layer_id=0),
     )
     model = NS(config=config, model=NS(layers=[NS(linear_attn=linear)]))

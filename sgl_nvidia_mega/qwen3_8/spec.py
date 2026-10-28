@@ -75,7 +75,15 @@ REQUIREMENTS = Requirements(
 
 # A numeric slot's outputs are held to fp64 on the same operands (test/kernels), at
 # most these multiples of the error of SGLang's own op; every other slot is bitwise.
-NUMERIC_TOLERANCES: dict[str, dict[str, float]] = {}
+NUMERIC_TOLERANCES: dict[str, dict[str, float]] = {
+    "gdn_front": {
+        "gdn_front.in_proj_qkvz.rel_l2_vs_stock": 1.05,
+        "gdn_front.in_proj_qkvz.max_abs_vs_stock": 2.0,
+        "gdn_front.in_proj_ba.rel_l2_vs_stock": 1.05,
+        "gdn_front.in_proj_ba.max_abs_vs_stock": 2.0,
+    },
+    # gdn_mk is not offered until its FP64 single/2048-step errors are measured.
+}
 
 
 def numerics(slots) -> Numerics:
@@ -95,7 +103,12 @@ NUMERICS = numerics(runtime.SLOTS)
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    return runtime.slot_reasons()
+    reasons = runtime.slot_reasons()
+    if runtime.SLOTS & {"gdn_verify", "gdn_pdl", "gdn_front"}:
+        from sgl_nvidia_mega.qwen3_8.gdn.config import config_disable_reasons
+        # Verify row count comes from BuildContext in gdn.build, not a constant.
+        reasons += config_disable_reasons(hf_config, None, cfg.tp_size)
+    return reasons
 
 
 def _build(model, hf_config, ctx):

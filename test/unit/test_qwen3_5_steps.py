@@ -121,7 +121,7 @@ def _moe_block(log, x, *, alt_stream=True, shared=True, deferred_ok=True):
     mlp = qwen2_moe.Qwen2MoeSparseMoeBlock.__new__(qwen2_moe.Qwen2MoeSparseMoeBlock)
     torch.nn.Module.__init__(mlp)
     bypassed = SimpleNamespace(format="bypassed")
-    routed = torch.zeros(7, 4)
+    routed = torch.zeros(x.shape[0], 4)
     log.known["routed"] = routed
     experts = _Callable(
         log.op("experts", routed),
@@ -135,7 +135,10 @@ def _moe_block(log, x, *, alt_stream=True, shared=True, deferred_ok=True):
         _use_mega_moe=False,
         layer_id=3,
         gate=_Callable(log.op("gate", ("logits", None))),
-        topk=_Callable(log.op("topk", bypassed)),
+        topk=_Callable(
+            log.op("topk", bypassed),
+            empty_topk_output=log.op("empty_topk", bypassed),
+        ),
         experts=experts,
         shared_expert=_Callable(log.op("shared", "shared_out")) if shared else None,
         shared_expert_gate=_Callable(
@@ -207,6 +210,40 @@ def test_the_moe_step_issues_what_sglang_issues(capture, defer, alt_stream):
     (want_log, want), (got_log, got) = runs
     assert got_log == want_log
     assert want == got if not isinstance(want, torch.Tensor) else torch.equal(want, got)
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("alt_stream", [False, True])
+def test_empty_dp_rank_skips_gate_and_shared_but_runs_experts(capture, alt_stream):
+    runs = []
+    for which in ("sglang", "plugin"):
+        x = torch.zeros(0, 4)
+        log = _log(x=x)
+        mlp = _moe_block(log, x, alt_stream=alt_stream)
+        with _streams(log, capture), _moe_kernels(log):
+            if which == "sglang":
+                out = mlp.forward(x, None)
+            else:
+                out = moe.step(SimpleNamespace(mlp=mlp), x, _st(), defer=False)
+        runs.append((log, out))
+    (want_log, want), (got_log, got) = runs
+    assert got_log == want_log
+    assert [entry[0] for entry in got_log] == ["empty_topk", "experts"]
+    assert want.shape == got.shape == (0, 4)
+
+
+@pytest.mark.parametrize("which", ["sglang", "plugin"])
+def test_empty_dp_rank_rejects_deferred_finalize_before_any_op(which):
+    x = torch.zeros(0, 4)
+    log = _log(x=x)
+    mlp = _moe_block(log, x)
+    with _streams(log, True), _moe_kernels(log):
+        with pytest.raises(RuntimeError, match="does not support M=0"):
+            if which == "sglang":
+                mlp.forward(x, None, defer_finalize=True)
+            else:
+                moe.step(SimpleNamespace(mlp=mlp), x, _st(), defer=True)
+    assert not log
 
 
 def _st(route=False):
@@ -674,7 +711,7 @@ def test_the_draft_mkm_uses_the_complete_slot_schema(monkeypatch):
     assert not slots.route_lin and not slots.route_pre_topk
 
 
-def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch):
+def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch, caplog):
     from sgl_nvidia_mega.qwen3_5.moe import route
 
     mlp = _moe_block(_log(), torch.zeros(7, 4))
@@ -689,22 +726,129 @@ def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch):
         "sglang.srt.runtime_context.get_parallel",
         lambda: SimpleNamespace(tp_size=8, moe_ep_size=1),
     )
-    ctx = SimpleNamespace(widths=(7,), tokens_per_request=7, deadline_s=60.0)
+    ctx = SimpleNamespace(
+        widths=(7,), tokens_per_request=7, deadline_s=60.0, binding=None
+    )
     want = "layer 0: router gate torch.float16 (512, 4096)"
     assert route.build(model, 7, fused=False).reason == want
-    with pytest.raises(
-        RuntimeError, match="requested slots \\['route'\\] built no width"
-    ):
-        runtime.build(model, ctx)
+    with caplog.at_level("INFO"):
+        built = runtime.build(model, ctx)
+    assert built.slots == {7: plan.Slots()}
+    assert "none (stock)" in built.summary()
+    assert "requested slots ['route'] use stock" in caplog.text
+    assert want in caplog.text
 
 
-def _gdn_module(log, x):
+def _gdn_build_model():
+    layer = qwen3_5.Qwen3_5LinearDecoderLayer.__new__(qwen3_5.Qwen3_5LinearDecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer.linear_attn = SimpleNamespace(
+        attn=SimpleNamespace(layer_id=0, num_k_heads=2, num_v_heads=8),
+        norm=SimpleNamespace(weight=torch.ones(128)),
+        out_proj=SimpleNamespace(weight=torch.ones(4, 4)),
+    )
+    return SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=1, layers=[layer])
+    )
+
+
+@pytest.mark.parametrize("tokens,reason", [(6, "6 rows a request"), (7, "TP 4")])
+def test_optional_gdn_front_falls_back_without_disabling_verify(
+    monkeypatch, tokens, reason
+):
+    from sgl_nvidia_mega.qwen3_5.gdn import front, verify
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core
+
+    model = _gdn_build_model()
+    monkeypatch.setattr(
+        runtime,
+        "SLOTS",
+        frozenset(
+            {
+                "gdn_verify",
+                "gdn_pdl",
+                "gdn_conv",
+                "gdn_core",
+                "gdn_front",
+                "gdn_trt_front",
+            }
+        ),
+    )
+    monkeypatch.setattr(verify, "unsupported", lambda _: "")
+    monkeypatch.setattr(front, "unsupported", lambda _: "TP 4")
+    monkeypatch.setattr(
+        front, "build", lambda *a: pytest.fail("unsupported front built")
+    )
+    monkeypatch.setattr(torch, "zeros", lambda *a, **kw: pytest.fail("front allocated"))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    compiled = []
+    monkeypatch.setattr(core, "build", lambda *a: compiled.append(a))
+
+    bound = gdn.build(model, SimpleNamespace(tokens_per_request=tokens))
+
+    assert bound.gdn_verify and bound.gdn_pdl and bound.gdn_conv and bound.gdn_core
+    assert bound.front == {} and bound.error is None and not bound.gdn_trt_front
+    assert reason in bound.reason
+    assert "gdn_trt_front: requires supported gdn_front and gdn_core" in bound.reason
+    assert compiled == [(0, tokens, 2, 8, True)]
+
+
+@pytest.mark.parametrize("bad_slot", ["gdn_push", "route_lin"])
+def test_optional_gdn_push_or_route_lin_falls_back_independently(monkeypatch, bad_slot):
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop
+
+    model = _gdn_build_model()
+    monkeypatch.setattr(
+        runtime, "SLOTS", frozenset({"gdn_verify", "gdn_pdl", "gdn_push", "route_lin"})
+    )
+    monkeypatch.setattr(verify, "unsupported", lambda _: "")
+
+    def pack(weight):
+        if bad_slot == "gdn_push":
+            raise ValueError("unsupported out_proj shape")
+        return "packed"
+
+    monkeypatch.setattr(hop, "pack_out_proj", pack)
+    checked = []
+    monkeypatch.setattr(
+        gdn, "_route_lin", lambda *a: checked.append(True) or ({}, "TP 4")
+    )
+
+    bound = gdn.build(model, SimpleNamespace(tokens_per_request=7))
+
+    assert bound.gdn_verify and bound.gdn_pdl and bound.rlin == {}
+    assert bad_slot in bound.reason
+    if bad_slot == "gdn_push":
+        assert bound.packed == {} and not checked
+        assert "route_lin: requires supported gdn_push" in bound.reason
+    else:
+        assert bound.packed == {0: "packed"} and checked == [True]
+        assert "route_lin: TP 4" in bound.reason
+
+
+def test_gdn_front_compilation_failure_is_not_treated_as_unsupported(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.gdn import front, verify
+
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"gdn_verify", "gdn_front"}))
+    monkeypatch.setattr(verify, "unsupported", lambda _: "")
+    monkeypatch.setattr(front, "unsupported", lambda _: "")
+
+    def compile_front(*args):
+        raise RuntimeError("front compilation failed")
+
+    monkeypatch.setattr(front, "build", compile_front)
+    with pytest.raises(RuntimeError, match="front compilation failed"):
+        gdn.build(_gdn_build_model(), SimpleNamespace(tokens_per_request=7))
+
+
+def _gdn_module(log, x, core_rows=7):
     """A Qwen3_5GatedDeltaNet whose projections, backend call, norm and out_proj log."""
     mod = qwen3_5.Qwen3_5GatedDeltaNet.__new__(qwen3_5.Qwen3_5GatedDeltaNet)
     torch.nn.Module.__init__(mod)
     qkvz, ba = torch.zeros(7, 10), torch.zeros(7, 2)
     z = torch.zeros(7, 2, 3)
-    core = torch.zeros(7, 2, 3)
+    core = torch.ones(core_rows, 2, 3)
     log.known.update(qkvz=qkvz, ba=ba, z=z, core=core)
     mod.__dict__.update(
         num_k_heads=16,
@@ -722,12 +866,21 @@ def _gdn_module(log, x):
 
 
 @pytest.mark.parametrize("packed_verify", [False, True])
-def test_the_gdn_step_issues_what_sglang_issues(packed_verify):
+@pytest.mark.parametrize("core_rows", [0, 3, 7])
+def test_the_gdn_step_issues_what_sglang_issues(packed_verify, core_rows):
     runs = []
     for which in ("sglang", "plugin"):
         x = torch.zeros(7, 4)
         log = _log(x=x)
-        mod, split = _gdn_module(log, x)
+        mod, split = _gdn_module(log, x, core_rows=core_rows)
+        norm_inputs = []
+        norm = mod.norm
+
+        def checked_norm(core, z):
+            norm_inputs.append(core.clone())
+            return norm(core, z)
+
+        mod.norm = checked_norm
         backend = SimpleNamespace(
             linear_attn_backend=SimpleNamespace(supports_packed_verify=packed_verify)
         )
@@ -763,13 +916,18 @@ def test_the_gdn_step_issues_what_sglang_issues(packed_verify):
                     out = gdn.step(SimpleNamespace(linear_attn=mod), x, st)
             except (NotImplementedError, RuntimeError, AttributeError) as e:
                 out = type(e).__name__
-        runs.append((log, out))
-    (want_log, want), (got_log, got) = runs
+        runs.append((log, out, norm_inputs))
+    (want_log, want, want_norm), (got_log, got, got_norm) = runs
     if packed_verify:
         # SGLang folds the split and conv into such a backend; the step refuses it
         assert got == "NotImplementedError" and want != got
         return
     assert got_log == want_log and want == got == "out"
+    assert len(want_norm) == len(got_norm) == 1
+    assert torch.equal(got_norm[0], want_norm[0])
+    assert got_norm[0].shape == (14, 3)
+    assert torch.equal(got_norm[0][: core_rows * 2], torch.ones(core_rows * 2, 3))
+    assert torch.equal(got_norm[0][core_rows * 2 :], torch.zeros(14 - core_rows * 2, 3))
 
 
 def _gdn_verify_setup(log, *, ring_len=16, temporal_dtype=torch.bfloat16, draft=7):
@@ -2573,10 +2731,12 @@ class _MoeBlock(qwen2_moe.Qwen2MoeSparseMoeBlock):
         return "moe_out"
 
 
-def _decoder_layer(kind, log, defer):
+def _decoder_layer(kind, log, defer, rows=7, tuple_input=False):
     layer = kind.__new__(kind)
     torch.nn.Module.__init__(layer)
-    a_in, m_in = torch.zeros(7, 4), torch.zeros(7, 4)
+    a_in, m_in = torch.zeros(rows, 4), torch.zeros(rows, 4)
+    if tuple_input:
+        a_in = (a_in, "scale")
     log.known.update(a_in=a_in, m_in=m_in)
     layer.mlp = _MoeBlock(log)
     layer.__dict__.update(
@@ -2598,12 +2758,16 @@ def _decoder_layer(kind, log, defer):
     "kind", [qwen3_5.Qwen3_5LinearDecoderLayer, qwen3_5.Qwen3_5AttentionDecoderLayer]
 )
 @pytest.mark.parametrize("defer", [False, True])
-def test_a_layer_runs_what_sglangs_decoder_layer_runs(kind, defer):
-    batch = SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: False))
+@pytest.mark.parametrize("rows,idle", [(7, False), (0, False), (7, True), (0, True)])
+@pytest.mark.parametrize("tuple_input", [False, True])
+def test_a_layer_runs_what_sglangs_decoder_layer_runs(
+    kind, defer, rows, idle, tuple_input
+):
+    batch = SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: idle))
     runs = []
     for which in ("sglang", "plugin"):
         log = _log(hidden="hidden", batch=batch, positions="pos", h1="h1", part="part")
-        layer = _decoder_layer(kind, log, defer)
+        layer = _decoder_layer(kind, log, defer, rows=rows, tuple_input=tuple_input)
         if which == "sglang":
             out = layer.forward(
                 positions="pos",
@@ -2628,6 +2792,7 @@ def test_a_layer_runs_what_sglangs_decoder_layer_runs(kind, defer):
         runs.append((log, out))
     (want_log, want), (got_log, got) = runs
     assert got_log == want_log and want == got == "layer_out"
+    assert any(entry[0] == "mixer" for entry in got_log) == (rows > 0 and not idle)
 
 
 def test_the_layer_loop_opens_the_stream_scopes_each_layer_and_closes_it(monkeypatch):

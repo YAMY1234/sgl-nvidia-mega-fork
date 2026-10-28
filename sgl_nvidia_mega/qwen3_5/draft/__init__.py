@@ -214,6 +214,7 @@ def _build(model, hf_config, ctx) -> MtpDraft:
     from sgl_nvidia_mega.qwen3_5 import runtime
 
     runtime.apply_expert_parallel(get_parallel().moe_ep_size)
+    runtime.apply_topology(get_parallel())
     return MtpDraft(
         model,
         binding=ctx.binding,

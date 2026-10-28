@@ -76,6 +76,52 @@ SLOT_TOPOLOGIES = {
         "draft_skv2_cp",
     )
 }
+# a9212216c6 already serves these TP4 shapes. Preserve that baseline support:
+# MoE's small engine accepts I=256, GDN uses the layer's local head counts,
+# the hop serves world 4, attention serves 8 Q / 1 KV heads, and the draft's
+# exchange/embedding kernels serve world 4. Each package keeps its shape checks.
+# The I=128-only wide MoE engines, TP8 GDN fronts and TP8 router-lin stay excluded.
+TP4_V2_SLOTS = frozenset(
+    {
+        "route",
+        "route_topk",
+        "route_gemm",
+        "mkm",
+        "gdn_verify",
+        "gdn_pdl",
+        "gdn_conv",
+        "gdn_core",
+        "gdn_push",
+        "hop",
+        "hop_mid",
+        "hop_fp8",
+        "route_shared",
+        "skv2",
+        "skv2_cp",
+        "mka",
+        "mka_push",
+        "lowm_in",
+        "lowm_out",
+        "lowm_se",
+        "lowm_push",
+        "draft_loop",
+        "draft_extend",
+        "draft_moe",
+        "draft_q1",
+        "draft_xchg",
+        "draft_hop",
+        "draft_fin",
+        "draft_front",
+        "draft_skv2",
+        "draft_multi",
+        "draft_embed",
+        "draft_q1_cp",
+        "draft_skv2_cp",
+    }
+)
+for name in TP4_V2_SLOTS:
+    SLOT_TOPOLOGIES[name] = SLOT_TOPOLOGIES[name] | {"tp4"}
+
 # These names select coverage or SGLang's own runtime policy, not a plugin kernel.
 SLOT_TOPOLOGIES.update(
     multi_request=TOPOLOGIES,

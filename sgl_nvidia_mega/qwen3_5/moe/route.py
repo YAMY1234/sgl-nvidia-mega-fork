@@ -76,6 +76,9 @@ SGLANG_READS = {
         "TopKOutputChecker",
         "format_is_bypassed",
         "StandardTopKOutput",
+        "TopKOutputFormat",
+        "BYPASSED",
+        "output_format",
     ),
     "srt/layers/moe/fused_moe_triton/layer.py": (
         "dispatcher",
@@ -282,6 +285,7 @@ def build_m32(
 def unsupported(mlp) -> str:
     """Why the router front cannot stand in for ``mlp``'s gate and the runner's input
     quantizer ("" when it can)."""
+    from sglang.srt.layers.moe.topk import TopKOutputFormat
     from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 
     from sgl_nvidia_mega.qwen3_5.sm103.moe import router
@@ -301,23 +305,24 @@ def unsupported(mlp) -> str:
         return "per-token activation scales"
     if not mlp.supports_deferred_finalize:
         return "no deferred finalize"
+    # TopK binds None to BYPASSED for the TRTLLM runner during model setup.
+    # Check the bound contract, before compiling or claiming engagement.
+    if mlp.topk.topk_config.output_format != TopKOutputFormat.BYPASSED:
+        return "the router front requires logits-based bypassed TopK"
     return ""
 
 
 def topk_unsupported(model) -> str:
     """Why slot route_topk cannot serve every MoE layer of ``model`` ("" when it can):
-    the router front's gate and input quantizer, and the trtllm-gen weights with a
-    softmax top-10 renormalized over 512 experts. Under expert parallelism only the
-    materialized-routing contract applies; the plugin's full-expert engines do not."""
+    the router front's gate and input quantizer, and a softmax top-10 renormalized
+    over 512 experts. The stock runner owns the expert GEMMs: TP2's intermediate
+    of 512 does not need a matching mkm engine."""
     from sgl_nvidia_mega.qwen3_5.moe import mkm
 
     m = model.model
     for i in range(m.start_layer, m.end_layer):
         mlp = m.layers[i].mlp
-        expert_parallel = mlp.experts.num_local_experts != mlp.experts.num_experts
-        reason = unsupported(mlp) or (
-            mkm.routing_unsupported(mlp) if expert_parallel else mkm.unsupported(mlp)
-        )
+        reason = unsupported(mlp) or mkm.routing_unsupported(mlp)
         if reason:
             return f"layer {i}: {reason}"
     return ""

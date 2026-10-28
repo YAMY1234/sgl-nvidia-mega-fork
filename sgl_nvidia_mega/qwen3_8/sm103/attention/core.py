@@ -232,6 +232,8 @@ def run_gated(q, k_pool, v_pool, k_new, v_new, loc, req_to_token, row_requests,
         partial, maximum, sums, output, gate, gate.stride(0),
         gate.stride(1) if gate.ndim == 3 else 256,
         nt, triton.next_power_of_2(nt), qheads, kvheads, qheads // kvheads,
-        num_warps=4, launch_pdl=True,
+        # One warp keeps scalar reductions out of shared scratch. The old
+        # four-warp layout had redundant writers with unequal FP32 sums.
+        num_warps=1, launch_pdl=True,
     )
     return output

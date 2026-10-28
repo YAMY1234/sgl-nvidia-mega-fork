@@ -76,8 +76,8 @@ The remaining kernel families are opt-in through that one slot policy. These cha
 `mka` uses the fused projection kernels through 14 verify rows on TP8 and 8 on
 TP4. At wider rows, and at every TP2 width, it keeps SGLang's projection GEMMs
 and fuses Q/K normalization, RoPE and the FP8 KV write, then the output gate
-and static FP8 quantization. TP2 has 16 query heads and two KV heads per rank;
-TP4 has 8/1 and TP8 has 4/1. The same front path serves PD decode TP2.
+and static FP8 quantization. TP2 has 16 query heads and one KV head per rank;
+TP4 has 8/1 and TP8 has 4/1. The same front path serves PD decode TP2 and DEP8 (32/2 per rank).
 `multi_request` coverage is required for more than one request. `skv2` keeps
 its one-request, one-KV-head scope; `skv2_cp` additionally requires replicated
 KV heads across ranks.

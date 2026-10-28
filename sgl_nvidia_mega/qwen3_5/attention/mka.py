@@ -17,7 +17,7 @@ the MoE input's all-reduce will run the hop for them, and that all-reduce only c
 (the branch's MKA_PUSH).
 
 Steps of several requests (with ``multi_request``): TP8 uses the fused entries through
-14 rows, TP4 through 8, and TP2 always uses the front path, which keeps SGLang's qkv
+14 rows, TP4 through 8, and TP2 and DEP8 always use the front path, which keeps SGLang's qkv
 and o_proj GEMMs and fuses the rest bit for bit: the q / k norm, RoPE and gate split with
 the FP8 q and K / V write in one launch (the attention front of slot ``draft_front``),
 and the output gate with o_proj's static FP8 input quantization in one launch.
@@ -107,10 +107,10 @@ def unsupported(layer) -> str:
     rope = layer.rotary_emb
     if not layer.attn_output_gate:
         return "no attention output gate"
-    if (layer.num_heads, layer.num_kv_heads) not in ((4, 1), (8, 1), (16, 2)):
+    if (layer.num_heads, layer.num_kv_heads) not in ((4, 1), (8, 1), (16, 1), (32, 2)):
         return (
             f"{layer.num_heads} query / {layer.num_kv_heads} KV heads a rank "
-            "(MKA runs 4/1, 8/1 or 16/2)"
+            "(MKA runs 4/1, 8/1, 16/1 or 32/2)"
         )
     if layer.head_dim != 256 or layer.hidden_size != 4096:
         return f"head_dim {layer.head_dim}, hidden {layer.hidden_size} (MKA runs 256, 4096)"
@@ -125,7 +125,7 @@ def unsupported(layer) -> str:
 
 def pool_reasons(kv) -> list[str]:
     """Why the prologue cannot write these KV pools ([] when it can): contiguous
-    NHD FP8 rows of one (TP8/TP4) or two (TP2) heads of 256."""
+    NHD FP8 rows of one (TP8/TP4) or two (DEP8) heads of 256."""
     for buf in (*kv.k, *kv.v):
         if (
             buf.dtype != torch.float8_e4m3fn
@@ -141,8 +141,8 @@ def pack(layer, route_lin: bool = False) -> str:
 
     Returns why its router-before-all-reduce weights cannot be packed, when requested.
     """
-    # TP2 keeps the stock GEMMs; its generic front needs no packed weights.
-    if layer.num_heads == 16:
+    # TP2 and DEP8 keep the stock GEMMs; its generic front needs no packed weights.
+    if layer.num_heads > 8:
         return _pack_route_lin(layer) if route_lin else ""
     from sgl_nvidia_mega.qwen3_5.sm103.attention import mka as kernels
 

@@ -446,7 +446,7 @@ def test_front_with_the_cache_write_replays_in_a_cuda_graph_bit_for_bit():
 
 
 @pytest.mark.parametrize("rows", [7, 14, 28, 56, 112, 224, 448, 896])
-@pytest.mark.parametrize("heads,kv_heads", [(4, 1), (8, 1), (16, 2)])
+@pytest.mark.parametrize("heads,kv_heads", [(4, 1), (8, 1), (16, 1), (32, 2)])
 def test_front_with_the_cache_write_is_sglangs_front_then_fp8_kv_write(
     rows, heads, kv_heads
 ):
@@ -492,7 +492,7 @@ def test_front_with_the_cache_write_is_sglangs_front_then_fp8_kv_write(
 
 
 @pytest.mark.parametrize("rows", [7, 14, 28, 56, 112, 224, 448, 896])
-@pytest.mark.parametrize("heads", [4, 8, 16])
+@pytest.mark.parametrize("heads", [4, 8, 16, 32])
 def test_gate_quant_is_sglangs_sigmoid_mul_then_static_quant(rows, heads):
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
     from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8

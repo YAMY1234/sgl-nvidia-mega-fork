@@ -2246,7 +2246,8 @@ def test_the_mka_slot_runs_the_prologue_the_attention_and_the_epilogue(skv2):
 
 @pytest.mark.parametrize("consumed", [False, True])
 @pytest.mark.parametrize(
-    "heads,kv_heads,rows", [(4, 21), (8, 14), (16, 7), (16, 42), (16, 70)]
+    "heads,kv_heads,rows",
+    [(4, 1, 21), (8, 1, 14), (16, 1, 7), (16, 1, 42), (16, 1, 70), (32, 2, 224)],
 )
 def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(
     consumed, heads, kv_heads, rows
@@ -2402,7 +2403,8 @@ def test_the_mka_push_slot_pushes_where_the_moe_input_only_consumes(consumes):
     [
         (dict(), ""),
         (dict(num_heads=8), ""),
-        (dict(num_heads=16, num_kv_heads=2), ""),
+        (dict(num_heads=16), ""),
+        (dict(num_heads=32, num_kv_heads=2), ""),
         (dict(attn_output_gate=False), "no attention output gate"),
         (dict(num_heads=2), "2 query / 1 KV heads a rank"),
         (dict(num_kv_heads=2), "4 query / 2 KV heads a rank"),
@@ -2509,12 +2511,12 @@ def test_the_mka_slot_names_the_pools_it_cannot_write():
 
 
 def test_tp2_mka_keeps_the_stock_projection_weights(monkeypatch):
-    """TP2's two KV heads use the generic front and cannot be packed for the
+    """TP2's sixteen query heads use the generic front and cannot be packed for the
     single-KV-head CUDA prologue, even at one request."""
     from sgl_nvidia_mega.qwen3_5.attention import mka
     from sgl_nvidia_mega.qwen3_5.sm103.attention import mka as kernels
 
-    layer = _mka_layer(_log(), None, num_heads=16, num_kv_heads=2)
+    layer = _mka_layer(_log(), None, num_heads=16, num_kv_heads=1)
     monkeypatch.setattr(
         kernels, "build", lambda _: pytest.fail("TP2 compiled fused MKA")
     )

@@ -279,6 +279,57 @@ def test_extend_mkd_head_is_the_scan_path(ranks, boundary):
             dist.barrier(group=cpu_group)
 
 
+@pytest.mark.parametrize("nan_key", ["split", "torch"])
+def test_exchange_full_row_ids_on_tp2_sized_shards(ranks, boundary, nan_key):
+    """A local winner above 65535 and NaN/tie rules survive the exchange."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, _ = ranks
+    mkd, _ = boundary
+    vocab = 124544
+    # Token-only exchange never reads the candidate payload.
+    candidates = torch.empty(vocab, H, dtype=torch.float32, device="cuda")
+    hot_ids = torch.arange(world * vocab, dtype=torch.int64, device="cuda")
+    index = torch.empty(1, 1, dtype=torch.int64, device="cuda")
+    probability = torch.empty(1, 1, dtype=torch.float32, device="cuda")
+    key = (
+        kernels.NAN_KEY_SPLIT_ARGMAX
+        if nan_key == "split"
+        else kernels.NAN_KEY_TORCH_ARGMAX
+    )
+    for case in ("high", "ties", "nan"):
+        logits = torch.zeros(1, vocab, dtype=torch.bfloat16, device="cuda")
+        logits[0, vocab - 1] = 5.0
+        if case == "ties":
+            logits[0, 65536] = 5.0
+        if case == "nan" and rank == 1:
+            logits[0, vocab - 3] = float("nan")
+        kernels.mkd_xchg(
+            logits,
+            candidates,
+            hot_ids,
+            mkd.own_partial,
+            mkd.epoch_done,
+            mkd.ext_cand,
+            mkd.ext_partials,
+            index,
+            probability,
+            None,
+            None,
+            None,
+            mkd.mc,
+            mkd.uc,
+            rank,
+            world,
+            0,
+            key,
+            token_only=True,
+            scan_part=mkd.scan_part,
+        )
+        want = _want_token(logits, group, -1e30 if nan_key == "split" else float("inf"))
+        assert int(index) == want and float(probability) == 1.0
+
+
 @pytest.mark.parametrize("m", [1, 2, 6, 7, 10, 14, 16])
 def test_split_fc_gathers_and_sums_in_rank_order(ranks, boundary, m):
     from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels

@@ -379,8 +379,10 @@ def mkd_xchg(
         fc_out = None
     _check(topk_index, "topk_index", (1, 1), torch.int64)
     _check(topk_p, "topk_p", (1, 1), torch.float32)
-    if v % 8 != 0 or v > 65536:
-        raise ValueError("mkd_xchg: local vocab must be a multiple of 8 and <= 65536")
+    if v % 8 != 0:
+        raise ValueError("mkd_xchg: local vocab must be a multiple of 8")
+    if v > 65536 and head_part is not None:
+        raise ValueError("mkd_xchg: packed head maxima require a <=65536-row shard")
     head_parts = head_part.numel() if head_part is not None else 0
     if head_parts > XCHG_THREADS:
         raise ValueError("mkd_xchg: at most one head partial per exchange thread")

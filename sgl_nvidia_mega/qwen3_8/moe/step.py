@@ -38,8 +38,10 @@ def ffn(layer, hidden, st):
     The special single-row decode communicator remains entirely native. No
     communication, HC write, or publish is performed inside the MoE slot.
     """
+    # The mixer may return an opaque OwedOutput. Only boundary.prepare may
+    # consume it; the step already owns the host-known token count.
     if not st.slots.route or (
-        hidden.shape[0] == 1 and layer._decode_moe_comm is not None
+        layer._decode_moe_comm is not None and st.input_ids.shape[0] == 1
     ):
         return layer._run_ffn_stage(hidden, st.fb)
     x = layer.ffn_boundary.prepare(hidden, st.fb)
@@ -49,6 +51,8 @@ def ffn(layer, hidden, st):
 
 
 def step(layer, x, st, *, defer):
+    from sgl_nvidia_mega.qwen3_8.runtime import engaged
+
     from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
     from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
         MoeDeferredFinalize,
@@ -64,8 +68,10 @@ def step(layer, x, st, *, defer):
     gate_up = None
     if st.slots.route_shared:
         produced, gate_up = route.produce_shared(mlp, x, bound)
+        engaged.mark(st, "route_shared")
     else:
         produced = route.produce(mlp, x, bound)
+    engaged.mark(st, "route")
 
     def shared_output(input_, *, apply_gate):
         if gate_up is None:
@@ -111,6 +117,8 @@ def step(layer, x, st, *, defer):
         routed = route.routed(
             mlp, x, bound, defer=defer, produced=produced, fused=st.slots.mkm
         )
+    if st.slots.mkm and bound.mkm:
+        engaged.mark(st, "mkm")
     if defer:
         if shared is None:
             raise RuntimeError(

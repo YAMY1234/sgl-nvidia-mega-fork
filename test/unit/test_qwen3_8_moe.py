@@ -10,6 +10,7 @@ import torch
 from sgl_nvidia_mega.qwen3_8 import plan
 from sgl_nvidia_mega.qwen3_8.moe.config import Shape, config_disable_reasons
 from sgl_nvidia_mega.qwen3_8.moe.step import ffn
+from sglang.srt.layers.layer_boundary.residual.stream import Contribution, OwedOutput
 
 
 def config(**kw):
@@ -44,10 +45,13 @@ def test_route_and_mkm_coverage_has_native_wide_fallback():
 
 
 @pytest.mark.parametrize("defer", [False, True])
-def test_ffn_exit_keeps_prepare_finalize_and_finish_order(defer):
+@pytest.mark.parametrize("opaque", [False, True])
+@pytest.mark.parametrize("communicator", [False, True])
+def test_ffn_exit_keeps_prepare_finalize_and_finish_order(defer, opaque, communicator):
     order = []
     prepared, routed, done = object(), object(), object()
-    hidden = torch.empty(4, 2560, dtype=torch.bfloat16)
+    tensor = torch.empty(4, 2560, dtype=torch.bfloat16)
+    hidden = OwedOutput(Contribution(tensor, None)) if opaque else tensor
 
     def prepare(x, fb):
         assert x is hidden
@@ -66,11 +70,15 @@ def test_ffn_exit_keeps_prepare_finalize_and_finish_order(defer):
         return done
 
     layer = NS(
-        _decode_moe_comm=None,
+        _decode_moe_comm=object() if communicator else None,
         ffn_boundary=NS(prepare=prepare, exit=exit_),
         _run_ffn_stage=Mock(),
     )
-    st = NS(slots=plan.Slots(route=True, mkm=True), fb=object())
+    st = NS(
+        slots=plan.Slots(route=True, mkm=True),
+        fb=object(),
+        input_ids=torch.empty(4, dtype=torch.int64),
+    )
 
     def moe(layer_, x, state, *, defer):
         assert x is prepared and state is st
@@ -86,7 +94,11 @@ def test_ffn_exit_keeps_prepare_finalize_and_finish_order(defer):
 
 def test_native_single_row_decode_communicator_is_preserved():
     layer = NS(_decode_moe_comm=object(), _run_ffn_stage=Mock(return_value="native"))
-    st = NS(slots=plan.Slots(route=True, mkm=True), fb=object())
-    hidden = torch.empty(1, 2560, dtype=torch.bfloat16)
+    st = NS(
+        slots=plan.Slots(route=True, mkm=True),
+        fb=object(),
+        input_ids=torch.empty(1, dtype=torch.int64),
+    )
+    hidden = OwedOutput(Contribution(torch.empty(1, 2560, dtype=torch.bfloat16), None))
     assert ffn(layer, hidden, st) == "native"
     layer._run_ffn_stage.assert_called_once_with(hidden, st.fb)

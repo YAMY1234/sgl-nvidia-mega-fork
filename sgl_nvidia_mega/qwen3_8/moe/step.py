@@ -38,8 +38,10 @@ def ffn(layer, hidden, st):
     The special single-row decode communicator remains entirely native. No
     communication, HC write, or publish is performed inside the MoE slot.
     """
+    # The mixer may return an opaque OwedOutput. Only boundary.prepare may
+    # consume it; the step already owns the host-known token count.
     if not st.slots.route or (
-        hidden.shape[0] == 1 and layer._decode_moe_comm is not None
+        layer._decode_moe_comm is not None and st.input_ids.shape[0] == 1
     ):
         return layer._run_ffn_stage(hidden, st.fb)
     x = layer.ffn_boundary.prepare(hidden, st.fb)

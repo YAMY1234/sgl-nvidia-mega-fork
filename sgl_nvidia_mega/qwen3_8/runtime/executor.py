@@ -157,7 +157,7 @@ class Qwen38Verify:
         self.parity = parity  # qwen3_5.runtime.parity.Parity under the test-only switch
         m = lm.model
         self.mixers = {
-            i: (gdn_step if any(s.gdn_verify or s.gdn_mk or s.gdn_front
+            i: (gdn_step if any(s.gdn_verify or s.gdn_mk
                                for s in slots.values()) else gdn_stock)
             if isinstance(m.layers[i], Qwen4ExpLinearDecoderLayer)
             else (attention_step if any(s.qsa_core for s in slots.values()) else attention_stock)

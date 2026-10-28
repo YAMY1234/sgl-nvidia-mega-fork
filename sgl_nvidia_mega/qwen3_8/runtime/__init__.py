@@ -17,7 +17,6 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "gdn_verify",
     "gdn_pdl",
     "gdn_mk",
-    "gdn_front",
     "route",
     "mkm",
     "route_shared",
@@ -81,7 +80,6 @@ def build(model, ctx, *, hf_config=None):
         gdn_verify=gdn_bound.gdn_verify,
         gdn_pdl=gdn_bound.gdn_pdl,
         gdn_mk=gdn_bound.gdn_mk,
-        gdn_front=gdn_bound.gdn_front,
     )
     facts = slot_plan.Facts(**gdn_facts, **attention_facts)
     if "route" in SLOTS:

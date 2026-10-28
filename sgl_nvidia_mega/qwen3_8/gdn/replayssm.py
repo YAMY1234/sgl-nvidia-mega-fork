@@ -12,7 +12,7 @@ The grid starts while the causal conv before it finishes, reads the gates and th
 committed history, and waits for the conv's q / k / v only where it first reads them
 (PTX ``griddepcontrol``). The gates and the history must be ready when it starts:
 they come from launches before the conv. Where the launch before it also writes the
-gates b / a (slot gdn_front's verify front), ``wait_for_gate_producer`` moves the wait
+gates b / a (FN's fused BF16 projection/conv), ``wait_for_gate_producer`` moves the wait
 before the gates' reads, as the kernel on SGLang branch nvidia/qwen35-agentx-gb300 does;
 the arithmetic is the same.
 """

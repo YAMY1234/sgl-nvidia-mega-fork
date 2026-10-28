@@ -6,14 +6,13 @@ from .config import shapes
 
 SGLANG_READS = {"srt/models/qwen3_5.py": ("_fused_in_proj_weight",)}
 
-GDN_SLOTS = frozenset({"gdn_verify", "gdn_pdl", "gdn_mk", "gdn_front"})
+GDN_SLOTS = frozenset({"gdn_verify", "gdn_pdl", "gdn_mk"})
 
 
 class Bound(msgspec.Struct, frozen=True):
     gdn_verify: bool = False
     gdn_pdl: bool = False
     gdn_mk: bool = False
-    gdn_front: bool = False
     shape: object = None
     reason: str = ""
 
@@ -23,8 +22,6 @@ def build(model, ctx):
     requested = GDN_SLOTS & SLOTS
     if not requested:
         return Bound()
-    if "gdn_front" in requested:
-        return Bound(reason="gdn_front numeric/speed qualification pending")
     from . import verify
     gdns = [layer.linear_attn for layer in model.model.layers
             if hasattr(layer, "linear_attn")]

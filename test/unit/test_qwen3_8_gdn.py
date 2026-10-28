@@ -89,3 +89,10 @@ def test_gdn_and_moe_build_and_plan_together(monkeypatch,numeric):
     assert held.gdn_mk==numeric and held.gdn_verify!=numeric and held.gdn_pdl
     assert held.route and held.mkm and held.route_shared
     assert seen==dict(max_rows=4,fused=True,shared=True,hf_config=model.config,tp_size=4)
+
+
+def test_stopped_front_slot_is_rejected():
+    from sgl_nvidia_mega.qwen3_8 import runtime
+    with patch.object(runtime,'SLOTS',frozenset({'gdn_front'})):
+        assert any("unknown FN slot 'gdn_front'" in reason
+                   for reason in runtime.slot_reasons())

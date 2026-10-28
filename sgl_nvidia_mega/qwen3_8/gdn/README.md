@@ -9,7 +9,6 @@ verify rows come from the build's `PackageContext.tokens_per_request`.
   core and fused sigmoid norm. It owns
   its original PDL entry trigger/wait and preserves native commit/track. Four
   verify rows/request are qualified. Out projection, AR and HC stay native.
-- `gdn_front`: the new BF16 N32 projection/conv; not yet available.
 
 Native primitive qualification: four independent GPU seeds, 120/120 tests,
 local heads4/12, M4/M8/M12, contiguous/gapped projection views, convolution
@@ -25,7 +24,10 @@ parity/smoke and performance remain pending.
 Mature front port:24/24 GPU cases against frozen e5 source, M4/M8/M12 with
 and without bias, int32/int64 indices, strided windows, three changed-input/state
 graph replays per case. The same BF16 mature front is retained for the MK slot;
-the new N32 front remains separately disabled. Integrated87153be CPU gate:
+the new N32 front was stopped after failing its cold-L2 mixer speed gate. Integrated87153be CPU gate:
 FN spec12, own GDN8 (including native/numeric GDN + MoE build/plan combinations),
 qwen3_8 contract30 and entrypoint1 pass. Combined wiring tests mock GPU resource
 construction; they do not claim model execution or service parity.
+
+N32 research is not registered as a slot and has no numeric tolerance claim.
+The mature BF16 front remains part of `gdn_mk`.

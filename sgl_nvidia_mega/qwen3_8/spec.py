@@ -88,12 +88,6 @@ NUMERIC_TOLERANCES: dict[str, dict[str, float]] = {
         "qsa_core.attention.rel_l2_vs_stock": 1.05,
         "qsa_core.attention.max_abs_vs_stock": 2.0,
     },
-    "gdn_front": {
-        "gdn_front.in_proj_qkvz.rel_l2_vs_stock": 1.05,
-        "gdn_front.in_proj_qkvz.max_abs_vs_stock": 2.0,
-        "gdn_front.in_proj_ba.rel_l2_vs_stock": 1.05,
-        "gdn_front.in_proj_ba.max_abs_vs_stock": 2.0,
-    },
     # FP64 primitive qualification454129 (main4517, TP4): single +2048 verify
     # steps/5120 accepted tokens, M4(two seeds)/M8/M12. Maximum measured ratios
     # relL2 1.035356, max_abs1.535666, including tracked state and sigmoid norm.
@@ -132,7 +126,7 @@ NUMERICS = numerics(runtime.SLOTS)
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     reasons = runtime.slot_reasons()
-    if runtime.SLOTS & {"gdn_verify", "gdn_pdl", "gdn_mk", "gdn_front"}:
+    if runtime.SLOTS & {"gdn_verify", "gdn_pdl", "gdn_mk"}:
         from sgl_nvidia_mega.qwen3_8.gdn.config import config_disable_reasons
         # Verify row count comes from BuildContext in gdn.build, not a constant.
         reasons += config_disable_reasons(hf_config, None, cfg.tp_size)

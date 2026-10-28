@@ -1385,11 +1385,6 @@ def test_tp4_preserves_v2_shipped_capabilities():
         "gdn_pdl",
         "gdn_conv",
         "gdn_core",
-        "draft_loop",
-        "draft_extend",
-        "draft_multi",
-        "draft_embed",
-        "draft_front",
     }
     assert topology.select(topology.TP4_V2_SLOTS, topology.Topology(8, 8, 8)) == {
         "mka",
@@ -1400,6 +1395,50 @@ def test_tp4_preserves_v2_shipped_capabilities():
     assert topology.select({"mka"}, topology.Topology(2)) == {"mka"}
     assert topology.select({"mka"}, topology.Topology(8, 8, 8)) == {"mka"}
     assert runtime.slot_reasons(topology.select(shipped, topology.Topology(4))) == []
+
+
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_measured_topology_policy_selects_actual_draft_entries(monkeypatch, tp_size):
+    from sgl_nvidia_mega.qwen3_5 import draft, topology
+
+    # All explicit opt-ins, not just SHIPPED_SLOTS: the formal47 recipe must
+    # leave every TP2 draft callback unset, as in the topo-adapted v2 baseline.
+    requested = frozenset(topology.SLOT_TOPOLOGIES)
+    monkeypatch.setattr(runtime, "SLOTS", requested)
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=tp_size, moe_ep_size=1),
+    )
+    built = draft.SPEC.build("lm", SimpleNamespace(context_len=8192), _draft_ctx())
+    if tp_size == 2:
+        assert not built.slots
+        assert all(
+            getattr(built, name) is None
+            for name in (
+                "draft_loop", "draft_extend", "begin_draft_round", "graph_variants",
+            )
+        )
+        assert runtime.SLOTS == frozenset(
+            {
+                "multi_request",
+                "gdn_commit",
+                "sharded_gumbel",
+                "gdn_verify",
+                "gdn_pdl",
+                "gdn_conv",
+                "gdn_core",
+                "route",
+                "route_topk",
+                "route_gemm",
+                "mka",
+            }
+        )
+    else:
+        assert built.draft_loop is not None and built.draft_extend is not None
+        assert built.slots == topology.select(
+            frozenset(runtime.DRAFT_ENTRIES + runtime.DRAFT_SLOTS),
+            topology.Topology(tp_size),
+        )
 
 
 def test_tp4_declarations_preserve_existing_kernel_shape_boundaries():
@@ -1571,7 +1610,7 @@ def test_prefill_all_slots_off_can_compare_native_twice_under_test_switch(monkey
     assert step.mode == "prefill" and not built.enabled
 
 
-@pytest.mark.parametrize("tp_size", [2, 4, 8])
+@pytest.mark.parametrize("tp_size", [4, 8])
 def test_bf16_draft_entries_cover_pd_batches_without_quantized_experts(
     monkeypatch, tp_size
 ):
@@ -1593,8 +1632,6 @@ def test_bf16_draft_entries_cover_pd_batches_without_quantized_experts(
     )
     selected = topology.select(requested, topology.Topology(tp_size))
     assert runtime.slot_reasons(selected) == []
-    if tp_size == 2:
-        assert not selected & {"draft_moe", "draft_q1", "draft_xchg"}
     monkeypatch.setattr(runtime, "SLOTS", selected)
     parts = _DraftParts(slots=selected, tp_size=tp_size)
     parts.top1x = object()

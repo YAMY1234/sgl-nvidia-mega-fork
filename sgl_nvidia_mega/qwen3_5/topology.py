@@ -139,8 +139,8 @@ SLOT_TOPOLOGIES.update(
     gdn_commit=TOPOLOGIES,
     sharded_gumbel=TOPOLOGIES,
 )
-# BF16 draft entries use the binding's local attention-TP metadata. TP2's
-# FC launch handles the full input half; DEP8 keeps SGLang's draft.
+# Full-step AB+BA prefers v2's stock draft on TP2. Keep every draft entry
+# filtered there, including PD decode TP2; TP4/TP8 retain the BF16 entries.
 for _name in (
     "draft_loop",
     "draft_extend",
@@ -148,9 +148,8 @@ for _name in (
     "draft_embed",
     "draft_front",
 ):
-    SLOT_TOPOLOGIES[_name] = frozenset({"tp2", "tp4", "tp8", "tep8"})
-# Paired full-step measurements prefer the stock TP2 boundary. Keep the other
-# BF16 draft entries there; TP4/TP8 retain the fused vocabulary exchange.
+    SLOT_TOPOLOGIES[_name] = frozenset({"tp4", "tp8", "tep8"})
+# TP4/TP8 retain the fused vocabulary exchange.
 SLOT_TOPOLOGIES["draft_xchg"] = frozenset({"tp4", "tp8", "tep8"})
 SLOT_TOPOLOGIES["draft_moe"] = frozenset({"tp4", "tp8"})
 SLOT_TOPOLOGIES["draft_q1"] = frozenset({"tp4", "tp8", "tep8"})

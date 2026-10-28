@@ -127,7 +127,9 @@ def test_the_covered_widths_are_the_ones_the_build_returns():
     assert built.plan(torch.zeros(21, dtype=torch.int64), _batch()) is None
 
 
-@pytest.mark.parametrize("tp_size, want", [(8, (7,)), (4, (7,))])
+@pytest.mark.parametrize(
+    "tp_size, want", [(8, (7,)), (4, (7, 14, 21, 28)), (2, (7, 14, 21, 28))]
+)
 def test_the_build_covers_more_requests_only_where_a_slot_runs(
     monkeypatch, tp_size, want
 ):
@@ -147,7 +149,7 @@ def test_the_build_covers_more_requests_only_where_a_slot_runs(
         binding="EagleBinding",
     )
     built = runtime.build(model, ctx)
-    assert built.widths == want and built.summary() == "slots none (stock)"
+    assert built.widths == want and built.summary().startswith("slots none (stock)")
 
 
 def test_the_build_hands_over_the_binding_and_ships_the_bitwise_draft_entries():
@@ -816,9 +818,9 @@ def test_the_draft_loop_writes_each_steps_token_and_restores_the_positions(
     [
         (8, {"multi_request"}, (1, 2)),
         (8, set(), (1,)),
-        (4, {"multi_request"}, (1,)),
+        (4, {"multi_request"}, (1, 2)),
         (8, {"multi_request", "draft_multi"}, tuple(range(1, 129))),
-        (4, {"multi_request", "draft_multi"}, (1,)),
+        (4, {"multi_request", "draft_multi"}, tuple(range(1, 129))),
     ],
 )
 def test_the_draft_loop_serves_two_requests_at_tp8_on_request(
@@ -837,7 +839,7 @@ def test_the_draft_loop_serves_two_requests_at_tp8_on_request(
     [
         (8, {"multi_request", "draft_multi"}, True, tuple(range(1, 129))),
         (8, {"multi_request", "draft_multi"}, False, (1,)),
-        (4, {"multi_request", "draft_multi"}, True, (1,)),
+        (4, {"multi_request", "draft_multi"}, True, tuple(range(1, 129))),
         (8, {"draft_multi"}, True, (1,)),
     ],
 )
@@ -1200,3 +1202,62 @@ def test_the_step_state_carries_the_binding():
         "EagleBinding",
         "EagleForwardView",
     )
+
+
+@pytest.mark.parametrize("tp, dp, ep, rows", [(2, 1, 1, (42, 70)), (8, 8, 8, (224,))])
+def test_new_topologies_cover_actual_pd_stock_widths(monkeypatch, tp, dp, ep, rows):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset())
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=tp, attn_dp_size=dp, moe_ep_size=ep),
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    ctx = SimpleNamespace(
+        widths=rows, tokens_per_request=7, deadline_s=60.0, binding="binding"
+    )
+    built = runtime.build(model, ctx)
+    assert built.widths == rows
+    for width in rows:
+        assert built.plan(torch.zeros(width, dtype=torch.int64), _batch()).rows == width
+
+
+def test_slot_topology_declarations_are_complete_and_fail_closed():
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    known = set(
+        (
+            *runtime.SHIPPED_SLOTS,
+            *runtime.OPT_IN_SLOTS,
+            *runtime.OPT_IN_VARIANTS,
+            *runtime.DRAFT_ENTRIES,
+            *runtime.DRAFT_SLOTS,
+            *runtime.RUNTIME_ONLY_SLOTS,
+        )
+    )
+    assert set(topology.SLOT_TOPOLOGIES) == known
+    assert (
+        topology.select(frozenset({"undeclared"}), topology.Topology(2)) == frozenset()
+    )
+
+
+def test_unsupported_specialization_does_not_disable_a_supported_slot(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    monkeypatch.setitem(topology.SLOT_TOPOLOGIES, "gdn_verify", topology.TOPOLOGIES)
+    requested = frozenset({"gdn_verify", "gdn_front", "gdn_pdl", "multi_request"})
+    selected = topology.select(requested, topology.Topology(2))
+    assert selected == frozenset({"gdn_verify", "multi_request"})
+    assert runtime.slot_reasons(selected) == []
+
+
+def test_dep8_is_not_confused_with_tep8_and_keeps_the_draft_stock():
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    requested = frozenset(runtime.SHIPPED_SLOTS)
+    assert topology.Topology(8, 8, 8).name == "dep8"
+    assert topology.Topology(8, 1, 8).name == "tep8"
+    dep = topology.select(requested, topology.Topology(8, 8, 8))
+    assert not dep & set(runtime.DRAFT_ENTRIES + runtime.DRAFT_SLOTS)
+    assert topology.select(requested, topology.Topology(8, 1, 8)) == requested

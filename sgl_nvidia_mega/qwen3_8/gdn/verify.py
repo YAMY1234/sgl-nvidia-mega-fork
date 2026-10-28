@@ -59,10 +59,10 @@ def step(layer, x, st):
     rows = x.shape[0]
     draft = shape.tokens_per_request
     requests = rows // draft
-    key = (rows, st.slots.gdn_pdl)
+    key = (rows, st.slots.gdn_pdl, st.slots.gdn_mk)
     if key not in _ENGAGED:
-        logger.info("NVIDIA megakernel: FN gdn_verify rows=%d T=%d pdl=%d",
-                    rows, draft, st.slots.gdn_pdl)
+        logger.info("NVIDIA megakernel: FN GDN rows=%d T=%d pdl=%d mk=%d",
+                    rows, draft, st.slots.gdn_pdl, st.slots.gdn_mk)
         _ENGAGED.add(key)
     qkvz, ba = gdn._forward_input_proj(x)
     mixed, z, b, a = qwen3_5_gdn_prefill_projection_views(
@@ -82,18 +82,31 @@ def step(layer, x, st):
     k = k.view(rows, shape.hk, shape.key_dim)
     v = v.view(rows, shape.hv, shape.value_dim)
     out = v.new_empty(v.shape)
-    replayssm.verify(
-        q, k, v, a.reshape(rows, shape.hv), b.reshape(rows, shape.hv),
-        attn.A_log, attn.dt_bias, out, cache.temporal,
-        cache.replayssm_d, cache.replayssm_k, cache.replayssm_g,
-        cache.replayssm_rawv, cache.replayssm_rawk, cache.replayssm_beta,
-        meta.query_start_loc, states, st.fb.req_pool_indices,
-        pool.replayssm_spec_write_pos, pool.replayssm_cache_base,
-        pool.replayssm_is_flush,
-        max_cache_len=cache.replayssm_d.shape[-2], max_spec_len=draft,
-        scale=shape.key_dim**-0.5, null_block_id=-1,
-        block_v=64, num_warps=1, pdl=st.slots.gdn_pdl,
-        wait_for_gate_producer=True)
-    norm = gdn.norm(out.reshape(-1, shape.value_dim),
-                    z.reshape(-1, shape.value_dim))
+    if st.slots.gdn_mk:
+        from sgl_nvidia_mega.qwen3_8.sm103.gdn.core import core
+        normalized = out.new_empty((rows, shape.hv*shape.value_dim))
+        core(convolved, a.reshape(rows, shape.hv), b.reshape(rows, shape.hv),
+             attn.A_log, attn.dt_bias, cache.temporal,
+             cache.replayssm_d, cache.replayssm_k, cache.replayssm_g,
+             cache.replayssm_rawv, cache.replayssm_rawk,
+             states, st.fb.req_pool_indices, pool.replayssm_spec_write_pos,
+             pool.replayssm_cache_base, pool.replayssm_is_flush, out,
+             z=z.reshape(rows, shape.hv*shape.value_dim), norm_weight=gdn.norm.weight,
+             normalized=normalized, eps=gdn.norm.eps, tokens_per_request=draft)
+        norm = normalized
+    else:
+        replayssm.verify(
+            q, k, v, a.reshape(rows, shape.hv), b.reshape(rows, shape.hv),
+            attn.A_log, attn.dt_bias, out, cache.temporal,
+            cache.replayssm_d, cache.replayssm_k, cache.replayssm_g,
+            cache.replayssm_rawv, cache.replayssm_rawk, cache.replayssm_beta,
+            meta.query_start_loc, states, st.fb.req_pool_indices,
+            pool.replayssm_spec_write_pos, pool.replayssm_cache_base,
+            pool.replayssm_is_flush,
+            max_cache_len=cache.replayssm_d.shape[-2], max_spec_len=draft,
+            scale=shape.key_dim**-0.5, null_block_id=-1,
+            block_v=64, num_warps=1, pdl=st.slots.gdn_pdl,
+            wait_for_gate_producer=True)
+        norm = gdn.norm(out.reshape(-1, shape.value_dim),
+                        z.reshape(-1, shape.value_dim))
     return gdn.out_proj(norm.reshape(rows, shape.hv*shape.value_dim))[0]

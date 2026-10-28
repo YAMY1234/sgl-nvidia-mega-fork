@@ -38,7 +38,7 @@ def slots(rows: int, facts: Facts) -> Slots:
     if not 1 <= rows <= MAX_ROWS:
         raise ValueError(f"{rows} rows are outside the covered widths 1-{MAX_ROWS}")
     return Slots(gdn_verify=facts.gdn_verify,
-                 gdn_pdl=facts.gdn_verify and facts.gdn_pdl,
+                 gdn_pdl=(facts.gdn_verify or facts.gdn_mk) and facts.gdn_pdl,
                  gdn_mk=facts.gdn_mk, gdn_front=facts.gdn_front)
 
 

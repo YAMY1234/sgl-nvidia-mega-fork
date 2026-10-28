@@ -2,7 +2,7 @@
 """FN GDN slots, on generic ForwardView and native backend-owned state."""
 import msgspec
 
-from .config import Shapes, shapes
+from .config import shapes
 
 GDN_SLOTS = frozenset({"gdn_verify", "gdn_pdl", "gdn_mk", "gdn_front"})
 
@@ -21,8 +21,8 @@ def build(model, ctx):
     requested = GDN_SLOTS & SLOTS
     if not requested:
         return Bound()
-    if requested & {"gdn_mk", "gdn_front"}:
-        return Bound(reason="gdn_mk/gdn_front numeric qualification pending")
+    if "gdn_front" in requested:
+        return Bound(reason="gdn_front numeric/speed qualification pending")
     from . import verify
     gdns = [layer.linear_attn for layer in model.model.layers
             if hasattr(layer, "linear_attn")]
@@ -33,11 +33,16 @@ def build(model, ctx):
         reason = verify.unsupported(gdn)
         if reason:
             return Bound(reason=f"GDN layer {gdn.attn.layer_id}: {reason}")
-    return Bound(gdn_verify=True, gdn_pdl="gdn_pdl" in requested, shape=shape)
+    mk = "gdn_mk" in requested
+    if mk and ctx.tokens_per_request != 4:
+        return Bound(reason="gdn_mk is qualified for four verify rows/request")
+    # The unchanged e5 numeric core includes its PDL wait/entry trigger.
+    return Bound(gdn_verify=not mk, gdn_pdl=mk or "gdn_pdl" in requested,
+                 gdn_mk=mk, shape=shape)
 
 
 def step(layer, x, st):
-    if not st.slots.gdn_verify:
+    if not (st.slots.gdn_verify or st.slots.gdn_mk):
         return layer.linear_attn(x, st.fb)
     from . import verify
     return verify.step(layer, x, st)

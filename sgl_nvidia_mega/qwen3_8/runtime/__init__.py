@@ -13,7 +13,7 @@ import msgspec
 from sgl_nvidia_mega.qwen3_5.runtime import SLOTS, SLOTS_ENV
 
 # The kernel slots that run only when requested (in Qwen3.5's request variable)
-OPT_IN_SLOTS: tuple[str, ...] = ("gdn_verify", "gdn_pdl", "gdn_front")
+OPT_IN_SLOTS: tuple[str, ...] = ("gdn_verify", "gdn_pdl", "gdn_mk", "gdn_front")
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {

@@ -49,6 +49,8 @@ SGLANG_READS = {
         "speculative_eagle_topk",
         "speculative_use_rejection_sampling",
         "moe_a2a_backend",
+        "enable_linear_replayssm_spec", "mamba_ssm_dtype",
+        "linear_attn_verify_backend",
     ),
 }
 
@@ -82,7 +84,19 @@ NUMERIC_TOLERANCES: dict[str, dict[str, float]] = {
         "gdn_front.in_proj_ba.rel_l2_vs_stock": 1.05,
         "gdn_front.in_proj_ba.max_abs_vs_stock": 2.0,
     },
-    # gdn_mk is not offered until its FP64 single/2048-step errors are measured.
+    # FP64 primitive qualification454129 (main4517, TP4): single +2048 verify
+    # steps/5120 accepted tokens, M4(two seeds)/M8/M12. Maximum measured ratios
+    # relL2 1.035356, max_abs1.535666, including tracked state and sigmoid norm.
+    # Historical e5 service evidence: frozen trajectory438826/fullGSM440385;
+    # this plugin port still needs its own service smoke and performance gates.
+    "gdn_mk": {
+        "gdn_mk.raw_O.rel_l2_vs_stock": 1.05,
+        "gdn_mk.raw_O.max_abs_vs_stock": 2.0,
+        "gdn_mk.state.rel_l2_vs_stock": 1.05,
+        "gdn_mk.state.max_abs_vs_stock": 2.0,
+        "gdn_mk.gated_norm.rel_l2_vs_stock": 1.05,
+        "gdn_mk.gated_norm.max_abs_vs_stock": 2.0,
+    },
 }
 
 
@@ -104,10 +118,17 @@ NUMERICS = numerics(runtime.SLOTS)
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     reasons = runtime.slot_reasons()
-    if runtime.SLOTS & {"gdn_verify", "gdn_pdl", "gdn_front"}:
+    if runtime.SLOTS & {"gdn_verify", "gdn_pdl", "gdn_mk", "gdn_front"}:
         from sgl_nvidia_mega.qwen3_8.gdn.config import config_disable_reasons
         # Verify row count comes from BuildContext in gdn.build, not a constant.
         reasons += config_disable_reasons(hf_config, None, cfg.tp_size)
+        for name, allowed in (
+            ("enable_linear_replayssm_spec", (True,)),
+            ("mamba_ssm_dtype", ("bfloat16",)),
+            ("linear_attn_verify_backend", ("triton",)),
+        ):
+            if getattr(cfg, name, None) not in allowed:
+                reasons.append(f"FN GDN requires {name} in {allowed!r}")
     return reasons
 
 

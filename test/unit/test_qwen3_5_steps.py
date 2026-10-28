@@ -6,6 +6,7 @@ arguments): the decoder layers, the GatedDeltaNet, the attention, the MoE, the l
 loop, and the slots route, mkm, gdn_verify and hop."""
 
 import contextlib
+import weakref
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -2741,6 +2742,49 @@ def test_a_layer_runs_what_sglangs_decoder_layer_runs(
     (want_log, want), (got_log, got) = runs
     assert got_log == want_log and want == got == "layer_out"
     assert any(entry[0] == "mixer" for entry in got_log) == (rows > 0 and not idle)
+
+
+@pytest.mark.parametrize("tuple_input", [False, True])
+def test_layer_releases_mixer_input_before_moe(monkeypatch, tuple_input):
+    # The hop norm is a temporary. Keeping it through MoE changes which graph
+    # allocations can reuse its storage, even when the issued ops are identical.
+    refs, events = [], []
+    st = SimpleNamespace(
+        fb=SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: False)),
+        scratch={},
+        residual=torch.empty(7, 4),
+    )
+
+    def pre(*args, **kwargs):
+        norm = torch.empty(7, 4)
+        refs.append(weakref.ref(norm))
+        weakref.finalize(norm, events.append, "released")
+        st.scratch["lowm.fp8"] = (norm.data_ptr(), 7, torch.empty(7, 4))
+        st.scratch["rlin.h0"] = (0, st.residual)
+        return (norm, torch.empty(1)) if tuple_input else norm
+
+    def post(*args):
+        assert refs[0]() is not None
+        events.append("post")
+        return torch.empty(7, 4)
+
+    def moe_step(*args, **kwargs):
+        assert refs[0]() is None
+        events.append("moe")
+        return "out"
+
+    @contextlib.contextmanager
+    def exit_scope(*args):
+        yield SimpleNamespace(defer_moe_finalize=False, finish=lambda out: out)
+
+    monkeypatch.setattr(executor.boundary, "pre", pre)
+    monkeypatch.setattr(executor.boundary, "post_attn", post)
+    monkeypatch.setattr(executor.boundary, "ffn_exit", exit_scope)
+    monkeypatch.setattr(executor.moe, "step", moe_step)
+    built = _verify()
+    built.mixers = {0: lambda *args: torch.empty(7, 4)}
+    assert built._layer(0, object(), torch.empty(7, 4), st, None) == "out"
+    assert events == ["post", "released", "moe"]
 
 
 def test_the_layer_loop_opens_the_stream_scopes_each_layer_and_closes_it(monkeypatch):

@@ -274,10 +274,10 @@ class Qwen35Verify:
         x = boundary.pre(layer, hidden, st, capture)
         # Idle DP ranks still cross the boundaries and run the MoE's collective,
         # but the decoder layers skip their mixer (including empty FP4 GEMMs).
-        hs = x[0] if isinstance(x, tuple) else x
+        rows = (x[0] if isinstance(x, tuple) else x).shape[0]
         part = (
             self.mixers[i](layer, x, st)
-            if not st.fb.forward_mode.is_idle() and hs.shape[0] > 0
+            if not st.fb.forward_mode.is_idle() and rows > 0
             else x
         )
         x = boundary.post_attn(layer, part, st)

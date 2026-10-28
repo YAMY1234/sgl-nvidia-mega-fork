@@ -112,6 +112,12 @@ REQUIREMENTS = Requirements(
 # outputs are held to stock or fp64 on the same quantized operands (test/kernels), at
 # most these multiples of the error of SGLang's own op.
 NUMERIC_TOLERANCES = {
+    # Gumbel-max consumes a deterministic per-token stream different from the stock
+    # sampler.  It is categorical-distribution equivalent, not tokenwise close; the
+    # migrated chi-square test pools low-expectation bins and enforces this p-value.
+    "sharded_gumbel": {
+        "sharded_gumbel.categorical.chi_square_p_value_min": 1e-4,
+    },
     # Four router GEMV chains sum in another order than SGLang's cuBLAS GEMM.
     "route": {"route.router_logits.bf16_ulp_vs_stock": 1.0},
     # The tiled router front stays within one BF16 ULP of SGLang's whole-M GEMM.

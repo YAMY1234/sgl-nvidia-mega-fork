@@ -86,9 +86,9 @@ DRAFT_SLOTS: tuple[str, ...] = (
     "draft_skv2_cp",
 )
 CP_LITE_SLOTS = frozenset({"skv2_cp", "draft_q1_cp", "draft_skv2_cp"})
-# SGLang consumes these names from the shared slot policy itself.  They are valid
-# requests, but are intentionally not built or dispatched by this plugin.
-RUNTIME_ONLY_SLOTS: tuple[str, ...] = ("gdn_commit", "sharded_gumbel")
+# Provider callbacks consume these names from the shared slot policy.  They do not
+# build a target-verify width of their own.
+HOOK_SLOTS: tuple[str, ...] = ("sharded_gumbel",)
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 # These slots run all 512 experts themselves. Under expert parallelism, keep the
 # route-only and boundary slots but let SGLang's EP path run the routed experts.
@@ -183,7 +183,7 @@ def slot_reasons() -> list[str]:
                 *OPT_IN_VARIANTS,
                 *DRAFT_ENTRIES,
                 *DRAFT_SLOTS,
-                *RUNTIME_ONLY_SLOTS,
+                *HOOK_SLOTS,
             )
         )
     )
@@ -479,7 +479,7 @@ def build(model, ctx):
         - set(DRAFT_SLOTS)
         - set(OPT_IN_COVERAGE)
         - set(OPT_IN_VARIANTS)
-        - set(RUNTIME_ONLY_SLOTS)
+        - set(HOOK_SLOTS)
     )
     # mkm's 16-token engine has nothing to serve where no covered step is wider than 7 rows
     vacuous = (

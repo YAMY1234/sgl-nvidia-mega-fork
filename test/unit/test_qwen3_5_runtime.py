@@ -189,8 +189,8 @@ def test_cp_gate_epilogue_offer_is_consumed_once():
     assert not cp.take_gate_epilogue()
 
 
-def test_runtime_only_slots_are_accepted_but_not_built_by_the_plugin(monkeypatch):
-    requested = frozenset({"gdn_commit", "sharded_gumbel"})
+def test_hook_slots_are_accepted_but_build_no_verify_width(monkeypatch):
+    requested = frozenset({"sharded_gumbel"})
     monkeypatch.setattr(runtime, "SLOTS", requested)
     assert runtime.slot_reasons() == []
 
@@ -201,6 +201,68 @@ def test_runtime_only_slots_are_accepted_but_not_built_by_the_plugin(monkeypatch
         widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
     )
     assert runtime.build(model, ctx).summary() == "slots none (stock)"
+
+
+def test_draft_fin_owns_the_exact_bf16_finalize_policy():
+    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+    from sgl_nvidia_mega.qwen3_5.draft import finalize
+
+    method = object.__new__(UnquantizedFusedMoEMethod)
+    experts = SimpleNamespace(
+        is_draft=True,
+        quant_method=method,
+        params_dtype=torch.bfloat16,
+        hidden_size=4096,
+        num_experts=512,
+        top_k=10,
+        runner_backend=SimpleNamespace(is_flashinfer_trtllm=lambda: True),
+        supports_deferred_finalize=False,
+    )
+    assert (
+        finalize.enable(SimpleNamespace(experts=experts, shared_expert=object())) == ""
+    )
+    assert experts.supports_deferred_finalize
+
+
+@pytest.mark.parametrize(
+    "change, reason",
+    [
+        ({"is_draft": False}, "not a draft MoE"),
+        ({"quant_method": object()}, "quant method object"),
+        ({"params_dtype": torch.float16}, "params dtype torch.float16"),
+        ({"hidden_size": 2048}, "hidden size 2048"),
+        ({"num_experts": 256}, "experts 256"),
+        ({"top_k": 8}, "top-k 8"),
+        ({"shared_expert": None}, "no separate shared expert"),
+        (
+            {"runner_backend": SimpleNamespace(is_flashinfer_trtllm=lambda: False)},
+            "MoE runner",
+        ),
+    ],
+)
+def test_draft_fin_refuses_every_unvalidated_policy_dimension(change, reason):
+    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+    from sgl_nvidia_mega.qwen3_5.draft import finalize
+
+    change = dict(change)
+    experts = SimpleNamespace(
+        is_draft=True,
+        quant_method=object.__new__(UnquantizedFusedMoEMethod),
+        params_dtype=torch.bfloat16,
+        hidden_size=4096,
+        num_experts=512,
+        top_k=10,
+        runner_backend=SimpleNamespace(is_flashinfer_trtllm=lambda: True),
+        supports_deferred_finalize=False,
+    )
+    shared_expert = change.pop("shared_expert", object())
+    for name, value in change.items():
+        setattr(experts, name, value)
+    got = finalize.enable(SimpleNamespace(experts=experts, shared_expert=shared_expert))
+    assert reason in got
+    assert not experts.supports_deferred_finalize
 
 
 def test_multi_request_coverage_has_no_kernel_build_result(monkeypatch):

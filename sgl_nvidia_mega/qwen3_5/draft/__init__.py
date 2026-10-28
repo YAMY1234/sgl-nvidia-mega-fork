@@ -86,6 +86,7 @@ def numerics(slots: frozenset) -> Numerics:
         "draft_q1",
         "draft_xchg",
         "draft_hop",
+        "draft_fin",
         "draft_front",
         "draft_skv2",
     }:

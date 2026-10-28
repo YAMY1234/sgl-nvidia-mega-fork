@@ -100,7 +100,7 @@ SGLANG_READS = {
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/models/qwen3_vl.py:Qwen3VLForConditionalGeneration.forward": "dbdcf4b88a2c0d40",
+    "srt/models/qwen3_vl.py:Qwen3VLForConditionalGeneration.forward": "d394d79ba7fa7b31",
     "srt/models/qwen4_exp.py:Qwen4ExpForConditionalGeneration.forward": (
         "1d988276834c06bb"
     ),

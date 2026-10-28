@@ -624,12 +624,13 @@ def test_the_mkm_slot_names_what_a_layer_lacks():
     assert mkm.unsupported(mlp).startswith("an expert activation")
 
 
-def test_route_topk_checks_only_materialized_routing_under_expert_parallelism(
-    monkeypatch,
+@pytest.mark.parametrize("local_experts", [64, 128, 512])
+def test_route_topk_checks_materialized_routing_without_a_fused_expert_engine(
+    monkeypatch, local_experts
 ):
     from sgl_nvidia_mega.qwen3_5.moe import mkm, route
 
-    experts = SimpleNamespace(num_experts=512, num_local_experts=128)
+    experts = SimpleNamespace(num_experts=512, num_local_experts=local_experts)
     mlp = SimpleNamespace(experts=experts)
     model = SimpleNamespace(
         model=SimpleNamespace(
@@ -642,11 +643,72 @@ def test_route_topk_checks_only_materialized_routing_under_expert_parallelism(
         mkm, "routing_unsupported", lambda _: checked.append("routing") or ""
     )
     monkeypatch.setattr(
-        mkm, "unsupported", lambda _: pytest.fail("full-expert engine checked under EP")
+        mkm,
+        "unsupported",
+        lambda _: pytest.fail("full-expert engine checked for routing"),
     )
 
     assert route.topk_unsupported(model) == ""
     assert checked == ["routing"]
+
+
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_route_topk_accepts_native_topk_config_at_each_tp_width(tp_size):
+    from sglang.srt.configs.shared_experts import SharedExpertsConfig
+    from sglang.srt.layers.moe.topk import TopK, TopKConfig, TopKOutputFormat
+    from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
+
+    from sgl_nvidia_mega.qwen3_5.moe import mkm, route
+
+    mlp = qwen2_moe.Qwen2MoeSparseMoeBlock.__new__(qwen2_moe.Qwen2MoeSparseMoeBlock)
+    torch.nn.Module.__init__(mlp)
+    cfg = TopKConfig(top_k=10)
+    topk = TopK.__new__(TopK)
+    torch.nn.Module.__init__(topk)
+    topk.topk_config = cfg
+    topk._runner_backend_bound = False
+    assert cfg.output_format is None
+    topk.bind_runner_backend(
+        MoeRunnerBackend.FLASHINFER_TRTLLM,
+        routing_method_type=RoutingMethodType.RenormalizeNaive,
+    )
+    assert cfg.output_format == TopKOutputFormat.BYPASSED
+    mlp.__dict__.update(
+        gate=SimpleNamespace(
+            weight=torch.empty(512, 4096, dtype=torch.bfloat16, device="meta")
+        ),
+        topk=topk,
+        shared_expert=object(),
+        experts=SimpleNamespace(
+            num_experts=512,
+            num_local_experts=512,
+            top_k=10,
+            w13_weight=torch.empty(
+                512, 2 * (1024 // tp_size), 2048, dtype=torch.uint8, device="meta"
+            ),
+            w13_input_scale_quant=torch.ones(1),
+            trtllm_padded_hidden_size=None,
+            quant_method=SimpleNamespace(
+                quant_config=SimpleNamespace(use_per_token_activation=False)
+            ),
+            supports_deferred_finalize=True,
+            routing_method_type=RoutingMethodType.RenormalizeNaive,
+        ),
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            start_layer=0, end_layer=1, layers=[SimpleNamespace(mlp=mlp)]
+        )
+    )
+    assert cfg.num_shared_topk_slots == 0
+    assert route.topk_unsupported(model) == ""
+    # Main binds the default None to BYPASSED before the plugin is built. A stale
+    # output-format assumption must fail visibly instead of claiming engagement.
+    cfg.output_format = TopKOutputFormat.STANDARD
+    assert "bypassed TopK" in route.topk_unsupported(model)
+    cfg.output_format = TopKOutputFormat.BYPASSED
+    cfg.shared_experts = SharedExpertsConfig(num_fused_shared_experts=1)
+    assert mkm.routing_unsupported(mlp).startswith("routing other than")
 
 
 def test_the_draft_mkm_uses_the_complete_slot_schema(monkeypatch):

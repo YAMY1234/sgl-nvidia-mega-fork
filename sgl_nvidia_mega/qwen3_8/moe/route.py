@@ -11,6 +11,8 @@ from . import mkm
 
 logger = logging.getLogger(__name__)
 SGLANG_READS = {
+    "srt/layers/activation.py": ("SiluAndMul",),
+    "srt/layers/quantization/unquant.py": ("UnquantizedLinearMethod",),
     "srt/models/qwen2_moe.py": (
         "Qwen2MoeSparseMoeBlock",
         "gate",
@@ -21,6 +23,10 @@ SGLANG_READS = {
         "supports_deferred_finalize",
         "layer_id",
         "reduce_results",
+        "gate_up_proj",
+        "down_proj",
+        "act_fn",
+        "_enable_silu_fp4_quant_fusion",
     ),
     "srt/layers/moe/topk.py": ("TopKOutputChecker", "format_is_bypassed"),
     "srt/layers/moe/fused_moe_triton/layer.py": (
@@ -96,12 +102,19 @@ def build(
     if wide:
         reasons.append("FN mkm_wide is not implemented; retain native at wider rows")
     if shared:
-        reasons.append("FN BF16 route_shared numeric gate pending; no FP8 substitution")
+        reasons.extend(
+            config_disable_reasons(hf_config, tp_size, max_rows, "route_shared")
+        )
     for i, mlp in enumerate(layers, m.start_layer):
         why = unsupported(mlp, shape)
         if why:
             reasons.append(f"layer{i}: {why}")
             break
+        if shared:
+            why = shared_unsupported(mlp, shape)
+            if why:
+                reasons.append(f"layer{i} shared: {why}")
+                break
         if fused:
             why = mkm.unsupported(mlp, shape)
             if why:
@@ -113,6 +126,10 @@ def build(
     if torch.cuda.get_device_capability(device) != (10, 3):
         return Bound(shape=shape, reason="FN MoE currently requires SM103")
     router.build(device, shape)
+    if shared:
+        from sgl_nvidia_mega.qwen3_8.sm103.moe import shared as shared_kernel
+
+        shared_kernel.build(device, shape)
     maps = {}
     if fused:
         kernel.build(device, shape)
@@ -128,7 +145,7 @@ def build(
         if fused
         else None
     )
-    return Bound(route=True, mkm=maps, identity=identity, shape=shape)
+    return Bound(route=True, mkm=maps, identity=identity, shape=shape, shared=shared)
 
 
 def produce(mlp, x, bound, shared=False):
@@ -172,3 +189,52 @@ def routed(mlp, x, bound, *, defer=True, produced=None, fused=True):
     with flashinfer_trtllm_deferred_finalize_context() if defer else nullcontext():
         combine = experts.run_moe_core(dispatch_output=dispatch)
     return experts.dispatcher.combine(combine_input=combine)
+
+
+def shared_unsupported(mlp, shape):
+    from sglang.srt.layers.activation import SiluAndMul
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    expert = mlp.shared_expert
+    if expert is None:
+        return "route_shared requires the separate native BF16 expert"
+    local = shape.shared_intermediate // shape.tp_size
+    if local <= 0 or 2 * local > shape.experts or local % 4:
+        return f"BF16 shared grid requires 8-aligned gate/up rows <= E; got I{local}"
+    for layer, dims in [
+        (expert.gate_up_proj, (2 * local, shape.hidden)),
+        (expert.down_proj, (shape.hidden, local)),
+    ]:
+        if not isinstance(layer.quant_method, UnquantizedLinearMethod):
+            return "route_shared requires original unquantized BF16 weights"
+        if (
+            layer.weight.dtype != torch.bfloat16
+            or tuple(layer.weight.shape) != dims
+            or not layer.weight.is_contiguous()
+        ):
+            return f"BF16 shared projection expected contiguous {dims}"
+    if (
+        not isinstance(expert.act_fn, SiluAndMul)
+        or expert._enable_silu_fp4_quant_fusion
+    ):
+        return "route_shared requires native BF16 SwiGLU without FP4 activation quantization"
+    return ""
+
+
+def produce_shared(mlp, x, bound):
+    from sgl_nvidia_mega.qwen3_8.sm103.moe import shared
+
+    return shared.router_shared(
+        x,
+        mlp.gate.weight,
+        mlp.experts.w13_input_scale_quant.reshape(1),
+        mlp.shared_expert.gate_up_proj.weight,
+        shape=bound.shape,
+    )
+
+
+def shared_expert_tail(expert, gate_up):
+    """Keep native BF16 activation, down projection and its original boundary."""
+    act = expert.act_fn(gate_up)
+    output, _ = expert.down_proj(act)
+    return output

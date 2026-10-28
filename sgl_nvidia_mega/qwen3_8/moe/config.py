@@ -18,6 +18,7 @@ class Shape:
     intermediate: int
     tp_size: int
     max_rows: int
+    shared_intermediate: int = 0
 
     @classmethod
     def from_config(cls, hf_config, tp_size: int, max_rows: int):
@@ -29,6 +30,7 @@ class Shape:
             int(_get(text, "moe_intermediate_size", 0)),
             int(tp_size),
             int(max_rows),
+            int(_get(text, "shared_expert_intermediate_size", 0)),
         )
 
     @property

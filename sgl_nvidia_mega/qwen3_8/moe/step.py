@@ -61,7 +61,18 @@ def step(layer, x, st, *, defer):
     bound = st.bound["moe"]
     # ae62 ordering: the main-stream producer completes before the alternate
     # stream's actual wait event. No early ready flag or speculative input read.
-    produced = route.produce(mlp, x, bound)
+    gate_up = None
+    if st.slots.route_shared:
+        produced, gate_up = route.produce_shared(mlp, x, bound)
+    else:
+        produced = route.produce(mlp, x, bound)
+
+    def shared_output(input_, *, apply_gate):
+        if gate_up is None:
+            return mlp._forward_shared_experts(input_, apply_gate=apply_gate)
+        output = route.shared_expert_tail(mlp.shared_expert, gate_up)
+        return mlp._gate_shared_output_out_of_place(x, output) if apply_gate else output
+
     use_gate = mlp.shared_expert_gate is not None
     if (
         mlp.alt_stream is not None
@@ -75,14 +86,16 @@ def step(layer, x, st, *, defer):
                 mlp, x, bound, defer=True, produced=produced, fused=st.slots.mkm
             )
             with torch.cuda.stream(mlp.alt_stream):
-                shared = mlp._forward_shared_experts(x, apply_gate=False)
+                shared = shared_output(x, apply_gate=False)
                 if shared is not None:
                     shared = mlp._gate_shared_output_out_of_place(x, shared)
         else:
             # Preserve the native clone until the complete stock consumer's
             # ownership contract has been audited independently.
             shared = (
-                mlp._forward_shared_experts(x.clone(), apply_gate=not use_gate)
+                shared_output(
+                    x if gate_up is not None else x.clone(), apply_gate=not use_gate
+                )
                 if mlp.shared_expert is not None
                 else None
             )
@@ -92,7 +105,7 @@ def step(layer, x, st, *, defer):
                 )
         current.wait_stream(mlp.alt_stream)
     else:
-        shared = mlp._forward_shared_experts(x, apply_gate=not use_gate and not defer)
+        shared = shared_output(x, apply_gate=not use_gate and not defer)
         if defer and shared is not None:
             shared = mlp._gate_shared_output_out_of_place(x, shared)
         routed = route.routed(

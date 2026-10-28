@@ -205,13 +205,17 @@ def test_hoisted_conv_is_sglangs(window_mode, tile, tp, bs):
 @pytest.mark.parametrize("tp, bs", TOPOLOGY_BATCHES)
 @pytest.mark.parametrize("views", [False, True])
 def test_norm_fp8_is_sglangs_norm_then_static_quant(views, tp, bs):
+    _norm_fp8_matches_stock(views, tp, bs, int(views) + 10 * bs)
+
+
+def _norm_fp8_matches_stock(views, tp, bs, seed):
     _, HV, D = _heads(tp)
     from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm
     from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 
     from sgl_nvidia_mega.qwen3_5.gdn.norm_fp8 import rms_norm_gated_fp8
 
-    g = torch.Generator(device="cuda").manual_seed(int(views) + 10 * bs)
+    g = torch.Generator(device="cuda").manual_seed(seed)
     tokens = bs * DRAFT
     core = torch.randn(tokens * HV, V, device="cuda", generator=g).to(torch.bfloat16)
     qkvz = torch.randn(tokens, D + HV * V, device="cuda", generator=g).to(
@@ -234,6 +238,14 @@ def test_norm_fp8_is_sglangs_norm_then_static_quant(views, tp, bs):
     assert torch.equal(
         got.view(torch.uint8).reshape(tokens, -1), want.view(torch.uint8)
     )
+
+
+@pytest.mark.parametrize("views", [False, True])
+def test_norm_fp8_keeps_bf16_rounding_before_quantization(views):
+    # At row 136/head 32/column 86, seed 320 produces a value at the BF16
+    # rounding boundary. Quantizing the adjacent BF16 values gives E4M3 32
+    # versus 36; both Z layouts must keep SGLang's rounding point.
+    _norm_fp8_matches_stock(views, tp=1, bs=32, seed=320)
 
 
 @pytest.mark.parametrize("tp, bs", TOPOLOGY_BATCHES)

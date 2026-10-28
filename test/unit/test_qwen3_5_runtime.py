@@ -1316,6 +1316,52 @@ def test_router_only_slots_cover_aggregate_and_pd_widths(tp, rows):
     assert not topology.select(requested, topology.Topology(8, 8, 8))
 
 
+def test_tp4_preserves_v2_shipped_capabilities():
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    shipped = frozenset(runtime.SHIPPED_SLOTS)
+    # The wide expert engines serve TP8's I=128, while TP4 holds I=256.
+    tp8_engines = frozenset({"mkm_m32", "mkm_m64", "mkm_m128", "mkm_m256", "mkm_m512"})
+    assert topology.select(shipped, topology.Topology(4)) == shipped - tp8_engines
+    assert (
+        topology.select(topology.TP4_V2_SLOTS, topology.Topology(4))
+        == topology.TP4_V2_SLOTS
+    )
+    # Restoring TP4 must not declare support for the unimplemented new shapes.
+    assert topology.select(topology.TP4_V2_SLOTS, topology.Topology(2)) == frozenset(
+        {"route", "route_topk", "route_gemm"}
+    )
+    assert not topology.select(topology.TP4_V2_SLOTS, topology.Topology(8, 8, 8))
+    assert runtime.slot_reasons(topology.select(shipped, topology.Topology(4))) == []
+
+
+def test_tp4_declarations_preserve_existing_kernel_shape_boundaries():
+    from sgl_nvidia_mega.qwen3_5 import topology
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import q1, xchg
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm
+
+    assert 256 in mkm.INTERMEDIATES
+    assert 256 not in mkm.WIDE_ENGINES and 256 not in mkm.M32_ENGINES
+    assert 4 in hop.WORLDS and 4 in xchg.WORLDS and 8 in q1.QUERY_HEADS
+    tp8_only = frozenset(
+        {
+            "mkm_wide",
+            "mkm_m32",
+            "mkm_m64",
+            "mkm_m128",
+            "mkm_m256",
+            "mkm_m512",
+            "mkm_wide_bal",
+            "gdn_front",
+            "gdn_trt_front",
+            "route_lin",
+        }
+    )
+    assert not topology.select(tp8_only, topology.Topology(4))
+    assert topology.select(tp8_only, topology.Topology(8)) == tp8_only
+
+
 def test_unsupported_specialization_does_not_disable_a_supported_slot(monkeypatch):
     from sgl_nvidia_mega.qwen3_5 import topology
 

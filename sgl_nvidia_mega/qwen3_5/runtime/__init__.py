@@ -126,7 +126,10 @@ def build_cp_lite(binding) -> None:
     rank, so this runs once from each Qwen3.5 plugin build, before any package checks
     ``CpLite._instance`` or CUDA graph variant is created.
     """
-    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+    try:
+        from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+    except ImportError:  # pragma: no cover - the pre-kernel_plugins SGLang path
+        from sglang.srt.megakernels.runtime import megakernel_agree
 
     requested = tuple(sorted(SLOTS & CP_LITE_SLOTS))
     megakernel_agree(
@@ -365,7 +368,9 @@ SGLANG_READS = {
         "tp_size",
         "tp_device_group",
     ),
-    "srt/kernel_plugins/nvidia/binding.py": ("megakernel_agree",),
+    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/runtime.py": (
+        "megakernel_agree",
+    ),
 }
 
 

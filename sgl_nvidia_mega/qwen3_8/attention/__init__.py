@@ -126,6 +126,9 @@ def step(layer, x, st):
     else:
         indices = indexer.select(layer, x, st.positions, sparse)
     output = qsa_core.attend(layer, q, k, v, gate, indices, st, sparse)
+    from sgl_nvidia_mega.qwen3_8.runtime import engaged
+
+    engaged.mark(st, "qsa_core")
     if x.shape[0] not in _ENGAGED:
         _ENGAGED.add(x.shape[0])
         logger.info("FN qsa_core route: rows=%s Q=%s KV=%s", x.shape[0], layer.num_heads, layer.num_kv_heads)

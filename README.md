@@ -73,6 +73,15 @@ The remaining kernel families are opt-in through that one slot policy. These cha
 | `lowm_in`, `lowm_out`, `lowm_se`, `lowm_push` | shape-bounded | Validated low-row projection and shared-expert launches |
 | `draft_moe`, `draft_q1`, `draft_xchg`, `draft_hop`, `draft_fin`, `draft_front`, `draft_skv2` | shape-bounded | Fused MTP draft kernels and boundaries |
 
+`mka` uses the fused projection kernels through 14 verify rows on TP8 and 8 on
+TP4. At wider rows, and at every TP2 width, it keeps SGLang's projection GEMMs
+and fuses Q/K normalization, RoPE and the FP8 KV write, then the output gate
+and static FP8 quantization. TP2 has 16 query heads and two KV heads per rank;
+TP4 has 8/1 and TP8 has 4/1. The same front path serves PD decode TP2.
+`multi_request` coverage is required for more than one request. `skv2` keeps
+its one-request, one-KV-head scope; `skv2_cp` additionally requires replicated
+KV heads across ranks.
+
 The sampling and acceptance after the verify, and the GatedDeltaNet extend of prefill, stay SGLang's own code. In an SGLang that has the switches, `SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1` runs the sampling and acceptance in CUDA graphs, and `SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND=1` captures the GatedDeltaNet extend inside the breakable prefill CUDA graphs.
 
 ### Design

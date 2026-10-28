@@ -55,7 +55,7 @@ class Bound(msgspec.Struct, frozen=True):
 
     skv2: bool = False  # slot skv2 serves every full-attention layer
     mka: bool = False
-    mka_wide: bool = False  # mka's wide entries serve the steps of several requests
+    mka_wide: bool = False  # mka's front path also serves steps of several requests
     mka_push: bool = False
     route_lin: bool = False  # router-before-all-reduce packed for every layer
     reason: str = ""  # why a requested slot is not built
@@ -102,7 +102,7 @@ def build(model, ctx) -> Bound:
     return Bound(
         skv2="skv2" in SLOTS,
         mka=mka_on,
-        mka_wide=mka_on and all(layer.num_heads == 4 for _, layer in layers),
+        mka_wide=mka_on,
         mka_push="mka_push" in SLOTS,
         route_lin="route_lin" in SLOTS,
     )

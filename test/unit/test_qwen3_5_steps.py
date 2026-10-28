@@ -2476,7 +2476,13 @@ def test_the_mka_slot_runs_the_prologue_the_attention_and_the_epilogue(skv2):
 
 
 @pytest.mark.parametrize("consumed", [False, True])
-def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(consumed):
+@pytest.mark.parametrize(
+    "heads,kv_heads,rows",
+    [(4, 1, 21), (8, 1, 14), (16, 1, 7), (16, 1, 42), (16, 1, 70), (32, 2, 224)],
+)
+def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(
+    consumed, heads, kv_heads, rows
+):
     from sglang.srt.layers.attention.q35_cp_lite import CpLite
     from sglang.srt.layers.quantization import fp8_utils
 
@@ -2485,16 +2491,16 @@ def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(consumed):
     from sgl_nvidia_mega.qwen3_5.sm103.attention import gate_quant as gate_module
     from sgl_nvidia_mega.qwen3_5.sm103.draft import front
 
-    rows = 21
     log = _log()
     attn, st = _skv2_setup(log)
-    layer = _mka_layer(log, attn)
+    layer = _mka_layer(log, attn, num_heads=heads, num_kv_heads=kv_heads)
+    width = heads * 256
     x = torch.zeros(rows, 4096, dtype=torch.bfloat16)
-    qkv = torch.zeros(rows, 2560, dtype=torch.bfloat16)
-    q = torch.zeros(rows, 1024, dtype=torch.float8_e4m3fn)
-    gate = torch.zeros(rows, 1024, dtype=torch.bfloat16)
-    attention_out = torch.zeros(rows, 1024, dtype=torch.bfloat16)
-    fallback = torch.zeros(rows, 1024, dtype=torch.float8_e4m3fn)
+    qkv = torch.zeros(rows, 2 * width + 2 * kv_heads * 256, dtype=torch.bfloat16)
+    q = torch.zeros(rows, width, dtype=torch.float8_e4m3fn)
+    gate = torch.zeros(rows, width, dtype=torch.bfloat16)
+    attention_out = torch.zeros(rows, width, dtype=torch.bfloat16)
+    fallback = torch.zeros(rows, width, dtype=torch.float8_e4m3fn)
     result = torch.zeros(rows, 4096, dtype=torch.bfloat16)
     qkv_linear = layer.qkv_proj
     layer.qkv_proj = _Callable(lambda _: (qkv, None), **vars(qkv_linear))
@@ -2542,7 +2548,7 @@ def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(consumed):
     assert offered_gate.data_ptr() == gate.data_ptr()
     assert calls[0][2] is layer.o_proj.input_scale
     offered = calls[0][3]
-    assert tuple(offered.shape) == (rows, 1024)
+    assert tuple(offered.shape) == (rows, width)
     assert offered.dtype == torch.float8_e4m3fn
     assert calls[1] == ("take",)
     if consumed:
@@ -2627,6 +2633,9 @@ def test_the_mka_push_slot_pushes_where_the_moe_input_only_consumes(consumes):
     "kw, want",
     [
         (dict(), ""),
+        (dict(num_heads=8), ""),
+        (dict(num_heads=16), ""),
+        (dict(num_heads=32, num_kv_heads=2), ""),
         (dict(attn_output_gate=False), "no attention output gate"),
         (dict(num_heads=2), "2 query / 1 KV heads a rank"),
         (dict(num_kv_heads=2), "4 query / 2 KV heads a rank"),
@@ -2692,8 +2701,8 @@ def test_the_mka_slot_is_built_with_its_weights_packed_for_every_attention_layer
     ctx = SimpleNamespace(tokens_per_request=7)
     for made in layers[1:]:
         made.num_heads = 8
-    # TP4's eight query heads a rank: the narrow kernels only
-    assert attention.build(model, ctx) == attention.Bound(mka=True)
+    # TP4's narrow kernels and the generic front at wider rows.
+    assert attention.build(model, ctx) == attention.Bound(mka=True, mka_wide=True)
     packed.clear()
     for made in layers[1:]:
         made.num_heads = 4
@@ -2720,10 +2729,58 @@ def test_the_mka_slot_names_the_pools_it_cannot_write():
     assert (
         mka.pool_reasons(kv(torch.zeros(64, 1, 256, dtype=torch.float8_e4m3fn))) == []
     )
-    assert mka.pool_reasons(kv(torch.zeros(64, 2, 256, dtype=torch.float8_e4m3fn))) == [
-        "a torch.float8_e4m3fn KV pool buffer of strides (512, 256, 1)"
+    assert (
+        mka.pool_reasons(kv(torch.zeros(64, 2, 256, dtype=torch.float8_e4m3fn))) == []
+    )
+    assert mka.pool_reasons(kv(torch.zeros(64, 4, 256, dtype=torch.float8_e4m3fn))) == [
+        "a torch.float8_e4m3fn KV pool buffer of strides (1024, 256, 1)"
     ]
+    assert mka.pool_reasons(
+        kv(torch.zeros(64, 1, 512, dtype=torch.float8_e4m3fn)[..., ::2])
+    )
     assert "torch.float32" in mka.pool_reasons(kv(torch.zeros(64, 1, 256)))[0]
+
+
+def test_tp2_mka_keeps_the_stock_projection_weights(monkeypatch):
+    """TP2's sixteen query heads use the generic front and cannot be packed for the
+    single-KV-head CUDA prologue, even at one request."""
+    from sgl_nvidia_mega.qwen3_5.attention import mka
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import mka as kernels
+
+    layer = _mka_layer(_log(), None, num_heads=16, num_kv_heads=1)
+    monkeypatch.setattr(
+        kernels, "build", lambda _: pytest.fail("TP2 compiled fused MKA")
+    )
+    assert mka.pack(layer) == ""
+
+
+@pytest.mark.parametrize("missing", ["mka", "skv2"])
+def test_an_unavailable_attention_slot_keeps_the_independent_slot(monkeypatch, missing):
+    """A head shape or projection format rejected by one slot must not disable
+    the other's attention path."""
+    from sgl_nvidia_mega.qwen3_5.attention import mka, split_kv
+
+    layer = qwen3_5.Qwen3_5AttentionDecoderLayer.__new__(
+        qwen3_5.Qwen3_5AttentionDecoderLayer
+    )
+    torch.nn.Module.__init__(layer)
+    layer.attn = SimpleNamespace()
+    model = SimpleNamespace(
+        is_mrope_enabled=True,
+        model=SimpleNamespace(start_layer=0, end_layer=1, layers=[layer]),
+    )
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"mka", "skv2"}))
+    monkeypatch.setattr(
+        mka, "unsupported", lambda _: "projection format" if missing == "mka" else ""
+    )
+    monkeypatch.setattr(
+        split_kv, "unsupported", lambda *_: "head shape" if missing == "skv2" else ""
+    )
+    monkeypatch.setattr(mka, "pack", lambda *a, **k: "")
+    bound = attention.build(model, SimpleNamespace(tokens_per_request=7))
+    assert bound.mka is (missing != "mka")
+    assert bound.skv2 is (missing != "skv2")
+    assert bound.reason
 
 
 class _Exit:

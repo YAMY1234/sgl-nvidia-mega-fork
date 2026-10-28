@@ -1380,6 +1380,7 @@ def test_tp4_preserves_v2_shipped_capabilities():
         "route",
         "route_topk",
         "route_gemm",
+        "mka",
         "gdn_verify",
         "gdn_pdl",
         "gdn_conv",
@@ -1391,10 +1392,13 @@ def test_tp4_preserves_v2_shipped_capabilities():
         "draft_front",
     }
     assert topology.select(topology.TP4_V2_SLOTS, topology.Topology(8, 8, 8)) == {
+        "mka",
         "gdn_verify",
         "gdn_pdl",
         "gdn_conv",
     }
+    assert topology.select({"mka"}, topology.Topology(2)) == {"mka"}
+    assert topology.select({"mka"}, topology.Topology(8, 8, 8)) == {"mka"}
     assert runtime.slot_reasons(topology.select(shipped, topology.Topology(4))) == []
 
 

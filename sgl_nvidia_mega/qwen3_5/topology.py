@@ -161,6 +161,12 @@ SLOT_TOPOLOGIES.update(
     route_topk=frozenset({"tp2", "tp4", "tp8", "tep8"}),
     route_gemm=frozenset({"tp2", "tp4", "tp8", "tep8"}),
 )
+# ATTN: the generic front uses stock projection GEMMs on TP2 and DEP8.
+SLOT_TOPOLOGIES.update(
+    mka=TOPOLOGIES,
+    skv2=frozenset({"tp4", "tp8", "tep8"}),
+    skv2_cp=frozenset({"tp4", "tp8", "tep8"}),
+)
 
 
 class Topology(msgspec.Struct, frozen=True):

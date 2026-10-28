@@ -75,6 +75,15 @@ The remaining kernel families are opt-in through that one slot policy. These cha
 
 The router-only `route`, `route_topk` and `route_gemm` slots support TP2, TP4, TP8 and TEP8 with the TRTLLM runner and no all-to-all. PD decode TP2 uses the same local row counts: batch 6/10 gives 42/70 verify rows. These fronts leave the expert GEMMs with the stock runner, so TP2 needs no fused expert engine. `route_shared` keeps its TP8/TEP8 projection bounds; DEP8 keeps stock MoE dispatch and routing.
 
+`mka` uses the fused projection kernels through 14 verify rows on TP8 and 8 on
+TP4. At wider rows, and at every TP2 width, it keeps SGLang's projection GEMMs
+and fuses Q/K normalization, RoPE and the FP8 KV write, then the output gate
+and static FP8 quantization. TP2 has 16 query heads and one KV head per rank;
+TP4 has 8/1 and TP8 has 4/1. The same front path serves PD decode TP2 and DEP8 (32/2 per rank).
+`multi_request` coverage is required for more than one request. `skv2` keeps
+its one-request, one-KV-head scope; `skv2_cp` additionally requires replicated
+KV heads across ranks.
+
 The sampling and acceptance after the verify stay SGLang's own code. `gdn_prefill_split_conv` is an explicit bitwise slot for ordinary text prefill on TP1/PP4 with the data-only prefill binding: it splits the native conv by Q/K/V channels above 8192 channels, retaining native recurrence, norm and state writes. Unsupported layouts use SGLang; an empty slot policy calls the original prefill forward directly. In an SGLang that has the switches, `SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1` runs the sampling and acceptance in CUDA graphs, and `SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND=1` captures the GatedDeltaNet extend inside the breakable prefill CUDA graphs.
 
 ### Design

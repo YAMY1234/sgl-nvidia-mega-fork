@@ -64,11 +64,11 @@ def _fill(q, pools, table, lengths, length, g):
     lengths.fill_(length)
 
 
-def _inputs(length, g, spare_pages=8):
+def _inputs(length, g, spare_pages=8, heads=HEADS):
     """FP8 query rows, a paged FP8 KV pool with the request's pages scattered, its page
     table and its length."""
     total = math.ceil(length / PAGE) + spare_pages
-    q = torch.empty(ROWS, HEADS, DIM, dtype=torch.float8_e4m3fn, device="cuda")
+    q = torch.empty(ROWS, heads, DIM, dtype=torch.float8_e4m3fn, device="cuda")
     pools = [
         torch.empty(total * PAGE, 1, DIM, dtype=torch.float8_e4m3fn, device="cuda")
         for _ in range(2)
@@ -113,14 +113,15 @@ def _sglang(q, kv, table, lengths, qk_scale, v_scale):
 
 
 @pytest.mark.parametrize("length", [7, 64, 2048, 8192, 32769, 131072, 150007])
-def test_skv2_is_within_twice_sglangs_error(length):
+@pytest.mark.parametrize("heads", [4, 8])
+def test_skv2_is_within_twice_sglangs_error(length, heads):
     from sgl_nvidia_mega.qwen3_5.sm103.attention.skv2 import StockSplitPlan
 
     g = torch.Generator(device="cuda").manual_seed(length)
-    q, pools, table, lengths = _inputs(length, g)
+    q, pools, table, lengths = _inputs(length, g, heads=heads)
     kv = tuple(map(_hnd, pools))
     qk_scale, v_scale = 0.75 * SCALE, 0.5
-    out = torch.empty(ROWS, HEADS, DIM, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(ROWS, heads, DIM, dtype=torch.bfloat16, device="cuda")
     plan = StockSplitPlan(q, kv, table, lengths)
     plan.run(q, kv, table, lengths, qk_scale=qk_scale, v_scale=v_scale, out=out)
     want = _reference(q, kv, table, length, qk_scale, v_scale)
@@ -369,14 +370,11 @@ def _bits(a, b):
     )
 
 
-def _front_operands(rows, g, mrope=True, slots=64 * 16):
-    q_gate = (torch.randn(rows, HEADS * 2 * DIM, device="cuda", generator=g) * 3).to(
-        torch.bfloat16
-    )
-    k, v = (
-        (torch.randn(rows, DIM, device="cuda", generator=g) * 3).to(torch.bfloat16)
-        for _ in range(2)
-    )
+def _front_operands(rows, g, mrope=True, slots=64 * 16, heads=HEADS, kv_heads=1):
+    # As qkv_proj's split: all three inputs keep the packed projection's row stride.
+    widths = (heads * 2 * DIM, kv_heads * DIM, kv_heads * DIM)
+    qkv = (torch.randn(rows, sum(widths), device="cuda", generator=g) * 3).bfloat16()
+    q_gate, k, v = qkv.split(widths, dim=-1)
     norms = [
         (torch.randn(DIM, device="cuda", generator=g) * 0.1).to(torch.bfloat16)
         for _ in range(2)
@@ -389,11 +387,13 @@ def _front_operands(rows, g, mrope=True, slots=64 * 16):
     else:
         pos, axis = torch.randint(0, 4096, (rows,), device="cuda", generator=g), None
     pools = tuple(
-        torch.randn(slots, 1, DIM, device="cuda", generator=g).to(torch.float8_e4m3fn)
+        torch.randn(slots, kv_heads, DIM, device="cuda", generator=g).to(
+            torch.float8_e4m3fn
+        )
         for _ in range(2)
     )
     loc = torch.randperm(slots, device="cuda", generator=g)[:rows]
-    args = (q_gate, k, *norms, cos_sin, pos, 1e-6, HEADS, 1, DIM, 64)
+    args = (q_gate, k, *norms, cos_sin, pos, 1e-6, heads, kv_heads, DIM, 64)
     return args, axis, v, pools, loc
 
 
@@ -447,7 +447,10 @@ def test_front_with_the_cache_write_replays_in_a_cuda_graph_bit_for_bit():
 
 
 @pytest.mark.parametrize("rows", [7, 14, 28, 56, 112, 224, 448, 896])
-def test_front_with_the_cache_write_is_sglangs_front_then_fp8_kv_write(rows):
+@pytest.mark.parametrize("heads,kv_heads", [(4, 1), (8, 1), (16, 1), (32, 2)])
+def test_front_with_the_cache_write_is_sglangs_front_then_fp8_kv_write(
+    rows, heads, kv_heads
+):
     """The front with its FP8 KV write (one launch) gives the bytes of SGLang's front
     followed by its fused FP8 q / k / v + KV write, at every covered width."""
     from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
@@ -462,7 +465,9 @@ def test_front_with_the_cache_write_is_sglangs_front_then_fp8_kv_write(rows):
     )
 
     g = torch.Generator(device="cuda").manual_seed(300 + rows)
-    args, axis, v, pools, loc = _front_operands(rows, g, slots=64 * 32)
+    args, axis, v, pools, loc = _front_operands(
+        rows, g, slots=64 * 32, heads=heads, kv_heads=kv_heads
+    )
     scales = [torch.full((1,), s, device="cuda") for s in (0.8, 1.3)]
     want_pools = tuple(p.clone() for p in pools)
     q, k, gate = sglang_front(*args, has_gate=True, mrope_axis_map=axis)
@@ -488,15 +493,16 @@ def test_front_with_the_cache_write_is_sglangs_front_then_fp8_kv_write(rows):
 
 
 @pytest.mark.parametrize("rows", [7, 14, 28, 56, 112, 224, 448, 896])
-def test_gate_quant_is_sglangs_sigmoid_mul_then_static_quant(rows):
+@pytest.mark.parametrize("heads", [4, 8, 16, 32])
+def test_gate_quant_is_sglangs_sigmoid_mul_then_static_quant(rows, heads):
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
     from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 
     from sgl_nvidia_mega.qwen3_5.sm103.attention.gate_quant import gate_quant
 
     g = torch.Generator(device="cuda").manual_seed(400 + rows)
-    attn = (torch.randn(rows, HEADS * DIM, device="cuda", generator=g) * 4).bfloat16()
-    gate = (torch.randn(rows, HEADS * DIM, device="cuda", generator=g) * 3).bfloat16()
+    attn = (torch.randn(rows, heads * DIM, device="cuda", generator=g) * 4).bfloat16()
+    gate = (torch.randn(rows, heads * DIM, device="cuda", generator=g) * 3).bfloat16()
     scale = torch.full((1,), 0.013, device="cuda")
     want, _ = static_quant_fp8(fused_sigmoid_mul(attn, gate), scale)
     assert _bits(want, gate_quant(attn, gate, scale))

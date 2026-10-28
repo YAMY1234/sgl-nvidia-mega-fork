@@ -16,8 +16,8 @@ slot ``mka_push`` the epilogue also pushes its rows into the decode hop's mailbo
 the MoE input's all-reduce will run the hop for them, and that all-reduce only consumes
 (the branch's MKA_PUSH).
 
-Steps of several requests (TP8, with ``multi_request``): up to ``FUSED_MAX_ROWS`` rows
-the wide entries of the same kernels; past it the front path, which keeps SGLang's qkv
+Steps of several requests (with ``multi_request``): TP8 uses the fused entries through
+14 rows, TP4 through 8, and TP2 and DEP8 always use the front path, which keeps SGLang's qkv
 and o_proj GEMMs and fuses the rest bit for bit: the q / k norm, RoPE and gate split with
 the FP8 q and K / V write in one launch (the attention front of slot ``draft_front``),
 and the output gate with o_proj's static FP8 input quantization in one launch.
@@ -107,10 +107,10 @@ def unsupported(layer) -> str:
     rope = layer.rotary_emb
     if not layer.attn_output_gate:
         return "no attention output gate"
-    if layer.num_heads not in (4, 8) or layer.num_kv_heads != 1:
+    if (layer.num_heads, layer.num_kv_heads) not in ((4, 1), (8, 1), (16, 1), (32, 2)):
         return (
             f"{layer.num_heads} query / {layer.num_kv_heads} KV heads a rank "
-            "(MKA runs 4 or 8 / 1)"
+            "(MKA runs 4/1, 8/1, 16/1 or 32/2)"
         )
     if layer.head_dim != 256 or layer.hidden_size != 4096:
         return f"head_dim {layer.head_dim}, hidden {layer.hidden_size} (MKA runs 256, 4096)"
@@ -124,10 +124,14 @@ def unsupported(layer) -> str:
 
 
 def pool_reasons(kv) -> list[str]:
-    """Why the prologue cannot write these KV pools ([] when it can): one FP8 KV head
-    of 256 per slot."""
+    """Why the prologue cannot write these KV pools ([] when it can): contiguous
+    NHD FP8 rows of one (TP8/TP4) or two (DEP8) heads of 256."""
     for buf in (*kv.k, *kv.v):
-        if buf.dtype != torch.float8_e4m3fn or buf.stride(0) != 256:
+        if (
+            buf.dtype != torch.float8_e4m3fn
+            or buf.shape[1:] not in ((1, 256), (2, 256))
+            or not buf.is_contiguous()
+        ):
             return [f"a {buf.dtype} KV pool buffer of strides {buf.stride()}"]
     return []
 
@@ -137,6 +141,9 @@ def pack(layer, route_lin: bool = False) -> str:
 
     Returns why its router-before-all-reduce weights cannot be packed, when requested.
     """
+    # TP2 and DEP8 keep the stock GEMMs; its generic front needs no packed weights.
+    if layer.num_heads > 8:
+        return _pack_route_lin(layer) if route_lin else ""
     from sgl_nvidia_mega.qwen3_5.sm103.attention import mka as kernels
 
     kernels.build(layer.qkv_proj.weight.device)
@@ -205,14 +212,19 @@ def step(layer, x, st):
     from sgl_nvidia_mega.qwen3_5.sm103.attention import mka as kernels
 
     m = x.shape[0]
-    if m not in _ENGAGED:
-        _ENGAGED.add(m)
+    fused_max = (
+        FUSED_MAX_ROWS if layer.num_heads == 4 else 8 if layer.num_heads == 8 else 0
+    )
+    key = (layer.num_heads, m)
+    if key not in _ENGAGED:
+        _ENGAGED.add(key)
         logger.info(
-            "NVIDIA megakernel: Qwen3.5 slot mka runs at %d rows (%s)",
+            "NVIDIA megakernel: Qwen3.5 slot mka runs at %d rows, %d query heads (%s)",
             m,
-            "fused" if m <= FUSED_MAX_ROWS else "front path",
+            layer.num_heads,
+            "fused" if m <= fused_max else "front path",
         )
-    if m > FUSED_MAX_ROWS:
+    if m > fused_max:
         return _front_step(layer, x, st)
     attn = layer.attn
     width = layer.num_heads * layer.head_dim

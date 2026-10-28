@@ -148,6 +148,7 @@ class Qwen38Verify:
     ):
         from sglang.srt.models.qwen4_exp import Qwen4ExpLinearDecoderLayer
         from sgl_nvidia_mega.qwen3_8.gdn import step as gdn_step
+        from sgl_nvidia_mega.qwen3_8.attention import step as attention_step
 
         self.lm, self.slots, self.bound = lm, slots, bound
         self.widths = tuple(sorted(widths))
@@ -159,7 +160,7 @@ class Qwen38Verify:
             i: (gdn_step if any(s.gdn_verify or s.gdn_mk or s.gdn_front
                                for s in slots.values()) else gdn_stock)
             if isinstance(m.layers[i], Qwen4ExpLinearDecoderLayer)
-            else attention_stock
+            else (attention_step if any(s.qsa_core for s in slots.values()) else attention_stock)
             for i in range(m.start_layer, m.end_layer)
         }
 

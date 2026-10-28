@@ -21,6 +21,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
     "route",
     "mkm",
     "route_shared",
+    "qsa_core",
 )
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -53,7 +54,7 @@ def build(model, ctx, *, hf_config=None):
     import torch
 
     from sgl_nvidia_mega.qwen3_5.runtime import PackageContext, parity
-    from sgl_nvidia_mega.qwen3_8 import gdn
+    from sgl_nvidia_mega.qwen3_8 import attention, gdn
     from sgl_nvidia_mega.qwen3_8 import plan as slot_plan
     from sgl_nvidia_mega.qwen3_8.runtime.executor import Qwen38Verify
 
@@ -71,14 +72,18 @@ def build(model, ctx, *, hf_config=None):
     gdn_bound = gdn.build(model, pctx)
     if gdn_bound.reason:
         raise RuntimeError(f"NVIDIA megakernel: FN GDN: {gdn_bound.reason}")
-    bound = {"gdn": gdn_bound}
+    attn_bound = attention.build(model, pctx, hf_config, SLOTS)
+    if "qsa_core" in SLOTS and not attn_bound.qsa_core:
+        raise RuntimeError(f"NVIDIA megakernel: FN attention: {attn_bound.reason}")
+    bound = {"gdn": gdn_bound, "attention": attn_bound}
+    attention_facts = dict(qsa_core=attn_bound.qsa_core)
     gdn_facts = dict(
         gdn_verify=gdn_bound.gdn_verify,
         gdn_pdl=gdn_bound.gdn_pdl,
         gdn_mk=gdn_bound.gdn_mk,
         gdn_front=gdn_bound.gdn_front,
     )
-    facts = slot_plan.Facts(**gdn_facts)
+    facts = slot_plan.Facts(**gdn_facts, **attention_facts)
     if "route" in SLOTS:
         from sglang.srt.runtime_context import get_parallel
         from sgl_nvidia_mega.qwen3_8.moe import route
@@ -101,7 +106,7 @@ def build(model, ctx, *, hf_config=None):
             )
         bound["moe"] = moe
         facts = slot_plan.Facts(
-            **gdn_facts, route=moe.route, mkm=bool(moe.mkm), route_shared=moe.shared
+            **gdn_facts, **attention_facts, route=moe.route, mkm=bool(moe.mkm), route_shared=moe.shared
         )
     slots = slot_plan.plan(widths, facts)
     checker = (

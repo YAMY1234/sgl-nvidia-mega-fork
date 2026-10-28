@@ -5,7 +5,8 @@ verify rows come from the build's `PackageContext.tokens_per_request`.
 - `gdn_verify`: native Triton convolution, ReplaySSM, native sigmoid norm/output.
 - `gdn_pdl`: the same arithmetic with a gate-safe producer wait. This is a
   bitwise fallback, not the performance competitor of in-tree e5 MK.
-- `gdn_mk`: numeric e5 four-warp full-head core and fused sigmoid norm. It owns
+- `gdn_mk`: mature e5 BF16 projection/conv plus the numeric four-warp full-head
+  core and fused sigmoid norm. It owns
   its original PDL entry trigger/wait and preserves native commit/track. Four
   verify rows/request are qualified. Out projection, AR and HC stay native.
 - `gdn_front`: the new BF16 N32 projection/conv; not yet available.
@@ -20,3 +21,11 @@ error ratio to native is1.035356 and maximum absolute-error ratio1.535666.
 Standard1.05/2.0 tolerances apply. Both BF16 lanes use the native compact commit;
 FP64 keeps ideal unrounded state. These are primitive gates; plugin service
 parity/smoke and performance remain pending.
+
+Mature front port:24/24 GPU cases against frozen e5 source, M4/M8/M12 with
+and without bias, int32/int64 indices, strided windows, three changed-input/state
+graph replays per case. The same BF16 mature front is retained for the MK slot;
+the new N32 front remains separately disabled. Integrated87153be CPU gate:
+FN spec12, own GDN8 (including native/numeric GDN + MoE build/plan combinations),
+qwen3_8 contract30 and entrypoint1 pass. Combined wiring tests mock GPU resource
+construction; they do not claim model execution or service parity.

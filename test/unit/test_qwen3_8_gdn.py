@@ -59,3 +59,33 @@ def test_unqualified_mk_row_count_has_a_reason():
     with patch.object(runtime,"SLOTS",frozenset({"gdn_mk"})):
         bound=gdn.build(fake_model(),SimpleNamespace(tokens_per_request=7))
     assert "four verify rows" in bound.reason
+
+
+@pytest.mark.parametrize('numeric',[False,True])
+def test_gdn_and_moe_build_and_plan_together(monkeypatch,numeric):
+    from sgl_nvidia_mega.qwen3_5.runtime import parity
+    from sgl_nvidia_mega.qwen3_8 import runtime
+    from sgl_nvidia_mega.qwen3_8.runtime import executor
+    from sgl_nvidia_mega.qwen3_8.moe import route
+    from sglang.srt import runtime_context
+    names={'gdn_mk'} if numeric else {'gdn_verify','gdn_pdl'}
+    monkeypatch.setattr(runtime,'SLOTS',frozenset(names|{'route','mkm','route_shared'}))
+    monkeypatch.setattr(parity,'ENABLED',False)
+    monkeypatch.setattr(runtime_context,'get_parallel',lambda:SimpleNamespace(tp_size=4))
+    seen={}
+    def moe_build(model,max_rows,**kwargs):
+        seen.update(max_rows=max_rows,**kwargs)
+        return route.Bound(route=True,mkm={3:object()},shared=True)
+    monkeypatch.setattr(route,'build',moe_build)
+    # This is a wiring/plan test: GPU resource construction/execution has its
+    # independent primitive and service gates, not simulated CPU success.
+    monkeypatch.setattr(executor,'Qwen38Verify',lambda model,slots,**kwargs:
+                        SimpleNamespace(slots=slots,**kwargs))
+    model=fake_model()
+    ctx=SimpleNamespace(widths=(4,8,12),tokens_per_request=4,deadline_s=2.,binding=object())
+    built=runtime.build(model,ctx,hf_config=model.config)
+    assert built.widths==(4,) and set(built.bound)=={'gdn','moe'}
+    held=built.slots[4]
+    assert held.gdn_mk==numeric and held.gdn_verify!=numeric and held.gdn_pdl
+    assert held.route and held.mkm and held.route_shared
+    assert seen==dict(max_rows=4,fused=True,shared=True,hf_config=model.config,tp_size=4)

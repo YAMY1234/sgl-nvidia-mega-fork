@@ -82,8 +82,10 @@ NUMERIC_TOLERANCES: dict[str, dict[str, float]] = {
     # four real TP4 rank-local224K inputs and explicitly derived8K fixtures,
     # each N5. Error ratios: relL2 .814905-.921637, maxabs .513759-1.000000.
     # Evidence: lanes/qsa/fn-mega-attn-v1/native-summary-454345.json.
-    # This gate used the1015 image (FI0.7.1); repeat on1028/FI0.7.2 before
-    # service parity/performance. These remain separate gates.
+    # Requalified456180 on1028/FI0.7.2 with the same standard error bounds:
+    # relL2 .814905-.921637, maxabs .513759-1.000000, nativeA/A0, N5.
+    # Evidence: lanes/qsa/fn-mega-attn-v1/native-summary-456180.json.
+    # Primitive qualification and service parity/performance are separate gates.
     "qsa_core": {
         "qsa_core.attention.rel_l2_vs_stock": 1.05,
         "qsa_core.attention.max_abs_vs_stock": 2.0,

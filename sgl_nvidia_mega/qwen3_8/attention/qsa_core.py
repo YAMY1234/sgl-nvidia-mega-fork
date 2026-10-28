@@ -1,7 +1,7 @@
 """Selected BF16 KV core, over the actual QSA backend's metadata.
 
-The generic ForwardView's metadata is GDN metadata. It is deliberately never
-used for attention lengths or logical positions here.
+The generic ForwardView's metadata is None on the hybrid backend. Attention
+lengths and logical positions come from the resolved full attention backend.
 """
 
 SGLANG_READS = {

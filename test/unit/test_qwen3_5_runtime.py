@@ -1248,7 +1248,7 @@ def test_unsupported_specialization_does_not_disable_a_supported_slot(monkeypatc
     monkeypatch.setitem(topology.SLOT_TOPOLOGIES, "gdn_verify", topology.TOPOLOGIES)
     requested = frozenset({"gdn_verify", "gdn_front", "gdn_pdl", "multi_request"})
     selected = topology.select(requested, topology.Topology(2))
-    assert selected == frozenset({"gdn_verify", "multi_request"})
+    assert selected == frozenset({"gdn_verify", "gdn_pdl", "multi_request"})
     assert runtime.slot_reasons(selected) == []
 
 
@@ -1261,3 +1261,23 @@ def test_dep8_is_not_confused_with_tep8_and_keeps_the_draft_stock():
     dep = topology.select(requested, topology.Topology(8, 8, 8))
     assert not dep & set(runtime.DRAFT_ENTRIES + runtime.DRAFT_SLOTS)
     assert topology.select(requested, topology.Topology(8, 1, 8)) == requested
+
+
+@pytest.mark.parametrize("topology_name", ["tp2", "tp4", "tp8", "tep8", "dep8"])
+def test_gdn_slot_topologies_keep_generic_verify_and_bound_the_core(topology_name):
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    configs = {
+        "tp2": topology.Topology(2),
+        "tp4": topology.Topology(4),
+        "tp8": topology.Topology(8),
+        "tep8": topology.Topology(8, 1, 8),
+        "dep8": topology.Topology(8, 8, 8),
+    }
+    generic = frozenset({"gdn_verify", "gdn_pdl", "gdn_conv"})
+    requested = generic | {"gdn_core", "gdn_front", "gdn_push"}
+    got = topology.select(requested, configs[topology_name])
+    assert generic <= got
+    assert ("gdn_core" in got) == (topology_name != "dep8")
+    if topology_name in {"tp2", "tp4", "dep8"}:
+        assert not got & {"gdn_front", "gdn_push"}

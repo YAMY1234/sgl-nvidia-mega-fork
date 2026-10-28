@@ -65,6 +65,15 @@ SLOT_TOPOLOGIES = {
         "draft_skv2_cp",
     )
 }
+# GDN's opened chain uses the layer's local head counts; the Triton verify
+# supports the aggregate 16-entry ring and DEP8's 32-entry ring. The numeric
+# CUDA core retains its measured two-tile (16-entry) history implementation.
+SLOT_TOPOLOGIES.update(
+    gdn_verify=TOPOLOGIES,
+    gdn_pdl=TOPOLOGIES,
+    gdn_conv=TOPOLOGIES,
+    gdn_core=frozenset({"tp2", "tp4", "tp8", "tep8"}),
+)
 # These names select coverage or SGLang's own runtime policy, not a plugin kernel.
 SLOT_TOPOLOGIES.update(
     multi_request=TOPOLOGIES,

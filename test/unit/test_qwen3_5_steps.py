@@ -654,19 +654,29 @@ def test_route_topk_checks_materialized_routing_without_a_fused_expert_engine(
 @pytest.mark.parametrize("tp_size", [2, 4, 8])
 def test_route_topk_accepts_native_topk_config_at_each_tp_width(tp_size):
     from sglang.srt.configs.shared_experts import SharedExpertsConfig
-    from sglang.srt.layers.moe.topk import TopKConfig, TopKOutputFormat
-    from sglang.srt.layers.moe.utils import RoutingMethodType
+    from sglang.srt.layers.moe.topk import TopK, TopKConfig, TopKOutputFormat
+    from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 
     from sgl_nvidia_mega.qwen3_5.moe import mkm, route
 
     mlp = qwen2_moe.Qwen2MoeSparseMoeBlock.__new__(qwen2_moe.Qwen2MoeSparseMoeBlock)
     torch.nn.Module.__init__(mlp)
-    cfg = TopKConfig(top_k=10, output_format=TopKOutputFormat.BYPASSED)
+    cfg = TopKConfig(top_k=10)
+    topk = TopK.__new__(TopK)
+    torch.nn.Module.__init__(topk)
+    topk.topk_config = cfg
+    topk._runner_backend_bound = False
+    assert cfg.output_format is None
+    topk.bind_runner_backend(
+        MoeRunnerBackend.FLASHINFER_TRTLLM,
+        routing_method_type=RoutingMethodType.RenormalizeNaive,
+    )
+    assert cfg.output_format == TopKOutputFormat.BYPASSED
     mlp.__dict__.update(
         gate=SimpleNamespace(
             weight=torch.empty(512, 4096, dtype=torch.bfloat16, device="meta")
         ),
-        topk=SimpleNamespace(topk_config=cfg),
+        topk=topk,
         shared_expert=object(),
         experts=SimpleNamespace(
             num_experts=512,

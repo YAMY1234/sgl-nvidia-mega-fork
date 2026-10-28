@@ -71,6 +71,19 @@ SLOT_TOPOLOGIES.update(
     gdn_commit=TOPOLOGIES,
     sharded_gumbel=TOPOLOGIES,
 )
+# BF16 draft entries use the binding's local attention-TP metadata. TP2's
+# exchange/FC launch also handles the full input half; DEP8 keeps SGLang's draft.
+for _name in (
+    "draft_loop",
+    "draft_extend",
+    "draft_multi",
+    "draft_embed",
+    "draft_xchg",
+    "draft_front",
+):
+    SLOT_TOPOLOGIES[_name] = frozenset({"tp2", "tp4", "tp8", "tep8"})
+SLOT_TOPOLOGIES["draft_moe"] = frozenset({"tp4", "tp8"})
+SLOT_TOPOLOGIES["draft_q1"] = frozenset({"tp4", "tp8", "tep8"})
 
 
 class Topology(msgspec.Struct, frozen=True):

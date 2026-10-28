@@ -1311,3 +1311,38 @@ def test_dep8_is_not_confused_with_tep8_and_keeps_the_draft_stock():
     dep = topology.select(requested, topology.Topology(8, 8, 8))
     assert not dep & set(runtime.DRAFT_ENTRIES + runtime.DRAFT_SLOTS)
     assert topology.select(requested, topology.Topology(8, 1, 8)) == requested
+
+
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_bf16_draft_entries_cover_pd_batches_without_quantized_experts(
+    monkeypatch, tp_size
+):
+    from sgl_nvidia_mega.qwen3_5 import topology
+    from sgl_nvidia_mega.qwen3_5.draft.extend import DraftExtend
+    from sgl_nvidia_mega.qwen3_5.draft.loop import DraftLoop
+
+    requested = frozenset(
+        {
+            "multi_request",
+            "draft_loop",
+            "draft_extend",
+            "draft_multi",
+            "draft_embed",
+            "draft_xchg",
+            "draft_moe",
+            "draft_q1",
+        }
+    )
+    selected = topology.select(requested, topology.Topology(tp_size))
+    assert runtime.slot_reasons(selected) == []
+    if tp_size == 2:
+        assert not selected & {"draft_moe", "draft_q1"}
+    monkeypatch.setattr(runtime, "SLOTS", selected)
+    parts = _DraftParts(slots=selected, tp_size=tp_size)
+    parts.top1x = object()
+    parts.attention = SimpleNamespace(q1=object())
+    loop = DraftLoop(parts, num_steps=6)
+    extend = DraftExtend(parts, tokens_per_request=7)
+    for batch in (1, 6, 10):
+        assert loop.step_for(batch) == loop.step
+        assert extend.step_for(batch) == extend.step

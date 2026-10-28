@@ -1314,9 +1314,13 @@ def test_tp4_preserves_v2_shipped_capabilities():
         topology.select(topology.TP4_V2_SLOTS, topology.Topology(4))
         == topology.TP4_V2_SLOTS
     )
-    # Restoring TP4 must not declare support for the unimplemented new shapes.
-    assert not topology.select(topology.TP4_V2_SLOTS, topology.Topology(2))
-    assert not topology.select(topology.TP4_V2_SLOTS, topology.Topology(8, 8, 8))
+    # ATTN explicitly extends mka's generic front to TP2 and DEP8. Restoring
+    # the other v2 TP4 slots must not admit their unimplemented new shapes.
+    inherited = topology.TP4_V2_SLOTS - {"mka"}
+    assert not topology.select(inherited, topology.Topology(2))
+    assert not topology.select(inherited, topology.Topology(8, 8, 8))
+    assert topology.select({"mka"}, topology.Topology(2)) == {"mka"}
+    assert topology.select({"mka"}, topology.Topology(8, 8, 8)) == {"mka"}
     assert runtime.slot_reasons(topology.select(shipped, topology.Topology(4))) == []
 
 

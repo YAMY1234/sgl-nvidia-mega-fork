@@ -22,8 +22,6 @@ the measured crossover runs CP-lite (``cp_core``) instead of SKV2.
 
 from __future__ import annotations
 
-import importlib
-import inspect
 import logging
 
 import torch
@@ -176,6 +174,27 @@ def core(attn, q, st):
     step are written: [rows, heads * head_dim] in bf16."""
     from sgl_nvidia_mega.qwen3_5.attention import route
 
+    if cp_multi(q.shape[0]):
+        o = cp_core(
+            attn,
+            q,
+            st.view.kv,
+            st.view.attn,
+            st.fb,
+            ROWS,
+            min_bs=None,
+        )
+        if o is not None:
+            key = (route.SPLIT_KV_CP, q.shape[0])
+            if key not in _ENGAGED:
+                _ENGAGED.add(key)
+                logger.info(
+                    "NVIDIA megakernel: Qwen3.5 slot skv2_cp keeps CP-lite for "
+                    "%d requests x %d target-verify rows",
+                    q.shape[0] // ROWS,
+                    ROWS,
+                )
+            return o
     label = route.label(route.verify_variants(), st.fb)
     if (label, q.shape[0]) not in _ENGAGED:
         _ENGAGED.add((label, q.shape[0]))
@@ -204,29 +223,22 @@ def core(attn, q, st):
 
 
 def cp_lite():
-    """SGLang's process CP-lite (q35_cp_lite.CpLite, built by its TRT-LLM MHA backend
-    when a CP graph variant is requested) when it can serve one request
-    (``attend(min_bs=)``), else None."""
-    try:
-        module = importlib.import_module("sglang.srt.layers.attention.q35_cp_lite")
-    except ImportError:
-        return None
-    if "min_bs" not in inspect.signature(module.CpLite.attend).parameters:
-        return None
-    return module.CpLite._instance
+    """The CP state built collectively by the Qwen3.5 plugin, else None."""
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    return CpLite._instance
+
+
+def cp_multi(rows: int) -> bool:
+    """Whether a multi-request target verify can try the plugin's CP state."""
+    from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
+
+    return "skv2_cp" in SLOTS and rows > ROWS and cp_lite() is not None
 
 
 def cp_reason() -> str:
     """Why the CP graph variants cannot run ("" when they can)."""
-    try:
-        module = importlib.import_module("sglang.srt.layers.attention.q35_cp_lite")
-    except ImportError:
-        return "this SGLang has no CP-lite (q35_cp_lite)"
-    if "min_bs" not in inspect.signature(module.CpLite.attend).parameters:
-        return "this SGLang's CP-lite serves no single request (attend has no min_bs)"
-    if module.CpLite._instance is None:
-        return "SGLang's attention backend did not build CP-lite"
-    return ""
+    return "" if cp_lite() is not None else "the plugin did not build CP-lite"
 
 
 def cp_core(attn, q, kv, meta, forward_batch, q_len: int, min_bs: int | None = 1):

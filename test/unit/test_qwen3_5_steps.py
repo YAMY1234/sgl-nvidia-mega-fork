@@ -29,8 +29,13 @@ from sgl_nvidia_mega.qwen3_5.runtime import executor
 
 @pytest.fixture(autouse=True)
 def registered(monkeypatch):
+    from sglang.srt.kernel_plugins.nvidia import binding as plugin_binding
+
     monkeypatch.setattr(registry, "_REGISTRY", {})
     monkeypatch.delenv(plugin.PARITY_SORT_ENV, raising=False)
+    monkeypatch.setattr(
+        plugin_binding, "megakernel_agree", lambda *args, **kwargs: None
+    )
     plugin.register()
 
 
@@ -637,7 +642,12 @@ def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch):
         "sglang.srt.runtime_context.get_parallel",
         lambda: SimpleNamespace(tp_size=8, moe_ep_size=1),
     )
-    ctx = SimpleNamespace(widths=(7,), tokens_per_request=7, deadline_s=60.0)
+    ctx = SimpleNamespace(
+        widths=(7,),
+        tokens_per_request=7,
+        deadline_s=60.0,
+        binding="EagleBinding",
+    )
     want = "layer 0: router gate torch.float16 (512, 4096)"
     assert route.build(model, 7, fused=False).reason == want
     with pytest.raises(
@@ -1663,7 +1673,7 @@ def _attention_layer(log, x):
         qwen3_5.Qwen3_5AttentionDecoderLayer
     )
     torch.nn.Module.__init__(layer)
-    q, k, v, gate, o = (torch.zeros(7, 4) for _ in range(5))
+    q, k, v, gate, o = (torch.zeros(x.shape[0], 4) for _ in range(5))
     log.known.update(q=q, k=k, v=v, gate=gate, o=o)
     layer.__dict__.update(
         attn_output_gate=True,
@@ -1763,7 +1773,7 @@ def _skv2_kernels(log, label=None, capture=True):
         yield
 
 
-def _skv2_setup(log, k_scale=None, **fb):
+def _skv2_setup(log, k_scale=None, *, batch_size=1, rows=7, **fb):
     """Layer 7's RadixAttention (TP8: 4 query heads, 1 KV head of 256), the forward's
     view of a pool of 3 pages for layers 3 and 7, and the verify step's state."""
     from sgl_nvidia_mega.qwen3_5.attention import split_kv
@@ -1794,12 +1804,14 @@ def _skv2_setup(log, k_scale=None, **fb):
             v_scale=(1.0, 0.5),
         ),
         attn=SimpleNamespace(
-            page_table=torch.zeros(1, 4, dtype=torch.int32),
-            cache_seqlens=torch.full((1,), 130, dtype=torch.int32),
+            page_table=torch.zeros(batch_size, 4, dtype=torch.int32),
+            cache_seqlens=torch.full((batch_size,), 130, dtype=torch.int32),
         ),
     )
     batch = SimpleNamespace(
-        out_cache_loc=torch.zeros(7, dtype=torch.int64), batch_size=1, **fb
+        out_cache_loc=torch.zeros(rows, dtype=torch.int64),
+        batch_size=batch_size,
+        **fb,
     )
     log.known.update(
         pool,
@@ -2003,6 +2015,62 @@ def test_the_skv2_cp_slot_runs_cp_lite_for_one_request_in_its_variant(
         assert log[-1][0] == "skv2"
 
 
+@pytest.mark.parametrize("served", [True, False])
+def test_cp_slots_keep_multi_request_target_verify_in_the_plugin(monkeypatch, served):
+    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+    requests, rows = 8, 8 * 7
+    log = _log()
+    attn, st = _skv2_setup(log, batch_size=requests, rows=rows)
+    q8 = torch.zeros(rows, 1024, dtype=torch.float8_e4m3fn)
+    out = torch.ones(rows, 4, 256, dtype=torch.bfloat16)
+    log.known["q8"] = q8
+    calls = []
+
+    class CpLite:
+        def attend(
+            self, q, kv, pages, lens, q_len, bmm1, bmm2, ws, layer, fb, min_bs=None
+        ):
+            calls.append(
+                (
+                    tuple(q.shape),
+                    tuple(pages.shape),
+                    tuple(lens.shape),
+                    q_len,
+                    fb is st.fb,
+                    min_bs,
+                )
+            )
+            return out if served else None
+
+    monkeypatch.setattr(split_kv, "cp_lite", CpLite)
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2_cp"}))
+    with (
+        _skv2_kernels(log, label="split_kv_stock"),
+        patch("sglang.srt.runtime_context.get_buffer", lambda name, make: None),
+    ):
+        got = split_kv.core(attn, q8, st)
+
+    assert calls == [((rows, 4, 256), (requests, 4), (requests,), 7, True, None)]
+    if served:
+        assert got.shape == (rows, 1024) and bool((got == 1).all())
+        assert not log
+    else:
+        assert got == "stock_o" and log[-1][0] == "attention"
+
+
+def test_draft_only_cp_slots_do_not_enable_target_multi_request(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+    monkeypatch.setattr(split_kv, "cp_lite", lambda: object())
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"draft_q1_cp", "draft_skv2_cp"}))
+    assert not split_kv.cp_multi(56)
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2_cp"}))
+    assert split_kv.cp_multi(56)
+
+
 @pytest.mark.parametrize(
     "kw, want",
     [
@@ -2085,6 +2153,29 @@ def test_the_skv2_slot_runs_the_attention_step_through_the_slot():
     stock, slot = runs
     assert stock == ["prepare", "attention", "sigmoid_mul", "o_proj"]
     assert slot == ["prepare", "skv2_attend", "sigmoid_mul", "o_proj"]
+
+
+def test_multi_request_cp_routes_the_stock_attention_step_through_the_plugin():
+    x = torch.zeros(56, 4)
+    log = _log(x=x, positions="pos", batch="fb")
+    layer = _attention_layer(log, x)
+    mul = log.op("sigmoid_mul", "gated")
+    st = SimpleNamespace(positions="pos", fb="fb", slots=plan.Slots())
+    with (
+        patch.object(qwen3_5, "_is_cuda", True),
+        patch("sglang.kernels.ops.elementwise.elementwise.fused_sigmoid_mul", mul),
+        patch(
+            "sgl_nvidia_mega.qwen3_5.attention.split_kv.cp_multi",
+            return_value=True,
+        ),
+        patch(
+            "sgl_nvidia_mega.qwen3_5.attention.split_kv.attend",
+            log.op("cp_attend", log.known["o"]),
+        ),
+    ):
+        attention.step(layer, x, st)
+
+    assert [e[0] for e in log] == ["prepare", "cp_attend", "sigmoid_mul", "o_proj"]
 
 
 def test_the_executor_offers_the_verify_split_kv_variants_with_slot_skv2():
@@ -2246,17 +2337,17 @@ def test_the_mka_slot_runs_the_prologue_the_attention_and_the_epilogue(skv2):
 
 @pytest.mark.parametrize("consumed", [False, True])
 def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(consumed):
-    from sglang.srt.layers.attention.q35_cp_lite import CpLite
     from sglang.srt.layers.quantization import fp8_utils
 
-    from sgl_nvidia_mega.qwen3_5 import lowm
-    from sgl_nvidia_mega.qwen3_5.attention import mka
+    from sgl_nvidia_mega.qwen3_5 import lowm, runtime
+    from sgl_nvidia_mega.qwen3_5.attention import mka, split_kv
     from sgl_nvidia_mega.qwen3_5.sm103.attention import gate_quant as gate_module
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
     from sgl_nvidia_mega.qwen3_5.sm103.draft import front
 
     rows = 21
     log = _log()
-    attn, st = _skv2_setup(log)
+    attn, st = _skv2_setup(log, batch_size=3, rows=rows)
     layer = _mka_layer(log, attn)
     x = torch.zeros(rows, 4096, dtype=torch.bfloat16)
     qkv = torch.zeros(rows, 2560, dtype=torch.bfloat16)
@@ -2292,6 +2383,7 @@ def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(consumed):
 
     with (
         patch.object(CpLite, "_instance", GateEpilogue()),
+        patch.object(runtime, "SLOTS", frozenset({"skv2_cp"})),
         patch.object(
             front,
             "fused_qk_gemma_rmsnorm_rope_gate",
@@ -2301,6 +2393,7 @@ def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(consumed):
         patch.object(fp8_utils, "flashinfer_bmm_fp8", create=True),
         patch.object(lowm, "take_fp8", return_value=None),
         patch.object(lowm, "row_parallel", row_parallel),
+        patch.object(split_kv, "core", return_value=attention_out),
     ):
         out = mka.step(layer, x, st)
 

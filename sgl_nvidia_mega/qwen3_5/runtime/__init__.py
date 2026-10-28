@@ -85,6 +85,7 @@ DRAFT_SLOTS: tuple[str, ...] = (
     "draft_q1_cp",
     "draft_skv2_cp",
 )
+CP_LITE_SLOTS = frozenset({"skv2_cp", "draft_q1_cp", "draft_skv2_cp"})
 # SGLang consumes these names from the shared slot policy itself.  They are valid
 # requests, but are intentionally not built or dispatched by this plugin.
 RUNTIME_ONLY_SLOTS: tuple[str, ...] = ("gdn_commit", "sharded_gumbel")
@@ -116,6 +117,44 @@ def _requested_slots() -> frozenset:
 
 
 SLOTS = _requested_slots()
+
+
+def build_cp_lite(binding) -> None:
+    """Collectively build the CP slots' process-local state before validation.
+
+    The allocation and rendezvous order must be identical on every attention-TP
+    rank, so this runs once from each Qwen3.5 plugin build, before any package checks
+    ``CpLite._instance`` or CUDA graph variant is created.
+    """
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    requested = tuple(sorted(SLOTS & CP_LITE_SLOTS))
+    megakernel_agree(
+        requested,
+        what="Qwen3.5 CP slots requested",
+    )
+    if not requested:
+        return
+    megakernel_agree(
+        (binding.page_size, binding.tp_size),
+        what="Qwen3.5 CP page size and TP size",
+    )
+    if binding.page_size != 64:
+        raise RuntimeError(
+            "NVIDIA megakernel: Qwen3.5 CP slots need page size 64 "
+            f"(got {binding.page_size})"
+        )
+
+    import torch
+
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    cp = CpLite.maybe_create(binding, torch.device("cuda", torch.cuda.current_device()))
+    if cp is None:
+        raise RuntimeError(
+            "NVIDIA megakernel: Qwen3.5 CP slots need a supported attention-TP "
+            "Q/KV-head topology"
+        )
 
 
 def apply_expert_parallel(ep_size: int) -> frozenset:
@@ -320,6 +359,13 @@ SGLANG_READS = {
         "binding",
     ),
     "srt/runtime_context.py": ("get_parallel", '"tp_size"', '"moe_ep_size"'),
+    "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
+        "page_size",
+        "tp_rank",
+        "tp_size",
+        "tp_device_group",
+    ),
+    "srt/kernel_plugins/nvidia/binding.py": ("megakernel_agree",),
 }
 
 
@@ -341,6 +387,8 @@ def build(model, ctx):
     from sgl_nvidia_mega.qwen3_5 import plan as slot_plan
     from sgl_nvidia_mega.qwen3_5.runtime import parity
     from sgl_nvidia_mega.qwen3_5.runtime.executor import Qwen35Verify
+
+    build_cp_lite(ctx.binding)
 
     dropped = apply_expert_parallel(get_parallel().moe_ep_size)
     if dropped:

@@ -238,7 +238,8 @@ def test_norm_fp8_is_sglangs_norm_then_static_quant(views, tp, bs):
 
 @pytest.mark.parametrize("tp, bs", TOPOLOGY_BATCHES)
 @pytest.mark.parametrize("pdl, gate", [(False, False), (True, False), (True, True)])
-def test_replayssm_verify_is_sglangs(pdl, gate, tp, bs):
+@pytest.mark.parametrize("ring_len", [16, 32])
+def test_replayssm_verify_is_sglangs(pdl, gate, ring_len, tp, bs):
     """The slot's verify launch (32-wide value tiles on 2 warps, and with or without the
     dependent launch, waiting before the gates with ``gate``) against
     gdn_replayssm_spec_decode's verify launch: the output and this step's ring entries."""
@@ -257,7 +258,7 @@ def test_replayssm_verify_is_sglangs(pdl, gate, tp, bs):
     g = torch.Generator(device="cuda").manual_seed(
         3 + int(pdl) + 2 * int(gate) + 10 * bs
     )
-    ring_len, slots = 16, SLOTS
+    slots = SLOTS
     tokens = bs * DRAFT
 
     def rand(*shape, dtype=torch.bfloat16):

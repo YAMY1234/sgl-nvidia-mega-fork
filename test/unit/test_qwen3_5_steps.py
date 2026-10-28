@@ -1644,6 +1644,16 @@ def test_the_gdn_verify_slot_names_the_pools_it_cannot_serve(kw, want):
         built.forward(step, None, torch.zeros(7, dtype=torch.int64), None, None)
 
 
+@pytest.mark.parametrize("ring_len", [16, 32])
+def test_gdn_verify_accepts_aggregate_and_dep8_rings(ring_len):
+    verify, _, st = _gdn_verify_setup(_log(), ring_len=ring_len)
+    assert verify.pool_reasons(st.view.mamba, st.binding.tokens_per_request) == []
+    if ring_len == 32:
+        assert "core ring length 32 (serves 16)" in verify.core_pool_reasons(
+            st.view.mamba
+        )
+
+
 def test_the_pools_are_checked_once_at_the_first_covered_step(monkeypatch):
     verify, _, st = _gdn_verify_setup(_log())
     built = _verify(binding=st.binding)

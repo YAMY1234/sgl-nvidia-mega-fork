@@ -148,7 +148,7 @@ SGLANG_MIRRORS = {
     "srt/layers/quantization/modelopt_quant.py:ModelOptFp8LinearMethod.apply": "91b563cf074bff42",
 }
 
-RING_LEN, MAX_DRAFT = 16, 8  # the verify tiles' bounds, as measured
+RING_LENGTHS, MAX_DRAFT = (16, 32), 8  # aggregate and DEP8 ReplaySSM pools
 
 # the step widths that have run the slot (each logged once, as engagement evidence)
 _ENGAGED: set = set()
@@ -221,7 +221,7 @@ def pool_reasons(pools, tokens_per_request: int) -> list[str]:
     reasons = []
     if pools.ring_d is None or pools.ring_cache_base is None:
         reasons.append("no circular ReplaySSM verify ring")
-    elif pools.ring_d.shape[-2] != RING_LEN:
+    elif pools.ring_d.shape[-2] not in RING_LENGTHS:
         reasons.append(f"ring length {pools.ring_d.shape[-2]}")
     if pools.temporal.dtype != torch.bfloat16:
         reasons.append(f"{pools.temporal.dtype} checkpoints")
@@ -250,6 +250,10 @@ def core_pool_reasons(pools) -> list[str]:
     compact ring (update / key low parts, no exact-replay buffers) of BF16 checkpoints,
     int32 cursors and int8 flush flags."""
     reasons = []
+    # The fused CUDA core has two eight-entry history tiles. The generic
+    # gdn_verify path handles DEP8's 32-entry ring instead.
+    if pools.ring_d.shape[-2] != 16:
+        reasons.append(f"core ring length {pools.ring_d.shape[-2]} (serves 16)")
     if (
         pools.ring_beta is not None
         or pools.ring_rawk is None

@@ -121,4 +121,8 @@ def step(layer, x, st):
             wait_for_gate_producer=True)
         norm = gdn.norm(out.reshape(-1, shape.value_dim),
                         z.reshape(-1, shape.value_dim))
+    from sgl_nvidia_mega.qwen3_8.runtime import engaged
+    engaged.mark(st, "gdn_mk" if st.slots.gdn_mk else "gdn_verify")
+    if st.slots.gdn_pdl:
+        engaged.mark(st, "gdn_pdl")
     return gdn.out_proj(norm.reshape(rows, shape.hv*shape.value_dim))[0]

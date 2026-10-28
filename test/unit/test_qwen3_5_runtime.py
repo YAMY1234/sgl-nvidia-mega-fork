@@ -1081,6 +1081,59 @@ def test_parity_counts_the_requests_own_rows_apart():
     assert int(parity.differing(a, b, valid)) == 1
 
 
+@pytest.mark.parametrize("captured", [False, True])
+@pytest.mark.parametrize("output_rows", [0, 7])
+def test_parity_handles_an_empty_dp_rank(
+    eager, monkeypatch, caplog, captured, output_rows
+):
+    monkeypatch.setattr(parity, "MODE", "1")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: captured)
+    monkeypatch.setattr(
+        "sglang.srt.model_executor.runner.get_is_capture_mode", lambda: False
+    )
+    monkeypatch.setattr(
+        parity, "conv_rows", lambda: (torch.empty(0, dtype=torch.long), [])
+    )
+
+    def output(value):
+        return lambda: SimpleNamespace(
+            next_token_logits=torch.full((output_rows, 3), value),
+            hidden_states=torch.full((output_rows, 4), value),
+        )
+
+    checker = parity.Parity((7,), "cpu")
+    with caplog.at_level("INFO"):
+        got = checker.run(Step("target_verify", 7), output(0.0), output(1.0))
+        if captured:
+            assert checker.counters[7].tolist() == [
+                1,
+                output_rows * 3,
+                output_rows * 4,
+                output_rows * 3,
+                output_rows * 4,
+                0,
+                0,
+            ]
+            monkeypatch.setattr(
+                torch.cuda, "is_current_stream_capturing", lambda: False
+            )
+            checker.flush()
+    assert got.hidden_states.shape == (output_rows, 4)
+    assert "rows_compared=" + str(output_rows) in caplog.text
+    assert "hidden_dist_max=" + ("1" if output_rows else "0") in caplog.text
+    if captured:
+        assert "valid_logits_differ=0 valid_hidden_differ=0" in caplog.text
+    else:
+        assert "valid_rows=0" in caplog.text
+        assert "logits_max_abs=" + ("1" if output_rows else "0") in caplog.text
+
+
+def test_empty_request_metadata_has_no_valid_rows():
+    slots = torch.empty(0, dtype=torch.long)
+    assert parity.valid_rows(slots, 0).tolist() == []
+    assert parity.valid_rows(slots, 7).tolist() == [False] * 7
+
+
 @pytest.mark.parametrize("mode", ["1", "control"])
 def test_an_eager_parity_step_runs_sglangs_forward_first(
     eager, monkeypatch, caplog, mode
@@ -1183,6 +1236,14 @@ def test_the_parity_distance_reads_top1_flips_and_log_prob_gaps():
     assert (rows, top1, hidden) == (2.0, 1.0, 0.25)
     assert total == pytest.approx(gap.item()) and worst == pytest.approx(gap.item())
     assert parity.distance(None, None, None, None) is None
+
+
+def test_empty_logits_preserve_nonempty_hidden_distance():
+    empty_logits = torch.empty(0, 3)
+    apart = parity.distance(
+        empty_logits, empty_logits, torch.zeros(2, 4), torch.ones(2, 4)
+    )
+    assert apart.tolist() == [0.0, 0.0, 0.0, 0.0, 1.0]
 
 
 def test_the_step_state_carries_the_binding():

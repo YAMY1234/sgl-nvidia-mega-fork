@@ -64,11 +64,11 @@ def _fill(q, pools, table, lengths, length, g):
     lengths.fill_(length)
 
 
-def _inputs(length, g, spare_pages=8):
+def _inputs(length, g, spare_pages=8, heads=HEADS):
     """FP8 query rows, a paged FP8 KV pool with the request's pages scattered, its page
     table and its length."""
     total = math.ceil(length / PAGE) + spare_pages
-    q = torch.empty(ROWS, HEADS, DIM, dtype=torch.float8_e4m3fn, device="cuda")
+    q = torch.empty(ROWS, heads, DIM, dtype=torch.float8_e4m3fn, device="cuda")
     pools = [
         torch.empty(total * PAGE, 1, DIM, dtype=torch.float8_e4m3fn, device="cuda")
         for _ in range(2)
@@ -113,14 +113,15 @@ def _sglang(q, kv, table, lengths, qk_scale, v_scale):
 
 
 @pytest.mark.parametrize("length", [7, 64, 2048, 8192, 32769, 131072, 150007])
-def test_skv2_is_within_twice_sglangs_error(length):
+@pytest.mark.parametrize("heads", [4, 8])
+def test_skv2_is_within_twice_sglangs_error(length, heads):
     from sgl_nvidia_mega.qwen3_5.sm103.attention.skv2 import StockSplitPlan
 
     g = torch.Generator(device="cuda").manual_seed(length)
-    q, pools, table, lengths = _inputs(length, g)
+    q, pools, table, lengths = _inputs(length, g, heads=heads)
     kv = tuple(map(_hnd, pools))
     qk_scale, v_scale = 0.75 * SCALE, 0.5
-    out = torch.empty(ROWS, HEADS, DIM, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(ROWS, heads, DIM, dtype=torch.bfloat16, device="cuda")
     plan = StockSplitPlan(q, kv, table, lengths)
     plan.run(q, kv, table, lengths, qk_scale=qk_scale, v_scale=v_scale, out=out)
     want = _reference(q, kv, table, length, qk_scale, v_scale)

@@ -117,7 +117,7 @@ class Qwen35Prefill:
             (not self.enabled and self.parity is None)
             or kwargs
             or get_embedding
-            or forward_batch.mm_inputs
+            or any(item is not None for item in (forward_batch.mm_inputs or ()))
             or not forward_batch.forward_mode.is_extend_without_speculative()
         ):
             return None

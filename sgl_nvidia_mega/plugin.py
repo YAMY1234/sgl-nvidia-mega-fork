@@ -23,6 +23,7 @@ SPECS = (
     # The MTP draft offers EAGLE draft-loop and draft-extend entries.
     ("Qwen3_5ForCausalLMMTP", "sgl_nvidia_mega.qwen3_5.draft:SPEC"),
     ("KimiK3ForConditionalGeneration", "sgl_nvidia_mega.kimi_k3.spec:SPEC"),
+    ("Qwen4ExpForConditionalGeneration", "sgl_nvidia_mega.qwen3_8.spec:SPEC"),
 )
 
 # Test only: with SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1, the composition check

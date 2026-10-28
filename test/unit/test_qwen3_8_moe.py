@@ -37,9 +37,11 @@ def test_hf_logical_and_native_storage_are_distinct():
     assert "H4096" in " ".join(config_disable_reasons(other, 4, 4))
 
 
-def test_route_and_mkm_coverage_has_native_wide_fallback():
+def test_route_and_mkm_coverage_has_native_wide_fallback(monkeypatch):
     facts = plan.Facts(route=True, mkm=True)
     assert plan.slots(4, facts).mkm
+    assert not plan.slots(8, facts).route  # route is qualified for one request only
+    monkeypatch.setattr(plan, "ROUTE_MAX_ROWS", 8)
     assert plan.slots(8, facts).route and not plan.slots(8, facts).mkm
     assert not plan.slots(4, plan.Facts()).route
 

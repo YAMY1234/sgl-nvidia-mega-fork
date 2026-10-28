@@ -1016,6 +1016,56 @@ def test_the_draft_extend_writes_the_selected_rows_outputs(monkeypatch):
 # ------------------------------------------------------------------- the parity check
 
 
+@pytest.mark.parametrize("world", [2, 4, 8])
+def test_draft_fc_tiles_fit_shared_memory_at_each_tp(world):
+    from sgl_nvidia_mega.qwen3_5.draft.xchg import fc_split_slice
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg
+
+    hidden, sms = 4096, 148
+    width = 2 * hidden // world
+    rows = xchg.draft_fc_partial_rows(hidden, width, sms)
+    assert world in xchg.WORLDS
+    assert 0 < rows <= -(-hidden // sms)
+    assert (rows + xchg.MAX_TOKENS) * width * 2 <= xchg._MAX_SMEM_BYTES
+    assert [fc_split_slice(hidden, r, world) for r in range(world)] == [
+        (r >= world // 2, (r % (world // 2)) * width, width) for r in range(world)
+    ]
+    if world in (4, 8):
+        assert rows == -(-hidden // sms)
+
+
+@pytest.mark.parametrize("requests", [2, 6, 10])
+def test_multi_draft_extend_uses_split_fc_only_within_its_bound(monkeypatch, requests):
+    from sgl_nvidia_mega.qwen3_5.draft import layer
+    from sgl_nvidia_mega.qwen3_5.draft.extend import DraftExtend
+
+    parts = _DraftParts()
+    calls = []
+    parts.embed = lambda ids: calls.append("embed") or ids
+    parts.mkd = SimpleNamespace(
+        split_fc=lambda embeds, hidden: calls.append("split") or hidden
+    )
+    monkeypatch.setattr(layer, "fc_input", lambda *a: calls.append("stock") or a[2])
+    monkeypatch.setattr(layer, "layer", lambda p, x, *a, **kw: x)
+    monkeypatch.setattr(layer, "top1_into", lambda *a, **kw: None)
+    rows = requests * 7
+    io = SimpleNamespace(
+        input_ids=torch.arange(rows),
+        hidden_states=torch.ones(rows, 1),
+        positions=None,
+        out_cache_loc=None,
+        attn=None,
+        kv=None,
+        tokens_per_request=7,
+        select_index=torch.arange(requests),
+        hidden_out=torch.empty(requests, 1),
+        topk_index_out=None,
+        topk_p_out=None,
+    )
+    DraftExtend(parts, tokens_per_request=7)._multi_step(io)
+    assert calls == (["embed", "split"] if rows <= 16 else ["stock"])
+
+
 @pytest.fixture
 def eager(monkeypatch):
     """Outside CUDA graph capture (a CPU build of torch has no capture to query), with
@@ -1311,12 +1361,18 @@ def test_tp4_preserves_v2_shipped_capabilities():
         topology.select(topology.TP4_V2_SLOTS, topology.Topology(4))
         == topology.TP4_V2_SLOTS
     )
-    # Restoring TP4 must not declare support for the unimplemented new shapes.
+    # Keep each owner's separately declared TP2 capabilities; restoring TP4
+    # must not enable any other unimplemented TP2 kernel.
     assert topology.select(topology.TP4_V2_SLOTS, topology.Topology(2)) == {
         "gdn_verify",
         "gdn_pdl",
         "gdn_conv",
         "gdn_core",
+        "draft_loop",
+        "draft_extend",
+        "draft_multi",
+        "draft_embed",
+        "draft_front",
     }
     assert topology.select(topology.TP4_V2_SLOTS, topology.Topology(8, 8, 8)) == {
         "gdn_verify",
@@ -1493,3 +1549,38 @@ def test_prefill_all_slots_off_can_compare_native_twice_under_test_switch(monkey
         SimpleNamespace(mm_inputs=None, forward_mode=ForwardMode.EXTEND),
     )
     assert step.mode == "prefill" and not built.enabled
+
+
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_bf16_draft_entries_cover_pd_batches_without_quantized_experts(
+    monkeypatch, tp_size
+):
+    from sgl_nvidia_mega.qwen3_5 import topology
+    from sgl_nvidia_mega.qwen3_5.draft.extend import DraftExtend
+    from sgl_nvidia_mega.qwen3_5.draft.loop import DraftLoop
+
+    requested = frozenset(
+        {
+            "multi_request",
+            "draft_loop",
+            "draft_extend",
+            "draft_multi",
+            "draft_embed",
+            "draft_xchg",
+            "draft_moe",
+            "draft_q1",
+        }
+    )
+    selected = topology.select(requested, topology.Topology(tp_size))
+    assert runtime.slot_reasons(selected) == []
+    if tp_size == 2:
+        assert not selected & {"draft_moe", "draft_q1", "draft_xchg"}
+    monkeypatch.setattr(runtime, "SLOTS", selected)
+    parts = _DraftParts(slots=selected, tp_size=tp_size)
+    parts.top1x = object()
+    parts.attention = SimpleNamespace(q1=object())
+    loop = DraftLoop(parts, num_steps=6)
+    extend = DraftExtend(parts, tokens_per_request=7)
+    for batch in (1, 6, 10):
+        assert loop.step_for(batch) == loop.step
+        assert extend.step_for(batch) == extend.step

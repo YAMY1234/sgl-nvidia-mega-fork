@@ -490,13 +490,11 @@ def test_shared_swiglu_static_quant_replays_from_a_cuda_graph():
     assert torch.equal(expected.view(torch.uint8), captured.view(torch.uint8))
 
 
-def test_shared_swiglu_static_quant_feeds_modelopt_flashinfer_down_projection():
+def test_shared_tail_normalizes_modelopt_scalar_scale_for_flashinfer_down_projection():
     from sglang.srt.layers.activation import SiluAndMul
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
 
-    from sgl_nvidia_mega.qwen3_5.sm103.moe.shared_act_quant import (
-        silu_and_mul_static_quant_fp8,
-    )
+    from sgl_nvidia_mega.qwen3_5.moe import route
 
     generator = torch.Generator(device="cuda").manual_seed(91)
     rows, intermediate, hidden = 8, 256, 4096
@@ -513,18 +511,31 @@ def test_shared_swiglu_static_quant_feeds_modelopt_flashinfer_down_projection():
     weight = (
         torch.randn(hidden, intermediate, device="cuda", generator=generator) * 0.05
     ).to(torch.float8_e4m3fn)
-    input_scale = torch.tensor([0.02], device="cuda")
-    layer = SimpleNamespace(
-        use_flashinfer_bmm=True,
-        weight=weight.t(),
-        weight_scale=torch.tensor([0.01], device="cuda"),
-        input_scale=input_scale,
-    )
+    input_scale = torch.tensor(0.02, device="cuda")
     method = object.__new__(ModelOptFp8LinearMethod)
     method.use_marlin = method.use_sm120_fp8 = False
 
-    expected = method.apply(layer, SiluAndMul()(gate_up))
-    actual = method.apply(layer, silu_and_mul_static_quant_fp8(gate_up, input_scale))
+    class Down:
+        use_flashinfer_bmm = True
+        quant_method = method
+
+        def __init__(self):
+            self.weight = weight.t()
+            self.weight_scale = torch.tensor(0.01, device="cuda")
+            self.input_scale = input_scale
+
+        def __call__(self, value):
+            return method.apply(self, value), None
+
+    down = Down()
+    expert = SimpleNamespace(
+        _enable_silu_fp4_quant_fusion=False,
+        act_fn=SiluAndMul(),
+        down_proj=down,
+    )
+
+    expected = method.apply(down, SiluAndMul()(gate_up))
+    actual = route.shared_expert_tail(expert, gate_up)
 
     assert actual.dtype == torch.bfloat16
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))

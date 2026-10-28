@@ -485,6 +485,14 @@ def test_the_route_shared_slot_names_what_a_layer_lacks(change, want):
     got = route.shared_unsupported(mlp)
     assert (want in got) if want else got == ""
 
+    if not change:
+        # ModelOptFp8LinearMethod collapses these scales with ``.max()`` after
+        # loading, so production modules carry 0-D Parameters rather than [1].
+        expert.gate_up_proj.input_scale = _CudaMeta((), torch.float32)
+        expert.gate_up_proj.weight_scale = _CudaMeta((), torch.float32)
+        expert.down_proj.input_scale = _CudaMeta((), torch.float32)
+        assert route.shared_unsupported(mlp) == ""
+
 
 def test_route_shared_missing_quant_scales_falls_back_instead_of_raising():
     from sgl_nvidia_mega.qwen3_5.moe import route
@@ -522,6 +530,9 @@ def test_route_shared_owns_the_static_fp8_down_projection_policy():
     )
 
     assert route._down_takes_static_fp8(expert)
+    expert.down_proj.input_scale = _CudaMeta((), torch.float32)
+    assert route._down_takes_static_fp8(expert)
+    expert.down_proj.input_scale = scale
     method.use_marlin = True
     assert not route._down_takes_static_fp8(expert)
     method.use_marlin = False
@@ -537,6 +548,36 @@ def test_route_shared_owns_the_static_fp8_down_projection_policy():
     assert not route._down_takes_static_fp8(expert)
 
 
+def test_route_shared_normalizes_modelopts_scalar_down_scale(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.moe import route
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import shared_act_quant
+
+    scale = torch.ones((), dtype=torch.float32)
+    seen = []
+
+    def quantize(gate_up, got_scale):
+        seen.append((gate_up, got_scale))
+        return "quantized"
+
+    class Down:
+        input_scale = scale
+
+        def __call__(self, value):
+            return value, None
+
+    expert = SimpleNamespace(
+        _enable_silu_fp4_quant_fusion=False,
+        down_proj=Down(),
+    )
+    monkeypatch.setattr(route, "_down_takes_static_fp8", lambda unused: True)
+    monkeypatch.setattr(shared_act_quant, "silu_and_mul_static_quant_fp8", quantize)
+
+    gate_up = torch.ones((2, 4), dtype=torch.bfloat16)
+    assert route.shared_expert_tail(expert, gate_up) == "quantized"
+    assert seen[0][0] is gate_up
+    assert tuple(seen[0][1].shape) == (1,)
+
+
 @pytest.mark.parametrize("scale_name", ["input_scale", "weight_scale"])
 @pytest.mark.parametrize(
     "scale",
@@ -545,9 +586,17 @@ def test_route_shared_owns_the_static_fp8_down_projection_policy():
         _CudaMeta((1,), torch.float32, is_cuda=False, device="cpu"),
         _CudaMeta((1,), torch.float32, contiguous=False),
         _CudaMeta((2,), torch.float32),
+        _CudaMeta((1, 1), torch.float32),
         _CudaMeta((1,), torch.float32, device="cuda:1"),
     ],
-    ids=["wrong-dtype", "not-cuda", "non-contiguous", "wrong-shape", "device"],
+    ids=[
+        "wrong-dtype",
+        "not-cuda",
+        "non-contiguous",
+        "wrong-size",
+        "wrong-rank",
+        "device",
+    ],
 )
 def test_route_shared_rejects_invalid_gate_up_scales(scale_name, scale):
     from sglang.srt.layers.activation import SiluAndMul
@@ -590,9 +639,17 @@ def test_route_shared_rejects_invalid_gate_up_scales(scale_name, scale):
         _CudaMeta((1,), torch.float32, is_cuda=False, device="cpu"),
         _CudaMeta((1,), torch.float32, contiguous=False),
         _CudaMeta((2,), torch.float32),
+        _CudaMeta((1, 1), torch.float32),
         _CudaMeta((1,), torch.float32, device="cuda:1"),
     ],
-    ids=["wrong-dtype", "not-cuda", "non-contiguous", "wrong-shape", "device"],
+    ids=[
+        "wrong-dtype",
+        "not-cuda",
+        "non-contiguous",
+        "wrong-size",
+        "wrong-rank",
+        "device",
+    ],
 )
 def test_route_shared_rejects_invalid_down_scale(scale):
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod

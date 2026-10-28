@@ -396,13 +396,13 @@ def shared_unsupported(mlp) -> str:
         or not input_scale.is_cuda
         or input_scale.device != weight.device
         or input_scale.dtype != torch.float32
-        or tuple(input_scale.shape) != (1,)
+        or tuple(input_scale.shape) not in ((), (1,))
         or not input_scale.is_contiguous()
         or weight_scale is None
         or not weight_scale.is_cuda
         or weight_scale.device != weight.device
         or weight_scale.dtype != torch.float32
-        or tuple(weight_scale.shape) != (1,)
+        or tuple(weight_scale.shape) not in ((), (1,))
         or not weight_scale.is_contiguous()
     ):
         return "the shared gate/up is not a static per-tensor FP8 linear of <= 512 rows"
@@ -423,7 +423,9 @@ def shared_expert_tail(expert, gate_up: torch.Tensor) -> torch.Tensor:
             silu_and_mul_static_quant_fp8,
         )
 
-        quantized = silu_and_mul_static_quant_fp8(gate_up, expert.down_proj.input_scale)
+        quantized = silu_and_mul_static_quant_fp8(
+            gate_up, expert.down_proj.input_scale.reshape(1)
+        )
         key = ("route_shared_act_quant", gate_up.shape[0])
         if key not in _ENGAGED:
             _ENGAGED.add(key)
@@ -464,7 +466,7 @@ def _down_takes_static_fp8(expert) -> bool:
         and scale.is_cuda
         and scale.device == weight.device
         and scale.dtype == torch.float32
-        and tuple(scale.shape) == (1,)
+        and tuple(scale.shape) in ((), (1,))
         and scale.is_contiguous()
     )
 

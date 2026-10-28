@@ -18,16 +18,28 @@ MAX_ROWS = 8  # the widest covered step: one request of up to 8 verify rows
 class Slots(msgspec.Struct, frozen=True):
     """The kernels that fill one width's step."""
 
+    route: bool = False
+    mkm: bool = False
+    route_shared: bool = False
+
 
 class Facts(msgspec.Struct, frozen=True):
     """What build found, which every rank must agree on. All off: every step
     function runs its stock code."""
 
+    route: bool = False
+    mkm: bool = False
+    route_shared: bool = False
+
 
 def slots(rows: int, facts: Facts) -> Slots:
     if not 1 <= rows <= MAX_ROWS:
         raise ValueError(f"{rows} rows are outside the covered widths 1-{MAX_ROWS}")
-    return Slots()
+    return Slots(
+        route=facts.route,
+        mkm=facts.route and facts.mkm and rows <= 7,
+        route_shared=facts.route and facts.route_shared and rows <= 8,
+    )
 
 
 def plan(widths: tuple[int, ...], facts: Facts) -> dict[int, Slots]:

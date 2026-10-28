@@ -13,7 +13,7 @@ import msgspec
 from sgl_nvidia_mega.qwen3_5.runtime import SLOTS, SLOTS_ENV
 
 # The kernel slots that run only when requested (in Qwen3.5's request variable)
-OPT_IN_SLOTS: tuple[str, ...] = ()
+OPT_IN_SLOTS: tuple[str, ...] = ("route", "mkm", "route_shared")
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -21,20 +21,26 @@ SGLANG_READS = {
         "widths",
         "tokens_per_request",
         "binding",
+        "deadline_s",
     ),
+    "srt/runtime_context.py": ("get_parallel", '"tp_size"'),
 }
 
 
 def slot_reasons() -> list[str]:
     """Why the requested slots cannot be served ([] when they can)."""
-    return [
+    reasons = [
         f"{SLOTS_ENV}: unknown FN slot {name!r} "
         f"(known: {', '.join(OPT_IN_SLOTS) or 'none'})"
         for name in sorted(SLOTS - set(OPT_IN_SLOTS))
     ]
+    for name in ("mkm", "route_shared"):
+        if name in SLOTS and "route" not in SLOTS:
+            reasons.append(f"{SLOTS_ENV}: slot {name!r} requires slot 'route'")
+    return reasons
 
 
-def build(model, ctx):
+def build(model, ctx, *, hf_config=None):
     """The slot plan per width and the executor; ``ctx`` is SGLang's BuildContext."""
     import torch
 
@@ -48,7 +54,32 @@ def build(model, ctx):
             f"NVIDIA megakernel: {ctx.tokens_per_request} rows a request leave no "
             "covered width"
         )
+    bound = {}
     facts = slot_plan.Facts()
+    if "route" in SLOTS:
+        from sglang.srt.runtime_context import get_parallel
+        from sgl_nvidia_mega.qwen3_8.moe import route
+
+        moe = route.build(
+            model,
+            max(widths),
+            fused="mkm" in SLOTS,
+            shared="route_shared" in SLOTS,
+            hf_config=hf_config,
+            tp_size=get_parallel().tp_size,
+        )
+        if (
+            not moe.route
+            or ("mkm" in SLOTS and not moe.mkm)
+            or ("route_shared" in SLOTS and not moe.shared)
+        ):
+            raise RuntimeError(
+                f"NVIDIA megakernel: FN MoE slots not built: {moe.reason}"
+            )
+        bound["moe"] = moe
+        facts = slot_plan.Facts(
+            route=moe.route, mkm=bool(moe.mkm), route_shared=moe.shared
+        )
     slots = slot_plan.plan(widths, facts)
     checker = (
         parity.Parity(widths, torch.cuda.current_device(), model)
@@ -59,7 +90,7 @@ def build(model, ctx):
     return Qwen38Verify(
         model,
         slots,
-        bound={},
+        bound=bound,
         widths=widths,
         binding=ctx.binding,
         summary=f"slots {on or 'none (stock)'}",

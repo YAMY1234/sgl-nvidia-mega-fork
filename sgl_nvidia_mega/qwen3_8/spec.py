@@ -75,7 +75,12 @@ REQUIREMENTS = Requirements(
 
 # A numeric slot's outputs are held to fp64 on the same operands (test/kernels), at
 # most these multiples of the error of SGLang's own op; every other slot is bitwise.
-NUMERIC_TOLERANCES: dict[str, dict[str, float]] = {}
+NUMERIC_TOLERANCES: dict[str, dict[str, float]] = {
+    "route_shared": {
+        "route_shared.gate_up.rel_l2_vs_stock": 1.05,
+        "route_shared.gate_up.max_abs_vs_stock": 2.0,
+    },
+}
 
 
 def numerics(slots) -> Numerics:
@@ -95,11 +100,21 @@ NUMERICS = numerics(runtime.SLOTS)
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    return runtime.slot_reasons()
+    reasons = runtime.slot_reasons()
+    if "route" in runtime.SLOTS:
+        from sgl_nvidia_mega.qwen3_8.moe.config import config_disable_reasons
+
+        for slot in runtime.SLOTS & {"route", "mkm", "route_shared"}:
+            reasons.extend(
+                config_disable_reasons(
+                    hf_config, cfg.tp_size, cfg.speculative_num_draft_tokens, slot
+                )
+            )
+    return reasons
 
 
 def _build(model, hf_config, ctx):
-    return runtime.build(model, ctx)
+    return runtime.build(model, ctx, hf_config=hf_config)
 
 
 SPEC = MegakernelSpec(

@@ -1397,7 +1397,10 @@ def test_gdn_slot_topologies_keep_generic_verify_and_bound_the_core(topology_nam
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_prefill_plan_uses_actual_chunk_rows_and_stock_when_slot_off(enabled):
+@pytest.mark.parametrize("mm_inputs", [None, [], [None], [None, None, None, None]])
+def test_prefill_plan_uses_actual_chunk_rows_and_stock_when_slot_off(
+    enabled, mm_inputs
+):
     from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -1405,7 +1408,7 @@ def test_prefill_plan_uses_actual_chunk_rows_and_stock_when_slot_off(enabled):
         model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
     )
     built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), enabled)
-    fb = SimpleNamespace(mm_inputs=None, forward_mode=ForwardMode.EXTEND)
+    fb = SimpleNamespace(mm_inputs=mm_inputs, forward_mode=ForwardMode.EXTEND)
     step = built.plan(torch.zeros(33, dtype=torch.int64), fb)
     if enabled:
         assert step.mode == "prefill" and step.rows == 33
@@ -1413,6 +1416,19 @@ def test_prefill_plan_uses_actual_chunk_rows_and_stock_when_slot_off(enabled):
         assert step is None
     fb.forward_mode = ForwardMode.TARGET_VERIFY
     assert built.plan(torch.zeros(7, dtype=torch.int64), fb) is None
+
+
+@pytest.mark.parametrize("mm_inputs", [[object()], [None, object()]])
+def test_prefill_plan_keeps_real_multimodal_batches_on_stock(mm_inputs):
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), True)
+    fb = SimpleNamespace(mm_inputs=mm_inputs, forward_mode=ForwardMode.EXTEND)
+    assert built.plan(torch.zeros(33, dtype=torch.int64), fb) is None
 
 
 def test_prefill_unsupported_view_returns_the_original_before_state_writes():

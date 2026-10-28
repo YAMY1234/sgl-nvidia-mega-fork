@@ -78,6 +78,16 @@ REQUIREMENTS = Requirements(
 # A numeric slot's outputs are held to fp64 on the same operands (test/kernels), at
 # most these multiples of the error of SGLang's own op; every other slot is bitwise.
 NUMERIC_TOLERANCES: dict[str, dict[str, float]] = {
+    # FP64 primitive qualification454345, main4517 native TRTLLM sparse QSA:
+    # four real TP4 rank-local224K inputs and explicitly derived8K fixtures,
+    # each N5. Error ratios: relL2 .814905-.921637, maxabs .513759-1.000000.
+    # Evidence: lanes/qsa/fn-mega-attn-v1/native-summary-454345.json.
+    # This gate used the1015 image (FI0.7.1); repeat on1028/FI0.7.2 before
+    # service parity/performance. These remain separate gates.
+    "qsa_core": {
+        "qsa_core.attention.rel_l2_vs_stock": 1.05,
+        "qsa_core.attention.max_abs_vs_stock": 2.0,
+    },
     "gdn_front": {
         "gdn_front.in_proj_qkvz.rel_l2_vs_stock": 1.05,
         "gdn_front.in_proj_qkvz.max_abs_vs_stock": 2.0,
@@ -142,6 +152,12 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
                     hf_config, cfg.tp_size, cfg.speculative_num_draft_tokens, slot
                 )
             )
+    if "qsa_core" in runtime.SLOTS:
+        from sgl_nvidia_mega.qwen3_8.attention.config import config_disable_reasons
+
+        reasons += config_disable_reasons(
+            hf_config, cfg.tp_size, cfg.speculative_num_draft_tokens,
+        )
     return reasons
 
 

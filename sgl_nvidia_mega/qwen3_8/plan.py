@@ -25,6 +25,7 @@ class Slots(msgspec.Struct, frozen=True):
     route: bool = False
     mkm: bool = False
     route_shared: bool = False
+    qsa_core: bool = False  # numeric selected-KV attention + gate
 
 
 class Facts(msgspec.Struct, frozen=True):
@@ -38,6 +39,7 @@ class Facts(msgspec.Struct, frozen=True):
     route: bool = False
     mkm: bool = False
     route_shared: bool = False
+    qsa_core: bool = False  # numeric selected-KV attention + gate
 
 
 def slots(rows: int, facts: Facts) -> Slots:
@@ -51,6 +53,7 @@ def slots(rows: int, facts: Facts) -> Slots:
         route=facts.route,
         mkm=facts.route and facts.mkm and rows <= 7,
         route_shared=facts.route and facts.route_shared and rows <= 8,
+        qsa_core=facts.qsa_core and rows == 4,
     )
 
 

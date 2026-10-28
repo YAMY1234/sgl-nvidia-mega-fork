@@ -28,6 +28,7 @@ so their branches of the mirrored code do not appear here.
 
 from __future__ import annotations
 
+import os
 from functools import partial
 
 import torch
@@ -97,6 +98,8 @@ SGLANG_READS = {
         "with_current_layer",
     ),
 }
+
+PARITY_SELF = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_PARITY_SELF") == "1"
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
@@ -202,6 +205,10 @@ class Qwen38Verify:
             stock = partial(
                 original, input_ids, positions, forward_batch, *args, **kwargs
             )
+            # test only: the executor against itself, the floor of a numeric slot's
+            # comparison when the first forward leaves state the second reads
+            if PARITY_SELF:
+                stock = run
             return self.parity.run(step, stock, run)
         return run()
 

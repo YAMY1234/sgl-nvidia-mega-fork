@@ -1303,8 +1303,18 @@ def test_tp4_preserves_v2_shipped_capabilities():
         topology.select(topology.TP4_V2_SLOTS, topology.Topology(4))
         == topology.TP4_V2_SLOTS
     )
-    # Restoring TP4 must not declare support for the unimplemented new shapes.
-    assert not topology.select(topology.TP4_V2_SLOTS, topology.Topology(2))
+    # TP2 only inherits this section's separately verified BF16 draft entries.
+    # TP4 restoration must not enable any other unimplemented TP2 kernel.
+    assert topology.select(topology.TP4_V2_SLOTS, topology.Topology(2)) == frozenset(
+        {
+            "draft_loop",
+            "draft_extend",
+            "draft_multi",
+            "draft_embed",
+            "draft_xchg",
+            "draft_front",
+        }
+    )
     assert not topology.select(topology.TP4_V2_SLOTS, topology.Topology(8, 8, 8))
     assert runtime.slot_reasons(topology.select(shipped, topology.Topology(4))) == []
 

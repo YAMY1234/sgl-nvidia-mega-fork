@@ -84,7 +84,7 @@ def test_gdn_and_moe_build_and_plan_together(monkeypatch,numeric):
     model=fake_model()
     ctx=SimpleNamespace(widths=(4,8,12),tokens_per_request=4,deadline_s=2.,binding=object())
     built=runtime.build(model,ctx,hf_config=model.config)
-    assert built.widths==(4,) and set(built.bound)=={'gdn','moe'}
+    assert built.widths==(4,) and set(built.bound)=={'gdn','moe','attention'}
     held=built.slots[4]
     assert held.gdn_mk==numeric and held.gdn_verify!=numeric and held.gdn_pdl
     assert held.route and held.mkm and held.route_shared

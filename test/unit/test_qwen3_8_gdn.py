@@ -37,7 +37,9 @@ def test_generic_view_is_not_an_eagle_view():
 def fake_model():
     norm=SimpleNamespace(activation="sigmoid",group_size=None,norm_before_gate=True)
     out=SimpleNamespace(reduce_results=False,input_is_parallel=True,bias=None)
+    import torch
     gdn=SimpleNamespace(norm=norm,out_proj=out,attn_tp_size=4,
+                        _fused_in_proj_weight=torch.empty(4120,2560,dtype=torch.bfloat16),
                         attn=SimpleNamespace(layer_id=3))
     return SimpleNamespace(config=hf(),model=SimpleNamespace(
         layers=[SimpleNamespace(linear_attn=gdn)]))

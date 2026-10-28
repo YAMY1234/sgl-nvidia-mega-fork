@@ -4,6 +4,8 @@ import msgspec
 
 from .config import shapes
 
+SGLANG_READS = {"srt/models/qwen3_5.py": ("_fused_in_proj_weight",)}
+
 GDN_SLOTS = frozenset({"gdn_verify", "gdn_pdl", "gdn_mk", "gdn_front"})
 
 
@@ -36,6 +38,13 @@ def build(model, ctx):
     mk = "gdn_mk" in requested
     if mk and ctx.tokens_per_request != 4:
         return Bound(reason="gdn_mk is qualified for four verify rows/request")
+    if mk:
+        import torch
+        for gdn in gdns:
+            weight = gdn._fused_in_proj_weight
+            if (weight is None or weight.dtype != torch.bfloat16
+                    or tuple(weight.shape) != (shape.packed, shape.hidden)):
+                return Bound(reason="gdn_mk needs the finalized native BF16 input projection")
     # The unchanged e5 numeric core includes its PDL wait/entry trigger.
     return Bound(gdn_verify=not mk, gdn_pdl=mk or "gdn_pdl" in requested,
                  gdn_mk=mk, shape=shape)

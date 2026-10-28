@@ -8,7 +8,8 @@ SGLANG_READS = {
         "qwen3_5_gdn_prefill_projection_views",),
     "srt/models/qwen3_5.py": (
         "_forward_input_proj", "attn_tp_size", "num_k_heads", "num_v_heads",
-        "head_k_dim", "head_v_dim", "norm", "out_proj"),
+        "head_k_dim", "head_v_dim", "norm", "out_proj",
+        "_fused_in_proj_weight"),
     "srt/layers/attention/linear/gdn_backend.py": (
         "verify_intermediate_state_indices",),
     "srt/layers/attention/hybrid_linear_attn_backend.py": (
@@ -64,19 +65,30 @@ def step(layer, x, st):
         logger.info("NVIDIA megakernel: FN GDN rows=%d T=%d pdl=%d mk=%d",
                     rows, draft, st.slots.gdn_pdl, st.slots.gdn_mk)
         _ENGAGED.add(key)
-    qkvz, ba = gdn._forward_input_proj(x)
-    mixed, z, b, a = qwen3_5_gdn_prefill_projection_views(
-        qkvz, ba, shape.hk, shape.hv, shape.key_dim, shape.value_dim)
     attn = gdn.attn
     impl, meta, pool, cache = context(attn, st)
     states = meta.mamba_cache_indices
-    convolved = conv_update(
-        mixed.view(requests, draft, -1).transpose(1, 2),
-        cache.conv[0], attn.conv_weights, attn.bias, attn.activation,
-        states[:requests], cache.intermediate_conv_window[0],
-        impl.verify_intermediate_state_indices[:requests],
-        block_n=128, token_major_out=True)
-    convolved = convolved.transpose(1, 2).view(rows, -1)
+    if st.slots.gdn_mk:
+        from sgl_nvidia_mega.qwen3_8.sm103.gdn.front import run as mature_front
+        packed, convolved = mature_front(
+            x, gdn._fused_in_proj_weight, attn.conv_weights, attn.bias,
+            cache.conv[0], states[:requests], cache.intermediate_conv_window[0],
+            impl.verify_intermediate_state_indices[:requests], shape=shape)
+        qkvz_width = shape.packed - 2*shape.hv
+        qkvz, ba = packed[:, :qkvz_width], packed[:, qkvz_width:]
+        _, z, b, a = qwen3_5_gdn_prefill_projection_views(
+            qkvz, ba, shape.hk, shape.hv, shape.key_dim, shape.value_dim)
+    else:
+        qkvz, ba = gdn._forward_input_proj(x)
+        mixed, z, b, a = qwen3_5_gdn_prefill_projection_views(
+            qkvz, ba, shape.hk, shape.hv, shape.key_dim, shape.value_dim)
+        convolved = conv_update(
+            mixed.view(requests, draft, -1).transpose(1, 2),
+            cache.conv[0], attn.conv_weights, attn.bias, attn.activation,
+            states[:requests], cache.intermediate_conv_window[0],
+            impl.verify_intermediate_state_indices[:requests],
+            block_n=128, token_major_out=True)
+        convolved = convolved.transpose(1, 2).view(rows, -1)
     q, k, v = convolved.split((attn.q_dim, attn.k_dim, attn.v_dim), dim=-1)
     q = q.view(rows, shape.hk, shape.key_dim)
     k = k.view(rows, shape.hk, shape.key_dim)

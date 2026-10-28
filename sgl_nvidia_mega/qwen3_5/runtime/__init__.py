@@ -390,7 +390,7 @@ def build(model, ctx):
 
     from sgl_nvidia_mega.qwen3_5 import attention, boundary, gdn, lowm, moe
     from sgl_nvidia_mega.qwen3_5 import plan as slot_plan
-    from sgl_nvidia_mega.qwen3_5.runtime import parity
+    from sgl_nvidia_mega.qwen3_5.runtime import hooks, parity
     from sgl_nvidia_mega.qwen3_5.runtime.executor import Qwen35Verify
 
     build_cp_lite(ctx.binding)
@@ -533,6 +533,9 @@ def build(model, ctx):
         if parity.ENABLED
         else None
     )
+    hook_factory = (
+        hooks.build(model, ctx.binding) if "sharded_gumbel" in SLOTS else None
+    )
     on = sorted(name for name, ok in built.items() if ok)
     return Qwen35Verify(
         model,
@@ -542,4 +545,5 @@ def build(model, ctx):
         binding=ctx.binding,
         summary=f"slots {on or 'none (stock)'}{wider}",
         parity=checker,
+        speculative_runtime_hooks=hook_factory,
     )

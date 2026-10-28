@@ -11,7 +11,9 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from sglang.kernels.plugin_kernels.nvidia import spec
 
+from sgl_nvidia_mega.qwen3_5.runtime import hooks
 from sgl_nvidia_mega.qwen3_5.sm103.sharded_gumbel import (
     build,
     gumbel_shard_keys,
@@ -431,3 +433,68 @@ def test_prebuilt_kernel_captures_with_a_preallocated_output(dtype):
         splits=splits,
     )
     assert torch.equal(captured, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_provider_factory_draws_seeds_and_replays_from_a_cuda_graph(dtype):
+    rows, columns = 8, 4097
+    splits = key_splits(columns)
+    weight = torch.empty((columns, 1), dtype=torch.bfloat16, device="cuda")
+    model = SimpleNamespace(
+        lm_head=SimpleNamespace(
+            weight=weight,
+            shard_indices=SimpleNamespace(
+                org_vocab_start_index=0,
+                num_org_elements=columns,
+                num_added_elements_padded=0,
+            ),
+        ),
+        logits_processor=SimpleNamespace(vocab_size=columns),
+    )
+    binding = SimpleNamespace(tp_size=1, tp_rank=0)
+    # hooks.build invokes the real two-dtype precompile before this graph exists.
+    factory = hooks.build(model, binding)
+    assert callable(factory)
+
+    def stock_run(io, local_keys):
+        return io, local_keys
+
+    def stock_keys(view):
+        raise AssertionError("sampled provider delegated to greedy stock keys")
+
+    defaults = spec.SpeculativeRuntimeHooks(
+        post_verify=spec.PostVerifyStrategy(run=stock_run, local_keys=stock_keys)
+    )
+    selected = factory(defaults)
+    assert selected.post_verify.run is defaults.post_verify.run
+    local_keys = selected.post_verify.local_keys
+
+    # Equal logits make the internally generated per-row seed observable in the
+    # winning key.  A graph replay advances PyTorch's captured RNG state.
+    logits = torch.zeros((rows, columns), dtype=dtype, device="cuda")
+    temperatures = torch.ones(rows, dtype=torch.float32, device="cuda")
+    view = spec.ShardedLogitsView(
+        values=logits,
+        shard=spec.VocabShardView(start=0, valid=columns, vocab_size=columns),
+        temperatures=temperatures,
+        seeds=None,
+        splits=splits,
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        keys = local_keys(view)
+    assert keys is not None
+    assert keys.dtype == torch.int64
+    assert keys.device == logits.device
+    assert keys.is_contiguous()
+    assert tuple(keys.shape) == (rows, splits)
+
+    first = keys.clone()
+    graph.replay()
+    second = keys.clone()
+    graph.replay()
+    third = keys.clone()
+    assert not torch.equal(first, second)
+    assert not torch.equal(second, third)

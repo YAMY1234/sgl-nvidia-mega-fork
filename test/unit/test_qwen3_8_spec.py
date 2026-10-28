@@ -114,3 +114,17 @@ def test_the_slot_plan_covers_one_request():
     assert plan.plan((4,), plan.Facts()) == {4: plan.Slots()}
     with pytest.raises(ValueError):
         plan.slots(plan.MAX_ROWS + 1, plan.Facts())
+
+
+def test_multi_request_widths_are_covered_only_where_a_slot_runs():
+    assert plan.candidates((4, 8, 12, 16), 4, multi=True) == (4, 8, 16)
+    every = plan.Facts(**dict.fromkeys(plan.Facts.__struct_fields__, True))
+    # every slot is bounded to one request until it qualifies wider steps
+    assert plan.covered((4, 8, 16), every, 4) == (4,)
+    assert plan.covered((4, 8, 16), plan.Facts(), 4) == (4,)
+    assert plan.widest((4, 8, 16), plan.ROUTE_MAX_ROWS) == 4
+
+
+def test_multi_request_is_a_known_request(monkeypatch):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"multi_request", "gdn_mk"}))
+    assert "unknown FN slot" not in _refusal()

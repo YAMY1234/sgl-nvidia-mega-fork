@@ -11,6 +11,7 @@ from __future__ import annotations
 import msgspec
 
 from sgl_nvidia_mega.qwen3_5.runtime import SLOTS, SLOTS_ENV
+from sgl_nvidia_mega.qwen3_8.plan import MULTI_REQUEST
 
 # The kernel slots that run only when requested (in Qwen3.5's request variable)
 OPT_IN_SLOTS: tuple[str, ...] = (
@@ -40,7 +41,7 @@ def slot_reasons() -> list[str]:
     reasons = [
         f"{SLOTS_ENV}: unknown FN slot {name!r} "
         f"(known: {', '.join(OPT_IN_SLOTS) or 'none'})"
-        for name in sorted(SLOTS - set(OPT_IN_SLOTS))
+        for name in sorted(SLOTS - set(OPT_IN_SLOTS) - {MULTI_REQUEST})
     ]
     for name in ("mkm", "route_shared"):
         if name in SLOTS and "route" not in SLOTS:
@@ -58,7 +59,9 @@ def build(model, ctx, *, hf_config=None):
     from sgl_nvidia_mega.qwen3_8 import plan as slot_plan
     from sgl_nvidia_mega.qwen3_8.runtime.executor import Qwen38Verify
 
-    widths = slot_plan.candidates(ctx.widths, ctx.tokens_per_request)
+    widths = slot_plan.candidates(
+        ctx.widths, ctx.tokens_per_request, MULTI_REQUEST in SLOTS
+    )
     if not widths:
         raise RuntimeError(
             f"NVIDIA megakernel: {ctx.tokens_per_request} rows a request leave no "
@@ -89,7 +92,7 @@ def build(model, ctx, *, hf_config=None):
 
         moe = route.build(
             model,
-            max(widths),
+            slot_plan.widest(widths, slot_plan.ROUTE_MAX_ROWS),
             fused="mkm" in SLOTS,
             shared="route_shared" in SLOTS,
             hf_config=hf_config,
@@ -107,6 +110,7 @@ def build(model, ctx, *, hf_config=None):
         facts = slot_plan.Facts(
             **gdn_facts, **attention_facts, route=moe.route, mkm=bool(moe.mkm), route_shared=moe.shared
         )
+    widths = slot_plan.covered(widths, facts, ctx.tokens_per_request)
     slots = slot_plan.plan(widths, facts)
     checker = (
         parity.Parity(widths, torch.cuda.current_device(), model)

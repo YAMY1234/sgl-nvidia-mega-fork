@@ -1,6 +1,6 @@
 # FN MoE slots
 
-Opt in with `SGLANG_NVIDIA_MEGAKERNEL_SLOTS=route,mkm`. `route_shared` adds the BF16 shared gate/up projection to the router grid; it is a separate numeric slot. All slots default off.
+Opt in with `SGLANG_NVIDIA_MEGAKERNEL_SLOTS=route,mkm`. `route` is a numeric producer slot; `mkm` is exact given the same producer inputs. `route_shared` adds the BF16 shared gate/up projection to the router grid and is also numeric. All slots default off.
 
 Dimensions come from `hf_config.text_config`, and rows from the build context. The current router supports H2560/E512/top10. The current SF-MKM supports TP4 logical intermediate160/native ModelOpt storage192, up to7 rows; the served one-request verify uses4 rows. Unsupported shapes return config/build reasons. The storage shard is the native192-row checkpoint slice, not a160-row logical slice followed by padding.
 
@@ -15,3 +15,5 @@ The GPU test `test/kernels/test_qwen3_8_moe.py` takes `FN_MOE_FIXTURE` (one rank
 Qualification on the 20261015 image (FlashInfer0.7.1 / sglang-kernel0.4.9): route+mkm passed four independent TP4-shaped ranks, M1/M4×3 real inputs, strict native output parity, nine changed-input replays per shape/rank and rank3 memcheck. This is an isolated kernel qualification; model smoke and same-node TP4 Static parity remain separate. Shared gate/up passed four independent ranks, M1/M4×3 real inputs, its1.05/2.0 FP64 gate and rank3 memcheck. Shared-tail graph/model/performance gates remain separate. The shared GPU test additionally takes `FN_SHARED_FIXTURE` (the original BF16 shared weight fixture) and its precompiled shared-router cache.
 
 The project switched to the 20261028 image (FlashInfer0.7.2 / sglang-kernel0.4.10). Both primitive gates must be repeated there before service parity; the earlier image qualification is historical.
+
+Router numerical contract: compare original BF16 input/weight against FP64. At each changed logit, candidate absolute error must be no larger than native error or one BF16 ULP. The spec metric divides candidate error by the maximum of those two bounds (zero error at zero bound is zero). Adjacent expert FP64 margins and native/plugin rankings are reported separately: an error within the logit bound can reorder nearly tied experts. MKM's exact contract compares native FI and MKM with identical logits, packed input and linear scales, including IDs, weights, canonical rows and ordered final output. Whole-model parity against a different route is not this same-input test. Service coverage, self-parity and paired natural-AL/GSM gates remain separate.

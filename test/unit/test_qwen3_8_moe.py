@@ -170,3 +170,11 @@ def test_engaged_marks_only_dispatched_moe_slots(fused, shared_slot, defer):
         assert result == "deferred"
     else:
         assert result.shape == (4, 2560)
+
+
+def test_router_is_numeric_while_same_input_mkm_stays_exact():
+    from sgl_nvidia_mega.qwen3_8 import spec
+
+    assert spec.numerics({"route"}).kind is spec.NumericsKind.TOLERANCE
+    assert spec.numerics({"mkm"}).kind is spec.NumericsKind.BITWISE
+    assert spec.numerics({"route", "mkm"}).tolerances == spec.numerics({"route"}).tolerances

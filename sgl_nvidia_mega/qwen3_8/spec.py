@@ -76,8 +76,15 @@ REQUIREMENTS = Requirements(
 )
 
 # A numeric slot's outputs are held to fp64 on the same operands (test/kernels), at
-# most these multiples of the error of SGLang's own op; every other slot is bitwise.
+# bounds below compare native error or an explicit BF16-ULP floor; other slots are bitwise.
 NUMERIC_TOLERANCES: dict[str, dict[str, float]] = {
+    # BF16 router GEMMs can straddle a rounding midpoint and change nearly tied
+    # expert order. On identical BF16 input/weight, use an FP64 reference:
+    # |candidate-ref| <= max(|native-ref|, one BF16 ULP). MKM remains exact
+    # against native FI given the same logits, packed activation and scales.
+    "route": {
+        "route.router.abs_error_vs_max_stock_or_bf16_ulp": 1.0,
+    },
     # FP64 primitive qualification454345, main4517 native TRTLLM sparse QSA:
     # four real TP4 rank-local224K inputs and explicitly derived8K fixtures,
     # each N5. Error ratios: relL2 .814905-.921637, maxabs .513759-1.000000.

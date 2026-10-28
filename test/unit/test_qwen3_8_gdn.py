@@ -1,0 +1,59 @@
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+from sgl_nvidia_mega.qwen3_8.gdn.config import config_disable_reasons, shapes
+from sgl_nvidia_mega.qwen3_8.gdn import verify
+
+
+def hf():
+    return SimpleNamespace(text_config=SimpleNamespace(hidden_size=2560,
+        linear_num_key_heads=16,linear_num_value_heads=48,
+        linear_key_head_dim=128,linear_value_head_dim=128))
+
+
+@pytest.mark.parametrize("tp,hk,hv",[(1,16,48),(4,4,12)])
+def test_dimensions_are_read_from_text_config(tp,hk,hv):
+    shape=shapes(hf(),4,tp)
+    assert (shape.hk,shape.hv,shape.tokens_per_request)==(hk,hv,4)
+    assert shape.packed==2*hk*128+2*hv*128+2*hv
+
+
+def test_unsupported_configuration_returns_reasons():
+    cfg=hf();cfg.text_config.linear_value_head_dim=64
+    assert any("128-dimensional" in x for x in config_disable_reasons(cfg,4,4))
+    assert any("verify rows" in x for x in config_disable_reasons(hf(),9,4))
+
+
+def test_generic_view_is_not_an_eagle_view():
+    cache=object();pool=object();metadata=object()
+    impl=SimpleNamespace(forward_metadata=metadata,state_pool=pool,
+                         state_layer_cache=lambda layer: cache)
+    st=SimpleNamespace(view=SimpleNamespace(metadata=None),binding=object())
+    with patch.object(verify,"backend",return_value=impl):
+        assert verify.context(SimpleNamespace(layer_id=3),st)==(impl,metadata,pool,cache)
+
+
+def fake_model():
+    norm=SimpleNamespace(activation="sigmoid",group_size=None,norm_before_gate=True)
+    out=SimpleNamespace(reduce_results=False,input_is_parallel=True,bias=None)
+    gdn=SimpleNamespace(norm=norm,out_proj=out,attn_tp_size=4,
+                        attn=SimpleNamespace(layer_id=3))
+    return SimpleNamespace(config=hf(),model=SimpleNamespace(
+        layers=[SimpleNamespace(linear_attn=gdn)]))
+
+
+def test_mk_has_separate_numeric_claim_and_owns_pdl():
+    from sgl_nvidia_mega.qwen3_8 import gdn, runtime, plan
+    with patch.object(runtime,"SLOTS",frozenset({"gdn_mk"})):
+        bound=gdn.build(fake_model(),SimpleNamespace(tokens_per_request=4))
+    assert bound.gdn_mk and bound.gdn_pdl and not bound.gdn_verify
+    held=plan.slots(4,plan.Facts(gdn_mk=True,gdn_pdl=True))
+    assert held.gdn_mk and held.gdn_pdl and not held.gdn_verify
+
+
+def test_unqualified_mk_row_count_has_a_reason():
+    from sgl_nvidia_mega.qwen3_8 import gdn, runtime
+    with patch.object(runtime,"SLOTS",frozenset({"gdn_mk"})):
+        bound=gdn.build(fake_model(),SimpleNamespace(tokens_per_request=7))
+    assert "four verify rows" in bound.reason

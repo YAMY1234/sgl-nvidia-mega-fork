@@ -13,7 +13,7 @@ import msgspec
 from sgl_nvidia_mega.qwen3_5.runtime import SLOTS, SLOTS_ENV
 
 # The kernel slots that run only when requested (in Qwen3.5's request variable)
-OPT_IN_SLOTS: tuple[str, ...] = ()
+OPT_IN_SLOTS: tuple[str, ...] = ("gdn_verify", "gdn_pdl", "gdn_mk", "gdn_front")
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -38,7 +38,8 @@ def build(model, ctx):
     """The slot plan per width and the executor; ``ctx`` is SGLang's BuildContext."""
     import torch
 
-    from sgl_nvidia_mega.qwen3_5.runtime import parity
+    from sgl_nvidia_mega.qwen3_5.runtime import PackageContext, parity
+    from sgl_nvidia_mega.qwen3_8 import gdn
     from sgl_nvidia_mega.qwen3_8 import plan as slot_plan
     from sgl_nvidia_mega.qwen3_8.runtime.executor import Qwen38Verify
 
@@ -48,7 +49,15 @@ def build(model, ctx):
             f"NVIDIA megakernel: {ctx.tokens_per_request} rows a request leave no "
             "covered width"
         )
-    facts = slot_plan.Facts()
+    pctx = PackageContext(widths=widths, tokens_per_request=ctx.tokens_per_request,
+                          deadline_s=ctx.deadline_s)
+    gdn_bound = gdn.build(model, pctx)
+    if gdn_bound.reason:
+        raise RuntimeError(f"NVIDIA megakernel: FN GDN: {gdn_bound.reason}")
+    facts = slot_plan.Facts(gdn_verify=gdn_bound.gdn_verify,
+                           gdn_pdl=gdn_bound.gdn_pdl,
+                           gdn_mk=gdn_bound.gdn_mk,
+                           gdn_front=gdn_bound.gdn_front)
     slots = slot_plan.plan(widths, facts)
     checker = (
         parity.Parity(widths, torch.cuda.current_device(), model)
@@ -59,7 +68,7 @@ def build(model, ctx):
     return Qwen38Verify(
         model,
         slots,
-        bound={},
+        bound={"gdn": gdn_bound},
         widths=widths,
         binding=ctx.binding,
         summary=f"slots {on or 'none (stock)'}",

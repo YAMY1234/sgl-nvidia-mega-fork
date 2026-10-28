@@ -22,6 +22,9 @@ class Slots(msgspec.Struct, frozen=True):
     gdn_pdl: bool = False
     gdn_mk: bool = False  # numeric MK core, qualified separately
     gdn_front: bool = False  # numeric N32 projection/conv
+    route: bool = False
+    mkm: bool = False
+    route_shared: bool = False
 
 
 class Facts(msgspec.Struct, frozen=True):
@@ -32,14 +35,23 @@ class Facts(msgspec.Struct, frozen=True):
     gdn_pdl: bool = False
     gdn_mk: bool = False
     gdn_front: bool = False
+    route: bool = False
+    mkm: bool = False
+    route_shared: bool = False
 
 
 def slots(rows: int, facts: Facts) -> Slots:
     if not 1 <= rows <= MAX_ROWS:
         raise ValueError(f"{rows} rows are outside the covered widths 1-{MAX_ROWS}")
-    return Slots(gdn_verify=facts.gdn_verify,
-                 gdn_pdl=(facts.gdn_verify or facts.gdn_mk) and facts.gdn_pdl,
-                 gdn_mk=facts.gdn_mk, gdn_front=facts.gdn_front)
+    return Slots(
+        gdn_verify=facts.gdn_verify,
+        gdn_pdl=(facts.gdn_verify or facts.gdn_mk) and facts.gdn_pdl,
+        gdn_mk=facts.gdn_mk,
+        gdn_front=facts.gdn_front,
+        route=facts.route,
+        mkm=facts.route and facts.mkm and rows <= 7,
+        route_shared=facts.route and facts.route_shared and rows <= 8,
+    )
 
 
 def plan(widths: tuple[int, ...], facts: Facts) -> dict[int, Slots]:

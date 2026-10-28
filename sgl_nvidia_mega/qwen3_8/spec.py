@@ -97,6 +97,10 @@ NUMERIC_TOLERANCES: dict[str, dict[str, float]] = {
         "gdn_mk.gated_norm.rel_l2_vs_stock": 1.05,
         "gdn_mk.gated_norm.max_abs_vs_stock": 2.0,
     },
+    "route_shared": {
+        "route_shared.gate_up.rel_l2_vs_stock": 1.05,
+        "route_shared.gate_up.max_abs_vs_stock": 2.0,
+    },
 }
 
 
@@ -129,11 +133,20 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         ):
             if getattr(cfg, name, None) not in allowed:
                 reasons.append(f"FN GDN requires {name} in {allowed!r}")
+    if "route" in runtime.SLOTS:
+        from sgl_nvidia_mega.qwen3_8.moe.config import config_disable_reasons
+
+        for slot in runtime.SLOTS & {"route", "mkm", "route_shared"}:
+            reasons.extend(
+                config_disable_reasons(
+                    hf_config, cfg.tp_size, cfg.speculative_num_draft_tokens, slot
+                )
+            )
     return reasons
 
 
 def _build(model, hf_config, ctx):
-    return runtime.build(model, ctx)
+    return runtime.build(model, ctx, hf_config=hf_config)
 
 
 SPEC = MegakernelSpec(

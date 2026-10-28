@@ -275,4 +275,8 @@ class Qwen38Verify:
         x = layer._prepare_attn_stage(hidden, st.fb, ple_batch)
         part = self.mixers[i](layer, x, st)
         hidden = layer.attn_boundary.finish(part, st.fb)
+        if st.slots.route:
+            from sgl_nvidia_mega.qwen3_8.moe.step import ffn
+
+            return ffn(layer, hidden, st)
         return layer._run_ffn_stage(hidden, st.fb)

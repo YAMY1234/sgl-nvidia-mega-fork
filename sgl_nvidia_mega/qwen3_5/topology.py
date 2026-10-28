@@ -11,6 +11,17 @@ from __future__ import annotations
 
 import msgspec
 
+SGLANG_READS = {
+    "srt/runtime_context.py": ('"tp_size"', '"attn_dp_size"', '"moe_ep_size"'),
+    "srt/arg_groups/fields/*.py": (
+        "tp_size",
+        "attn_dp_size",
+        "ep_size",
+        "dp_size",
+        "enable_dp_attention",
+    ),
+}
+
 TOPOLOGIES = frozenset({"tp2", "tp4", "tp8", "tep8", "dep8"})
 LEGACY = frozenset({"tp8", "tep8"})
 

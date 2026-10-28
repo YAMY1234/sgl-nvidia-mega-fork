@@ -1311,7 +1311,6 @@ def test_tp4_preserves_v2_shipped_capabilities():
             "draft_extend",
             "draft_multi",
             "draft_embed",
-            "draft_xchg",
             "draft_front",
         }
     )
@@ -1390,7 +1389,7 @@ def test_bf16_draft_entries_cover_pd_batches_without_quantized_experts(
     selected = topology.select(requested, topology.Topology(tp_size))
     assert runtime.slot_reasons(selected) == []
     if tp_size == 2:
-        assert not selected & {"draft_moe", "draft_q1"}
+        assert not selected & {"draft_moe", "draft_q1", "draft_xchg"}
     monkeypatch.setattr(runtime, "SLOTS", selected)
     parts = _DraftParts(slots=selected, tp_size=tp_size)
     parts.top1x = object()

@@ -170,9 +170,10 @@ def test_config_filter_derives_attention_tp_before_publication(monkeypatch):
     )
     monkeypatch.setattr(target, "text_config_reasons", lambda hf_config: [])
     monkeypatch.setattr(target, "binding_reasons", lambda: [])
-    monkeypatch.setattr(runtime, "slot_reasons", lambda: [])
+    monkeypatch.setattr(runtime, "slot_reasons", lambda requested=None: [])
     monkeypatch.setattr(target, "pd_reasons", lambda cfg: [])
-    cfg = SimpleNamespace(tp_size=8, attn_cp_size=1, attn_dp_size=8, ep_size=8)
+    cfg = SimpleNamespace(tp_size=8, attn_cp_size=1, attn_dp_size=8, ep_size=8,
+                          enable_dp_attention=True, dp_size=8, disaggregation_mode="decode")
 
     assert not hasattr(cfg, "attn_tp_size")
     assert target._config_disable_reasons(cfg, SimpleNamespace()) == []
@@ -1589,7 +1590,7 @@ def test_new_topologies_cover_actual_pd_stock_widths(monkeypatch, tp, dp, ep, ro
     monkeypatch.setattr(runtime, "SLOTS", frozenset())
     monkeypatch.setattr(
         "sglang.srt.runtime_context.get_parallel",
-        lambda: SimpleNamespace(tp_size=tp, attn_dp_size=dp, moe_ep_size=ep),
+        lambda: SimpleNamespace(tp_size=tp, attn_dp_size=dp, attn_tp_size=tp // dp, moe_ep_size=ep),
     )
     model = SimpleNamespace(
         model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
@@ -1683,7 +1684,7 @@ def test_measured_topology_policy_selects_actual_draft_entries(monkeypatch, tp_s
     monkeypatch.setattr(runtime, "SLOTS", requested)
     monkeypatch.setattr(
         "sglang.srt.runtime_context.get_parallel",
-        lambda: SimpleNamespace(tp_size=tp_size, moe_ep_size=1),
+        lambda: SimpleNamespace(tp_size=tp_size, attn_tp_size=tp_size, moe_ep_size=1),
     )
     built = draft.SPEC.build("lm", SimpleNamespace(context_len=8192), _draft_ctx())
     if tp_size == 2:

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The kernels slot gdn_verify launches its own way, on one SM100-family GPU (GB300),
-against SGLang's, bit for bit, at Qwen3.5's TP8 GatedDeltaNet shapes, for steps of 1, 2
-and 4 requests:
+against SGLang's, bit for bit, at Qwen3.5's TP8, TP4, TP2 and DP-attention
+GatedDeltaNet shapes, including TP2 decode B6/B10 and DEP8 per-rank B32:
 
 - the causal conv update with the 128-channel tile and the token-major output, against
   ``causal_conv1d_update`` (output, conv states and intermediate windows), on the
@@ -55,32 +55,50 @@ def _gpu_ready() -> bool:
 pytestmark = pytest.mark.skipif(not _gpu_ready(), reason="needs an SM100-family GPU")
 
 
-def _projection(bs, views, g):
+def _projection(bs, views, g, h=H, hv=HV):
     """A verify step's mixed q / k / v rows [bs * 7, D]: a contiguous copy, or the
     token-major view of the q / k / v / z projection."""
-    qkvz = torch.randn(bs * DRAFT, D + HV * V, device="cuda", generator=g).to(
+    dim = 2 * h * K + hv * V
+    qkvz = torch.randn(bs * DRAFT, dim + hv * V, device="cuda", generator=g).to(
         torch.bfloat16
     )
-    return qkvz[:, :D] if views else qkvz[:, :D].contiguous()
+    return qkvz[:, :dim] if views else qkvz[:, :dim].contiguous()
 
 
 # a covered step's requests (slot gdn_verify covers B1 to B128) and their slots
 REQUESTS = (1, 2, 4, 8, 16, 32, 64, 128)
+# Existing TP8 coverage plus the #4162 aggregate / PD decode shapes. DEP8 has
+# attention TP1 on each DP rank; no cross-rank communication occurs in GDN.
+TOPOLOGY_BATCHES = [(8, bs) for bs in REQUESTS] + [
+    (4, 1),
+    (2, 1),
+    (2, 6),
+    (2, 10),
+    (1, 32),
+]
+
+
+def _heads(tp):
+    h, hv = 16 // tp, 64 // tp
+    return h, hv, 2 * h * K + hv * V
+
+
 STATE_SLOTS = (4, 7, 0, 8, *range(39, 11, -1), *range(135, 39, -1))
 RING_SLOTS = (3, 5, 0, 8, *range(12, 136))
 REPLAY_SLOTS = (1, 2, 4, 6, *range(10, 134))
 
 
-@pytest.mark.parametrize("bs", REQUESTS)
+@pytest.mark.parametrize("tp, bs", TOPOLOGY_BATCHES)
 @pytest.mark.parametrize("views", [False, True])
 @pytest.mark.parametrize("block_n", [256, 128])
-def test_conv_update_is_sglangs(views, block_n, bs):
+def test_conv_update_is_sglangs(views, block_n, tp, bs):
+    H, HV, D = _heads(tp)
     from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
 
     from sgl_nvidia_mega.qwen3_5.gdn.conv import conv_update
 
     g = torch.Generator(device="cuda").manual_seed(block_n + views + 10 * bs)
-    rows = _projection(bs, views, g)
+    rows = _projection(bs, views, g, H, HV)
     weight = torch.randn(D, WIDTH, device="cuda", generator=g).to(torch.bfloat16)
     bias = torch.randn(D, device="cuda", generator=g).to(torch.bfloat16)
     state = torch.randn(SLOTS, D, WIDTH - 1, device="cuda", generator=g).to(
@@ -121,18 +139,19 @@ def test_conv_update_is_sglangs(views, block_n, bs):
     assert got.transpose(1, 2).is_contiguous()
 
 
-@pytest.mark.parametrize("bs", REQUESTS)
+@pytest.mark.parametrize("tp, bs", TOPOLOGY_BATCHES)
 @pytest.mark.parametrize("tile", [(128, 4), (64, 2)])
 @pytest.mark.parametrize("window_mode", [0, 1])
-def test_hoisted_conv_is_sglangs(window_mode, tile, bs):
+def test_hoisted_conv_is_sglangs(window_mode, tile, tp, bs):
     """Slot gdn_conv: x rows loaded first (and with window_mode 1 one window row a channel) writes the
     output, the conv states and the deduplicated windows bit for bit as SGLang's kernel."""
+    H, HV, D = _heads(tp)
     from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
 
     from sgl_nvidia_mega.qwen3_5.gdn.conv import conv_update
 
     g = torch.Generator(device="cuda").manual_seed(window_mode + tile[0] + 10 * bs)
-    rows = _projection(bs, True, g)
+    rows = _projection(bs, True, g, H, HV)
     weight = torch.randn(D, WIDTH, device="cuda", generator=g).to(torch.bfloat16)
     state = torch.randn(SLOTS, D, WIDTH - 1, device="cuda", generator=g).to(
         torch.bfloat16
@@ -183,15 +202,20 @@ def test_hoisted_conv_is_sglangs(window_mode, tile, bs):
     assert torch.equal(state, want_state) and torch.equal(shared, want_shared)
 
 
-@pytest.mark.parametrize("bs", REQUESTS)
+@pytest.mark.parametrize("tp, bs", TOPOLOGY_BATCHES)
 @pytest.mark.parametrize("views", [False, True])
-def test_norm_fp8_is_sglangs_norm_then_static_quant(views, bs):
+def test_norm_fp8_is_within_v2_numeric_bound(views, tp, bs):
+    _norm_fp8_matches_stock(views, tp, bs, int(views) + 10 * bs)
+
+
+def _norm_fp8_matches_stock(views, tp, bs, seed):
+    _, HV, D = _heads(tp)
     from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm
     from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 
     from sgl_nvidia_mega.qwen3_5.gdn.norm_fp8 import rms_norm_gated_fp8
 
-    g = torch.Generator(device="cuda").manual_seed(int(views) + 10 * bs)
+    g = torch.Generator(device="cuda").manual_seed(seed)
     tokens = bs * DRAFT
     core = torch.randn(tokens * HV, V, device="cuda", generator=g).to(torch.bfloat16)
     qkvz = torch.randn(tokens, D + HV * V, device="cuda", generator=g).to(
@@ -211,17 +235,33 @@ def test_norm_fp8_is_sglangs_norm_then_static_quant(views, bs):
     got = rms_norm_gated_fp8(
         core, norm.weight, norm.eps, z, scale, activation=norm.activation
     )
-    assert torch.equal(
-        got.view(torch.uint8).reshape(tokens, -1), want.view(torch.uint8)
+    from sgl_nvidia_mega.qwen3_5.spec import NUMERIC_TOLERANCES
+
+    ref = want.float().reshape(-1)
+    error = torch.linalg.vector_norm(got.float().reshape(-1) - ref)
+    relative = error / torch.linalg.vector_norm(ref)
+    assert (
+        relative.item()
+        <= NUMERIC_TOLERANCES["gdn_verify"]["gdn_verify.norm_fp8.rel_l2_vs_stock"]
     )
 
 
-@pytest.mark.parametrize("bs", REQUESTS)
+@pytest.mark.parametrize("views", [False, True])
+def test_norm_fp8_bf16_midpoint_stays_within_v2_numeric_bound(views):
+    # At row 136/head 32/column 86, seed 320 produces a value at the BF16
+    # rounding boundary. Quantizing the adjacent BF16 values gives E4M3 32
+    # versus 36. Both Z layouts must obey the existing v2 numeric bound.
+    _norm_fp8_matches_stock(views, tp=1, bs=32, seed=320)
+
+
+@pytest.mark.parametrize("tp, bs", TOPOLOGY_BATCHES)
 @pytest.mark.parametrize("pdl, gate", [(False, False), (True, False), (True, True)])
-def test_replayssm_verify_is_sglangs(pdl, gate, bs):
+@pytest.mark.parametrize("ring_len", [16, 32])
+def test_replayssm_verify_is_sglangs(pdl, gate, ring_len, tp, bs):
     """The slot's verify launch (32-wide value tiles on 2 warps, and with or without the
     dependent launch, waiting before the gates with ``gate``) against
     gdn_replayssm_spec_decode's verify launch: the output and this step's ring entries."""
+    H, HV, D = _heads(tp)
     try:
         from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
             gdn_replayssm_spec_decode,
@@ -236,7 +276,7 @@ def test_replayssm_verify_is_sglangs(pdl, gate, bs):
     g = torch.Generator(device="cuda").manual_seed(
         3 + int(pdl) + 2 * int(gate) + 10 * bs
     )
-    ring_len, slots = 16, SLOTS
+    slots = SLOTS
     tokens = bs * DRAFT
 
     def rand(*shape, dtype=torch.bfloat16):
@@ -332,15 +372,16 @@ def test_replayssm_verify_is_sglangs(pdl, gate, bs):
 # -------------------------------------------------------------------- slot gdn_core
 
 
-@pytest.mark.parametrize("bs", REQUESTS)
+@pytest.mark.parametrize("tp, bs", TOPOLOGY_BATCHES)
 @pytest.mark.parametrize("history", [False, True])
 @pytest.mark.parametrize("pad", [False, True])
-def test_core_is_gdn_verify_numerically(pad, history, bs):
+def test_core_is_gdn_verify_numerically(pad, history, tp, bs):
     """Slot gdn_core's one launch against slot gdn_verify's verify (32-wide value tiles,
     2 warps) and FP8 gated norm on the same inputs: the replay output and the FP8 bytes
     up to rounding, this step's ring entries (update and key high + low parts, log-decay)
     up to FP32 summation order; a padded request writes zeros and leaves its ring alone.
     History: an empty ring (BF16 checkpoints fold every commit) or 1-9 committed steps."""
+    H, HV, D = _heads(tp)
     from sgl_nvidia_mega.qwen3_5.gdn import replayssm
     from sgl_nvidia_mega.qwen3_5.gdn.norm_fp8 import rms_norm_gated_fp8
     from sgl_nvidia_mega.qwen3_5.sm103.gdn.core import core
@@ -1151,3 +1192,148 @@ def test_trt_front_replays_from_a_cuda_graph_and_never_compiles_in_one():
             trt_lowm.prepare(unprepared)
         with pytest.raises(RuntimeError, match="not prepared"):
             trt_lowm.run(unprepared, out=outs["ba"], x16=o["x"], w_bf16=o["ba_w"])
+
+
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("prefix", [False, True])
+@pytest.mark.parametrize("pad", [False, True])
+def test_prefill_split_conv_matches_native_state_chain(bias, compact, prefix, pad):
+    """P TP1's conv, recurrence and tracked writes on the same native operands."""
+    from types import SimpleNamespace as NS
+
+    from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+    from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm
+    from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
+    from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+        qwen3_5_gdn_prefill_projection_views,
+    )
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
+
+    from sgl_nvidia_mega.qwen3_5.gdn import prefill
+
+    g = torch.Generator(device="cuda").manual_seed(880 + bias + 10 * prefix)
+    h, hv, dim = _heads(1)
+    lengths = [129, 17]
+    tokens = sum(lengths)
+
+    def rand(*shape):
+        return torch.randn(*shape, generator=g, device="cuda").bfloat16()
+
+    projected, ba = rand(tokens, dim + hv * V), rand(tokens, 2 * hv)
+    mixed, z, b, a = qwen3_5_gdn_prefill_projection_views(projected, ba, h, hv, K, V)
+    attn = NS(
+        layer_id=12,
+        q_dim=h * K,
+        k_dim=h * K,
+        v_dim=hv * V,
+        num_q_heads=h,
+        num_k_heads=h,
+        num_v_heads=hv,
+        head_q_dim=K,
+        head_k_dim=K,
+        head_v_dim=V,
+        conv_weights=rand(dim, WIDTH),
+        bias=rand(dim) if bias else None,
+        activation="silu",
+        A_log=torch.rand(hv, device="cuda", generator=g),
+        dt_bias=rand(hv),
+    )
+    norm = RMSNorm(
+        V, eps=1e-6, norm_before_gate=True, device="cuda", dtype=torch.bfloat16
+    )
+    norm.weight.data = rand(V)
+    module = NS(
+        attn=attn,
+        num_k_heads=h,
+        num_v_heads=hv,
+        attn_tp_size=1,
+        head_k_dim=K,
+        head_v_dim=V,
+        norm=norm,
+        _forward_input_proj=lambda _: (projected, ba),
+        out_proj=lambda x: (x, None),
+    )
+    conv = rand(9, dim, WIDTH - 1)
+    ssm = rand(9, hv, V, K) * 0.02
+    indices = torch.tensor([2, -1 if pad else 4], device="cuda", dtype=torch.int32)
+    qsl = torch.tensor([0, 129, tokens], device="cuda", dtype=torch.int32)
+    table = (
+        torch.tensor(
+            [(i, c) for i, n in enumerate(lengths) for c in range((n + 7) // 8)],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        if compact
+        else None
+    )
+    fb = NS(
+        extend_prefix_lens=torch.tensor([8192 if prefix else 0, 0], device="cuda"),
+        extend_seq_lens_cpu=lengths,
+    )
+    if not prefix:
+        ssm[2].zero_()
+    ssm[4].zero_()
+    conv_ref, ssm_ref = conv.clone(), ssm.clone()
+    ix = lambda vals: torch.tensor(vals, device="cuda", dtype=torch.long)
+    view = NS(
+        state=NS(layer_ids=(12,), conv=(conv.unsqueeze(0),), temporal=ssm.unsqueeze(0)),
+        state_indices=indices,
+        query_start_loc=qsl,
+        conv_block_table=table,
+        kernel_id=1,
+        is_graph=False,
+        has_mis=False,
+        has_track=True,
+        track_conv_indices=ix([[126, 127, 128]]),
+        track_conv_dst=ix([6]),
+        track_ssm_h_src=ix([0]),
+        track_ssm_h_dst=ix([7]),
+        track_ssm_final_src=ix([2]),
+        track_ssm_final_dst=ix([8]),
+        track_ssm_recompute_dst=None,
+    )
+    assert not prefill.unsupported(view)
+    # Native tracking runs before convolution overwrites its committed state.
+    conv_ref[view.track_conv_dst] = mixed[view.track_conv_indices].transpose(1, 2)
+    convolved = causal_conv1d_fn(
+        mixed.T,
+        attn.conv_weights,
+        attn.bias,
+        conv_states=conv_ref,
+        has_initial_state=fb.extend_prefix_lens > 0,
+        cache_indices=indices,
+        query_start_loc=qsl,
+        seq_lens_cpu=lengths,
+        **({"block_table": table} if compact else {}),
+    ).T
+    q, k, v = [
+        x.view(1, tokens, heads, d)
+        for x, heads, d in zip(
+            convolved.split([h * K, h * K, hv * V], dim=-1), (h, h, hv), (K, K, V)
+        )
+    ]
+    gate, beta = fused_gdn_gating(attn.A_log, a, b, attn.dt_bias)
+    want, _, history = chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=gate,
+        beta=beta,
+        initial_state=ssm_ref,
+        initial_state_indices=indices,
+        cu_seqlens=qsl,
+        head_first=False,
+        use_qk_l2norm_in_kernel=True,
+        inplace_update=True,
+    )
+    ssm_ref[view.track_ssm_h_dst] = history.squeeze(0)[view.track_ssm_h_src].to(
+        ssm_ref.dtype
+    )
+    ssm_ref[view.track_ssm_final_dst] = ssm_ref[view.track_ssm_final_src]
+    want = norm(want.reshape(-1, V), z).reshape(tokens, -1)
+    got = prefill.step(module, projected, view, fb)
+    live = slice(0, 129) if pad else slice(None)
+    assert torch.equal(got[live], want[live])
+    assert torch.equal(conv, conv_ref)
+    assert torch.equal(ssm, ssm_ref)

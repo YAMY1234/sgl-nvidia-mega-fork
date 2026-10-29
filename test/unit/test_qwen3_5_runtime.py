@@ -255,6 +255,207 @@ def test_cp_exact_selector_keeps_r11s_unbalanced_batch_cap():
     assert [cp._exact_supported(1, batch) for batch in (32, 64)] == [True, False]
 
 
+def test_cp_call_override_pairs_the_exact_partial_and_merge_order(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import q35_cp_lite as cp_module
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    class Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(cp_module, "_cp_gather_q_ll", Kernel())
+    cp = CpLite.__new__(CpLite)
+    cp.hq, cp.device, cp.me, cp.llq_off, cp.cp = 4, torch.device("cpu"), 0, 0, 1
+    cp.peers = torch.zeros(1, dtype=torch.int64)
+    cp.q_all = torch.zeros(14, 4, 256, dtype=torch.uint8)
+    cp.cnt = torch.zeros(2, 14, dtype=torch.int32)
+    cp.pre_lens = cp.stock_lens = torch.zeros(2, dtype=torch.int32)
+    cp.gather_pdl, cp.early_merge = True, True
+    cp._gate_epilogue, cp._gate_epilogue_done, cp._logged = None, False, set()
+    calls = []
+    cp._exact_partial = lambda *args, **kwargs: calls.append(
+        ("partial", kwargs["early_trigger"])
+    )
+    cp._merge_h = lambda *args, **kwargs: calls.append(
+        ("merge", kwargs["early"], kwargs["plain"])
+    )
+    q = torch.zeros(14, 4, 256, dtype=torch.uint8)
+    cache = torch.zeros(2, 1, 64, 256, dtype=torch.uint8)
+    table = torch.zeros(2, 2, dtype=torch.int32)
+    lengths = torch.full((2,), 71, dtype=torch.int32)
+    gate = {"nb": 2, "thr": 0, "GATE": False, "NB": 2, "GMAX": False}
+
+    for override, expected in ((False, False), (None, True)):
+        calls.clear()
+        cp._ungated_main(
+            q,
+            cache,
+            cache,
+            table,
+            lengths,
+            7,
+            2,
+            14,
+            1.0,
+            1.0,
+            gate,
+            early_merge=override,
+        )
+        assert calls == [
+            ("partial", expected),
+            ("merge", expected, override is False),
+        ]
+
+
+def test_cp_fold_call_override_selects_the_r11_plain_merge(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import q35_cp_lite as cp_module
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    calls = []
+
+    class Kernel:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: calls.append((self.name, grid, kwargs))
+
+    monkeypatch.setattr(cp_module, "_cp_merge_h_ll", Kernel("feature-rich"))
+    monkeypatch.setattr(cp_module, "_cp_merge_h_ll_plain", Kernel("r11-plain"))
+    cp = CpLite.__new__(CpLite)
+    cp.cp, cp.hq, cp.me, cp.llh_off = 4, 4, 0, 0
+    cp.po = torch.zeros(4, 7, 4, 256, dtype=torch.bfloat16)
+    cp.plse = torch.zeros(4, 7, 4, dtype=torch.float32)
+    cp.peers = torch.zeros(4, dtype=torch.int64)
+    cp.cnt_h = torch.zeros(7 * 4, dtype=torch.int32)
+    q = torch.zeros(7, 4, 256, dtype=torch.uint8)
+    cache = torch.zeros(2, 1, 64, 256, dtype=torch.uint8)
+    table = torch.zeros(1, 2, dtype=torch.int32)
+    lengths = torch.full((1,), 71, dtype=torch.int32)
+    out = torch.zeros(7, 4, 256, dtype=torch.bfloat16)
+    gate = {"nb": 1, "thr": 0, "NB": 1, "GMAX": False}
+
+    for plain, expected in ((False, "feature-rich"), (True, "r11-plain")):
+        cp._fold_merge_h(
+            q,
+            cache,
+            cache,
+            table,
+            lengths,
+            7,
+            7,
+            1.0,
+            1.0,
+            out,
+            gate,
+            plain=plain,
+        )
+        assert calls[-1][0] == expected
+        assert calls[-1][1] == (7, 4)
+        assert calls[-1][2]["WAIT"] is False
+        assert "EARLY" not in calls[-1][2]
+        assert "GATE_EPILOGUE" not in calls[-1][2]
+
+    vstart = torch.zeros(1, dtype=torch.int32)
+    vcnt = torch.ones(1, dtype=torch.int32)
+    fused = (
+        (None, None, None, vstart, vcnt),
+        None,
+        torch.zeros(1, 7 * 4 * 4, 256, dtype=torch.bfloat16),
+        torch.zeros(1, 7 * 4 * 4, dtype=torch.float32),
+    )
+    cp._fold_merge_h(
+        q,
+        cache,
+        cache,
+        table,
+        lengths,
+        7,
+        7,
+        1.0,
+        1.0,
+        out,
+        gate,
+        fused=fused,
+        plain=True,
+    )
+    assert calls[-1][0] == "r11-plain"
+    assert calls[-1][2]["CHUNK"] is True
+    assert "EARLY" not in calls[-1][2]
+    assert "GATE_EPILOGUE" not in calls[-1][2]
+
+
+def test_cp_exact_plain_merge_does_not_pass_feature_constexprs(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import q35_cp_lite as cp_module
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    calls = []
+
+    class Kernel:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: calls.append((self.name, grid, kwargs))
+
+    monkeypatch.setattr(cp_module, "_cp_merge_h_ll", Kernel("feature-rich"))
+    monkeypatch.setattr(cp_module, "_cp_merge_h_ll_plain", Kernel("r11-plain"))
+    cp = CpLite.__new__(CpLite)
+    cp.cp, cp.hq, cp.me, cp.llh_off = 4, 4, 0, 0
+    cp.po_x = torch.zeros(4, 7, 4, 256, dtype=torch.bfloat16)
+    cp.pl_x = torch.zeros(4, 7, 4, dtype=torch.float32)
+    cp.peers = torch.zeros(4, dtype=torch.int64)
+    cp.cnt_h = torch.zeros(7 * 4, dtype=torch.int32)
+    q = torch.zeros(7, 4, 256, dtype=torch.uint8)
+    cache = torch.zeros(2, 1, 64, 256, dtype=torch.uint8)
+    table = torch.zeros(1, 2, dtype=torch.int32)
+    lengths = torch.full((1,), 71, dtype=torch.int32)
+    out = torch.zeros(7, 4, 256, dtype=torch.bfloat16)
+    gate = {"nb": 1, "thr": 0, "NB": 1, "GMAX": False}
+
+    cp._merge_h(
+        q,
+        cache,
+        cache,
+        table,
+        lengths,
+        7,
+        7,
+        1.0,
+        1.0,
+        out,
+        gate,
+        pdl=True,
+        early=False,
+        plain=True,
+    )
+    name, grid, kwargs = calls[-1]
+    assert (name, grid) == ("r11-plain", (7, 4))
+    assert kwargs["WAIT"] is True
+    assert "EARLY" not in kwargs
+    assert "GATE_EPILOGUE" not in kwargs
+
+    cp._merge_h(
+        q,
+        cache,
+        cache,
+        table,
+        lengths,
+        7,
+        7,
+        1.0,
+        1.0,
+        out,
+        gate,
+        pdl=True,
+        early=True,
+        plain=False,
+    )
+    name, grid, kwargs = calls[-1]
+    assert (name, grid) == ("feature-rich", (7, 4))
+    assert kwargs["EARLY"] is True
+
+
 def test_cp_gate_epilogue_offer_is_consumed_once():
     from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
 
@@ -732,9 +933,21 @@ def test_the_draft_decode_keeps_cp_lite_for_cp_variants_and_multi_request(
 
     class CpLite:
         def attend(
-            self, q, kv, pages, lens, q_len, bmm1, bmm2, ws, layer, owner, min_bs=None
+            self,
+            q,
+            kv,
+            pages,
+            lens,
+            q_len,
+            bmm1,
+            bmm2,
+            ws,
+            layer,
+            owner,
+            min_bs=None,
+            early_merge=None,
         ):
-            calls.append((tuple(q.shape), q_len, bmm1, bmm2, min_bs))
+            calls.append((tuple(q.shape), q_len, bmm1, bmm2, min_bs, early_merge))
             return torch.ones(q.shape[0], heads, dim, dtype=torch.bfloat16)
 
     monkeypatch.setattr(split_kv, "cp_lite", CpLite)
@@ -772,7 +985,16 @@ def test_the_draft_decode_keeps_cp_lite_for_cp_variants_and_multi_request(
     q8 = torch.zeros(requests * rows, heads * dim, dtype=torch.float8_e4m3fn)
     out = attn.decode(q8, meta, kv, rows_per_request=rows)
     assert out.shape == (requests * rows, heads * dim) and bool((out == 1).all())
-    assert calls == [((requests * rows, heads, dim), rows, 1.0, 3.0, min_bs)]
+    assert calls == [
+        (
+            (requests * rows, heads, dim),
+            rows,
+            1.0,
+            3.0,
+            min_bs,
+            False if requests > 1 else None,
+        )
+    ]
 
 
 @pytest.mark.parametrize(

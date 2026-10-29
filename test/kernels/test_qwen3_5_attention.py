@@ -172,6 +172,236 @@ def test_skv2_as_a_programmatic_dependent_gives_the_same_bytes(length):
     assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
 
 
+@pytest.mark.parametrize("chunk", [False, True], ids=["exact", "fold-chunk"])
+def test_cp_r11_plain_merge_matches_r11_at_b32(chunk):
+    """The draft-multi B32 merge's causal math is independent of whether it runs
+    before or after publishing the prefix partial.  The D2 plain kernel is the R11
+    program (including its volatile-load wait); EARLY is retained here only as a
+    numerical comparison, not as the reference.  The direct FP32 calculation is
+    diagnostic-only because the fold path merges its chunks in a different order;
+    the correctness gate is the plain kernel against the exact R11 program.
+
+    CP=1 makes the low-latency exchange self-contained on one GPU: every word this
+    kernel polls is published by the same launch. PDL liveness and the production
+    CP=4 exchange remain covered by the no-simulation server gate.
+    """
+    import hashlib
+    import importlib.util
+    import os
+    import sys
+    from pathlib import Path
+
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import (
+        _cp_merge_h_ll as feature_merge,
+        _cp_merge_h_ll_plain as plain_merge,
+    )
+
+    r11_path = os.environ.get("V3D_R11_Q35_CP_LITE")
+    r11_sha = os.environ.get("V3D_R11_Q35_CP_LITE_SHA256")
+    if r11_path is None and r11_sha is None:
+        pytest.skip("exact R11 q35_cp_lite source was not provided")
+    assert r11_path is not None and r11_sha is not None
+    r11_source = Path(r11_path)
+    assert r11_source.is_file()
+    actual_sha = hashlib.sha256(r11_source.read_bytes()).hexdigest()
+    assert actual_sha == r11_sha, (actual_sha, r11_sha)
+    spec = importlib.util.spec_from_file_location("_v3d_r11_q35_cp_lite", r11_source)
+    assert spec is not None and spec.loader is not None
+    r11_module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = r11_module
+    spec.loader.exec_module(r11_module)
+    r11_merge = r11_module._cp_merge_h_ll
+
+    rows, q_len, heads, dim, page, words = 32 * 7, 7, 4, 256, 64, 520
+    g = torch.Generator(device="cuda").manual_seed(20261029)
+    q = (torch.randn(rows, heads, dim, device="cuda", generator=g) * 2).to(
+        torch.float8_e4m3fn
+    )
+    po = (torch.randn(1, rows, heads, dim, device="cuda", generator=g) * 0.1).to(
+        torch.bfloat16
+    )
+    plse = torch.randn(1, rows, heads, device="cuda", generator=g)
+    chunks_per_request = 2
+    po_v = (
+        torch.randn(
+            32 * chunks_per_request,
+            q_len * heads,
+            dim,
+            device="cuda",
+            generator=g,
+        )
+        * 0.1
+    ).to(torch.bfloat16)
+    pl_v = torch.randn(
+        32 * chunks_per_request,
+        q_len * heads,
+        device="cuda",
+        generator=g,
+    )
+    vstart = (
+        torch.arange(32, dtype=torch.int32, device="cuda") * chunks_per_request
+    )
+    vcnt = torch.full(
+        (32,), chunks_per_request, dtype=torch.int32, device="cuda"
+    )
+    k, v = (
+        (torch.randn(32, 1, page, dim, device="cuda", generator=g) * 2).to(
+            torch.float8_e4m3fn
+        )
+        for _ in range(2)
+    )
+    table = torch.zeros(32, 2, dtype=torch.int32, device="cuda")
+    table[:, 1] = torch.arange(32, dtype=torch.int32, device="cuda")
+    lengths = torch.full((32,), page + q_len, dtype=torch.int32, device="cuda")
+
+    def run(kernel, early=None):
+        out = torch.empty(rows, heads, dim, dtype=torch.bfloat16, device="cuda")
+        ll = torch.empty(rows * words, dtype=torch.int64, device="cuda")
+        peers = torch.tensor([ll.data_ptr()], dtype=torch.int64, device="cuda")
+        counter = torch.zeros(rows * heads, dtype=torch.int32, device="cuda")
+        options = {} if early is None else {"EARLY": early}
+        if chunk:
+            options.update(
+                po_v=po_v.view(torch.int32),
+                pl_v=pl_v,
+                vstart=vstart,
+                vcnt=vcnt,
+                CHUNK=True,
+            )
+        kernel[(rows, heads)](
+            po.view(torch.int32),
+            plse.view(torch.int32),
+            heads * dim // 2,
+            po.stride(0) // 2,
+            heads,
+            plse.stride(0),
+            q,
+            q.stride(0),
+            k,
+            v,
+            k.stride(0),
+            k.stride(2),
+            table,
+            table.stride(0),
+            lengths,
+            out,
+            out.stride(0),
+            peers,
+            0,
+            0,
+            counter,
+            0.75 * dim**-0.5,
+            0.5,
+            32,
+            0,
+            QL=q_len,
+            HQ=heads,
+            CP=1,
+            D=dim,
+            PG=page,
+            NWP=words,
+            NB=32,
+            GMAX=False,
+            WAIT=False,
+            num_warps=4,
+            launch_pdl=False,
+            **options,
+        )
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all()
+        assert bool((counter == 1).all())
+        return out
+
+    # Direct FP32 evaluation of the same causal block followed by its prefix partial.
+    # Elementwise products and reductions avoid TF32 matmul in the reference.
+    requests = rows // q_len
+    qf = q.float().view(requests, q_len, heads, dim)
+    page_ids = table[:, 1].long()
+    kf = k[page_ids, 0, :q_len].float()
+    vf = v[page_ids, 0, :q_len].float()
+    scores = (qf.unsqueeze(3) * kf[:, None, None]).sum(-1) * (0.75 * dim**-0.5)
+    causal = torch.arange(q_len, device="cuda")
+    scores.masked_fill_(
+        causal[None, None, None] > causal[None, :, None, None], -math.inf
+    )
+    peak = scores.max(-1).values
+    weight = torch.exp(scores - peak.unsqueeze(-1))
+    causal_sum = weight.sum(-1)
+    causal_out = (weight.unsqueeze(-1) * vf[:, None, None]).sum(-2) * 0.5
+    if chunk:
+        chunk_lse = pl_v.view(
+            requests, chunks_per_request, q_len, heads
+        ).float()
+        chunk_peak = chunk_lse.max(1).values
+        chunk_weight = torch.exp2(chunk_lse - chunk_peak.unsqueeze(1))
+        chunk_sum = chunk_weight.sum(1)
+        prefix_out = (
+            po_v.float().view(
+                requests, chunks_per_request, q_len, heads, dim
+            )
+            * chunk_weight.unsqueeze(-1)
+        ).sum(1) / chunk_sum.unsqueeze(-1)
+        prefix_lse = (chunk_peak + torch.log2(chunk_sum)) * math.log(2.0)
+    else:
+        prefix_out = po[0].float().view(requests, q_len, heads, dim)
+        prefix_lse = plse[0].view(requests, q_len, heads) * math.log(2.0)
+    merged_peak = torch.maximum(peak, prefix_lse)
+    causal_weight = torch.exp(peak - merged_peak)
+    prefix_weight = torch.exp(prefix_lse - merged_peak)
+    reference = (
+        causal_out * causal_weight.unsqueeze(-1)
+        + prefix_out * prefix_weight.unsqueeze(-1)
+    ) / (causal_sum * causal_weight + prefix_weight).unsqueeze(-1)
+    reference = reference.view(rows, heads, dim)
+
+    rtol, atol = 2**-7, 1e-6
+    relative_floor = atol / rtol
+    rounded_reference = reference.to(torch.bfloat16)
+
+    def stats(got):
+        error = (got.float() - reference).abs()
+        relative = error / reference.abs().clamp_min(relative_floor)
+        violation = error > (atol + rtol * reference.abs())
+        return {
+            "max_abs": error.max().item(),
+            "max_rel": relative.max().item(),
+            "tolerance_violations": violation.count_nonzero().item(),
+            "bf16_mismatch": (
+                got.view(torch.int16) != rounded_reference.view(torch.int16)
+            )
+            .count_nonzero()
+            .item(),
+        }
+
+    def pair_stats(got, baseline):
+        error = (got.float() - baseline.float()).abs()
+        relative = error / baseline.float().abs().clamp_min(relative_floor)
+        return {
+            "max_abs": error.max().item(),
+            "max_rel": relative.max().item(),
+            "bf16_mismatch": (
+                got.view(torch.int16) != baseline.view(torch.int16)
+            )
+            .count_nonzero()
+            .item(),
+        }
+
+    r11 = run(r11_merge)
+    plain, early = run(plain_merge), run(feature_merge, True)
+    r11_stats = stats(r11)
+    plain_stats, early_stats = stats(plain), stats(early)
+    plain_vs_early = pair_stats(plain, early)
+    plain_vs_r11 = pair_stats(plain, r11)
+    print(
+        "DRAFT_MERGE_NUMERICS "
+        f"chunk={chunk} rtol={rtol:.9g} atol={atol:.9g} "
+        f"relative_floor={relative_floor:.9g} "
+        f"r11={r11_stats} plain={plain_stats} early={early_stats} "
+        f"plain_vs_early={plain_vs_early} plain_vs_r11={plain_vs_r11}"
+    )
+    assert torch.equal(plain.view(torch.int16), r11.view(torch.int16)), plain_vs_r11
+
+
 HIDDEN, QKV_ROWS, POOL_SLOTS = 4096, (2 * HEADS + 2) * DIM, 1024
 
 

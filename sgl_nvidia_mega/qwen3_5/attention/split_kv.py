@@ -263,8 +263,9 @@ def cp_core(
     """CP-lite on requests of ``q_len`` FP8 query rows over the pool ``kv``:
     [rows, heads * head_dim] bf16, or None where CP-lite declines. ``min_bs`` overrides
     CP-lite's configured minimum for a host-selected one-request graph; ``None`` keeps
-    the configured gate for a multi-request graph. ``early_merge`` overrides only this
-    call's exact-path producer/merge ordering; ``None`` preserves CP-lite's default."""
+    the configured gate for a multi-request graph. ``early_merge=False`` restores the
+    R11 plain merge for both exact and fold paths when no fused gate epilogue was
+    offered; ``None`` preserves CP-lite's default."""
     from sglang.kernels.ops.attention.utils import canonicalize_stride
     from sglang.srt.layers.attention.trtllm_mha_backend import (
         DEFAULT_WORKSPACE_SIZE_MB,

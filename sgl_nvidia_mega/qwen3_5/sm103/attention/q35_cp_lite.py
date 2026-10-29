@@ -472,6 +472,16 @@ def _ll_wait(src, n: tl.constexpr, e):
 
 
 @triton.jit
+def _ll_wait_plain(src, n: tl.constexpr, e):
+    """R11's volatile-load wait, used only by the R11 plain merge."""
+    k = tl.arange(0, n)
+    v = tl.load(src + k, volatile=True)
+    while tl.min(((v >> 32) == e).to(tl.int32), axis=0) == 0:
+        v = tl.load(src + k, volatile=True)
+    return v
+
+
+@triton.jit
 def _cp_gather_q_ll(
     q,
     q_stride,
@@ -988,6 +998,163 @@ def _cp_merge_h_ll(
     tl.store(cnt + i * HQ + h + one, e)
 
 
+@triton.jit
+def _cp_merge_h_ll_plain(
+    po,
+    plse,
+    po_sr,
+    po_sc,
+    pl_sr,
+    pl_sc,
+    q,
+    q_stride,
+    k_cache,
+    v_cache,
+    kv_page_stride,
+    kv_tok_stride,
+    table,
+    t_stride,
+    seq_lens,
+    out,
+    out_stride,
+    peers,
+    me,
+    ll_off,
+    cnt,
+    bmm1,
+    bmm2,
+    nb,
+    thr,
+    QL: tl.constexpr,
+    HQ: tl.constexpr,
+    CP: tl.constexpr,
+    D: tl.constexpr,
+    PG: tl.constexpr,
+    NWP: tl.constexpr,
+    NB: tl.constexpr,
+    GMAX: tl.constexpr,
+    WAIT: tl.constexpr,
+    po_v=None,
+    pl_v=None,
+    vstart=None,
+    vcnt=None,
+    CHUNK: tl.constexpr = False,
+):
+    """R11's plain non-EARLY merge, kept separate from EARLY/gate epilogues.
+
+    The separate JIT function is intentional: it gives draft calls the same
+    compile-time program as R11 instead of relying on dead-code elimination in
+    the feature-rich shared merge.
+    """
+    i = tl.program_id(0)
+    h = tl.program_id(1)
+    if WAIT:
+        _gdc_wait_clobber()
+    if _gate_on(seq_lens, nb, thr, NB, GMAX).to(tl.int32) == 0:
+        return
+    one = tl.arange(0, 1)
+    e = tl.load(cnt + i * HQ + h) + 1
+    flag = e.to(tl.int64) << 32
+    DW: tl.constexpr = D // 2
+    NO: tl.constexpr = HQ * D // 2
+    H: tl.constexpr = QL * CP * HQ
+    w = tl.arange(0, DW)
+    if CHUNK:
+        n_v = tl.load(vcnt + i // QL)
+        v0 = tl.load(vstart + i // QL)
+    for c in tl.static_range(CP):
+        if CHUNK:
+            if n_v > 0:
+                hh = (i % QL) * (CP * HQ) + c * HQ + h
+                mx = tl.full([1], float("-inf"), tl.float32)
+                sw = tl.zeros([1], tl.float32)
+                acc_lo = tl.zeros([DW], tl.float32)
+                acc_hi = tl.zeros([DW], tl.float32)
+                for j in range(0, n_v):
+                    vr = v0 + j
+                    lj = tl.load(pl_v + vr * H + hh + one)
+                    wd = tl.load(po_v + (vr * H + hh).to(tl.int64) * DW + w).to(
+                        tl.uint32, bitcast=True
+                    )
+                    mn = tl.maximum(mx, lj)
+                    a = tl.exp2(mx - mn)
+                    b2 = tl.exp2(lj - mn)
+                    acc_lo = acc_lo * a + (wd << 16).to(tl.float32, bitcast=True) * b2
+                    acc_hi = (
+                        acc_hi * a + (wd & 0xFFFF0000).to(tl.float32, bitcast=True) * b2
+                    )
+                    sw = sw * a + b2
+                    mx = mn
+                inv = 1.0 / tl.where(sw > 0, sw, 1.0)
+                lo16 = (acc_lo * inv).to(tl.bfloat16).to(tl.int16, bitcast=True).to(
+                    tl.int32
+                ) & 0xFFFF
+                hi16 = (acc_hi * inv).to(tl.bfloat16).to(tl.int16, bitcast=True).to(
+                    tl.int32
+                ) & 0xFFFF
+                lse2 = tl.where(
+                    sw > 0,
+                    mx + tl.log2(tl.where(sw > 0, sw, 1.0)),
+                    float("-inf"),
+                )
+                ow = _ll_pack(flag, lo16 | (hi16 << 16))
+                lw = _ll_pack(flag, lse2.to(tl.int32, bitcast=True))
+            else:
+                ow = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + h * DW + w))
+                lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h + one))
+        else:
+            ow = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + h * DW + w))
+            lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h + one))
+        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(
+            tl.pointer_type(tl.int64)
+        )
+        tl.store(dst + h * DW + w, ow)
+        tl.store(dst + NO + h + one, lw)
+    L = tl.load(seq_lens + i // QL)
+    acc, m, wsum = _causal_block_h(
+        q,
+        q_stride,
+        i,
+        h,
+        L,
+        k_cache,
+        v_cache,
+        kv_page_stride,
+        kv_tok_stride,
+        table,
+        t_stride,
+        bmm1,
+        bmm2,
+        QL,
+        D,
+        PG,
+    )
+    n_pages = (tl.maximum(L - QL, 0) + PG - 1) // PG
+    own = tl.load(peers + me) + ll_off
+    for c in tl.static_range(CP):
+        src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
+        v = _ll_wait_plain(src + h * DW, DW, e)
+        lv = _ll_wait_plain(src + NO + h, 1, e)
+        lc = (lv & 0xFFFFFFFF).to(tl.int32).to(
+            tl.float32, bitcast=True
+        ) * 0.6931471805599453
+        lc = tl.where(n_pages > c, lc, float("-inf"))
+        wd = (v & 0xFFFFFFFF).to(tl.uint32)
+        lo = (wd << 16).to(tl.float32, bitcast=True)
+        hi = (wd & 0xFFFF0000).to(tl.float32, bitcast=True)
+        oc = tl.reshape(tl.join(lo, hi), (D,))
+        mn = tl.maximum(m, lc)
+        mn0 = tl.where(mn > float("-inf"), mn, 0.0)
+        a_old = tl.where(m > float("-inf"), tl.exp(m - mn0), 0.0)
+        a_new = tl.where(lc > float("-inf"), tl.exp(lc - mn0), 0.0)
+        acc = acc * a_old + oc * a_new
+        wsum = wsum * a_old + a_new
+        m = mn
+    o = acc / tl.where(wsum > 0, wsum, 1.0)
+    tl.store(out + i * out_stride + h * D + tl.arange(0, D), o.to(tl.bfloat16))
+    tl.store(cnt + i * HQ + h + one, e)
+
+
 class CpLite:
     """One process's exchange buffer and scratch, shared by the Qwen3.5 target and
     draft slots; built collectively on the plugin binding's TP group."""
@@ -1219,7 +1386,8 @@ class CpLite:
         min_bs: override the smallest batch this call serves; a caller that picks CP by
         its own host-side KV length can pass 1.
         early_merge: override the exact ungated partial/merge ordering for this call;
-        None keeps the shared default."""
+        without a fused gate epilogue, False also selects the R11 plain merge for
+        exact and non-exact fold calls; None keeps the shared default."""
         rows = q.shape[0]
         b = seq_lens.shape[0]
         if (
@@ -1395,6 +1563,7 @@ class CpLite:
                 bmm2_scale,
                 out,
                 fold_gate,
+                plain=early_merge is False,
             )
         elif self.ll:
             self._fold_merge(
@@ -1851,6 +2020,7 @@ class CpLite:
             and epilogue[2].stride(1) == 1
         ):
             epilogue = None
+        plain = early_merge is False and epilogue is None
         self._merge_h(
             q,
             k_cache,
@@ -1865,6 +2035,7 @@ class CpLite:
             {**gate, "thr": 0},
             pdl=True,
             early=early,
+            plain=plain,
             gate_epilogue=epilogue,
         )
         if epilogue is not None:
@@ -1892,6 +2063,7 @@ class CpLite:
         gate,
         pdl=None,
         early=False,
+        plain=False,
         gate_epilogue=None,
     ):
         pdl = self.cp_pdl if pdl is None else pdl
@@ -1908,7 +2080,9 @@ class CpLite:
                 "GATE_EPILOGUE": True,
             }
         )
-        _cp_merge_h_ll[(rows, hq)](
+        merge_kernel = _cp_merge_h_ll_plain if plain else _cp_merge_h_ll
+        merge_options = {} if plain else {"EARLY": early and pdl, **epilogue_args}
+        merge_kernel[(rows, hq)](
             self.po_x.view(torch.int32),
             self.pl_x.view(torch.int32),
             hq * HEAD_DIM // 2,
@@ -1943,10 +2117,9 @@ class CpLite:
             NB=gate["NB"],
             GMAX=gate["GMAX"],
             WAIT=pdl,
-            EARLY=early and pdl,
             num_warps=4,
             launch_pdl=pdl,
-            **epilogue_args,
+            **merge_options,
         )
 
     def _own_workspace(self):
@@ -2167,10 +2340,12 @@ class CpLite:
         out,
         gate,
         fused=None,
+        plain=False,
     ):
         """Merge the fold layout with one program per row and query head."""
         hq = self.hq
-        _cp_merge_h_ll[(rows, hq)](
+        merge_kernel = _cp_merge_h_ll_plain if plain else _cp_merge_h_ll
+        merge_kernel[(rows, hq)](
             self.po.view(torch.int32),
             self.plse.view(torch.int32),
             self.cp * hq * HEAD_DIM // 2,

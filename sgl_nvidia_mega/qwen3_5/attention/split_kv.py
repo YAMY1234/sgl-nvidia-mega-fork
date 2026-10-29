@@ -238,8 +238,11 @@ def cp_lite():
 def cp_multi(rows: int) -> bool:
     """Whether a multi-request target verify can try the plugin's CP state."""
     from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_fused import MAX_BATCH
 
-    return "skv2_cp" in SLOTS and rows > ROWS and cp_lite() is not None
+    return (
+        "skv2_cp" in SLOTS and ROWS < rows <= ROWS * MAX_BATCH and cp_lite() is not None
+    )
 
 
 def cp_reason() -> str:

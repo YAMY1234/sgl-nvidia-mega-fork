@@ -31,7 +31,7 @@ def registered(monkeypatch):
     # the target and draft builds read moe_ep_size (expert parallelism); no process groups here
     monkeypatch.setattr(
         "sglang.srt.runtime_context.get_parallel",
-        lambda: SimpleNamespace(tp_size=8, moe_ep_size=1),
+        lambda: SimpleNamespace(tp_size=8, attn_tp_size=8, moe_ep_size=1),
     )
 
 
@@ -129,6 +129,73 @@ def test_cp_slots_refuse_an_incompatible_page_or_topology(monkeypatch):
     monkeypatch.setattr(CpLite, "maybe_create", lambda binding, device: None)
     with pytest.raises(RuntimeError, match="Q/KV-head topology"):
         runtime.build_cp_lite(SimpleNamespace(page_size=64, tp_size=8))
+
+
+@pytest.mark.parametrize("attention_tp_size", [1, 2, 3, 6, 32])
+def test_unsupported_attention_topology_drops_only_cp_slots(
+    monkeypatch, caplog, attention_tp_size
+):
+    requested = runtime.CP_LITE_SLOTS | {"skv2"}
+    monkeypatch.setattr(runtime, "SLOTS", requested)
+
+    with caplog.at_level("INFO"):
+        dropped = runtime.apply_cp_lite_topology(attention_tp_size)
+
+    assert dropped == runtime.CP_LITE_SLOTS
+    assert runtime.SLOTS == frozenset({"skv2"})
+    assert f"attention-TP {attention_tp_size}" in caplog.text
+
+
+@pytest.mark.parametrize("attention_tp_size", [4, 8, 16])
+def test_supported_attention_topology_keeps_cp_slots(monkeypatch, attention_tp_size):
+    requested = runtime.CP_LITE_SLOTS | {"skv2"}
+    monkeypatch.setattr(runtime, "SLOTS", requested)
+
+    assert runtime.apply_cp_lite_topology(attention_tp_size) == frozenset()
+    assert runtime.SLOTS == requested
+
+
+def test_config_filter_derives_attention_tp_before_publication(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import spec as target
+
+    calls = []
+    monkeypatch.setattr(
+        runtime,
+        "apply_expert_parallel",
+        lambda ep_size: calls.append(("ep", ep_size)) or frozenset(),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "apply_cp_lite_topology",
+        lambda attention_tp_size: (
+            calls.append(("attention_tp", attention_tp_size)) or frozenset()
+        ),
+    )
+    monkeypatch.setattr(target, "text_config_reasons", lambda hf_config: [])
+    monkeypatch.setattr(target, "binding_reasons", lambda: [])
+    monkeypatch.setattr(runtime, "slot_reasons", lambda: [])
+    monkeypatch.setattr(target, "pd_reasons", lambda cfg: [])
+    cfg = SimpleNamespace(tp_size=8, attn_cp_size=1, attn_dp_size=8, ep_size=8)
+
+    assert not hasattr(cfg, "attn_tp_size")
+    assert target._config_disable_reasons(cfg, SimpleNamespace()) == []
+    assert calls == [("ep", 8), ("attention_tp", 1)]
+
+
+@pytest.mark.parametrize("tp", [1, 2, 3, 4, 6, 8, 16, 32])
+def test_cp_topology_predicate_matches_state_creation(monkeypatch, tp):
+    from sgl_nvidia_mega.qwen3_5 import cp_lite_topology
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    made = []
+    binding = SimpleNamespace(tp_size=tp, tp_rank=0, tp_device_group=object())
+    monkeypatch.setattr(CpLite, "_instance", None)
+    monkeypatch.setattr(CpLite, "__init__", lambda self, *args: made.append(args))
+
+    state = CpLite.maybe_create(binding, torch.device("cuda", 0))
+
+    assert (state is not None) == (cp_lite_topology(tp) is not None)
+    assert bool(made) == (cp_lite_topology(tp) is not None)
 
 
 @pytest.mark.parametrize(
@@ -337,7 +404,7 @@ def test_the_build_covers_more_requests_only_where_a_slot_runs(
     monkeypatch.setattr(runtime, "SLOTS", frozenset())
     monkeypatch.setattr(
         "sglang.srt.runtime_context.get_parallel",
-        lambda: SimpleNamespace(tp_size=tp_size, moe_ep_size=1),
+        lambda: SimpleNamespace(tp_size=tp_size, attn_tp_size=tp_size, moe_ep_size=1),
     )
     model = SimpleNamespace(
         model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])

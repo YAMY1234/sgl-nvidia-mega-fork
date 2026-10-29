@@ -70,7 +70,11 @@ SGLANG_READS = {
         "bind_extend_graphs",
         "begin_draft_round",
     ),
-    "srt/runtime_context.py": ("get_parallel", '"moe_ep_size"'),
+    "srt/runtime_context.py": (
+        "get_parallel",
+        '"attn_tp_size"',
+        '"moe_ep_size"',
+    ),
 }
 
 ARCHITECTURE = "Qwen3_5ForCausalLMMTP"
@@ -214,7 +218,9 @@ def _build(model, hf_config, ctx) -> MtpDraft:
 
     from sgl_nvidia_mega.qwen3_5 import runtime
 
-    runtime.apply_expert_parallel(get_parallel().moe_ep_size)
+    parallel = get_parallel()
+    runtime.apply_expert_parallel(parallel.moe_ep_size)
+    runtime.apply_cp_lite_topology(parallel.attn_tp_size)
     runtime.build_cp_lite(ctx.binding)
     return MtpDraft(
         model,

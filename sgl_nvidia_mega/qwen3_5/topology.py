@@ -136,7 +136,6 @@ for name in TP4_V2_SLOTS:
 # These names select coverage or SGLang's own runtime policy, not a plugin kernel.
 SLOT_TOPOLOGIES.update(
     multi_request=TOPOLOGIES,
-    gdn_commit=TOPOLOGIES,
     sharded_gumbel=TOPOLOGIES,
 )
 # Full-step AB+BA prefers v2's stock draft on TP2. Keep every draft entry

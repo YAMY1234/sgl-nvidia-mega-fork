@@ -1613,7 +1613,8 @@ def test_slot_topology_declarations_are_complete_and_fail_closed():
             *runtime.OPT_IN_VARIANTS,
             *runtime.DRAFT_ENTRIES,
             *runtime.DRAFT_SLOTS,
-            *runtime.RUNTIME_ONLY_SLOTS,
+            *runtime.OPT_IN_COVERAGE,
+            *runtime.HOOK_SLOTS,
         )
     )
     assert set(topology.SLOT_TOPOLOGIES) == known
@@ -1676,6 +1677,9 @@ def test_measured_topology_policy_selects_actual_draft_entries(monkeypatch, tp_s
     # All explicit opt-ins, not just SHIPPED_SLOTS: the formal47 recipe must
     # leave every TP2 draft callback unset, as in the topo-adapted v2 baseline.
     requested = frozenset(topology.SLOT_TOPOLOGIES)
+    # This policy test uses a CPU binding stand-in. CP collective setup has
+    # its own v3 contract tests and cannot run against the string stand-in.
+    monkeypatch.setattr(runtime, "build_cp_lite", lambda binding: None)
     monkeypatch.setattr(runtime, "SLOTS", requested)
     monkeypatch.setattr(
         "sglang.srt.runtime_context.get_parallel",
@@ -1693,7 +1697,6 @@ def test_measured_topology_policy_selects_actual_draft_entries(monkeypatch, tp_s
         assert runtime.SLOTS == frozenset(
             {
                 "multi_request",
-                "gdn_commit",
                 "sharded_gumbel",
                 "gdn_verify",
                 "gdn_pdl",

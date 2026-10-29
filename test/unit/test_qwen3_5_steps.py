@@ -946,7 +946,7 @@ def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch):
     # runtime.build reads moe_ep_size (expert parallelism); no process groups here
     monkeypatch.setattr(
         "sglang.srt.runtime_context.get_parallel",
-        lambda: SimpleNamespace(tp_size=8, moe_ep_size=1),
+        lambda: SimpleNamespace(tp_size=8, attn_tp_size=8, moe_ep_size=1),
     )
     ctx = SimpleNamespace(
         widths=(7,),

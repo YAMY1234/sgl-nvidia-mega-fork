@@ -29,9 +29,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sgl_nvidia_mega.qwen3_5 import CP_LITE_HEAD_DIM, cp_lite_topology
+
 logger = logging.getLogger(__name__)
 
-PAGE, HEAD_DIM = 64, 256
+PAGE, HEAD_DIM = 64, CP_LITE_HEAD_DIM
 _MAX_ROWS = 896  # widest call: rows = requests * q_len (TP8 verify at B128: 896)
 _KINDS = 2  # flag regions: q gather, partial exchange
 # exact path's fused partial: E4M3 P with shift 8 against the exact running max (lazy rescale threshold 0), so the
@@ -1143,18 +1145,13 @@ class CpLite:
         those model-specific facts here avoids a runtime-side prebuild hook. Every
         rank calls this from plugin build before graph variants are validated.
         """
-        from sgl_nvidia_mega.qwen3_5 import TEXT_CONFIG
-
         if cls._instance is not None:
             return cls._instance
         tp, rank = binding.tp_size, binding.tp_rank
-        kv = TEXT_CONFIG["num_key_value_heads"]
-        if tp <= kv or tp % kv or TEXT_CONFIG["head_dim"] != HEAD_DIM:
+        topology = cp_lite_topology(tp, kernel_head_dim=HEAD_DIM)
+        if topology is None:
             return None
-        cp = tp // kv
-        q_heads = TEXT_CONFIG["num_attention_heads"] // tp
-        if cp not in (2, 4, 8) or q_heads * cp > 16:
-            return None
+        cp, q_heads = topology
         group = binding.tp_device_group
         cls._instance = cls(group, rank, tp, cp, q_heads, device)
         return cls._instance

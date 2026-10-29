@@ -119,6 +119,25 @@ def _requested_slots() -> frozenset:
 SLOTS = _requested_slots()
 
 
+def apply_cp_lite_topology(attention_tp_size: int) -> frozenset:
+    """Drop CP-lite slots when the attention-TP Q/KV topology cannot serve them."""
+    from sgl_nvidia_mega.qwen3_5 import cp_lite_topology
+
+    global SLOTS
+    if cp_lite_topology(attention_tp_size) is not None:
+        return frozenset()
+    dropped = SLOTS & CP_LITE_SLOTS
+    SLOTS = SLOTS - CP_LITE_SLOTS
+    if dropped:
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 attention-TP %d: CP slots %s use stock "
+            "(unsupported Q/KV-head topology)",
+            attention_tp_size,
+            sorted(dropped),
+        )
+    return dropped
+
+
 def build_cp_lite(binding) -> None:
     """Collectively build the CP slots' process-local state before validation.
 
@@ -361,7 +380,12 @@ SGLANG_READS = {
         "deadline_s",
         "binding",
     ),
-    "srt/runtime_context.py": ("get_parallel", '"tp_size"', '"moe_ep_size"'),
+    "srt/runtime_context.py": (
+        "get_parallel",
+        '"tp_size"',
+        '"attn_tp_size"',
+        '"moe_ep_size"',
+    ),
     "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "page_size",
         "tp_rank",
@@ -393,19 +417,20 @@ def build(model, ctx):
     from sgl_nvidia_mega.qwen3_5.runtime import hooks, parity
     from sgl_nvidia_mega.qwen3_5.runtime.executor import Qwen35Verify
 
-    build_cp_lite(ctx.binding)
-
-    dropped = apply_expert_parallel(get_parallel().moe_ep_size)
+    parallel = get_parallel()
+    dropped = apply_expert_parallel(parallel.moe_ep_size)
     if dropped:
         logger.info(
             "NVIDIA megakernel: Qwen3.5 under expert parallelism (moe_ep_size %d): "
             "slots %s run SGLang's EP path",
-            get_parallel().moe_ep_size,
+            parallel.moe_ep_size,
             sorted(dropped),
         )
+    apply_cp_lite_topology(parallel.attn_tp_size)
+    build_cp_lite(ctx.binding)
     multi = slot_plan.MULTI_REQUEST in SLOTS
     if multi:
-        multi = slot_plan.multi_request(get_parallel().tp_size, SLOTS)
+        multi = slot_plan.multi_request(parallel.tp_size, SLOTS)
     widths = slot_plan.candidates(ctx.widths, ctx.tokens_per_request, multi)
     if not widths:
         raise RuntimeError(

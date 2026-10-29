@@ -3097,6 +3097,17 @@ def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(
         out = mka.step(layer, x, st)
 
     assert out is result
+    if rows == 7:
+        # v3 f13fa5c attention/split_kv.py:234-238 makes cp_multi require
+        # rows > ROWS (7). The new TP2 B1 front therefore keeps the native
+        # single-request attention + gate quantization, without a CP offer.
+        # mka._front_step's offer -> take -> fallback order is unchanged.
+        assert [call[0] for call in calls] == ["gate_quant", "o_proj"]
+        assert calls[0][1].data_ptr() == attention_out.data_ptr()
+        assert calls[0][2].data_ptr() == gate.data_ptr()
+        assert calls[0][3] is layer.o_proj.input_scale
+        assert calls[1][2] is fallback
+        return
     assert calls[0][0] == "offer"
     offered_gate = calls[0][1]
     assert offered_gate.shape == gate.shape

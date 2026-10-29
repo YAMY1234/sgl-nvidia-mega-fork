@@ -335,7 +335,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert three.hop and three.hop_fp8 and three.mka_push
     assert not (three.lowm_in or three.lowm_outproj or three.lowm_oproj)
     # The 28/56-row low-M projection paths stay stock; hop_mid's one-shot path and
-    # FP8 copy also serve 28 rows, while GDN core and MKA serve through 224.
+    # FP8 copy also serve 28 rows, while GDN core and MKA serve through 896.
     for rows in (28, 56, 112, 224):
         expected = [
             "gdn_conv",
@@ -363,6 +363,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     for rows in (448, 896):
         expected = [
             "gdn_conv",
+            "gdn_core",
             "gdn_pdl",
             "gdn_verify",
             "mka",

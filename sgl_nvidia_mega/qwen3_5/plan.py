@@ -16,7 +16,7 @@ runs up to 7 rows, and with ``mkm_wide`` (its 16-token engine) up to 16. ``mkm_m
 the same routed-expert arithmetic on route_topk's 17–32 rows. ``gdn_verify`` (the
 GatedDeltaNet verify chain with its launch choices changed) covers every width, with
 ``gdn_core`` (numeric: its ReplaySSM verify, gated norm and FP8 output in one launch)
-up to 224 rows, and ``hop`` (the boundary's fused all-reduce points on the decode hop) the
+up to 896 rows, and ``hop`` (the boundary's fused all-reduce points on the decode hop) the
 widths where FlashInfer's low-latency kernels, which it equals bit for bit, run, or with
 ``hop_mid`` (numeric: its one-shot protocol past FlashInfer's) up to 28 rows.
 ``gdn_push`` (numeric: out_proj as the hop's push GEMM, on gdn_verify's FP8 norm) runs up
@@ -61,7 +61,7 @@ ROUTE_TOPK_MAX_ROWS = MAX_ROWS
 # The router front's 16-row tiles replace SGLang's router GEMM through two
 # waves; wider route_topk rows keep the stock GEMM.
 ROUTE_GEMM_MAX_ROWS = 32
-GDN_CORE_MAX_ROWS = 224  # and gdn_core's launch
+GDN_CORE_MAX_ROWS = 896  # and gdn_core's launch (TRT-L4: checked at 64 and 128 requests)
 MKM_MAX_ROWS = 7
 MKM_WIDE_MAX_ROWS = 16
 MKM_M32_MAX_ROWS = 32

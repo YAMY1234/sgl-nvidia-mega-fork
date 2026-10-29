@@ -47,11 +47,11 @@ _WIDE_PLAN_MAX_BATCH = 64
 _LANE_PLAN_MAX_BATCH = 32
 
 
-# Verify calls use the wide and two-slot plans through 128 requests; draft calls use
-# the wide plan through 64. Batches at or below 32 keep the equal split, so the
-# separate balanced-split optimization remains disabled.
-MAX_BATCH = 128
-MAX_BATCH_Q1 = 64
+# Keep the production selector on R11's unbalanced lane plan.  The wide and
+# two-slot kernels remain available to explicit test hooks, but R11 did not
+# select them when SGLANG_PLB_CP_BALANCED was disabled.
+MAX_BATCH = _LANE_PLAN_MAX_BATCH
+MAX_BATCH_Q1 = _LANE_PLAN_MAX_BATCH
 # Pack every two-slot call; the unpacked form remains available as a test hook.
 _TWO_SLOT_PACK = True
 

@@ -75,7 +75,11 @@ SGLANG_READS = {
 }
 
 SGLANG_MIRRORS = {
-    "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": "12a835fc4f78af33",
+    # v3 routes committed state via STATE_PART. LinearPrefillView already carries
+    # those exact committed conv/temporal buffers; no recurrence/order change.
+    "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": (
+        "12a835fc4f78af33", "6ed4eb6a818f7e20",
+    ),
     "srt/layers/attention/hybrid_linear_attn_backend.py:MambaAttnBackendBase._track_mamba_state_extend": "84c447ca707eba64",
 }
 

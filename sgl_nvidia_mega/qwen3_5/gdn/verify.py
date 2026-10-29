@@ -82,6 +82,7 @@ SGLANG_READS = {
         "use_marlin",
         "use_sm120_fp8",
         "use_flashinfer_bmm",
+        "orig_dtype",
         '"input_scale"',
         '"weight_scale"',
     ),
@@ -131,6 +132,7 @@ SGLANG_MIRRORS = {
     "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": (
         "ab7b048fafb07d0e",
         "12a835fc4f78af33",
+        "6ed4eb6a818f7e20",
     ),
     # Importing the ReplaySSM kernel from fla/ and, after sgl-project/sglang#45112, from
     # linear/; the first goes once all supported SGLangs have the move
@@ -144,8 +146,12 @@ SGLANG_MIRRORS = {
     "srt/layers/quantization/fp8_utils.py:apply_fp8_linear_bmm_flashinfer": (
         "c66562e1de0008db",
         "c94a4f1a622c2fe0",
+        "aaa39b9452d9df32",
     ),
-    "srt/layers/quantization/modelopt_quant.py:ModelOptFp8LinearMethod.apply": "91b563cf074bff42",
+    "srt/layers/quantization/modelopt_quant.py:ModelOptFp8LinearMethod.apply": (
+        "91b563cf074bff42",
+        "4f99db0f712ad24a",
+    ),
 }
 
 RING_LEN, MAX_DRAFT = 16, 8  # the verify tiles' bounds, as measured
@@ -344,7 +350,18 @@ def _out_proj(
     its own quantization returns), the TP-partial output in SGLang's symmetric pool; with
     slot lowm_out (``Slots.lowm_outproj``) the low-M launch instead (numeric), pushing into the hop with
     ``push`` (slot lowm_push)."""
-    if st is not None and st.slots.lowm_outproj:
+    # A prequantized E4M3 tensor does not carry the activation dtype that ModelOpt's
+    # linear must produce.  Match ModelOptFp8LinearMethod.apply's v3 contract rather
+    # than inheriting the GDN recurrence's (potentially different) working dtype.
+    dtype = out_proj.orig_dtype
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            "prequantized FP8 FlashInfer BMM requires an explicit "
+            "BF16 or FP16 output dtype"
+        )
+    # The low-M kernel writes BF16 unconditionally.  An FP16 ModelOpt layer must
+    # therefore take the stock FlashInfer BMM below even when lowm_out is enabled.
+    if st is not None and st.slots.lowm_outproj and dtype == torch.bfloat16:
         from sgl_nvidia_mega.qwen3_5 import lowm
 
         hop = st.bound["boundary"].hop if push else None

@@ -49,6 +49,7 @@ SGLANG_READS = {
     "srt/layers/attention/hybrid_linear_attn_backend.py": ("linear_attn_backend",),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "srt/layers/layer_boundary/fusions/norm.py": ("fused_norm_gamma",),
+    "srt/layers/quantization/modelopt_quant.py": ("orig_dtype",),
     "srt/runtime_context.py": ("get_parallel",),
 }
 
@@ -100,9 +101,16 @@ def build(model, ctx) -> Bound:
             return Bound(reason=f"layer {i}: {reason}")
     packed = {}
     if "gdn_push" in SLOTS:
+        import torch
+
         from sgl_nvidia_mega.qwen3_5.sm103.hop import pack_out_proj
 
         for i, gdn in gdns:
+            # The hop's out-projection kernel writes BF16.  Keep FP16 layers on
+            # the non-push path, whose FlashInfer BMM honors layer.orig_dtype.
+            if getattr(gdn.out_proj, "orig_dtype", torch.bfloat16) != torch.bfloat16:
+                packed = {}
+                break
             # the method keeps the weight as the [K, N] transpose of a row-major [N, K]
             try:
                 packed[gdn.attn.layer_id] = pack_out_proj(gdn.out_proj.weight.t())

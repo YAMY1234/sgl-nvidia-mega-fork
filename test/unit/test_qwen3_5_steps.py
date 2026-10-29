@@ -1084,7 +1084,10 @@ def _gdn_verify_setup(log, *, ring_len=16, temporal_dtype=torch.bfloat16, draft=
     norm = SimpleNamespace(weight=torch.ones(V), eps=1e-6, activation="silu")
     k.update(out_w=torch.zeros(HV * V, 8), out_s=torch.ones(1))
     out_proj = SimpleNamespace(
-        weight=k["out_w"], weight_scale=k["out_s"], input_scale=k["scale"]
+        weight=k["out_w"],
+        weight_scale=k["out_s"],
+        input_scale=k["scale"],
+        orig_dtype=torch.bfloat16,
     )
     gdn = SimpleNamespace(
         attn=attn,
@@ -1289,6 +1292,146 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows(pu
         ("?(7, 16)", "out_w(16, 8)", "scale(1,)", "out_s(1,)", "?"),
         (),
     )
+
+
+@pytest.mark.parametrize(
+    "model_dtype,recurrence_dtype",
+    [
+        (torch.bfloat16, torch.float16),
+        (torch.float16, torch.bfloat16),
+        (torch.float32, torch.bfloat16),
+    ],
+)
+def test_gdn_prequantized_out_proj_uses_v3_model_dtype(
+    monkeypatch, model_dtype, recurrence_dtype
+):
+    """The plugin's prequantized out_proj follows the layer dtype, not the
+    recurrence's working dtype, exactly as v3 ModelOpt does."""
+    from sglang.srt import runtime_context
+    from sglang.srt.distributed.device_communicators import pynccl_allocator
+    from sglang.srt.layers import dp_attention
+    from sglang.srt.layers.quantization import fp8_utils
+
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+
+    layer = SimpleNamespace(
+        weight=torch.zeros((4, 3), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.ones(1),
+        input_scale=torch.ones(1),
+        orig_dtype=model_dtype,
+    )
+    fp8 = torch.zeros((2, 4), dtype=torch.float8_e4m3fn)
+    calls = []
+
+    def bmm(x, weight, x_scale, weight_scale, output_dtype):
+        calls.append((x, weight, x_scale, weight_scale, output_dtype))
+        return torch.zeros((2, 3), dtype=output_dtype)
+
+    # This symbol is platform-gated in SGLang and is absent in a real CPU-only
+    # contract process, so install the native BMM stand-in explicitly.
+    monkeypatch.setattr(fp8_utils, "flashinfer_bmm_fp8", bmm, raising=False)
+    monkeypatch.setattr(
+        pynccl_allocator,
+        "use_symmetric_memory",
+        lambda *args, **kwargs: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(dp_attention, "is_allocation_symmetric", lambda: True)
+    monkeypatch.setattr(
+        runtime_context, "get_parallel", lambda: SimpleNamespace(tp_group=None)
+    )
+
+    if model_dtype == torch.float32:
+        with pytest.raises(ValueError, match="explicit BF16 or FP16"):
+            fp8_utils.apply_fp8_linear_bmm_flashinfer(
+                fp8,
+                layer.weight,
+                layer.weight_scale,
+                layer.input_scale,
+                pre_quant_output_dtype=model_dtype,
+            )
+        with pytest.raises(ValueError, match="explicit BF16 or FP16"):
+            verify._out_proj(layer, fp8, recurrence_dtype)
+        assert calls == []
+        return
+
+    expected = fp8_utils.apply_fp8_linear_bmm_flashinfer(
+        fp8,
+        layer.weight,
+        layer.weight_scale,
+        layer.input_scale,
+        pre_quant_output_dtype=model_dtype,
+    )
+    actual = verify._out_proj(layer, fp8, recurrence_dtype)
+
+    assert actual.dtype == expected.dtype == model_dtype
+    assert torch.equal(actual, expected)
+    assert len(calls) == 2
+    assert calls[0][-1] == calls[1][-1] == model_dtype
+    assert calls[0][0].data_ptr() == calls[1][0].data_ptr() == fp8.data_ptr()
+    assert all(left is right for left, right in zip(calls[0][1:4], calls[1][1:4]))
+
+
+def test_gdn_bf16_out_proj_can_use_lowm(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import lowm
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+
+    layer = SimpleNamespace(orig_dtype=torch.bfloat16)
+    fp8 = torch.zeros((2, 4), dtype=torch.float8_e4m3fn)
+    seen = []
+
+    def row_parallel(linear, x, dtype, what, hop):
+        seen.append((linear, x, dtype, what, hop))
+        return "out"
+
+    monkeypatch.setattr(lowm, "row_parallel", row_parallel)
+    st = SimpleNamespace(slots=SimpleNamespace(lowm_outproj=True))
+
+    assert verify._out_proj(layer, fp8, torch.float32, st) == "out"
+    assert seen == [(layer, fp8, torch.bfloat16, "out_proj", None)]
+
+
+def test_gdn_fp16_out_proj_bypasses_the_bf16_only_lowm(monkeypatch):
+    from sglang.srt import runtime_context
+    from sglang.srt.distributed.device_communicators import pynccl_allocator
+    from sglang.srt.layers import dp_attention
+    from sglang.srt.layers.quantization import fp8_utils
+
+    from sgl_nvidia_mega.qwen3_5 import lowm
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+
+    layer = SimpleNamespace(
+        weight=torch.zeros((4, 3), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.ones(1),
+        input_scale=torch.ones(1),
+        orig_dtype=torch.float16,
+    )
+    fp8 = torch.zeros((2, 4), dtype=torch.float8_e4m3fn)
+    seen = []
+
+    def bmm(x, weight, x_scale, weight_scale, output_dtype):
+        seen.append(output_dtype)
+        return torch.zeros((2, 3), dtype=output_dtype)
+
+    monkeypatch.setattr(
+        lowm,
+        "row_parallel",
+        lambda *args, **kwargs: pytest.fail("FP16 entered the BF16-only low-M kernel"),
+    )
+    monkeypatch.setattr(fp8_utils, "flashinfer_bmm_fp8", bmm, raising=False)
+    monkeypatch.setattr(
+        pynccl_allocator,
+        "use_symmetric_memory",
+        lambda *args, **kwargs: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(dp_attention, "is_allocation_symmetric", lambda: True)
+    monkeypatch.setattr(
+        runtime_context, "get_parallel", lambda: SimpleNamespace(tp_group=None)
+    )
+    st = SimpleNamespace(slots=SimpleNamespace(lowm_outproj=True))
+
+    out = verify._out_proj(layer, fp8, torch.bfloat16, st)
+    assert out.dtype == torch.float16
+    assert seen == [torch.float16]
 
 
 @pytest.mark.parametrize("takes", [False, True])

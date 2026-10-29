@@ -1210,13 +1210,16 @@ class CpLite:
         forward_batch,
         stock=None,
         min_bs: int | None = None,
+        early_merge: bool | None = None,
     ) -> torch.Tensor | None:
         """CP-lite attention of this rank's heads: [rows, heads, head_dim] bf16, or None
         where the call is not served (decided by shapes only, so every rank agrees).
         stock(seq_lens, out): the caller's own kernel call into out; with it and a KV gate for this batch size,
         both are captured and the device picks one per call.
         min_bs: override the smallest batch this call serves; a caller that picks CP by
-        its own host-side KV length can pass 1."""
+        its own host-side KV length can pass 1.
+        early_merge: override the exact ungated partial/merge ordering for this call;
+        None keeps the shared default."""
         rows = q.shape[0]
         b = seq_lens.shape[0]
         if (
@@ -1291,6 +1294,7 @@ class CpLite:
                 bmm1_scale,
                 bmm2_scale,
                 gate,
+                early_merge=early_merge,
             )
         if self.ll:
             _cp_gather_q_ll[(rows,)](
@@ -1795,8 +1799,10 @@ class CpLite:
         bmm1_scale,
         bmm2_scale,
         gate,
+        early_merge=None,
     ):
         """Run an ungated exact call with PDL and the per-head merge."""
+        early = self.early_merge if early_merge is None else early_merge
         words = self.hq * HEAD_DIM // 4
         _cp_gather_q_ll[(rows,)](
             q.view(torch.int32),
@@ -1832,7 +1838,7 @@ class CpLite:
             bmm2_scale,
             pdl=True,
             len_sub=q_len,
-            early_trigger=self.early_merge,
+            early_trigger=early,
         )
         out = torch.empty(
             rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device
@@ -1858,7 +1864,7 @@ class CpLite:
             out,
             {**gate, "thr": 0},
             pdl=True,
-            early=self.early_merge,
+            early=early,
             gate_epilogue=epilogue,
         )
         if epilogue is not None:

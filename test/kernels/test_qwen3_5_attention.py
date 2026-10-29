@@ -172,6 +172,88 @@ def test_skv2_as_a_programmatic_dependent_gives_the_same_bytes(length):
     assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
 
 
+def test_cp_per_head_merge_early_and_non_early_give_the_same_bytes_at_b32():
+    """The draft-multi B32 merge's causal math is independent of whether it runs
+    before or after publishing the prefix partial.
+
+    CP=1 makes the low-latency exchange self-contained on one GPU: every word this
+    kernel polls is published by the same launch. PDL liveness and the production
+    CP=4 exchange remain covered by the no-simulation server gate.
+    """
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import _cp_merge_h_ll
+
+    rows, q_len, heads, dim, page, words = 32 * 7, 7, 4, 256, 64, 520
+    g = torch.Generator(device="cuda").manual_seed(20261029)
+    q = (torch.randn(rows, heads, dim, device="cuda", generator=g) * 2).to(
+        torch.float8_e4m3fn
+    )
+    po = (torch.randn(1, rows, heads, dim, device="cuda", generator=g) * 0.1).to(
+        torch.bfloat16
+    )
+    plse = torch.randn(1, rows, heads, device="cuda", generator=g)
+    k, v = (
+        (torch.randn(32, 1, page, dim, device="cuda", generator=g) * 2).to(
+            torch.float8_e4m3fn
+        )
+        for _ in range(2)
+    )
+    table = torch.zeros(32, 2, dtype=torch.int32, device="cuda")
+    table[:, 1] = torch.arange(32, dtype=torch.int32, device="cuda")
+    lengths = torch.full((32,), page + q_len, dtype=torch.int32, device="cuda")
+
+    def run(early):
+        out = torch.empty(rows, heads, dim, dtype=torch.bfloat16, device="cuda")
+        ll = torch.empty(rows * words, dtype=torch.int64, device="cuda")
+        peers = torch.tensor([ll.data_ptr()], dtype=torch.int64, device="cuda")
+        counter = torch.zeros(rows * heads, dtype=torch.int32, device="cuda")
+        _cp_merge_h_ll[(rows, heads)](
+            po.view(torch.int32),
+            plse.view(torch.int32),
+            heads * dim // 2,
+            po.stride(0) // 2,
+            heads,
+            plse.stride(0),
+            q,
+            q.stride(0),
+            k,
+            v,
+            k.stride(0),
+            k.stride(2),
+            table,
+            table.stride(0),
+            lengths,
+            out,
+            out.stride(0),
+            peers,
+            0,
+            0,
+            counter,
+            0.75 * dim**-0.5,
+            0.5,
+            32,
+            0,
+            QL=q_len,
+            HQ=heads,
+            CP=1,
+            D=dim,
+            PG=page,
+            NWP=words,
+            NB=32,
+            GMAX=False,
+            WAIT=False,
+            EARLY=early,
+            num_warps=4,
+            launch_pdl=False,
+        )
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all()
+        assert bool((counter == 1).all())
+        return out
+
+    non_early, early = run(False), run(True)
+    assert torch.equal(non_early.view(torch.int16), early.view(torch.int16))
+
+
 HIDDEN, QKV_ROWS, POOL_SLOTS = 4096, (2 * HEADS + 2) * DIM, 1024
 
 

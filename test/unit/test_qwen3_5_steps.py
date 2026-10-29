@@ -2521,6 +2521,21 @@ def test_draft_only_cp_slots_do_not_enable_target_multi_request(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("requests", "eligible"),
+    [(5, True), (32, True), (33, False), (64, False), (128, False)],
+)
+def test_target_cp_multi_request_honors_fused_batch_cap(
+    monkeypatch, requests, eligible
+):
+    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+    monkeypatch.setattr(split_kv, "cp_lite", lambda: object())
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2_cp"}))
+    assert split_kv.cp_multi(requests * split_kv.ROWS) is eligible
+
+
+@pytest.mark.parametrize(
     "kw, want",
     [
         (dict(), ""),

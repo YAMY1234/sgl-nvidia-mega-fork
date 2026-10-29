@@ -61,9 +61,13 @@ SGLANG_READS = {
         "linear_attn_verify_backend",
         "enable_linear_replayssm_spec",
         "mamba_ssm_dtype",
+        "tp_size",
+        "attn_cp_size",
+        "attn_dp_size",
         "startup_weight_load_mode",
         "disaggregation_mode",
     ),
+    "srt/runtime_context.py": ("derive_attn_tp_size",),
     "srt/configs/qwen3_5.py": ("text_config",),
     "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "EagleForwardView",
@@ -240,7 +244,16 @@ def pd_reasons(cfg) -> list[str]:
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
+    from sglang.srt.runtime_context import derive_attn_tp_size
+
     runtime.apply_expert_parallel(cfg.ep_size or 1)
+    runtime.apply_cp_lite_topology(
+        derive_attn_tp_size(
+            tp_size=cfg.tp_size,
+            attn_cp_size=cfg.attn_cp_size,
+            attn_dp_size=cfg.attn_dp_size,
+        )
+    )
     return (
         text_config_reasons(hf_config)
         + binding_reasons()

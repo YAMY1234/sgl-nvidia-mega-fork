@@ -68,6 +68,7 @@ SGLANG_READS = {
         "use_marlin",
         "use_sm120_fp8",
         "use_flashinfer_bmm",
+        "orig_dtype",
         '"input_scale"',
         '"weight_scale"',
     ),
@@ -192,6 +193,8 @@ def fp8_unsupported(linear) -> str:
         return "scales are not FP32"
     if linear.bias is not None:
         return "a bias"
+    if getattr(linear, "orig_dtype", torch.bfloat16) != torch.bfloat16:
+        return f"output dtype {linear.orig_dtype} (low-M writes BF16)"
     return ""
 
 

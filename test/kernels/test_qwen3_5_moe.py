@@ -80,11 +80,20 @@ def _experts(g, rows, cols, std, n=E):
 def layer(request):
     """One TP8 (intermediate 128 a rank) or TP4 (256) Qwen3.5 MoE layer on the trtllm-gen
     weight layout, as SGLang loads it."""
+    return _layer(request.param, maps=True)
+
+
+@pytest.fixture(scope="module", params=[128, 256, 512], ids=lambda i: f"I{i}")
+def routing_layer(request):
+    """TP8/TP4/TP2 weights for the stock routed runner, without an mkm engine."""
+    return _layer(request.param, maps=False)
+
+
+def _layer(inter, maps):
     from sglang.srt.layers.quantization.utils import (
         prepare_static_weights_for_trtllm_fp4_moe,
     )
 
-    inter = request.param  # intermediate per rank
     g = torch.Generator(device="cuda").manual_seed(11)
     w13, sf13, s13 = _experts(g, 2 * inter, H, 0.02)
     w2, sf2, s2 = _experts(g, H, inter, 0.02)
@@ -100,7 +109,7 @@ def layer(request):
         "g1": g1,
         "g1c": (g1 / H_SCALE).float(),
         "g2": (H_SCALE / s2).float(),
-        "maps": mkm.weight_maps(w13, w2),
+        "maps": mkm.weight_maps(w13, w2) if maps else None,
         "inter": inter,
     }
 
@@ -604,8 +613,8 @@ def _topk_inputs(m, seed):
     return logits, x, torch.tensor([X_SCALE], device="cuda")
 
 
-@pytest.mark.parametrize("m", [1, 7, 17, 21, 28, 56, 112, 224, 448, 896])
-def test_route_topk_is_the_trtllm_routing_and_the_runners_quantizer(layer, m):
+@pytest.mark.parametrize("m", [1, 7, 17, 21, 28, 42, 56, 70, 112, 224, 448, 896])
+def test_route_topk_is_the_trtllm_routing_and_the_runners_quantizer(routing_layer, m):
     from flashinfer import fp4_quantize
 
     for seed in range(2):
@@ -616,8 +625,8 @@ def test_route_topk_is_the_trtllm_routing_and_the_runners_quantizer(layer, m):
         assert torch.equal(x_sf, q_sf.view(torch.uint8).reshape(m, -1))
         # the routed experts on this routing equal the runner's own routing from the
         # logits, row for row, weights included
-        want_rows, want_w = _stock(layer, logits, x_fp4, x_sf)
-        got_rows, got_w = _routed_stock(layer, (ids, weights), x_fp4, x_sf)
+        want_rows, want_w = _stock(routing_layer, logits, x_fp4, x_sf)
+        got_rows, got_w = _routed_stock(routing_layer, (ids, weights), x_fp4, x_sf)
         assert torch.equal(got_w.view(torch.int16), want_w.view(torch.int16))
         assert torch.equal(got_rows.view(torch.int16), want_rows.view(torch.int16))
 

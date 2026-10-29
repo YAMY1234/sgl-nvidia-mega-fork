@@ -50,6 +50,7 @@ SGLANG_READS = {
         "TopKOutputChecker",
         "format_is_bypassed",
         "format_is_standard",
+        "empty_topk_output",
     ),
     "srt/layers/moe/fused_moe_triton/layer.py": ("forward_deferred_finalize",),
     "srt/layers/moe/utils.py": ("sum_post_experts_output",),
@@ -167,9 +168,17 @@ def step(layer, x: torch.Tensor, st, defer: bool, reduce=None):
     mlp = layer.mlp
     rows, hidden = x.shape
     x = x.view(-1, hidden)
+    if defer and rows == 0:
+        raise RuntimeError("Qwen deferred finalize does not support M=0")
     # the gate is a plain linear on CUDA (no AMX, no NPU)
     use_fused_gate = mlp.shared_expert_gate is not None
-    if (
+    if rows == 0:
+        # Empty DP ranks skip the shared expert and gate, but must participate
+        # in the experts' collective in the same way as SGLang's forward.
+        shared = None
+        topk_output = mlp.topk.empty_topk_output(x.device)
+        routed = mlp.experts(x, topk_output)
+    elif (
         mlp.alt_stream is not None
         and get_is_capture_mode()
         and not torch.compiler.is_compiling()

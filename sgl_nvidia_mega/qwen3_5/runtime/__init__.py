@@ -23,9 +23,6 @@ SHIPPED_SLOTS: tuple[str, ...] = (
     "mkm_m128",
     "mkm_m256",
     "mkm_m512",
-    "gdn_verify",
-    "gdn_pdl",
-    "gdn_conv",
     "hop",
     "hop_fp8",
     "multi_request",
@@ -35,6 +32,12 @@ SHIPPED_SLOTS: tuple[str, ...] = (
     "draft_embed",
 )
 OPT_IN_SLOTS: tuple[str, ...] = (
+    # The fused FP8 norm can select a different reduction layout from BF16.
+    # Keep its verify chain and dependent variants explicitly requested.
+    "gdn_verify",
+    "gdn_pdl",
+    "gdn_conv",
+    "gdn_prefill_split_conv",
     "route",
     "route_gemm",
     "mkm",
@@ -191,8 +194,20 @@ def apply_expert_parallel(ep_size: int) -> frozenset:
     return dropped
 
 
-def slot_reasons() -> list[str]:
+def apply_topology(parallel) -> frozenset:
+    """Keep only each slot's declared capabilities before package builds run."""
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    global SLOTS
+    selected = topology.select(SLOTS, topology.from_parallel(parallel))
+    dropped = SLOTS - selected
+    SLOTS = selected
+    return dropped
+
+
+def slot_reasons(requested=None) -> list[str]:
     """Why the requested slots cannot be served ([] when they can)."""
+    slots = SLOTS if requested is None else requested
     known = tuple(
         dict.fromkeys(
             (
@@ -216,113 +231,113 @@ def slot_reasons() -> list[str]:
             "with post-verify graphs turns them on with "
             "SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1"
         )
-    if "mkm" in SLOTS and "route" not in SLOTS:
+    if "mkm" in slots and "route" not in slots:
         reasons.append(f"{SLOTS_ENV}: slot 'mkm' runs on slot 'route''s outputs")
-    if "mkm_wide" in SLOTS and "mkm" not in SLOTS:
+    if "mkm_wide" in slots and "mkm" not in slots:
         reasons.append(f"{SLOTS_ENV}: slot 'mkm_wide' is slot 'mkm''s 16-token engine")
-    if "mkm_wide" in SLOTS and "multi_request" not in SLOTS:
+    if "mkm_wide" in slots and "multi_request" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'mkm_wide' serves the steps of more than one request "
             "('multi_request')"
         )
-    if "mkm_m32" in SLOTS and "route_topk" not in SLOTS:
+    if "mkm_m32" in slots and "route_topk" not in slots:
         reasons.append(f"{SLOTS_ENV}: slot 'mkm_m32' takes slot 'route_topk''s rows")
-    if "mkm_m32" in SLOTS and "multi_request" not in SLOTS:
+    if "mkm_m32" in slots and "multi_request" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'mkm_m32' serves the steps of more than two requests "
             "('multi_request')"
         )
-    if "mkm_m64" in SLOTS and "route_topk" not in SLOTS:
+    if "mkm_m64" in slots and "route_topk" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'mkm_m64' runs on slot 'route_topk''s routing"
         )
-    if "mkm_m64" in SLOTS and "multi_request" not in SLOTS:
+    if "mkm_m64" in slots and "multi_request" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'mkm_m64' serves the steps of more than four requests "
             "('multi_request')"
         )
-    if "mkm_m128" in SLOTS and "route_topk" not in SLOTS:
+    if "mkm_m128" in slots and "route_topk" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'mkm_m128' runs on slot 'route_topk''s routing"
         )
-    if "mkm_m128" in SLOTS and "multi_request" not in SLOTS:
+    if "mkm_m128" in slots and "multi_request" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'mkm_m128' serves the steps of more than nine requests "
             "('multi_request')"
         )
     for name, more in (("mkm_m256", "18"), ("mkm_m512", "36")):
-        if name in SLOTS and "route_topk" not in SLOTS:
+        if name in slots and "route_topk" not in slots:
             reasons.append(
                 f"{SLOTS_ENV}: slot '{name}' runs on slot 'route_topk''s routing"
             )
-        if name in SLOTS and "multi_request" not in SLOTS:
+        if name in slots and "multi_request" not in slots:
             reasons.append(
                 f"{SLOTS_ENV}: slot '{name}' serves the steps of more than {more} requests "
                 "('multi_request')"
             )
     if (
-        "mkm_wide_bal" in SLOTS
+        "mkm_wide_bal" in slots
         and not {
             "mkm_m256",
             "mkm_m512",
         }
-        & SLOTS
+        & slots
     ):
         reasons.append(
             f"{SLOTS_ENV}: slot 'mkm_wide_bal' changes the work split of slot "
             "'mkm_m256' or 'mkm_m512'"
         )
-    if "route_shared" in SLOTS and "route" not in SLOTS:
+    if "route_shared" in slots and "route" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'route_shared' runs in slot 'route''s launch"
         )
-    if "route_gemm" in SLOTS and "route_topk" not in SLOTS:
+    if "route_gemm" in slots and "route_topk" not in slots:
         reasons.append(f"{SLOTS_ENV}: slot 'route_gemm' runs inside slot 'route_topk'")
-    if "hop_mid" in SLOTS and "hop" not in SLOTS:
+    if "hop_mid" in slots and "hop" not in slots:
         reasons.append(f"{SLOTS_ENV}: slot 'hop_mid' widens slot 'hop'")
-    if "gdn_push" in SLOTS and not {"gdn_verify", "hop"} <= SLOTS:
+    if "gdn_push" in slots and not {"gdn_verify", "hop"} <= slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_push' pushes slot 'gdn_verify''s out_proj into "
             "slot 'hop'"
         )
-    if "gdn_front" in SLOTS and not {"gdn_verify", "gdn_pdl"} <= SLOTS:
+    if "gdn_front" in slots and not {"gdn_verify", "gdn_pdl"} <= slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_front' runs slot 'gdn_pdl''s dependent verify"
         )
-    if "gdn_trt_front" in SLOTS and not {"gdn_front", "gdn_core"} <= SLOTS:
+    if "gdn_trt_front" in slots and not {"gdn_front", "gdn_core"} <= slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_trt_front' replaces slot 'gdn_front' in front "
             "of slot 'gdn_core'"
         )
-    if "gdn_core" in SLOTS and "gdn_verify" not in SLOTS:
+    if "gdn_core" in slots and "gdn_verify" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_core' runs slot 'gdn_verify''s step in one launch"
         )
-    if "gdn_conv" in SLOTS and "gdn_verify" not in SLOTS:
+    if "gdn_conv" in slots and "gdn_verify" not in slots:
         reasons.append(f"{SLOTS_ENV}: slot 'gdn_conv' runs slot 'gdn_verify''s conv")
-    if "gdn_pdl" in SLOTS and "gdn_verify" not in SLOTS:
+    if "gdn_pdl" in slots and "gdn_verify" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'gdn_pdl' launches slot 'gdn_verify''s verify"
         )
-    for name in sorted(SLOTS & set(DRAFT_SLOTS) - {"draft_skv2", "draft_skv2_cp"}):
-        if "draft_loop" not in SLOTS:
+    for name in sorted(slots & set(DRAFT_SLOTS) - {"draft_skv2", "draft_skv2_cp"}):
+        if "draft_loop" not in slots:
             reasons.append(f"{SLOTS_ENV}: slot {name!r} runs inside entry 'draft_loop'")
-    if "draft_hop" in SLOTS and "hop" not in SLOTS:
+    if "draft_hop" in slots and "hop" not in slots:
         reasons.append(f"{SLOTS_ENV}: slot 'draft_hop' runs on slot 'hop''s mailbox")
-    if "draft_fin" in SLOTS and "draft_hop" not in SLOTS:
+    if "draft_fin" in slots and "draft_hop" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'draft_fin' extends slot 'draft_hop''s fused final norm"
         )
-    if "draft_multi" in SLOTS and "multi_request" not in SLOTS:
+    if "draft_multi" in slots and "multi_request" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'draft_multi' serves the draft steps of two or more "
             "requests ('multi_request')"
         )
-    if "draft_embed" in SLOTS and "draft_multi" not in SLOTS:
+    if "draft_embed" in slots and "draft_multi" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'draft_embed' runs in slot 'draft_multi''s steps"
         )
-    if "draft_skv2" in SLOTS and "draft_extend" not in SLOTS:
+    if "draft_skv2" in slots and "draft_extend" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'draft_skv2' runs inside entry 'draft_extend'"
         )
@@ -331,25 +346,25 @@ def slot_reasons() -> list[str]:
         ("draft_q1_cp", "draft_q1"),
         ("draft_skv2_cp", "draft_skv2"),
     ):
-        if name in SLOTS and base not in SLOTS:
+        if name in slots and base not in slots:
             reasons.append(
                 f"{SLOTS_ENV}: slot {name!r} takes slot {base!r}'s long-KV graph "
                 "variant's place from its length up"
             )
-    if "hop_fp8" in SLOTS and "hop" not in SLOTS:
+    if "hop_fp8" in slots and "hop" not in slots:
         reasons.append(f"{SLOTS_ENV}: slot 'hop_fp8' is an output of slot 'hop'")
-    if "lowm_push" in SLOTS and not {"lowm_out", "hop"} <= SLOTS:
+    if "lowm_push" in slots and not {"lowm_out", "hop"} <= slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'lowm_push' pushes slot 'lowm_out''s rows into slot "
             "'hop''s mailbox"
         )
-    if "mka_push" in SLOTS and not {"mka", "hop"} <= SLOTS:
+    if "mka_push" in slots and not {"mka", "hop"} <= slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'mka_push' pushes slot 'mka''s epilogue into slot "
             "'hop''s mailbox"
         )
     if (
-        "route_lin" in SLOTS
+        "route_lin" in slots
         and not {
             "route",
             "mkm",
@@ -358,13 +373,13 @@ def slot_reasons() -> list[str]:
             "mka",
             "mka_push",
         }
-        <= SLOTS
+        <= slots
     ):
         reasons.append(
             f"{SLOTS_ENV}: slot 'route_lin' runs the router before the all-reduce "
             "through slots 'route', 'mkm', 'hop', 'gdn_push', 'mka' and 'mka_push'"
         )
-    if "route_lin" in SLOTS and "route_shared" in SLOTS and "lowm_se" not in SLOTS:
+    if "route_lin" in slots and "route_shared" in slots and "lowm_se" not in slots:
         reasons.append(
             f"{SLOTS_ENV}: slot 'route_lin' needs 'lowm_se' to replace "
             "'route_shared' at one request"
@@ -418,6 +433,11 @@ def build(model, ctx):
     from sgl_nvidia_mega.qwen3_5.runtime.executor import Qwen35Verify
 
     parallel = get_parallel()
+    if getattr(parallel, "pp_size", 1) == 4:
+        from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+
+        return Qwen35Prefill(model, ctx, "gdn_prefill_split_conv" in SLOTS)
+
     dropped = apply_expert_parallel(parallel.moe_ep_size)
     if dropped:
         logger.info(
@@ -428,8 +448,18 @@ def build(model, ctx):
         )
     apply_cp_lite_topology(parallel.attn_tp_size)
     build_cp_lite(ctx.binding)
-    multi = slot_plan.MULTI_REQUEST in SLOTS
-    if multi:
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    current = topology.from_parallel(parallel)
+    unsupported = apply_topology(parallel)
+    if unsupported:
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 %s: slots %s use stock (topology)",
+            current.name,
+            sorted(unsupported),
+        )
+    multi = current.stock_widths or slot_plan.MULTI_REQUEST in SLOTS
+    if multi and not current.stock_widths:
         multi = slot_plan.multi_request(parallel.tp_size, SLOTS)
     widths = slot_plan.candidates(ctx.widths, ctx.tokens_per_request, multi)
     if not widths:
@@ -488,7 +518,9 @@ def build(model, ctx):
         lowm_push=bound["lowm"].push,
         hop_fp8=bound["lowm"].hop_fp8,
     )
-    covered = slot_plan.covered(pctx.widths, facts, pctx.tokens_per_request)
+    covered = slot_plan.covered(
+        pctx.widths, facts, pctx.tokens_per_request, stock=current.stock_widths
+    )
     slots = slot_plan.plan(covered, facts, pctx.tokens_per_request)
     # the slots of every width wider than one request, for the startup line
     wider = "".join(
@@ -546,8 +578,8 @@ def build(model, ctx):
         vacuous.update({"route_topk", "route_gemm"})
     missing = sorted(name for name in target_slots - vacuous if not built[name])
     if missing:
-        raise RuntimeError(
-            f"NVIDIA megakernel: requested slots {missing} built no width (MoE: "
+        logger.info(
+            f"NVIDIA megakernel: requested slots {missing} use stock (MoE: "
             f"{bound['moe'].reason or 'built'}; GDN: {bound['gdn'].reason or 'built'}; "
             f"boundary: {bound['boundary'].reason or 'built'}; "
             f"attention: {bound['attention'].reason or 'built'}; "

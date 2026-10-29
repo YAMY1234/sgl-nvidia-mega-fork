@@ -61,9 +61,6 @@ def test_the_default_policy_ships_only_bitwise_shape_bounded_paths(monkeypatch):
             "mkm_m128",
             "mkm_m256",
             "mkm_m512",
-            "gdn_verify",
-            "gdn_pdl",
-            "gdn_conv",
             "hop",
             "hop_fp8",
             "multi_request",
@@ -397,7 +394,9 @@ def test_the_covered_widths_are_the_ones_the_build_returns():
     assert built.plan(torch.zeros(21, dtype=torch.int64), _batch()) is None
 
 
-@pytest.mark.parametrize("tp_size, want", [(8, (7,)), (4, (7,))])
+@pytest.mark.parametrize(
+    "tp_size, want", [(8, (7,)), (4, (7, 14, 21, 28)), (2, (7, 14, 21, 28))]
+)
 def test_the_build_covers_more_requests_only_where_a_slot_runs(
     monkeypatch, tp_size, want
 ):
@@ -417,7 +416,7 @@ def test_the_build_covers_more_requests_only_where_a_slot_runs(
         binding="EagleBinding",
     )
     built = runtime.build(model, ctx)
-    assert built.widths == want and built.summary() == "slots none (stock)"
+    assert built.widths == want and built.summary().startswith("slots none (stock)")
 
 
 def test_the_build_hands_over_the_binding_and_ships_the_bitwise_draft_entries():
@@ -1088,9 +1087,9 @@ def test_the_draft_loop_writes_each_steps_token_and_restores_the_positions(
     [
         (8, {"multi_request"}, (1, 2)),
         (8, set(), (1,)),
-        (4, {"multi_request"}, (1,)),
+        (4, {"multi_request"}, (1, 2)),
         (8, {"multi_request", "draft_multi"}, tuple(range(1, 129))),
-        (4, {"multi_request", "draft_multi"}, (1,)),
+        (4, {"multi_request", "draft_multi"}, tuple(range(1, 129))),
     ],
 )
 def test_the_draft_loop_serves_two_requests_at_tp8_on_request(
@@ -1109,7 +1108,7 @@ def test_the_draft_loop_serves_two_requests_at_tp8_on_request(
     [
         (8, {"multi_request", "draft_multi"}, True, tuple(range(1, 129))),
         (8, {"multi_request", "draft_multi"}, False, (1,)),
-        (4, {"multi_request", "draft_multi"}, True, (1,)),
+        (4, {"multi_request", "draft_multi"}, True, tuple(range(1, 129))),
         (8, {"draft_multi"}, True, (1,)),
     ],
 )
@@ -1289,6 +1288,56 @@ def test_the_draft_extend_writes_the_selected_rows_outputs(monkeypatch):
 # ------------------------------------------------------------------- the parity check
 
 
+@pytest.mark.parametrize("world", [2, 4, 8])
+def test_draft_fc_tiles_fit_shared_memory_at_each_tp(world):
+    from sgl_nvidia_mega.qwen3_5.draft.xchg import fc_split_slice
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg
+
+    hidden, sms = 4096, 148
+    width = 2 * hidden // world
+    rows = xchg.draft_fc_partial_rows(hidden, width, sms)
+    assert world in xchg.WORLDS
+    assert 0 < rows <= -(-hidden // sms)
+    assert (rows + xchg.MAX_TOKENS) * width * 2 <= xchg._MAX_SMEM_BYTES
+    assert [fc_split_slice(hidden, r, world) for r in range(world)] == [
+        (r >= world // 2, (r % (world // 2)) * width, width) for r in range(world)
+    ]
+    if world in (4, 8):
+        assert rows == -(-hidden // sms)
+
+
+@pytest.mark.parametrize("requests", [2, 6, 10])
+def test_multi_draft_extend_uses_split_fc_only_within_its_bound(monkeypatch, requests):
+    from sgl_nvidia_mega.qwen3_5.draft import layer
+    from sgl_nvidia_mega.qwen3_5.draft.extend import DraftExtend
+
+    parts = _DraftParts()
+    calls = []
+    parts.embed = lambda ids: calls.append("embed") or ids
+    parts.mkd = SimpleNamespace(
+        split_fc=lambda embeds, hidden: calls.append("split") or hidden
+    )
+    monkeypatch.setattr(layer, "fc_input", lambda *a: calls.append("stock") or a[2])
+    monkeypatch.setattr(layer, "layer", lambda p, x, *a, **kw: x)
+    monkeypatch.setattr(layer, "top1_into", lambda *a, **kw: None)
+    rows = requests * 7
+    io = SimpleNamespace(
+        input_ids=torch.arange(rows),
+        hidden_states=torch.ones(rows, 1),
+        positions=None,
+        out_cache_loc=None,
+        attn=None,
+        kv=None,
+        tokens_per_request=7,
+        select_index=torch.arange(requests),
+        hidden_out=torch.empty(requests, 1),
+        topk_index_out=None,
+        topk_p_out=None,
+    )
+    DraftExtend(parts, tokens_per_request=7)._multi_step(io)
+    assert calls == (["embed", "split"] if rows <= 16 else ["stock"])
+
+
 @pytest.fixture
 def eager(monkeypatch):
     """Outside CUDA graph capture (a CPU build of torch has no capture to query), with
@@ -1349,6 +1398,59 @@ def test_parity_counts_the_requests_own_rows_apart():
     assert int(parity.differing(a, b)) == 3 and int(parity.differing(a, b, valid)) == 0
     b[0, 1] = 1.0  # a request's row
     assert int(parity.differing(a, b, valid)) == 1
+
+
+@pytest.mark.parametrize("captured", [False, True])
+@pytest.mark.parametrize("output_rows", [0, 7])
+def test_parity_handles_an_empty_dp_rank(
+    eager, monkeypatch, caplog, captured, output_rows
+):
+    monkeypatch.setattr(parity, "MODE", "1")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: captured)
+    monkeypatch.setattr(
+        "sglang.srt.model_executor.runner.get_is_capture_mode", lambda: False
+    )
+    monkeypatch.setattr(
+        parity, "conv_rows", lambda: (torch.empty(0, dtype=torch.long), [])
+    )
+
+    def output(value):
+        return lambda: SimpleNamespace(
+            next_token_logits=torch.full((output_rows, 3), value),
+            hidden_states=torch.full((output_rows, 4), value),
+        )
+
+    checker = parity.Parity((7,), "cpu")
+    with caplog.at_level("INFO"):
+        got = checker.run(Step("target_verify", 7), output(0.0), output(1.0))
+        if captured:
+            assert checker.counters[7].tolist() == [
+                1,
+                output_rows * 3,
+                output_rows * 4,
+                output_rows * 3,
+                output_rows * 4,
+                0,
+                0,
+            ]
+            monkeypatch.setattr(
+                torch.cuda, "is_current_stream_capturing", lambda: False
+            )
+            checker.flush()
+    assert got.hidden_states.shape == (output_rows, 4)
+    assert "rows_compared=" + str(output_rows) in caplog.text
+    assert "hidden_dist_max=" + ("1" if output_rows else "0") in caplog.text
+    if captured:
+        assert "valid_logits_differ=0 valid_hidden_differ=0" in caplog.text
+    else:
+        assert "valid_rows=0" in caplog.text
+        assert "logits_max_abs=" + ("1" if output_rows else "0") in caplog.text
+
+
+def test_empty_request_metadata_has_no_valid_rows():
+    slots = torch.empty(0, dtype=torch.long)
+    assert parity.valid_rows(slots, 0).tolist() == []
+    assert parity.valid_rows(slots, 7).tolist() == [False] * 7
 
 
 @pytest.mark.parametrize("mode", ["1", "control"])
@@ -1455,6 +1557,14 @@ def test_the_parity_distance_reads_top1_flips_and_log_prob_gaps():
     assert parity.distance(None, None, None, None) is None
 
 
+def test_empty_logits_preserve_nonempty_hidden_distance():
+    empty_logits = torch.empty(0, 3)
+    apart = parity.distance(
+        empty_logits, empty_logits, torch.zeros(2, 4), torch.ones(2, 4)
+    )
+    assert apart.tolist() == [0.0, 0.0, 0.0, 0.0, 1.0]
+
+
 def test_the_step_state_carries_the_binding():
     lm = SimpleNamespace(model="model")
     st = StepState(
@@ -1472,3 +1582,350 @@ def test_the_step_state_carries_the_binding():
         "EagleBinding",
         "EagleForwardView",
     )
+
+
+@pytest.mark.parametrize("tp, dp, ep, rows", [(2, 1, 1, (42, 70)), (8, 8, 8, (224,))])
+def test_new_topologies_cover_actual_pd_stock_widths(monkeypatch, tp, dp, ep, rows):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset())
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=tp, attn_dp_size=dp, moe_ep_size=ep),
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    ctx = SimpleNamespace(
+        widths=rows, tokens_per_request=7, deadline_s=60.0, binding="binding"
+    )
+    built = runtime.build(model, ctx)
+    assert built.widths == rows
+    for width in rows:
+        assert built.plan(torch.zeros(width, dtype=torch.int64), _batch()).rows == width
+
+
+def test_slot_topology_declarations_are_complete_and_fail_closed():
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    known = set(
+        (
+            *runtime.SHIPPED_SLOTS,
+            *runtime.OPT_IN_SLOTS,
+            *runtime.OPT_IN_VARIANTS,
+            *runtime.DRAFT_ENTRIES,
+            *runtime.DRAFT_SLOTS,
+            *runtime.RUNTIME_ONLY_SLOTS,
+        )
+    )
+    assert set(topology.SLOT_TOPOLOGIES) == known
+    assert (
+        topology.select(frozenset({"undeclared"}), topology.Topology(2)) == frozenset()
+    )
+
+
+@pytest.mark.parametrize("tp,rows", [(2, 7), (2, 42), (2, 70), (4, 7), (8, 7)])
+def test_router_only_slots_cover_aggregate_and_pd_widths(tp, rows):
+    from sgl_nvidia_mega.qwen3_5 import plan, topology
+
+    requested = frozenset({"route", "route_topk", "route_gemm"})
+    assert topology.select(requested, topology.Topology(tp)) == requested
+    slots = plan.slots(rows, plan.Facts(route=True, route_topk=True, route_gemm=True))
+    assert slots.route == (rows <= 16)
+    assert slots.route_topk == (rows > 16)
+    assert not slots.mkm and not slots.mkm_m32 and not slots.mkm_m64
+    assert not topology.select(requested, topology.Topology(8, 8, 8))
+
+
+def test_tp4_preserves_v2_shipped_capabilities():
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    shipped = frozenset(runtime.SHIPPED_SLOTS)
+    # The wide expert engines serve TP8's I=128, while TP4 holds I=256.
+    tp8_engines = frozenset({"mkm_m32", "mkm_m64", "mkm_m128", "mkm_m256", "mkm_m512"})
+    assert topology.select(shipped, topology.Topology(4)) == shipped - tp8_engines
+    assert (
+        topology.select(topology.TP4_V2_SLOTS, topology.Topology(4))
+        == topology.TP4_V2_SLOTS
+    )
+    # Keep each owner's separately declared TP2 capabilities; restoring TP4
+    # must not enable any other unimplemented TP2 kernel.
+    assert topology.select(topology.TP4_V2_SLOTS, topology.Topology(2)) == {
+        "route",
+        "route_topk",
+        "route_gemm",
+        "mka",
+        "gdn_verify",
+        "gdn_pdl",
+        "gdn_conv",
+        "gdn_core",
+    }
+    assert topology.select(topology.TP4_V2_SLOTS, topology.Topology(8, 8, 8)) == {
+        "mka",
+        "gdn_verify",
+        "gdn_pdl",
+        "gdn_conv",
+    }
+    assert topology.select({"mka"}, topology.Topology(2)) == {"mka"}
+    assert topology.select({"mka"}, topology.Topology(8, 8, 8)) == {"mka"}
+    assert runtime.slot_reasons(topology.select(shipped, topology.Topology(4))) == []
+
+
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_measured_topology_policy_selects_actual_draft_entries(monkeypatch, tp_size):
+    from sgl_nvidia_mega.qwen3_5 import draft, topology
+
+    # All explicit opt-ins, not just SHIPPED_SLOTS: the formal47 recipe must
+    # leave every TP2 draft callback unset, as in the topo-adapted v2 baseline.
+    requested = frozenset(topology.SLOT_TOPOLOGIES)
+    monkeypatch.setattr(runtime, "SLOTS", requested)
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=tp_size, moe_ep_size=1),
+    )
+    built = draft.SPEC.build("lm", SimpleNamespace(context_len=8192), _draft_ctx())
+    if tp_size == 2:
+        assert not built.slots
+        assert all(
+            getattr(built, name) is None
+            for name in (
+                "draft_loop", "draft_extend", "begin_draft_round", "graph_variants",
+            )
+        )
+        assert runtime.SLOTS == frozenset(
+            {
+                "multi_request",
+                "gdn_commit",
+                "sharded_gumbel",
+                "gdn_verify",
+                "gdn_pdl",
+                "gdn_conv",
+                "gdn_core",
+                "route",
+                "route_topk",
+                "route_gemm",
+                "mka",
+            }
+        )
+    else:
+        assert built.draft_loop is not None and built.draft_extend is not None
+        assert built.slots == topology.select(
+            frozenset(runtime.DRAFT_ENTRIES + runtime.DRAFT_SLOTS),
+            topology.Topology(tp_size),
+        )
+
+
+def test_tp4_declarations_preserve_existing_kernel_shape_boundaries():
+    from sgl_nvidia_mega.qwen3_5 import topology
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import q1, xchg
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm
+
+    assert 256 in mkm.INTERMEDIATES
+    assert 256 not in mkm.WIDE_ENGINES and 256 not in mkm.M32_ENGINES
+    assert 4 in hop.WORLDS and 4 in xchg.WORLDS and 8 in q1.QUERY_HEADS
+    tp8_only = frozenset(
+        {
+            "mkm_wide",
+            "mkm_m32",
+            "mkm_m64",
+            "mkm_m128",
+            "mkm_m256",
+            "mkm_m512",
+            "mkm_wide_bal",
+            "gdn_front",
+            "gdn_trt_front",
+            "route_lin",
+        }
+    )
+    assert not topology.select(tp8_only, topology.Topology(4))
+    assert topology.select(tp8_only, topology.Topology(8)) == tp8_only
+
+
+def test_unsupported_specialization_does_not_disable_a_supported_slot(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    monkeypatch.setitem(topology.SLOT_TOPOLOGIES, "gdn_verify", topology.TOPOLOGIES)
+    requested = frozenset({"gdn_verify", "gdn_front", "gdn_pdl", "multi_request"})
+    selected = topology.select(requested, topology.Topology(2))
+    assert selected == frozenset({"gdn_verify", "gdn_pdl", "multi_request"})
+    assert runtime.slot_reasons(selected) == []
+
+
+def test_dep8_is_not_confused_with_tep8_and_keeps_the_draft_stock():
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    requested = frozenset(runtime.SHIPPED_SLOTS)
+    assert topology.Topology(8, 8, 8).name == "dep8"
+    assert topology.Topology(8, 1, 8).name == "tep8"
+    dep = topology.select(requested, topology.Topology(8, 8, 8))
+    assert not dep & set(runtime.DRAFT_ENTRIES + runtime.DRAFT_SLOTS)
+    assert topology.select(requested, topology.Topology(8, 1, 8)) == requested
+
+
+@pytest.mark.parametrize("topology_name", ["tp2", "tp4", "tp8", "tep8", "dep8"])
+def test_gdn_slot_topologies_keep_generic_verify_and_bound_the_core(topology_name):
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    configs = {
+        "tp2": topology.Topology(2),
+        "tp4": topology.Topology(4),
+        "tp8": topology.Topology(8),
+        "tep8": topology.Topology(8, 1, 8),
+        "dep8": topology.Topology(8, 8, 8),
+    }
+    generic = frozenset({"gdn_verify", "gdn_pdl", "gdn_conv"})
+    requested = generic | {"gdn_core", "gdn_front", "gdn_push"}
+    got = topology.select(requested, configs[topology_name])
+    assert generic <= got
+    assert ("gdn_core" in got) == (topology_name != "dep8")
+    if topology_name in {"tp2", "dep8"}:
+        assert not got & {"gdn_front", "gdn_push"}
+    if topology_name == "tp4":
+        assert "gdn_push" in got and "gdn_front" not in got
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("mm_inputs", [None, [], [None], [None, None, None, None]])
+def test_prefill_plan_uses_actual_chunk_rows_and_stock_when_slot_off(
+    enabled, mm_inputs
+):
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), enabled)
+    fb = SimpleNamespace(mm_inputs=mm_inputs, forward_mode=ForwardMode.EXTEND)
+    step = built.plan(torch.zeros(33, dtype=torch.int64), fb)
+    if enabled:
+        assert step.mode == "prefill" and step.rows == 33
+    else:
+        assert step is None
+    fb.forward_mode = ForwardMode.TARGET_VERIFY
+    assert built.plan(torch.zeros(7, dtype=torch.int64), fb) is None
+
+
+@pytest.mark.parametrize("mm_inputs", [[object()], [None, object()]])
+def test_prefill_plan_keeps_real_multimodal_batches_on_stock(mm_inputs):
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), True)
+    fb = SimpleNamespace(mm_inputs=mm_inputs, forward_mode=ForwardMode.EXTEND)
+    assert built.plan(torch.zeros(33, dtype=torch.int64), fb) is None
+
+
+def test_prefill_unsupported_view_returns_the_original_before_state_writes():
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+    from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), True)
+    marker = object()
+    original = lambda *a, **k: marker
+    step = Step(mode="prefill", rows=33, view=SimpleNamespace(kernel_id=0))
+    assert built.forward(step, original, None, None, None) is marker
+
+
+def _prefill_parity_fixture():
+    view = SimpleNamespace(
+        state=SimpleNamespace(
+            conv=(torch.zeros(1, 5, 2, 2),), temporal=torch.zeros(1, 5, 2)
+        ),
+        state_indices=torch.tensor([1]),
+        has_track=True,
+        track_conv_dst=torch.tensor([2]),
+        track_ssm_h_dst=torch.tensor([3]),
+        track_ssm_final_dst=torch.tensor([4]),
+        track_ssm_recompute_dst=None,
+    )
+
+    def forward():
+        conv, ssm = view.state.conv[0], view.state.temporal
+        conv[:, 1] += 1
+        conv[:, 2] = conv[:, 1] + 2
+        ssm[:, 1] += 2
+        ssm[:, 3] = ssm[:, 1] + 3
+        ssm[:, 4] = ssm[:, 1] + 4
+        return SimpleNamespace(tensors={"hidden": ssm[:, 1]})
+
+    return view, forward
+
+
+def test_prefill_parity_restores_committed_and_track_state_between_forwards():
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import PrefillParity
+
+    view, forward = _prefill_parity_fixture()
+    result = PrefillParity().run(33, view, forward, forward)
+    assert torch.equal(result.tensors["hidden"], torch.full((1, 2), 2.0))
+    assert torch.equal(view.state.conv[0][:, 1], torch.ones(1, 2, 2))
+    assert torch.equal(view.state.temporal[:, 4], torch.full((1, 2), 6.0))
+    assert not view.state.temporal[:, 0].any()
+
+
+def test_prefill_parity_catches_state_corruption_with_equal_output():
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import PrefillParity
+
+    view, forward = _prefill_parity_fixture()
+
+    def corrupt():
+        result = forward()
+        view.state.temporal[:, 4] += 1
+        return result
+
+    with pytest.raises(RuntimeError, match="output/state differs"):
+        PrefillParity().run(33, view, forward, corrupt)
+
+
+def test_prefill_all_slots_off_can_compare_native_twice_under_test_switch(monkeypatch):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+
+    monkeypatch.setattr(parity, "ENABLED", True)
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), False)
+    step = built.plan(
+        torch.zeros(33, dtype=torch.int64),
+        SimpleNamespace(mm_inputs=None, forward_mode=ForwardMode.EXTEND),
+    )
+    assert step.mode == "prefill" and not built.enabled
+
+
+@pytest.mark.parametrize("tp_size", [4, 8])
+def test_bf16_draft_entries_cover_pd_batches_without_quantized_experts(
+    monkeypatch, tp_size
+):
+    from sgl_nvidia_mega.qwen3_5 import topology
+    from sgl_nvidia_mega.qwen3_5.draft.extend import DraftExtend
+    from sgl_nvidia_mega.qwen3_5.draft.loop import DraftLoop
+
+    requested = frozenset(
+        {
+            "multi_request",
+            "draft_loop",
+            "draft_extend",
+            "draft_multi",
+            "draft_embed",
+            "draft_xchg",
+            "draft_moe",
+            "draft_q1",
+        }
+    )
+    selected = topology.select(requested, topology.Topology(tp_size))
+    assert runtime.slot_reasons(selected) == []
+    monkeypatch.setattr(runtime, "SLOTS", selected)
+    parts = _DraftParts(slots=selected, tp_size=tp_size)
+    parts.top1x = object()
+    parts.attention = SimpleNamespace(q1=object())
+    loop = DraftLoop(parts, num_steps=6)
+    extend = DraftExtend(parts, tokens_per_request=7)
+    for batch in (1, 6, 10):
+        assert loop.step_for(batch) == loop.step
+        assert extend.step_for(batch) == extend.step

@@ -27,8 +27,8 @@ current hidden all-reduce at exactly one request. ``route_shared`` (numeric: the
 expert's gate/up in route's launch) up to 8 rows. ``skv2`` runs the full attention's core
 of one request through the split-KV attention of SGLang branch
 nvidia/qwen35-agentx-gb300, ``mka`` the fused attention prologue and epilogue around it
-(up to 8 rows; with four query heads a rank, its wide entries up to 14 rows and past
-them its front path, bit for bit SGLang's, at every width), and ``mka_push`` (with
+(TP8 fused through 14 rows, TP4 through 8, then its front path at every width;
+TP2 always uses the front path, bit for bit SGLang's), and ``mka_push`` (with
 ``hop``) has the epilogue push its rows into the hop. ``lowm_in`` / ``lowm_out`` (numeric) run the static FP8 input / output projections on a
 low-M warp-MMA launch with the weights loaded before the dependency wait, up to each one's
 measured rows (``LOWM_*_MAX_ROWS``), and with ``lowm_push`` (with ``hop``) push their rows into the hop;
@@ -46,7 +46,7 @@ MAX_ROWS = 896  # the widest covered step: 128 requests of 7 verify rows (TP8 bs
 REQUESTS = tuple(range(1, 129))
 # the TP sizes whose steps of more than one request are covered when requested (checked at
 # TP8); at the others a covered step is one request
-MULTI_REQUEST_TP = (8,)
+MULTI_REQUEST_TP = (2, 4, 8)
 # the name that requests them in the slot list
 MULTI_REQUEST = "multi_request"
 GDN_FRONT_ROWS = 7  # the one-request custom front's fixed width
@@ -76,7 +76,7 @@ GDN_PUSH_MAX_ROWS = 8
 # the rows slot route_shared's shared stage fits shared memory for
 ROUTE_SHARED_ROWS = 8
 MKA_MAX_ROWS = 8
-# with four query heads a rank: the wide entries, then the front path (attention/mka.py)
+# The fused entries where supported, then the front path (attention/mka.py).
 MKA_WIDE_MAX_ROWS = MAX_ROWS
 # slots lowm / lowm_se: the rows up to which each low-M launch measured faster than SGLang's quantize +
 # cuBLAS path on GB300 (results/trt-1022/l6): the input projections (in_proj_qkvz + in_proj_ba, qkv_proj),
@@ -195,7 +195,7 @@ class Facts(msgspec.Struct, frozen=True):
     )
     skv2: bool = False  # SKV2 for every full-attention layer
     mka: bool = False  # the fused prologue and epilogue for every full-attention layer
-    mka_wide: bool = False  # with its wide entries (four query heads a rank)
+    mka_wide: bool = False  # with its front path at every width
     mka_push: bool = False  # with the epilogue's push into the hop
     route_lin: bool = False  # the router-before-all-reduce path built for every layer
     lowm_in: bool = False  # the low-M input projections built for every layer
@@ -342,12 +342,18 @@ def widest(widths: tuple[int, ...], max_rows: int) -> int:
 
 
 def covered(
-    widths: tuple[int, ...], facts: Facts, tokens_per_request: int
+    widths: tuple[int, ...],
+    facts: Facts,
+    tokens_per_request: int,
+    *,
+    stock: bool = False,
 ) -> tuple[int, ...]:
     """The widths a build covers: one request always (with no slot it runs the stock
     step), more requests only where a slot runs."""
     return tuple(
         w
         for w in widths
-        if w == tokens_per_request or slots(w, facts, tokens_per_request) != Slots()
+        if stock
+        or w == tokens_per_request
+        or slots(w, facts, tokens_per_request) != Slots()
     )

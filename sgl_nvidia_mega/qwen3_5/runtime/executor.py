@@ -63,7 +63,11 @@ SGLANG_READS = {
         "capture_aux_hidden_states",
         "model",
     ),
-    "srt/model_executor/forward_batch_info.py": ("mrope_positions", "forward_mode"),
+    "srt/model_executor/forward_batch_info.py": (
+        "mrope_positions",
+        "forward_mode",
+        "is_idle",
+    ),
     "srt/models/qwen3_5.py": (
         "Qwen3_5LinearDecoderLayer",
         "layers",
@@ -85,7 +89,10 @@ SGLANG_READS = {
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/models/qwen3_vl.py:Qwen3VLForConditionalGeneration.forward": "d394d79ba7fa7b31",
+    "srt/models/qwen3_vl.py:Qwen3VLForConditionalGeneration.forward": (
+        "d394d79ba7fa7b31",
+        "dbdcf4b88a2c0d40",
+    ),
     "srt/models/qwen3_5.py:Qwen3_5ForCausalLM.forward": "9e530b264ce30ad6",
     "srt/models/qwen3_5.py:Qwen3_5LinearDecoderLayer.forward": "2298a57111f9430e",
     "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer.forward": "6473f673a1a0796b",
@@ -269,7 +276,14 @@ class Qwen35Verify:
     def _layer(self, i, layer, hidden, st, capture):
         """A decoder layer's forward: the mixer stage, then the MoE stage."""
         x = boundary.pre(layer, hidden, st, capture)
-        part = self.mixers[i](layer, x, st)
+        # Idle DP ranks still cross the boundaries and run the MoE's collective,
+        # but the decoder layers skip their mixer (including empty FP4 GEMMs).
+        rows = (x[0] if isinstance(x, tuple) else x).shape[0]
+        part = (
+            self.mixers[i](layer, x, st)
+            if not st.fb.forward_mode.is_idle() and rows > 0
+            else x
+        )
         x = boundary.post_attn(layer, part, st)
         with boundary.ffn_exit(layer, st) as ffn_exit:
             out = moe.step(layer, x, st, defer=ffn_exit.defer_moe_finalize)

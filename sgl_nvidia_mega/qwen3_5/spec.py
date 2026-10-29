@@ -27,7 +27,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         Requirements,
     )
 
-from sgl_nvidia_mega.qwen3_5 import TEXT_CONFIG, runtime
+from sgl_nvidia_mega.qwen3_5 import TEXT_CONFIG, runtime, topology
 from sgl_nvidia_mega.qwen3_5.plan import MAX_ROWS
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -36,6 +36,7 @@ SGLANG_READS = {
         "Feature",
         "SPECULATIVE_DECODING",
         "MULTI_NODE_TP",
+        "DP_ATTENTION",
         "KV_OFFLOAD",
         "PD_DISAGGREGATION",
         "MegakernelSpec",
@@ -66,11 +67,14 @@ SGLANG_READS = {
         "attn_dp_size",
         "startup_weight_load_mode",
         "disaggregation_mode",
+        "pp_size",
+        "ep_size",
     ),
     "srt/runtime_context.py": ("derive_attn_tp_size",),
     "srt/configs/qwen3_5.py": ("text_config",),
     "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "EagleForwardView",
+        "LinearPrefillView",
     ),
 }
 
@@ -81,7 +85,7 @@ API_VERSION = 2
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_103"}),
     # TP8 over the two 4-GPU trays of one NVL72 rack, TP4 on one tray
-    tp_sizes=frozenset({4, 8}),
+    tp_sizes=frozenset({1, 2, 4, 8}),
     dtypes=frozenset({"bfloat16"}),
     # the decode CUDA graphs the covered step is tested with (eager steps too)
     decode_graph_backends=frozenset({"full", "disabled"}),
@@ -92,17 +96,17 @@ REQUIREMENTS = Requirements(
         "speculative_eagle_topk": frozenset({1}),
         # SGLang's EAGLE entries serve a chain without rejection sampling
         "speculative_use_rejection_sampling": frozenset({False}),
-        "moe_a2a_backend": frozenset({"none"}),
+        "moe_a2a_backend": frozenset({"none", "flashinfer"}),
         # the deferred MoE finalize the boundary takes (the measured TP8 setup)
-        "moe_runner_backend": frozenset({"flashinfer_trtllm"}),
-        "flashinfer_allreduce_fusion_backend": frozenset({"cutedsl"}),
+        "moe_runner_backend": frozenset({"flashinfer_trtllm", "flashinfer_cutedsl"}),
+        "flashinfer_allreduce_fusion_backend": frozenset({None, "cutedsl"}),
         "attention_backend": frozenset({"trtllm_mha"}),
         "decode_attention_backend": frozenset({None, "trtllm_mha"}),
         # the Triton GDN verify on the ReplaySSM ring with BF16 checkpoints
         "linear_attn_backend": frozenset({"triton"}),
         "linear_attn_decode_backend": frozenset({None, "triton"}),
         "linear_attn_verify_backend": frozenset({None, "triton"}),
-        "enable_linear_replayssm_spec": frozenset({True}),
+        "enable_linear_replayssm_spec": frozenset({False, True}),
         "mamba_ssm_dtype": frozenset({"bfloat16"}),
         # the kernels read the weights SGLang loaded, after its last conversion
         "startup_weight_load_mode": frozenset({"serial"}),
@@ -122,6 +126,9 @@ NUMERIC_TOLERANCES = {
     "sharded_gumbel": {
         "sharded_gumbel.categorical.chi_square_p_value_min": 1e-4,
     },
+    # Same FP8 norm bound as v2 gdn_core; output-store layout can change the
+    # FP32 reduction and the final BF16 rounding at a midpoint.
+    "gdn_verify": {"gdn_verify.norm_fp8.rel_l2_vs_stock": 2e-2},
     # Four router GEMV chains sum in another order than SGLang's cuBLAS GEMM.
     "route": {"route.router_logits.bf16_ulp_vs_stock": 1.0},
     # The tiled router front stays within one BF16 ULP of SGLang's whole-M GEMM.
@@ -235,12 +242,28 @@ def binding_reasons() -> list[str]:
 
 
 def pd_reasons(cfg) -> list[str]:
-    """Why this PD role has no covered step ([] on the decode side)."""
-    if (cfg.disaggregation_mode or "null") == "prefill":
-        return [
-            "a PD prefill server runs no covered step; enable it on the decode side"
-        ]
-    return []
+    """The P role is TP1/PP4; decode retains its established TP/PP contract."""
+    if (cfg.disaggregation_mode or "null") != "prefill":
+        reasons = []
+        if cfg.tp_size not in (2, 4, 8):
+            reasons.append(f"tp_size {cfg.tp_size} is not a supported decode topology")
+        if cfg.pp_size != 1:
+            reasons.append(
+                "pipeline parallelism is in use outside the supported prefill role"
+            )
+        if not cfg.enable_linear_replayssm_spec:
+            reasons.append("enable_linear_replayssm_spec must be True for decode")
+        return reasons
+    reasons = []
+    if (cfg.tp_size, cfg.pp_size, cfg.ep_size or 1) != (1, 4, 1):
+        reasons.append("PD prefill requires TP1/PP4 without expert parallelism")
+    if cfg.enable_linear_replayssm_spec:
+        reasons.append("PD prefill does not use the speculative ReplaySSM ring")
+    try:
+        from sglang.srt.kernel_plugins.nvidia.eagle_binding import LinearPrefillView  # noqa: F401
+    except ImportError:
+        reasons.append("PD prefill requires the data-only LinearPrefillView binding")
+    return reasons
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
@@ -254,10 +277,28 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
             attn_dp_size=cfg.attn_dp_size,
         )
     )
+    configured = topology.from_config(cfg)
+    topology_reasons = (
+        ["Qwen3.5 DP attention requires DEP8 (TP8, attention DP8, MoE EP8)"]
+        if configured.attn_dp_size > 1 and configured.name != "dep8"
+        else []
+    )
+    if configured.name != "dep8" and cfg.disaggregation_mode != "prefill":
+        for name, want in (
+            ("moe_a2a_backend", "none"),
+            ("moe_runner_backend", "flashinfer_trtllm"),
+            ("flashinfer_allreduce_fusion_backend", "cutedsl"),
+        ):
+            value = getattr(cfg, name)
+            if value != want:
+                topology_reasons.append(f"{name} {value!r} is not {want!r}")
     return (
-        text_config_reasons(hf_config)
+        topology_reasons
+        + text_config_reasons(hf_config)
         + binding_reasons()
-        + runtime.slot_reasons()
+        + runtime.slot_reasons(
+            topology.select(runtime.SLOTS, topology.from_config(cfg))
+        )
         + pd_reasons(cfg)
     )
 
@@ -274,12 +315,14 @@ SPEC = MegakernelSpec(
     features=frozenset(
         {
             Feature.SPECULATIVE_DECODING,
+            Feature.PIPELINE_PARALLEL,
             # TP8 spans the two 4-GPU trays of one NVL72 rack
             Feature.MULTI_NODE_TP,
             # HiCache: covered steps read only running requests' pages
             Feature.KV_OFFLOAD,
             # TEP (MoE TP x EP): the slots in runtime.EP_STOCK_SLOTS stay off
             Feature.EXPERT_PARALLEL,
+            Feature.DP_ATTENTION,
             # The decode side of PD; pd_reasons refuses the prefill side.
             Feature.PD_DISAGGREGATION,
         }

@@ -37,7 +37,7 @@ from sgl_nvidia_mega.common import jit
 
 SRC = Path(__file__).parent / "src"
 HIDDEN = 4096
-WORLDS = (4, 8)
+WORLDS = (2, 4, 8)
 # CTAs per exchange; each owns HIDDEN / CHUNKS columns of the candidate and partial rows
 CHUNKS = 16
 XCHG_THREADS = 1024
@@ -379,8 +379,10 @@ def mkd_xchg(
         fc_out = None
     _check(topk_index, "topk_index", (1, 1), torch.int64)
     _check(topk_p, "topk_p", (1, 1), torch.float32)
-    if v % 8 != 0 or v > 65536:
-        raise ValueError("mkd_xchg: local vocab must be a multiple of 8 and <= 65536")
+    if v % 8 != 0:
+        raise ValueError("mkd_xchg: local vocab must be a multiple of 8")
+    if v > 65536 and head_part is not None:
+        raise ValueError("mkd_xchg: packed head maxima require a <=65536-row shard")
     head_parts = head_part.numel() if head_part is not None else 0
     if head_parts > XCHG_THREADS:
         raise ValueError("mkd_xchg: at most one head partial per exchange thread")
@@ -626,11 +628,15 @@ def mkd_draft_head(
 
 
 def draft_fc_partial_rows(out_rows: int, width: int, num_sms: int) -> Optional[int]:
-    """Weight rows per CTA for the fused kernel, or None if they do not fit in shared
-    memory."""
+    """Weight rows per CTA, capped by shared memory for TP2's full-half slice.
+
+    The dot and norm reductions are independent of the output-row partition. TP4/8
+    retain one CTA per SM; TP2 may need more CTAs to fit the same BF16 operands.
+    """
     rows = -(-out_rows // num_sms)
     static = MAX_TOKENS * width * 2
-    return rows if rows * width * 2 + static <= _MAX_SMEM_BYTES else None
+    fit = (_MAX_SMEM_BYTES - static) // (width * 2)
+    return min(rows, fit) if fit > 0 else None
 
 
 def draft_fc_partial(
@@ -663,9 +669,7 @@ def draft_fc_partial(
     _check(out, "out", (m, HIDDEN), torch.float32)
     if not (col_start >= 0 and col_start + width <= HIDDEN and col_start % 8 == 0):
         raise ValueError("draft_fc_partial: slice out of range")
-    grid = _sm_count(device.index)
-    if (HIDDEN + grid - 1) // grid > max_rows:
-        raise ValueError("draft_fc_partial: more weight rows per CTA than kMaxRows")
+    grid = max(_sm_count(device.index), -(-HIDDEN // max_rows))
     p = DraftFcPartialParams(
         x=x.data_ptr(),
         norm_w=norm_weight.data_ptr(),

@@ -108,10 +108,14 @@ class DraftExtend:
         """More requests (slot draft_multi): SGLang's model step on every verify row,
         then the selected rows' sharded top-1 (torch.argmax's choice, a NaN first)
         straight into SGLang's outputs."""
+        from sgl_nvidia_mega.qwen3_5.draft.xchg import FC_SPLIT_MAX_TOKENS
         from sgl_nvidia_mega.qwen3_5.sm103.draft.top1 import NAN_KEY_TORCH_ARGMAX
 
         parts = self.parts
-        x = layer.fc_input(parts, io.input_ids, io.hidden_states)
+        if parts.mkd is not None and io.input_ids.shape[0] <= FC_SPLIT_MAX_TOKENS:
+            x = parts.mkd.split_fc(parts.embed(io.input_ids), io.hidden_states)
+        else:
+            x = layer.fc_input(parts, io.input_ids, io.hidden_states)
         hidden = layer.layer(
             parts,
             x,

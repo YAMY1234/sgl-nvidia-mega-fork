@@ -221,6 +221,7 @@ def _build(model, hf_config, ctx) -> MtpDraft:
     parallel = get_parallel()
     runtime.apply_expert_parallel(parallel.moe_ep_size)
     runtime.apply_cp_lite_topology(parallel.attn_tp_size)
+    runtime.apply_topology(parallel)
     runtime.build_cp_lite(ctx.binding)
     return MtpDraft(
         model,

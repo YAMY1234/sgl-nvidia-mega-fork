@@ -250,11 +250,22 @@ def cp_reason() -> str:
     return "" if cp_lite() is not None else "the plugin did not build CP-lite"
 
 
-def cp_core(attn, q, kv, meta, forward_batch, q_len: int, min_bs: int | None = 1):
+def cp_core(
+    attn,
+    q,
+    kv,
+    meta,
+    forward_batch,
+    q_len: int,
+    min_bs: int | None = 1,
+    early_merge: bool | None = None,
+):
     """CP-lite on requests of ``q_len`` FP8 query rows over the pool ``kv``:
     [rows, heads * head_dim] bf16, or None where CP-lite declines. ``min_bs`` overrides
     CP-lite's configured minimum for a host-selected one-request graph; ``None`` keeps
-    the configured gate for a multi-request graph."""
+    the configured gate for a multi-request graph. ``early_merge=False`` restores the
+    R11 plain merge for both exact and fold paths when no fused gate epilogue was
+    offered; ``None`` preserves CP-lite's default."""
     from sglang.kernels.ops.attention.utils import canonicalize_stride
     from sglang.srt.layers.attention.trtllm_mha_backend import (
         DEFAULT_WORKSPACE_SIZE_MB,
@@ -278,6 +289,7 @@ def cp_core(attn, q, kv, meta, forward_batch, q_len: int, min_bs: int | None = 1
             DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024, dtype=torch.uint8, device=q.device
         ),
     )
+    options = {} if early_merge is None else {"early_merge": early_merge}
     o = cp.attend(
         q.reshape(-1, attn.tp_q_head_num, attn.head_dim),
         caches,
@@ -290,6 +302,7 @@ def cp_core(attn, q, kv, meta, forward_batch, q_len: int, min_bs: int | None = 1
         attn,
         forward_batch,
         min_bs=min_bs,
+        **options,
     )
     return None if o is None else o.view(-1, attn.tp_q_head_num * attn.head_dim)
 

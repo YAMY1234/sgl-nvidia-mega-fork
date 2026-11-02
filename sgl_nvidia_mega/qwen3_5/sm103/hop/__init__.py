@@ -229,8 +229,9 @@ class Hop:
         )
         handle = symm_mem.rendezvous(self._mailbox, group)
         multicast = int(handle.multicast_ptr or 0)
-        if not multicast or multicast % 16:
-            raise RuntimeError("the hop needs an NVLink multicast mapping")
+        from sgl_nvidia_mega.qwen3_5.runtime import require_multicast
+
+        require_multicast("hop", multicast, group, self.device)
         self._mailbox.fill_(SENTINEL)
         self._ctrl = torch.zeros(4, dtype=torch.int32, device=self.device)
         self._handle = handle  # keeps the mapping alive

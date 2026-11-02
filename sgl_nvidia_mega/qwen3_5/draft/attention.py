@@ -385,17 +385,21 @@ class DraftExtendSplitKV:
 
     @classmethod
     def build(cls, parts):
+        from sgl_nvidia_mega.qwen3_5.runtime import unavailable_slots
+
         try:
             from sgl_nvidia_mega.qwen3_5.attention import route, split_kv
         except ImportError as e:
-            raise RuntimeError(
-                "NVIDIA megakernel: slot draft_skv2 needs the attention package's SKV2 "
-                f"(qwen3_5.attention.split_kv): {e}"
-            ) from e
+            unavailable_slots(
+                "draft_skv2",
+                f"needs the attention package's SKV2 (qwen3_5.attention.split_kv): {e}",
+            )
+            return None
         width = int(parts.binding.tokens_per_request)
         why = split_kv.unsupported(parts.layer.attn, width)
         if why:
-            raise RuntimeError(f"NVIDIA megakernel: slot draft_skv2 cannot run: {why}")
+            unavailable_slots("draft_skv2", why)
+            return None
         return cls(split_kv, route)
 
     def long(self) -> bool:
@@ -439,11 +443,15 @@ class DraftCP:
 
         why = split_kv.cp_reason()
         if why:
+            from sgl_nvidia_mega.qwen3_5.runtime import unavailable_slots
+
             if multi and not (steps or extend):
+                logger.info(
+                    "NVIDIA megakernel: draft_multi CP attention uses stock (%s)", why
+                )
                 return None
-            raise RuntimeError(
-                f"NVIDIA megakernel: slots draft_q1_cp / draft_skv2_cp cannot run: {why}"
-            )
+            unavailable_slots(parts.slots & {"draft_q1_cp", "draft_skv2_cp"}, why)
+            return None
         return cls(split_kv, route, steps, extend, multi)
 
     def takes(self, rows_per_request: int, rows: int) -> bool:
@@ -518,7 +526,10 @@ def build_q1(parts):
         device_index=device.index, max_context_len=attention.max_context_len
     )
     if why is not None:
-        raise RuntimeError(f"NVIDIA megakernel: slot draft_q1 cannot run: {why}")
+        from sgl_nvidia_mega.qwen3_5.runtime import unavailable_slots
+
+        unavailable_slots("draft_q1", why)
+        return None
     release = GATE_FOLD == 2
     q1.build(device.index, heads=attention.heads, pdl=Q1_PDL, release=release)
     decode = q1.Q1Decode(pdl=Q1_PDL, release=release)

@@ -195,13 +195,21 @@ def apply_expert_parallel(ep_size: int) -> frozenset:
 
 
 def apply_topology(parallel) -> frozenset:
-    """Keep only each slot's declared capabilities before package builds run."""
+    """Keep only each slot's declared capabilities, plus the slots the topology's plan
+    adds (``topology.plan``), before package builds run; returns the dropped names."""
     from sgl_nvidia_mega.qwen3_5 import topology
 
     global SLOTS
-    selected = topology.select(SLOTS, topology.from_parallel(parallel))
-    dropped = SLOTS - selected
+    current = topology.from_parallel(parallel)
+    selected = topology.plan(SLOTS, current)
+    dropped, added = SLOTS - selected, selected - SLOTS
     SLOTS = selected
+    if added:
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 %s plan: slots %s run with the requested ones",
+            current.name,
+            sorted(added),
+        )
     return dropped
 
 

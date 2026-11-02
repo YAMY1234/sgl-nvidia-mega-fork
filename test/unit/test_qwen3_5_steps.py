@@ -897,12 +897,13 @@ def test_the_mkm_slot_names_what_a_layer_lacks():
     assert mkm.unsupported(mlp).startswith("an expert activation")
 
 
-def test_route_topk_checks_only_materialized_routing_under_expert_parallelism(
-    monkeypatch,
+@pytest.mark.parametrize("local_experts", [128, 512])
+def test_route_topk_checks_materialized_routing_without_a_fused_expert_engine(
+    monkeypatch, local_experts
 ):
     from sgl_nvidia_mega.qwen3_5.moe import mkm, route
 
-    experts = SimpleNamespace(num_experts=512, num_local_experts=128)
+    experts = SimpleNamespace(num_experts=512, num_local_experts=local_experts)
     mlp = SimpleNamespace(experts=experts)
     model = SimpleNamespace(
         model=SimpleNamespace(
@@ -915,7 +916,7 @@ def test_route_topk_checks_only_materialized_routing_under_expert_parallelism(
         mkm, "routing_unsupported", lambda _: checked.append("routing") or ""
     )
     monkeypatch.setattr(
-        mkm, "unsupported", lambda _: pytest.fail("full-expert engine checked under EP")
+        mkm, "unsupported", lambda _: pytest.fail("full-expert engine checked")
     )
 
     assert route.topk_unsupported(model) == ""

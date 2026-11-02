@@ -8,7 +8,7 @@
 picked without reading the device.
 
 ``VERIFY`` (8192 tokens, as the TP8 serving configuration on SGLang branch
-nvidia/qwen35-agentx-gb300 sets ``SGLANG_Q35MF_MKA_SKV2_VERIFY_MIN_LENGTH``) routes the
+nvidia/qwen35-agentx-gb300) routes the
 target verify and ``EXTEND`` (32768, that branch's ``SPLIT_KV_MIN_LENGTH``) the draft
 extend. A built megakernel offers its variants per SGLang runner (``graph_variants``:
 "target_verify", "draft_loop", "draft_extend"); a runner captures each of

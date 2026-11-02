@@ -288,3 +288,33 @@ def test_the_mirrored_sglang_code_is_unchanged(path, key, digest):
         f"the mirror, then pin {got!r} in its SGLANG_MIRRORS (a tuple where the "
         "supported SGLangs differ)"
     )
+
+
+def test_qwen3_5_conv_kernel_defaults_preserve_legacy_window_stores():
+    # Q35MF conv_update calls this kernel directly, omitting the two new
+    # constexpr arguments. Updating the wrapper mirror pin must not implicitly
+    # enable native's deduplicated-window optimization in the plugin.
+    pattern = "kernels/ops/mamba/causal_conv1d_triton.py"
+    files = _files(pattern)
+    assert len(files) == 1, f"{pattern} matches {len(files)} files"
+    kernel = next(
+        node
+        for node in _tree(files[0]).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_causal_conv1d_update_kernel"
+    )
+    positional = kernel.args.posonlyargs + kernel.args.args
+    defaults = {
+        arg.arg: value
+        for arg, value in zip(
+            positional[len(positional) - len(kernel.args.defaults) :],
+            kernel.args.defaults,
+        )
+    }
+    defaults.update(
+        (arg.arg, value)
+        for arg, value in zip(kernel.args.kwonlyargs, kernel.args.kw_defaults)
+        if value is not None
+    )
+    assert ast.literal_eval(defaults["DEDUP_CONV_WINDOW"]) is False
+    assert ast.literal_eval(defaults["NP2_WINDOW_COLS"]) == 1

@@ -189,6 +189,7 @@ def core(attn, q, st):
             st.fb,
             ROWS,
             min_bs=None,
+            early_merge=False,
         )
         if o is not None:
             key = (route.SPLIT_KV_CP, q.shape[0])

@@ -2708,7 +2708,19 @@ def test_cp_slots_keep_multi_request_target_verify_in_the_plugin(monkeypatch, se
 
     class CpLite:
         def attend(
-            self, q, kv, pages, lens, q_len, bmm1, bmm2, ws, layer, fb, min_bs=None
+            self,
+            q,
+            kv,
+            pages,
+            lens,
+            q_len,
+            bmm1,
+            bmm2,
+            ws,
+            layer,
+            fb,
+            min_bs=None,
+            early_merge=None,
         ):
             calls.append(
                 (
@@ -2718,6 +2730,7 @@ def test_cp_slots_keep_multi_request_target_verify_in_the_plugin(monkeypatch, se
                     q_len,
                     fb is st.fb,
                     min_bs,
+                    early_merge,
                 )
             )
             return out if served else None
@@ -2730,7 +2743,9 @@ def test_cp_slots_keep_multi_request_target_verify_in_the_plugin(monkeypatch, se
     ):
         got = split_kv.core(attn, q8, st)
 
-    assert calls == [((rows, 4, 256), (requests, 4), (requests,), 7, True, None)]
+    assert calls == [
+        ((rows, 4, 256), (requests, 4), (requests,), 7, True, None, False)
+    ]
     if served:
         assert got.shape == (rows, 1024) and bool((got == 1).all())
         assert not log

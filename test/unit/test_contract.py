@@ -318,3 +318,28 @@ def test_qwen3_5_conv_kernel_defaults_preserve_legacy_window_stores():
     )
     assert ast.literal_eval(defaults["DEDUP_CONV_WINDOW"]) is False
     assert ast.literal_eval(defaults["NP2_WINDOW_COLS"]) == 1
+
+
+def test_qwen3_5_gdn_outproj_stays_on_collective_parallel_group():
+    """The replicated-only RowParallelLinear guard cannot affect this mirror."""
+    helper = next(
+        n for n in _tree(ROOT / "srt/runtime_context.py").body
+        if isinstance(n, ast.FunctionDef) and n.name == "linear_attn_parallel_group"
+    )
+    returns = [n.value for n in ast.walk(helper) if isinstance(n, ast.Return)]
+    assert len(returns) == 1 and isinstance(returns[0], ast.IfExp)
+    assert {ast.literal_eval(returns[0].body), ast.literal_eval(returns[0].orelse)} == {"tp", "attn_tp"}
+    model = next(
+        n for n in _tree(ROOT / "srt/models/qwen3_5.py").body
+        if isinstance(n, ast.ClassDef) and n.name == "Qwen3_5GatedDeltaNet"
+    )
+    init = next(n for n in model.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    group = next(n for n in init.body if isinstance(n, ast.Assign) and any(
+        isinstance(t, ast.Name) and t.id == "parallel_group" for t in n.targets))
+    assert isinstance(group.value, ast.Call) and isinstance(group.value.func, ast.Name)
+    assert group.value.func.id == "linear_attn_parallel_group"
+    out = next(n for n in init.body if isinstance(n, ast.Assign) and any(
+        isinstance(t, ast.Attribute) and t.attr == "out_proj" for t in n.targets))
+    assert isinstance(out.value.func, ast.Name) and out.value.func.id == "RowParallelLinear"
+    parallel = next(k.value for k in out.value.keywords if k.arg == "parallel_group")
+    assert isinstance(parallel, ast.Name) and parallel.id == "parallel_group"

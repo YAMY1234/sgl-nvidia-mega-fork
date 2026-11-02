@@ -142,7 +142,10 @@ SGLANG_MIRRORS = {
         "28b89fa4b48b47ad",
         "739e7115c370ac01",
     ),
-    "srt/layers/linear.py:RowParallelLinear.forward": "b291a3c452e428a5",
+    # main 61d200 guards replicated layers (tp_group=None). GDN out_proj
+    # uses linear_attn_parallel_group (tp/attn_tp), so that new guard is false;
+    # the specialized collective-memory BMM below keeps the same semantics.
+    "srt/layers/linear.py:RowParallelLinear.forward": "1d5fb1eabbb87ec4",
     # The follow-up also accepts an already-quantized FP8 input, which is the path
     # _out_proj mirrors; the BF16 path remains the stock alternative.
     "srt/layers/quantization/fp8_utils.py:apply_fp8_linear_bmm_flashinfer": (

@@ -1310,9 +1310,9 @@ def test_the_draft_loop_writes_each_steps_token_and_restores_the_positions(
     [
         (8, {"multi_request"}, (1, 2)),
         (8, set(), (1,)),
-        (4, {"multi_request"}, (1,)),
+        (4, {"multi_request"}, (1, 2)),
         (8, {"multi_request", "draft_multi"}, tuple(range(1, 129))),
-        (4, {"multi_request", "draft_multi"}, (1,)),
+        (4, {"multi_request", "draft_multi"}, tuple(range(1, 129))),
     ],
 )
 def test_the_draft_loop_serves_two_requests_at_tp8_on_request(
@@ -1331,7 +1331,7 @@ def test_the_draft_loop_serves_two_requests_at_tp8_on_request(
     [
         (8, {"multi_request", "draft_multi"}, True, tuple(range(1, 129))),
         (8, {"multi_request", "draft_multi"}, False, (1,)),
-        (4, {"multi_request", "draft_multi"}, True, (1,)),
+        (4, {"multi_request", "draft_multi"}, True, tuple(range(1, 129))),
         (8, {"draft_multi"}, True, (1,)),
     ],
 )

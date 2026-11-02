@@ -24,6 +24,7 @@ from sgl_nvidia_mega.qwen3_5 import (
     plan,
     runtime,
     spec,
+    topology,
 )
 
 
@@ -665,6 +666,36 @@ def test_the_shipped_policy_claims_bitwise_numerics():
 @pytest.mark.parametrize("pd", ["null", "decode"])
 def test_topology_admission_is_driven_by_plugin_capabilities(tp, pd):
     assert _refusal(tp_size=tp, nnodes=1, disaggregation_mode=pd) == ""
+
+
+# The router-overlap slots the TP8 serving policy requests, without route_lin
+ROUTE_LIN_SLOTS = frozenset(
+    {
+        "route",
+        "route_shared",
+        "lowm_se",
+        "mkm",
+        "hop",
+        "gdn_verify",
+        "gdn_push",
+        "mka",
+        "mka_push",
+    }
+)
+
+
+@pytest.mark.parametrize("pd", ["null", "decode"])
+def test_the_tp8_route_lin_plan_is_accepted_in_both_roles(monkeypatch, pd):
+    monkeypatch.setattr(runtime, "SLOTS", ROUTE_LIN_SLOTS)
+    assert _refusal(disaggregation_mode=pd) == ""
+
+
+def test_the_numerics_claim_covers_the_slots_a_plan_can_add():
+    claim = spec.numerics(topology.plannable(ROUTE_LIN_SLOTS))
+    assert claim == spec.numerics(ROUTE_LIN_SLOTS | {"route_lin"})
+    assert spec.NUMERIC_TOLERANCES["route_lin"].items() <= dict(claim.tolerances).items()
+    shipped = frozenset(runtime.SHIPPED_SLOTS)
+    assert topology.plannable(shipped) == shipped
 
 
 def test_dep8_accepts_the_recipe_stock_moe_and_dp_lm_head():

@@ -214,3 +214,30 @@ def select(requested: frozenset, topology: Topology) -> frozenset:
         for name in requested
         if topology.name in SLOT_TOPOLOGIES.get(name, frozenset())
     )
+
+
+# The slots route_lin runs through (runtime.slot_reasons); with route_shared, lowm_se
+# replaces it at one request.
+ROUTE_LIN_NEEDS = frozenset({"route", "mkm", "hop", "gdn_push", "mka", "mka_push"})
+
+
+def _route_lin_fits(slots: frozenset) -> bool:
+    return ROUTE_LIN_NEEDS <= slots and (
+        "route_shared" not in slots or "lowm_se" in slots
+    )
+
+
+def plan(requested: frozenset, topology: Topology) -> frozenset:
+    """``select``, plus the slots a topology's plan turns on with the requested ones:
+    the TP8 plan (aggregated and PD decode) adds route_lin wherever its slots are
+    selected. Every other topology keeps exactly its selected slots."""
+    selected = select(requested, topology)
+    if topology.name == "tp8" and _route_lin_fits(selected):
+        selected |= {"route_lin"}
+    return selected
+
+
+def plannable(requested: frozenset) -> frozenset:
+    """``requested`` plus every slot some topology's plan can add to it (the numerics
+    claim made before the topology is known)."""
+    return requested | ({"route_lin"} if _route_lin_fits(requested) else frozenset())

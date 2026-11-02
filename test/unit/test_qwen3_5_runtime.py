@@ -13,6 +13,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import Step
 from sgl_nvidia_mega import plugin
 from sgl_nvidia_mega.qwen3_5 import (
     runtime,
+    topology,
 )
 from sgl_nvidia_mega.qwen3_5.runtime import executor, hooks, parity
 from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
@@ -1862,6 +1863,66 @@ def test_router_only_slots_cover_aggregate_and_pd_widths(tp, rows):
     assert slots.route_topk == (rows > 16)
     assert not slots.mkm and not slots.mkm_m32 and not slots.mkm_m64
     assert not topology.select(requested, topology.Topology(8, 8, 8))
+
+
+# The router-overlap slots the TP8 serving policy requests, without route_lin
+ROUTE_LIN_SLOTS = frozenset(
+    {
+        "route",
+        "route_shared",
+        "lowm_se",
+        "mkm",
+        "hop",
+        "gdn_verify",
+        "gdn_push",
+        "mka",
+        "mka_push",
+    }
+)
+
+
+def test_the_tp8_plan_runs_route_lin_with_its_slots():
+    tp8 = topology.Topology(8)
+    planned = topology.plan(ROUTE_LIN_SLOTS, tp8)
+    assert planned == ROUTE_LIN_SLOTS | {"route_lin"}
+    assert runtime.slot_reasons(planned) == []
+    without_shared = ROUTE_LIN_SLOTS - {"route_shared", "lowm_se"}
+    assert topology.plan(without_shared, tp8) == without_shared | {"route_lin"}
+    assert topology.plan(ROUTE_LIN_SLOTS | {"route_lin"}, tp8) == planned
+
+
+@pytest.mark.parametrize(
+    "current",
+    [
+        topology.Topology(8, 1, 8),
+        topology.Topology(8, 8, 8),
+        topology.Topology(4),
+        topology.Topology(2),
+    ],
+    ids=["tep8", "dep8", "tp4", "tp2"],
+)
+def test_other_topology_plans_run_exactly_the_selected_slots(current):
+    planned = topology.plan(ROUTE_LIN_SLOTS, current)
+    assert planned == topology.select(ROUTE_LIN_SLOTS, current)
+    assert "route_lin" not in planned
+
+
+@pytest.mark.parametrize("missing", [*sorted(topology.ROUTE_LIN_NEEDS), "lowm_se"])
+def test_the_tp8_plan_leaves_route_lin_off_without_one_of_its_slots(missing):
+    assert "route_lin" not in topology.plan(
+        ROUTE_LIN_SLOTS - {missing}, topology.Topology(8)
+    )
+    assert "route_lin" not in topology.plannable(ROUTE_LIN_SLOTS - {missing})
+
+
+@pytest.mark.parametrize("ep, on", [(1, True), (8, False)], ids=["tp8", "tep8"])
+def test_apply_topology_turns_the_planned_slots_on(monkeypatch, ep, on):
+    monkeypatch.setattr(runtime, "SLOTS", ROUTE_LIN_SLOTS)
+    parallel = SimpleNamespace(tp_size=8, attn_dp_size=1, moe_ep_size=ep)
+    assert runtime.apply_topology(parallel) == frozenset()
+    assert ("route_lin" in runtime.SLOTS) is on
+    assert runtime.apply_topology(parallel) == frozenset()
+    assert ("route_lin" in runtime.SLOTS) is on
 
 
 def test_tp4_preserves_v2_shipped_capabilities():

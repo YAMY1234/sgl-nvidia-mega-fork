@@ -79,6 +79,12 @@ includes `hop`.  It remains opt-in rather than part of the bitwise default polic
 an explicit `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` value replaces, rather than extends,
 that default list.
 
+The TP8 plan (`topology.plan`, aggregated and PD decode) also runs `route_lin`
+whenever the policy holds the slots it runs through (`route`, `mkm`, `hop`,
+`gdn_push`, `mka`, `mka_push`, and `lowm_se` with `route_shared`): its router logits
+stay within 1.05x stock's RMS error against FP64 on the same quantized operands.
+TEP8, DEP8, TP2 and TP4 run exactly the requested slots their topology supports.
+
 The router-only `route`, `route_topk` and `route_gemm` slots support TP2, TP4, TP8 and TEP8 with the TRTLLM runner and no all-to-all. PD decode TP2 uses the same local row counts: batch 6/10 gives 42/70 verify rows. These fronts leave the expert GEMMs with the stock runner, so TP2 needs no fused expert engine. `route_shared` keeps its TP8/TEP8 projection bounds; DEP8 keeps stock MoE dispatch and routing.
 
 `mka` uses the fused projection kernels through 14 verify rows on TP8 and 8 on

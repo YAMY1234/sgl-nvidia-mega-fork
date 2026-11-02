@@ -213,7 +213,7 @@ def numerics(slots) -> Numerics:
     return Numerics(kind=NumericsKind.TOLERANCE, tolerances=tolerances)
 
 
-NUMERICS = numerics(runtime.SLOTS)
+NUMERICS = numerics(topology.plannable(runtime.SLOTS))
 
 
 def text_config_reasons(hf_config) -> list[str]:
@@ -296,9 +296,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         topology_reasons
         + text_config_reasons(hf_config)
         + binding_reasons()
-        + runtime.slot_reasons(
-            topology.select(runtime.SLOTS, topology.from_config(cfg))
-        )
+        + runtime.slot_reasons(topology.plan(runtime.SLOTS, topology.from_config(cfg)))
         + pd_reasons(cfg)
     )
 

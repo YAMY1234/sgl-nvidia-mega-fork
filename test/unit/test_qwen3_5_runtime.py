@@ -13,6 +13,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import Step
 from sgl_nvidia_mega import plugin
 from sgl_nvidia_mega.qwen3_5 import (
     runtime,
+    topology,
 )
 from sgl_nvidia_mega.qwen3_5.runtime import executor, hooks, parity
 from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
@@ -1765,6 +1766,33 @@ def test_every_slot_declares_its_topologies():
         )
     )
     assert set(topology.SLOT_TOPOLOGIES) == known
+
+
+# The router-overlap slots the TP8 serving policy requests, without route_lin
+ROUTE_LIN_SLOTS = frozenset(
+    "route route_shared lowm_se mkm hop gdn_verify gdn_push mka mka_push".split()
+)
+
+
+@pytest.mark.parametrize(
+    "tp, dp, ep, on",
+    [(8, 1, 1, True), (8, 1, 8, False), (8, 8, 8, False), (4, 1, 1, False)],
+)
+def test_only_the_tp8_plan_turns_route_lin_on(monkeypatch, tp, dp, ep, on):
+    monkeypatch.setattr(runtime, "SLOTS", ROUTE_LIN_SLOTS)
+    parallel = SimpleNamespace(tp_size=tp, attn_dp_size=dp, moe_ep_size=ep)
+    runtime.apply_topology(parallel)
+    selected = topology.select(ROUTE_LIN_SLOTS, topology.Topology(tp, dp, ep))
+    assert runtime.SLOTS == selected | ({"route_lin"} if on else set())
+    if on:
+        assert runtime.slot_reasons() == []
+
+
+@pytest.mark.parametrize("missing", [*sorted(topology.ROUTE_LIN_NEEDS), "lowm_se"])
+def test_the_tp8_plan_leaves_route_lin_off_without_one_of_its_slots(missing):
+    slots = ROUTE_LIN_SLOTS - {missing}
+    assert "route_lin" not in topology.plan(slots, topology.Topology(8))
+    assert "route_lin" not in topology.plannable(slots)
 
 
 def test_unsupported_specialization_does_not_disable_a_supported_slot(monkeypatch):

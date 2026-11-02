@@ -104,7 +104,7 @@ class Top1Exchange:
         self.vocab_local, self.vocab_start = vocab_local, vocab_start
         self.vocab_size = vocab_size
         self._buf, self._handle, self.mc = symmetric_words(
-            SLOTS * world * MAX_ROWS * 2, group, device
+            SLOTS * world * MAX_ROWS * 2, group, device, slot="draft_multi"
         )
         self.uc = self._buf.data_ptr()
         # [epoch from 1, CTA arrivals]

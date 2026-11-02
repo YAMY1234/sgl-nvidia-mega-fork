@@ -29,6 +29,8 @@ from typing import Optional
 import msgspec
 import torch
 
+from sgl_nvidia_mega.qwen3_5.runtime import slot_failure
+
 logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -173,14 +175,18 @@ def build(model, ctx) -> Bound:
     megakernel_agree(reasons, what="hop refusals")
     if reasons:
         return Bound(reason="; ".join(reasons))
-    hop = Hop(
-        max_m=rows,
-        eps=m.flashinfer_mnnvl_cutedsl_fusion.rms_epsilon,
-        group=group.device_group,
-        device=torch.device("cuda", torch.cuda.current_device()),
-        deadline_s=ctx.deadline_s,
-        route_lin="route_lin" in runtime.SLOTS,
-    )
+    try:
+        hop = Hop(
+            max_m=rows,
+            eps=m.flashinfer_mnnvl_cutedsl_fusion.rms_epsilon,
+            group=group.device_group,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            deadline_s=ctx.deadline_s,
+            route_lin="route_lin" in runtime.SLOTS,
+        )
+    except runtime.SlotUnavailable as exc:
+        runtime.unavailable_slots(exc.slots, exc.reason)
+        return Bound(reason=exc.reason)
     global _ACTIVE
     _ACTIVE = hop
     return Bound(hop=hop, mid=rows > plan.HOP_MAX_ROWS)
@@ -384,7 +390,10 @@ def moe_input(hop, layer, hidden, st):
         lid, h0 = st.scratch.get("rlin.h0", (None, None))
         if lid != layer.layer_id or h0 is None or h0.data_ptr() != residual.data_ptr():
             raise RuntimeError(
-                f"route-lin: layer {layer.layer_id}'s residual is not the one its router partials read"
+                slot_failure(
+                    "route_lin",
+                    f"layer {layer.layer_id}'s residual is not the one its router partials read",
+                )
             )
         _engage("MoE input + router (route-lin)", rows)
         (norm, residual, *fp8), rl = hop.all_reduce_residual_rms_norm_rl(

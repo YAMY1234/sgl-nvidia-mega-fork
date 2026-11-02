@@ -92,7 +92,10 @@ class EmbedExchange:
             device,
         )
         self._buf, self._handle, self.mc = symmetric_words(
-            SLOTS * MAX_ROWS * self.hidden // 2 + world, group, device
+            SLOTS * MAX_ROWS * self.hidden // 2 + world,
+            group,
+            device,
+            slot="draft_embed",
         )
         self.uc = self._buf.data_ptr()
         # [epoch from 1, CTA arrivals]

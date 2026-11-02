@@ -714,7 +714,7 @@ def ordered_partial_sum(
     return out
 
 
-def symmetric_words(words: int, group, device: torch.device):
+def symmetric_words(words: int, group, device: torch.device, *, slot="draft_xchg"):
     """(tensor, handle, multicast pointer) of a zeroed symmetric int64 buffer on
     ``group``; a collective on every rank of it."""
     import torch.distributed._symmetric_memory as symm_mem
@@ -725,8 +725,9 @@ def symmetric_words(words: int, group, device: torch.device):
     buf = symm_mem.empty((words,), dtype=torch.int64, device=device)
     handle = symm_mem.rendezvous(buf, group)
     multicast = int(handle.multicast_ptr or 0)
-    if not multicast or multicast % 16:
-        raise RuntimeError("the draft step boundary needs an NVLink multicast mapping")
+    from sgl_nvidia_mega.qwen3_5.runtime import require_multicast
+
+    require_multicast(slot, multicast, group, device)
     buf.zero_()
     return buf, handle, multicast
 

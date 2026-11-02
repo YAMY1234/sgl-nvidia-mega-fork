@@ -48,6 +48,31 @@ def _host_plan():
     return namespace
 
 
+def _split_mode(batch, override=None):
+    """Evaluate the actual dispatch expression without importing CUDA modules."""
+    path = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "sgl_nvidia_mega/qwen3_5/sm103/attention/q35_cp_fused.py"
+    )
+    function = next(
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "q35_cp_fused_partial"
+    )
+    assignment = next(
+        node
+        for node in function.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "bal" for t in node.targets)
+    )
+    namespace = dict(_host_plan(), b=batch, balanced=override)
+    exec(
+        compile(ast.Module(body=[assignment], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    return namespace["bal"]
+
+
 class TestBalancedCP(unittest.TestCase):
     def setUp(self):
         self.host = _host_plan()
@@ -62,6 +87,20 @@ class TestBalancedCP(unittest.TestCase):
             self.assertFalse(supported(q_len, 4, 1, 65, 152))
         self.assertFalse(supported(7, 4, 1, 64, 64))
         self.assertFalse(supported(7, 4, 1, 64, 152, max_batch=32))
+
+    def test_small_batches_keep_original_split_mode(self):
+        for batch in range(1, 33):
+            self.assertFalse(_split_mode(batch), batch)
+            self.assertEqual(self.host["_num_splits"](batch, 152), 152 // batch)
+
+    def test_wide_batches_use_balanced_split_mode(self):
+        for batch in range(33, 65):
+            self.assertTrue(_split_mode(batch), batch)
+
+    def test_explicit_split_mode_override_is_preserved(self):
+        for batch in (1, 2, 4, 8, 16, 32, 33, 64):
+            self.assertTrue(_split_mode(batch, True), batch)
+            self.assertFalse(_split_mode(batch, False), batch)
 
     def test_all_owned_tiles_appear_once_in_request_order(self):
         plan = self.host["balanced_split_plan"]

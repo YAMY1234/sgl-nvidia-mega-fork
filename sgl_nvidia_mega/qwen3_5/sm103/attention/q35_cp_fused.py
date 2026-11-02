@@ -47,8 +47,9 @@ _WIDE_PLAN_MAX_BATCH = 64
 _LANE_PLAN_MAX_BATCH = 32
 
 
-# Production default: distribute the grid's CTAs by owned KV length, including
-# batches <= 32. Match R11 TEP8's 64-request admission for verify and draft.
+# Production default: keep the original equal split through 32 requests, and
+# distribute CTAs by owned KV length above 32. Match R11 TEP8's 64-request
+# fused-kernel admission for verify and draft; scheduler admission is unchanged.
 # This is a plugin policy, not an environment switch; explicit split-mode test
 # overrides below retain their separate counter requirement.
 _DEFAULT_BALANCED = True
@@ -624,7 +625,11 @@ def q35_cp_fused_partial(
     device = q_all.device
     sms = sm_count or _sm_count(device)
     state = _state(device, sms)
-    bal = _DEFAULT_BALANCED if balanced is None else bool(balanced)
+    bal = (
+        _DEFAULT_BALANCED and b > _LANE_PLAN_MAX_BATCH
+        if balanced is None
+        else bool(balanced)
+    )
     assert bal or b <= _LANE_PLAN_MAX_BATCH, "the equal split handles <= 32 requests"
     # plan variant: lane (<= 32 requests), wide (33..64), two-slot (65..128); `plan` overrides it in tests (also
     # "quad": the one-slot plan for 65..128)

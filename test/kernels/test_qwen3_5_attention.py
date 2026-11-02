@@ -193,6 +193,8 @@ def test_cp_r11_plain_merge_matches_r11_at_b32(chunk):
 
     from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import (
         _cp_merge_h_ll as feature_merge,
+    )
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import (
         _cp_merge_h_ll_plain as plain_merge,
     )
 
@@ -238,12 +240,8 @@ def test_cp_r11_plain_merge_matches_r11_at_b32(chunk):
         device="cuda",
         generator=g,
     )
-    vstart = (
-        torch.arange(32, dtype=torch.int32, device="cuda") * chunks_per_request
-    )
-    vcnt = torch.full(
-        (32,), chunks_per_request, dtype=torch.int32, device="cuda"
-    )
+    vstart = torch.arange(32, dtype=torch.int32, device="cuda") * chunks_per_request
+    vcnt = torch.full((32,), chunks_per_request, dtype=torch.int32, device="cuda")
     k, v = (
         (torch.randn(32, 1, page, dim, device="cuda", generator=g) * 2).to(
             torch.float8_e4m3fn
@@ -329,16 +327,12 @@ def test_cp_r11_plain_merge_matches_r11_at_b32(chunk):
     causal_sum = weight.sum(-1)
     causal_out = (weight.unsqueeze(-1) * vf[:, None, None]).sum(-2) * 0.5
     if chunk:
-        chunk_lse = pl_v.view(
-            requests, chunks_per_request, q_len, heads
-        ).float()
+        chunk_lse = pl_v.view(requests, chunks_per_request, q_len, heads).float()
         chunk_peak = chunk_lse.max(1).values
         chunk_weight = torch.exp2(chunk_lse - chunk_peak.unsqueeze(1))
         chunk_sum = chunk_weight.sum(1)
         prefix_out = (
-            po_v.float().view(
-                requests, chunks_per_request, q_len, heads, dim
-            )
+            po_v.float().view(requests, chunks_per_request, q_len, heads, dim)
             * chunk_weight.unsqueeze(-1)
         ).sum(1) / chunk_sum.unsqueeze(-1)
         prefix_lse = (chunk_peak + torch.log2(chunk_sum)) * math.log(2.0)
@@ -379,9 +373,7 @@ def test_cp_r11_plain_merge_matches_r11_at_b32(chunk):
         return {
             "max_abs": error.max().item(),
             "max_rel": relative.max().item(),
-            "bf16_mismatch": (
-                got.view(torch.int16) != baseline.view(torch.int16)
-            )
+            "bf16_mismatch": (got.view(torch.int16) != baseline.view(torch.int16))
             .count_nonzero()
             .item(),
         }

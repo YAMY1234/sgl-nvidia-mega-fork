@@ -112,6 +112,7 @@ def test_cp_slots_build_the_plugin_state_before_validation(monkeypatch):
 
 
 def test_cp_slots_refuse_an_incompatible_page_or_topology(monkeypatch):
+    monkeypatch.setenv(runtime.SLOTS_ENV, "skv2_cp")
     from sglang.srt.kernel_plugins.nvidia import binding as plugin_binding
 
     from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
@@ -1867,3 +1868,466 @@ def test_prefill_unsupported_view_returns_the_original_before_state_writes():
     original = lambda *a, **k: marker
     step = Step(mode="prefill", rows=33, view=SimpleNamespace(kernel_id=0))
     assert built.forward(step, original, None, None, None) is marker
+
+
+# Default slot policy: a runtime-dependent capability refusal must keep stock.
+@pytest.mark.parametrize(
+    "tp,attn_tp,dp,ep,pp",
+    [
+        (2, 2, 1, 1, 1),
+        (4, 4, 1, 1, 1),
+        (8, 8, 1, 1, 1),
+        (8, 8, 1, 4, 1),
+        (8, 1, 8, 8, 1),
+        (1, 1, 1, 1, 4),
+        (2, 2, 1, 1, 1),
+    ],
+    ids=["TP2", "TP4", "TP8", "TEP8-EP4", "DEP8", "P-TP1-PP4", "PD-D-TP2"],
+)
+def test_default_topology_build_keeps_stock_for_unavailable_slots(
+    monkeypatch, caplog, tp, attn_tp, dp, ep, pp
+):
+    from sgl_nvidia_mega.qwen3_5 import moe
+
+    monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    parallel = SimpleNamespace(
+        tp_size=tp,
+        attn_tp_size=attn_tp,
+        attn_dp_size=dp,
+        moe_ep_size=ep,
+        pp_size=pp,
+        tp_group=SimpleNamespace(world_size=tp),
+    )
+    monkeypatch.setattr("sglang.srt.runtime_context.get_parallel", lambda: parallel)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    # Real package builders receive a model whose router / fused boundary cannot
+    # be replaced. No CUDA builder may run after these capability checks fail.
+    monkeypatch.setattr(
+        moe.route,
+        "topk_unsupported",
+        lambda model: "fixture router layout is unsupported",
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            start_layer=0, end_layer=0, layers=[], flashinfer_mnnvl_cutedsl_fusion=None
+        )
+    )
+    ctx = SimpleNamespace(
+        widths=(7, 14),
+        tokens_per_request=7,
+        deadline_s=60,
+        binding=SimpleNamespace(page_size=64, tp_size=tp),
+    )
+    with caplog.at_level("INFO"):
+        built = runtime.build(model, ctx)
+    assert built is not None
+    if pp == 1:
+        assert not built.slots or not any(
+            s.route_topk or s.hop for s in built.slots.values()
+        )
+        assert "stock" in caplog.text
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("kind", ["head", "added_vocab", "embedding_dtype"])
+def test_draft_shard_capability_falls_back_only_for_default_policy(
+    monkeypatch, caplog, explicit, kind
+):
+    from sgl_nvidia_mega.qwen3_5.draft.parts import Parts
+
+    if explicit:
+        monkeypatch.setenv(runtime.SLOTS_ENV, "draft_loop,draft_multi,draft_embed")
+    else:
+        monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    p = Parts.__new__(Parts)
+    p.binding = SimpleNamespace(tp_size=4, tp_rank=0)
+    shard = SimpleNamespace(
+        org_vocab_start_index=0,
+        org_vocab_end_index=8,
+        added_vocab_start_index=32,
+        added_vocab_end_index=33 if kind == "added_vocab" else 32,
+    )
+    p.lm = SimpleNamespace(
+        lm_head=SimpleNamespace(
+            weight=torch.empty(8, 4, dtype=torch.bfloat16), shard_indices=shard
+        ),
+        logits_processor=SimpleNamespace(vocab_size=33 if kind == "head" else 32),
+    )
+    p.model = SimpleNamespace(
+        embed_tokens=SimpleNamespace(
+            shard_indices=shard,
+            weight=torch.empty(
+                8,
+                4,
+                dtype=torch.float32 if kind == "embedding_dtype" else torch.bfloat16,
+            ),
+        )
+    )
+    slot = "draft_multi" if kind == "head" else "draft_embed"
+    build = p._build_top1x if kind == "head" else p._build_embedx
+    if explicit:
+        with pytest.raises(RuntimeError) as exc:
+            build()
+        text = str(exc.value)
+        assert slot in text and ("shard" in text or "embedding" in text)
+        assert (
+            "remove it from SGLANG_NVIDIA_MEGAKERNEL_SLOTS" in text
+            and "change the topology" in text
+        )
+    else:
+        with caplog.at_level("INFO"):
+            assert build() is None
+        assert slot in caplog.text and "stock" in caplog.text
+
+
+def test_default_shard_refusal_is_shared_before_collective_allocation(
+    monkeypatch, caplog
+):
+    import torch.distributed as dist
+
+    monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+
+    def gather(out, reason, group):
+        out[:] = [reason, "peer LM head has padded vocabulary"]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    with caplog.at_level("INFO"):
+        assert not runtime.slot_supported("draft_multi", "", cpu_group=object())
+    assert (
+        "peer LM head has padded vocabulary" in caplog.text and "stock" in caplog.text
+    )
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_draft_entry_with_multiple_layers_keeps_stock_only_by_default(
+    monkeypatch, caplog, explicit
+):
+    from sgl_nvidia_mega.qwen3_5.draft.parts import Parts
+
+    if explicit:
+        monkeypatch.setenv(runtime.SLOTS_ENV, "draft_loop")
+    else:
+        monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    draft = SimpleNamespace(
+        lm=SimpleNamespace(
+            model=SimpleNamespace(
+                layers=[object(), object()], start_layer=0, end_layer=2
+            )
+        ),
+        slots=frozenset({"draft_loop"}),
+    )
+    if explicit:
+        with pytest.raises(
+            RuntimeError,
+            match="draft_loop.*2 layers.*remove it from SGLANG_NVIDIA_MEGAKERNEL_SLOTS",
+        ):
+            Parts.build(draft)
+    else:
+        with caplog.at_level("INFO"):
+            assert Parts.build(draft) is None
+        assert "stock" in caplog.text
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_default_hop_without_multicast_keeps_stock_and_other_errors_propagate(
+    monkeypatch, caplog, explicit
+):
+    from sgl_nvidia_mega.qwen3_5.boundary import hop
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop as kernels
+
+    if explicit:
+        monkeypatch.setenv(runtime.SLOTS_ENV, "hop")
+    else:
+        monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"hop"}))
+    monkeypatch.setattr(hop, "refusals", lambda *a: [])
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(
+            tp_group=SimpleNamespace(world_size=8, device_group=object())
+        ),
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            flashinfer_mnnvl_cutedsl_fusion=SimpleNamespace(rms_epsilon=1e-6)
+        )
+    )
+    ctx = SimpleNamespace(widths=(7,), deadline_s=60)
+
+    def unavailable(**kwargs):
+        raise runtime.SlotUnavailable("hop", "needs NVLink multicast mapping")
+
+    monkeypatch.setattr(kernels, "Hop", unavailable)
+    if explicit:
+        with pytest.raises(
+            RuntimeError,
+            match="hop.*NVLink multicast.*remove it from SGLANG_NVIDIA_MEGAKERNEL_SLOTS",
+        ):
+            hop.build(model, ctx)
+    else:
+        with caplog.at_level("INFO"):
+            assert hop.build(model, ctx).hop is None
+        assert "stock" in caplog.text
+
+    def broken(**kwargs):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(kernels, "Hop", broken)
+    with pytest.raises(RuntimeError, match="CUDA out of memory"):
+        hop.build(model, ctx)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_draft_moe_recipe_layout_refusal_is_stock_only_by_default(
+    monkeypatch, caplog, explicit
+):
+    from sgl_nvidia_mega.qwen3_5.draft import moe as draft_moe
+
+    if explicit:
+        monkeypatch.setenv(runtime.SLOTS_ENV, "draft_loop,draft_moe")
+    else:
+        monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    monkeypatch.setattr(
+        draft_moe,
+        "unsupported_reason",
+        lambda mlp: "expert weights in a kernel-specific TRTLLM layout",
+    )
+    if explicit:
+        with pytest.raises(
+            RuntimeError,
+            match="draft_moe.*TRTLLM.*remove it from SGLANG_NVIDIA_MEGAKERNEL_SLOTS",
+        ):
+            draft_moe.DraftMoe.build(object(), 0)
+    else:
+        with caplog.at_level("INFO"):
+            assert draft_moe.DraftMoe.build(object(), 0) is None
+        assert "draft_moe" in caplog.text and "stock" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "filter_name,slot,argument,condition",
+    [
+        ("apply_cp_lite_topology", "skv2_cp", 2, "Q/KV-head topology"),
+        ("apply_expert_parallel", "draft_moe", 8, "moe_ep_size 8"),
+        (
+            "apply_topology",
+            "draft_multi",
+            SimpleNamespace(tp_size=2, attn_dp_size=1, moe_ep_size=1),
+            "topology tp2",
+        ),
+    ],
+)
+def test_explicit_topology_filters_keep_k5_stock_fallback(
+    monkeypatch, caplog, filter_name, slot, argument, condition
+):
+    monkeypatch.setenv(runtime.SLOTS_ENV, slot)
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({slot}))
+    with caplog.at_level("INFO"):
+        dropped = getattr(runtime, filter_name)(argument)
+    assert dropped == frozenset({slot})
+    assert not runtime.SLOTS
+    assert slot in caplog.text and "stock" in caplog.text
+
+
+@pytest.mark.parametrize("slot", ["draft_multi", "draft_embed"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_draft_default_exchange_without_multicast_keeps_stock(
+    monkeypatch, caplog, slot, explicit
+):
+    from sgl_nvidia_mega.qwen3_5.draft.parts import Parts
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import top1, embed
+
+    if explicit:
+        monkeypatch.setenv(runtime.SLOTS_ENV, slot)
+    else:
+        monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    p = Parts.__new__(Parts)
+    p.device = torch.device("cpu")
+    p.binding = SimpleNamespace(
+        tp_size=4, tp_rank=0, tp_device_group=None, tp_cpu_group=None
+    )
+    shard = SimpleNamespace(
+        org_vocab_start_index=0,
+        org_vocab_end_index=8,
+        added_vocab_start_index=32,
+        added_vocab_end_index=32,
+    )
+    weight = torch.empty(8, 4, dtype=torch.bfloat16)
+    p.lm = SimpleNamespace(
+        lm_head=SimpleNamespace(weight=weight, shard_indices=shard),
+        logits_processor=SimpleNamespace(vocab_size=32),
+    )
+    p.model = SimpleNamespace(
+        embed_tokens=SimpleNamespace(weight=weight, shard_indices=shard)
+    )
+
+    def no_mapping(**kwargs):
+        raise runtime.SlotUnavailable(slot, "NVLink multicast mapping unavailable")
+
+    monkeypatch.setattr(
+        top1 if slot == "draft_multi" else embed,
+        "Top1Exchange" if slot == "draft_multi" else "EmbedExchange",
+        no_mapping,
+    )
+    build = p._build_top1x if slot == "draft_multi" else p._build_embedx
+    if explicit:
+        with pytest.raises(
+            RuntimeError,
+            match=slot + ".*multicast.*remove it from SGLANG_NVIDIA_MEGAKERNEL_SLOTS",
+        ):
+            build()
+    else:
+        with caplog.at_level("INFO"):
+            assert build() is None
+        assert slot in caplog.text and "stock" in caplog.text
+
+
+def test_multicast_refusal_is_collective_and_explicitly_named(monkeypatch):
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "all_reduce", lambda value, **kwargs: value.zero_())
+    with pytest.raises(
+        runtime.SlotUnavailable,
+        match="draft_multi.*NVLink multicast.*remove it from SGLANG_NVIDIA_MEGAKERNEL_SLOTS",
+    ):
+        runtime.require_multicast("draft_multi", 16, None, torch.device("cpu"))
+
+
+# Frozen C-arm recipe lists from A167 SLOT-INTERSECTIONS.json.
+# Expected filters were evaluated from parent 1a4e88846c060fe956224002c23ec51066ce1d5b.
+_K6_FROZEN_RECIPE_CASES = {
+    "TP2": (
+        [2, 2, 1, 1, 1],
+        "route_topk,mkm_m32,mkm_m64,mkm_m128,mkm_m256,mkm_m512,gdn_verify,gdn_pdl,gdn_conv,hop,hop_fp8,multi_request,draft_loop,draft_extend,draft_multi,draft_embed,route,route_gemm,mkm,mkm_wide,gdn_core,hop_mid,gdn_push,gdn_front,gdn_trt_front,route_shared,route_lin,skv2,mka,mka_push,lowm_in,lowm_out,lowm_se,lowm_push,skv2_cp,mkm_wide_bal,draft_moe,draft_q1,draft_xchg,draft_hop,draft_fin,draft_front,draft_skv2,draft_q1_cp,draft_skv2_cp,sharded_gumbel",
+        "gdn_conv,gdn_core,gdn_pdl,gdn_verify,mka,multi_request,route,route_gemm,route_topk,sharded_gumbel",
+    ),
+    "TP4": (
+        [4, 4, 1, 1, 1],
+        "route_topk,mkm_m32,mkm_m64,mkm_m128,mkm_m256,mkm_m512,gdn_verify,gdn_pdl,gdn_conv,hop,hop_fp8,multi_request,draft_loop,draft_extend,draft_multi,draft_embed,route,route_gemm,mkm,mkm_wide,gdn_core,hop_mid,gdn_push,gdn_front,gdn_trt_front,route_shared,route_lin,skv2,mka,mka_push,lowm_in,lowm_out,lowm_se,lowm_push,skv2_cp,mkm_wide_bal,draft_moe,draft_q1,draft_xchg,draft_hop,draft_fin,draft_front,draft_skv2,draft_q1_cp,draft_skv2_cp,sharded_gumbel",
+        "draft_embed,draft_extend,draft_fin,draft_front,draft_hop,draft_loop,draft_moe,draft_multi,draft_q1,draft_q1_cp,draft_skv2,draft_skv2_cp,draft_xchg,gdn_conv,gdn_core,gdn_pdl,gdn_push,gdn_verify,hop,hop_fp8,hop_mid,lowm_in,lowm_out,lowm_push,lowm_se,mka,mka_push,mkm,multi_request,route,route_gemm,route_shared,route_topk,sharded_gumbel,skv2,skv2_cp",
+    ),
+    "TP8": (
+        [8, 8, 1, 1, 1],
+        "route_topk,mkm_m32,mkm_m64,mkm_m128,mkm_m256,mkm_m512,gdn_verify,gdn_pdl,gdn_conv,hop,hop_mid,hop_fp8,multi_request,draft_loop,draft_extend,draft_multi,draft_embed,route,route_gemm,mkm,mkm_wide,gdn_core,gdn_push,gdn_front,gdn_trt_front,route_shared,skv2,mka,mka_push,lowm_in,lowm_out,lowm_se,lowm_push,skv2_cp,draft_moe,draft_q1,draft_xchg,draft_hop,draft_fin,draft_front,draft_skv2,draft_q1_cp,draft_skv2_cp,sharded_gumbel",
+        "draft_embed,draft_extend,draft_fin,draft_front,draft_hop,draft_loop,draft_moe,draft_multi,draft_q1,draft_q1_cp,draft_skv2,draft_skv2_cp,draft_xchg,gdn_conv,gdn_core,gdn_front,gdn_pdl,gdn_push,gdn_trt_front,gdn_verify,hop,hop_fp8,hop_mid,lowm_in,lowm_out,lowm_push,lowm_se,mka,mka_push,mkm,mkm_m128,mkm_m256,mkm_m32,mkm_m512,mkm_m64,mkm_wide,multi_request,route,route_gemm,route_lin,route_shared,route_topk,sharded_gumbel,skv2,skv2_cp",
+    ),
+    "TEP8-EP4": (
+        [8, 8, 1, 4, 1],
+        "route_topk,mkm_m32,mkm_m64,mkm_m128,mkm_m256,mkm_m512,gdn_verify,gdn_pdl,gdn_conv,hop,hop_mid,hop_fp8,multi_request,draft_loop,draft_extend,draft_multi,draft_embed,route,route_gemm,mkm,mkm_wide,gdn_core,gdn_push,gdn_front,gdn_trt_front,route_shared,skv2,mka,mka_push,lowm_in,lowm_out,lowm_se,lowm_push,skv2_cp,draft_moe,draft_q1,draft_xchg,draft_hop,draft_fin,draft_front,draft_skv2,draft_q1_cp,draft_skv2_cp,sharded_gumbel",
+        "draft_embed,draft_extend,draft_fin,draft_front,draft_hop,draft_loop,draft_multi,draft_q1,draft_q1_cp,draft_skv2,draft_skv2_cp,draft_xchg,gdn_conv,gdn_core,gdn_front,gdn_pdl,gdn_push,gdn_trt_front,gdn_verify,hop,hop_fp8,hop_mid,lowm_in,lowm_out,lowm_push,lowm_se,mka,mka_push,multi_request,route,route_gemm,route_shared,route_topk,sharded_gumbel,skv2,skv2_cp",
+    ),
+    "DEP8": (
+        [8, 1, 8, 8, 1],
+        "route_topk,mkm_m32,mkm_m64,mkm_m128,mkm_m256,mkm_m512,gdn_verify,gdn_pdl,gdn_conv,hop,hop_fp8,multi_request,draft_loop,draft_extend,draft_multi,draft_embed,route,route_gemm,mkm,mkm_wide,gdn_core,hop_mid,gdn_push,gdn_front,gdn_trt_front,route_shared,route_lin,skv2,mka,mka_push,lowm_in,lowm_out,lowm_se,lowm_push,skv2_cp,mkm_wide_bal,draft_moe,draft_q1,draft_xchg,draft_hop,draft_fin,draft_front,draft_skv2,draft_q1_cp,draft_skv2_cp,sharded_gumbel",
+        "gdn_conv,gdn_pdl,gdn_verify,mka,multi_request,sharded_gumbel",
+    ),
+    "P-TP1-PP4": ([1, 1, 1, 1, 4], "gdn_prefill_split_conv", "gdn_prefill_split_conv"),
+    "PD-D-TP2": (
+        [2, 2, 1, 1, 1],
+        "route_topk,mkm_m32,mkm_m64,mkm_m128,mkm_m256,mkm_m512,gdn_verify,gdn_pdl,gdn_conv,hop,hop_fp8,multi_request,draft_loop,draft_extend,draft_multi,draft_embed,route,route_gemm,mkm,mkm_wide,gdn_core,hop_mid,gdn_push,gdn_front,gdn_trt_front,route_shared,route_lin,skv2,mka,mka_push,lowm_in,lowm_out,lowm_se,lowm_push,skv2_cp,mkm_wide_bal,draft_moe,draft_q1,draft_xchg,draft_hop,draft_fin,draft_front,draft_skv2,draft_q1_cp,draft_skv2_cp,sharded_gumbel",
+        "gdn_conv,gdn_core,gdn_pdl,gdn_verify,mka,multi_request,route,route_gemm,route_topk,sharded_gumbel",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", _K6_FROZEN_RECIPE_CASES)
+def test_explicit_frozen_recipe_lists_keep_parent_filter_selection(
+    monkeypatch, caplog, name
+):
+    profile, requested, expected = _K6_FROZEN_RECIPE_CASES[name]
+    tp, attn_tp, dp, ep, pp = profile
+    monkeypatch.setenv(runtime.SLOTS_ENV, requested)
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    original = runtime.SLOTS
+    parallel = SimpleNamespace(
+        tp_size=tp,
+        attn_tp_size=attn_tp,
+        attn_dp_size=dp,
+        moe_ep_size=ep,
+        pp_size=pp,
+    )
+    with caplog.at_level("INFO"):
+        if pp == 4:
+            model = SimpleNamespace(
+                model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+            )
+            monkeypatch.setattr(
+                "sglang.srt.runtime_context.get_parallel", lambda: parallel
+            )
+            assert (
+                runtime.build(model, SimpleNamespace(tokens_per_request=7)) is not None
+            )
+        else:
+            runtime.apply_expert_parallel(ep)
+            runtime.apply_cp_lite_topology(attn_tp)
+            runtime.apply_topology(parallel)
+        assert runtime.slot_reasons() == []
+    assert runtime.SLOTS == frozenset(expected.split(","))
+    for slot in original - runtime.SLOTS:
+        assert slot in caplog.text
+    if original - runtime.SLOTS:
+        assert "stock" in caplog.text
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_prefill_role_filter_keeps_stock_for_extra_slots(monkeypatch, caplog, explicit):
+    requested = "gdn_prefill_split_conv,hop"
+    if explicit:
+        monkeypatch.setenv(runtime.SLOTS_ENV, requested)
+    else:
+        monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(requested.split(",")))
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel", lambda: SimpleNamespace(pp_size=4)
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    with caplog.at_level("INFO"):
+        assert runtime.build(model, SimpleNamespace(tokens_per_request=7)) is not None
+    assert (
+        "hop" in caplog.text and "only supports gdn_prefill_split_conv" in caplog.text
+    )
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_target_missing_width_keeps_k5_stock_fallback(monkeypatch, caplog, explicit):
+    from sgl_nvidia_mega.qwen3_5 import moe
+
+    if explicit:
+        monkeypatch.setenv(runtime.SLOTS_ENV, "route_topk")
+    else:
+        monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"route_topk"}))
+    parallel = SimpleNamespace(
+        tp_size=8,
+        attn_tp_size=8,
+        attn_dp_size=1,
+        moe_ep_size=1,
+        pp_size=1,
+        tp_group=None,
+    )
+    monkeypatch.setattr("sglang.srt.runtime_context.get_parallel", lambda: parallel)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        moe.route, "topk_unsupported", lambda model: "fixture unsupported router"
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            start_layer=0, end_layer=0, layers=[], flashinfer_mnnvl_cutedsl_fusion=None
+        )
+    )
+    ctx = SimpleNamespace(
+        widths=(7,),
+        tokens_per_request=7,
+        deadline_s=60,
+        binding=SimpleNamespace(page_size=64, tp_size=8),
+    )
+    with caplog.at_level("INFO"):
+        result = runtime.build(model, ctx)
+    assert result is not None
+    assert "route_topk" in caplog.text and "stock" in caplog.text

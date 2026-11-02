@@ -18,8 +18,8 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | Qwen3.5-397B-A17B (NVFP4) | GB300 (SM103) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
 | Kimi K3 (packed MXFP4) | GB300 (SM103) | 8 | One-token decode steps of 1–8, 16, 32 and 64 rows |
 
-For DeepSeek-V4.1-Flash and Qwen3.5, larger verify steps, prefill and extend run
-SGLang's standard path. Their draft specs provide the DSpark proposal and the
+For DeepSeek-V4.1-Flash, larger verify steps, prefill and extend run
+SGLang's standard path. Qwen3.5 also offers the explicit GDN prefill slot below. Their draft specs provide the DSpark proposal and the
 Qwen3.5 EAGLE entries, respectively. For Kimi K3, the plugin covers the 93-layer
 language model (24 MLA and 69 KDA layers) at the listed widths; every other call
 runs the standard path.
@@ -55,7 +55,6 @@ Qwen3.5 (`qwen3_5/runtime`) runs the same way: per layer the stage boundary (`bo
 | Slot | Rows | Kernel |
 | --- | --- | --- |
 | `route_topk`, `mkm_m32` … `mkm_m512` | 1–896 | Materialized stock routing and the shape-selected fused wide routed-expert engines |
-| `gdn_verify`, `gdn_pdl`, `gdn_conv` | 7–896 | The opened GatedDeltaNet verify chain, dependent launch, and bitwise conv update |
 | `hop`, `hop_fp8` | 1–15 | The layer boundary's fused all-reduce + residual add + RMSNorm, also writing the next static-FP8 input |
 | `multi_request` | 2–128 requests | The target graphs keep every offered request count instead of padding to a coarser width |
 | `draft_loop`, `draft_extend`, `draft_multi`, `draft_embed` | 1–128 requests | EAGLE draft entries, exact sharded top-1 and embedding exchange; the pre-FC norms write directly into the FC input |
@@ -65,6 +64,7 @@ The remaining kernel families are opt-in through that one slot policy. These cha
 | Slot | Rows | Kernel |
 | --- | --- | --- |
 | `route`, `route_gemm`, `mkm`, `mkm_wide` | 1–32 | Fused router fronts and the small routed-expert engines |
+| `gdn_verify`, `gdn_pdl`, `gdn_conv` | 7–896 | Explicit numeric verify chain and dependent variants; FP8 norm uses the v2 relative-L2 bound of 2e-2 |
 | `gdn_core` | 7–224 | ReplaySSM verify, gated norm and FP8 output in one launch |
 | `hop_mid` (with `hop`) | 16–28 | Extends the one-shot boundary mailbox through four requests instead of returning those widths to the stock boundary |
 | `gdn_push` (with `gdn_verify`, `hop`) | 7 | The GatedDeltaNet `out_proj` as the hop's GEMM, whose epilogue pushes the partial into the hop's mailbox |
@@ -79,7 +79,18 @@ includes `hop`.  It remains opt-in rather than part of the bitwise default polic
 an explicit `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` value replaces, rather than extends,
 that default list.
 
-The sampling and acceptance after the verify, and the GatedDeltaNet extend of prefill, stay SGLang's own code. In an SGLang that has the switches, `SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1` runs the sampling and acceptance in CUDA graphs, and `SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND=1` captures the GatedDeltaNet extend inside the breakable prefill CUDA graphs.
+The router-only `route`, `route_topk` and `route_gemm` slots support TP2, TP4, TP8 and TEP8 with the TRTLLM runner and no all-to-all. PD decode TP2 uses the same local row counts: batch 6/10 gives 42/70 verify rows. These fronts leave the expert GEMMs with the stock runner, so TP2 needs no fused expert engine. `route_shared` keeps its TP8/TEP8 projection bounds; DEP8 keeps stock MoE dispatch and routing.
+
+`mka` uses the fused projection kernels through 14 verify rows on TP8 and 8 on
+TP4. At wider rows, and at every TP2 width, it keeps SGLang's projection GEMMs
+and fuses Q/K normalization, RoPE and the FP8 KV write, then the output gate
+and static FP8 quantization. TP2 has 16 query heads and one KV head per rank;
+TP4 has 8/1 and TP8 has 4/1. The same front path serves PD decode TP2 and DEP8 (32/2 per rank).
+`multi_request` coverage is required for more than one request. `skv2` keeps
+its one-request, one-KV-head scope; `skv2_cp` additionally requires replicated
+KV heads across ranks.
+
+The sampling and acceptance after the verify stay SGLang's own code. `gdn_prefill_split_conv` is an explicit bitwise slot for ordinary text prefill on TP1/PP4 with the data-only prefill binding: it splits the native conv by Q/K/V channels above 8192 channels, retaining native recurrence, norm and state writes. Unsupported layouts use SGLang; an empty slot policy calls the original prefill forward directly. In an SGLang that has the switches, `SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1` runs the sampling and acceptance in CUDA graphs, and `SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND=1` captures the GatedDeltaNet extend inside the breakable prefill CUDA graphs.
 
 ### Design
 

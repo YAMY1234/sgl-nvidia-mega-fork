@@ -158,7 +158,7 @@ def _moe_block(log, x, *, alt_stream=True, shared=True, deferred_ok=True):
     mlp = qwen2_moe.Qwen2MoeSparseMoeBlock.__new__(qwen2_moe.Qwen2MoeSparseMoeBlock)
     torch.nn.Module.__init__(mlp)
     bypassed = SimpleNamespace(format="bypassed")
-    routed = torch.zeros(7, 4)
+    routed = torch.zeros(x.shape[0], 4)
     log.known["routed"] = routed
     experts = _Callable(
         log.op("experts", routed),
@@ -172,7 +172,10 @@ def _moe_block(log, x, *, alt_stream=True, shared=True, deferred_ok=True):
         _use_mega_moe=False,
         layer_id=3,
         gate=_Callable(log.op("gate", ("logits", None))),
-        topk=_Callable(log.op("topk", bypassed)),
+        topk=_Callable(
+            log.op("topk", bypassed),
+            empty_topk_output=log.op("empty_topk", bypassed),
+        ),
         experts=experts,
         shared_expert=_Callable(log.op("shared", "shared_out")) if shared else None,
         shared_expert_gate=_Callable(
@@ -244,6 +247,25 @@ def test_the_moe_step_issues_what_sglang_issues(capture, defer, alt_stream):
     (want_log, want), (got_log, got) = runs
     assert got_log == want_log
     assert want == got if not isinstance(want, torch.Tensor) else torch.equal(want, got)
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_empty_dp_rank_skips_gate_and_shared_but_runs_experts(capture):
+    runs = []
+    for which in ("sglang", "plugin"):
+        x = torch.zeros(0, 4)
+        log = _log(x=x)
+        mlp = _moe_block(log, x)
+        with _streams(log, capture), _moe_kernels(log):
+            if which == "sglang":
+                out = mlp.forward(x, None)
+            else:
+                out = moe.step(SimpleNamespace(mlp=mlp), x, _st(), defer=False)
+        runs.append((log, out))
+    (want_log, want), (got_log, got) = runs
+    assert got_log == want_log
+    assert [entry[0] for entry in got_log] == ["empty_topk", "experts"]
+    assert want.shape == got.shape == (0, 4)
 
 
 def _st(route=False):
@@ -934,7 +956,7 @@ def test_the_draft_mkm_uses_the_complete_slot_schema(monkeypatch):
     assert not slots.route_lin and not slots.route_pre_topk
 
 
-def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch):
+def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch, caplog):
     from sgl_nvidia_mega.qwen3_5.moe import route
 
     mlp = _moe_block(_log(), torch.zeros(7, 4))
@@ -957,10 +979,12 @@ def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch):
     )
     want = "layer 0: router gate torch.float16 (512, 4096)"
     assert route.build(model, 7, fused=False).reason == want
-    with pytest.raises(
-        RuntimeError, match="requested slots \\['route'\\] built no width"
-    ):
-        runtime.build(model, ctx)
+    with caplog.at_level("INFO"):
+        built = runtime.build(model, ctx)
+    assert built.slots == {7: plan.Slots()}
+    assert "none (stock)" in built.summary()
+    assert "requested slots ['route'] use stock" in caplog.text
+    assert want in caplog.text
 
 
 def _gdn_build_model():
@@ -3210,10 +3234,12 @@ class _MoeBlock(qwen2_moe.Qwen2MoeSparseMoeBlock):
         return "moe_out"
 
 
-def _decoder_layer(kind, log, defer):
+def _decoder_layer(kind, log, defer, rows=7, tuple_input=False):
     layer = kind.__new__(kind)
     torch.nn.Module.__init__(layer)
-    a_in, m_in = torch.zeros(7, 4), torch.zeros(7, 4)
+    a_in, m_in = torch.zeros(rows, 4), torch.zeros(rows, 4)
+    if tuple_input:
+        a_in = (a_in, "scale")
     log.known.update(a_in=a_in, m_in=m_in)
     layer.mlp = _MoeBlock(log)
     layer.__dict__.update(
@@ -3235,12 +3261,17 @@ def _decoder_layer(kind, log, defer):
     "kind", [qwen3_5.Qwen3_5LinearDecoderLayer, qwen3_5.Qwen3_5AttentionDecoderLayer]
 )
 @pytest.mark.parametrize("defer", [False, True])
-def test_a_layer_runs_what_sglangs_decoder_layer_runs(kind, defer):
-    batch = SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: False))
+@pytest.mark.parametrize(
+    "rows,idle,tuple_input", [(7, False, True), (0, False, False), (7, True, False)]
+)
+def test_a_layer_runs_what_sglangs_decoder_layer_runs(
+    kind, defer, rows, idle, tuple_input
+):
+    batch = SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: idle))
     runs = []
     for which in ("sglang", "plugin"):
         log = _log(hidden="hidden", batch=batch, positions="pos", h1="h1", part="part")
-        layer = _decoder_layer(kind, log, defer)
+        layer = _decoder_layer(kind, log, defer, rows=rows, tuple_input=tuple_input)
         if which == "sglang":
             out = layer.forward(
                 positions="pos",
@@ -3265,6 +3296,7 @@ def test_a_layer_runs_what_sglangs_decoder_layer_runs(kind, defer):
         runs.append((log, out))
     (want_log, want), (got_log, got) = runs
     assert got_log == want_log and want == got == "layer_out"
+    assert any(entry[0] == "mixer" for entry in got_log) == (rows > 0 and not idle)
 
 
 def test_the_layer_loop_opens_the_stream_scopes_each_layer_and_closes_it(monkeypatch):

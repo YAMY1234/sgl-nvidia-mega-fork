@@ -61,9 +61,6 @@ def test_the_default_policy_ships_only_bitwise_shape_bounded_paths(monkeypatch):
             "mkm_m128",
             "mkm_m256",
             "mkm_m512",
-            "gdn_verify",
-            "gdn_pdl",
-            "gdn_conv",
             "hop",
             "hop_fp8",
             "multi_request",
@@ -173,9 +170,17 @@ def test_config_filter_derives_attention_tp_before_publication(monkeypatch):
     )
     monkeypatch.setattr(target, "text_config_reasons", lambda hf_config: [])
     monkeypatch.setattr(target, "binding_reasons", lambda: [])
-    monkeypatch.setattr(runtime, "slot_reasons", lambda: [])
+    monkeypatch.setattr(runtime, "slot_reasons", lambda requested=None: [])
     monkeypatch.setattr(target, "pd_reasons", lambda cfg: [])
-    cfg = SimpleNamespace(tp_size=8, attn_cp_size=1, attn_dp_size=8, ep_size=8)
+    cfg = SimpleNamespace(
+        tp_size=8,
+        attn_cp_size=1,
+        attn_dp_size=8,
+        ep_size=8,
+        enable_dp_attention=True,
+        dp_size=8,
+        disaggregation_mode="decode",
+    )
 
     assert not hasattr(cfg, "attn_tp_size")
     assert target._config_disable_reasons(cfg, SimpleNamespace()) == []
@@ -598,7 +603,9 @@ def test_the_covered_widths_are_the_ones_the_build_returns():
     assert built.plan(torch.zeros(21, dtype=torch.int64), _batch()) is None
 
 
-@pytest.mark.parametrize("tp_size, want", [(8, (7,)), (4, (7,))])
+@pytest.mark.parametrize(
+    "tp_size, want", [(8, (7,)), (4, (7, 14, 21, 28)), (2, (7, 14, 21, 28))]
+)
 def test_the_build_covers_more_requests_only_where_a_slot_runs(
     monkeypatch, tp_size, want
 ):
@@ -618,7 +625,7 @@ def test_the_build_covers_more_requests_only_where_a_slot_runs(
         binding="EagleBinding",
     )
     built = runtime.build(model, ctx)
-    assert built.widths == want and built.summary() == "slots none (stock)"
+    assert built.widths == want and built.summary().startswith("slots none (stock)")
 
 
 def test_the_build_hands_over_the_binding_and_ships_the_bitwise_draft_entries():
@@ -1726,6 +1733,65 @@ def test_the_step_state_carries_the_binding():
         "EagleBinding",
         "EagleForwardView",
     )
+
+
+@pytest.mark.parametrize(
+    "shape, name, on, off",
+    [
+        ((2,), "tp2", {"gdn_core", "mka", "route_topk"}, {"gdn_push", "draft_loop"}),
+        ((4,), "tp4", {"gdn_push", "skv2", "draft_loop"}, {"gdn_front", "mkm_m32"}),
+        ((8,), "tp8", {"gdn_front", "route_lin", "mkm_m32", "draft_moe"}, set()),
+        ((8, 1, 8), "tep8", {"gdn_front", "draft_loop"}, {"draft_moe"}),
+        ((8, 8, 8), "dep8", {"gdn_verify", "mka"}, {"gdn_core", "route", "draft_loop"}),
+    ],
+)
+def test_each_topology_selects_only_its_declared_slots(shape, name, on, off):
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    topo = topology.Topology(*shape)
+    got = topology.select(frozenset(topology.SLOT_TOPOLOGIES), topo)
+    assert topo.name == name and on <= got and not off & got
+    assert not topology.select(frozenset({"undeclared"}), topo)
+
+
+def test_every_slot_declares_its_topologies():
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    known = set(
+        (
+            *runtime.SHIPPED_SLOTS,
+            *runtime.OPT_IN_SLOTS,
+            *runtime.OPT_IN_VARIANTS,
+            *runtime.DRAFT_ENTRIES,
+            *runtime.DRAFT_SLOTS,
+            *runtime.OPT_IN_COVERAGE,
+            *runtime.HOOK_SLOTS,
+        )
+    )
+    assert set(topology.SLOT_TOPOLOGIES) == known
+
+
+def test_unsupported_specialization_does_not_disable_a_supported_slot(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import topology
+
+    monkeypatch.setitem(topology.SLOT_TOPOLOGIES, "gdn_verify", topology.TOPOLOGIES)
+    requested = frozenset({"gdn_verify", "gdn_front", "gdn_pdl", "multi_request"})
+    selected = topology.select(requested, topology.Topology(2))
+    assert selected == frozenset({"gdn_verify", "gdn_pdl", "multi_request"})
+    assert runtime.slot_reasons(selected) == []
+
+
+def test_tp2_keeps_the_draft_stock(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import draft, topology
+
+    monkeypatch.setattr(runtime, "build_cp_lite", lambda binding: None)
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(topology.SLOT_TOPOLOGIES))
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=2, attn_tp_size=2, moe_ep_size=1),
+    )
+    built = draft.SPEC.build("lm", SimpleNamespace(context_len=8192), _draft_ctx())
+    assert not built.slots and built.draft_loop is None and built.draft_extend is None
 
 
 @pytest.mark.parametrize("enabled", [False, True])

@@ -30,6 +30,7 @@ from sgl_nvidia_mega.qwen3_5 import (
 @pytest.fixture(autouse=True)
 def registered(monkeypatch):
     monkeypatch.setattr(registry, "_REGISTRY", {})
+    monkeypatch.setattr(runtime, "SLOTS", runtime.SLOTS)
     monkeypatch.delenv(plugin.PARITY_SORT_ENV, raising=False)
     plugin.register()
 
@@ -89,6 +90,28 @@ def test_the_decode_side_of_pd_is_accepted():
     assert _refusal(disaggregation_mode="decode") == ""
 
 
+def test_an_unsupported_prefill_topology_is_refused():
+    message = _refusal(
+        disaggregation_mode="prefill", enable_linear_replayssm_spec=False
+    )
+    assert "PD prefill requires TP1/PP4" in message, message
+
+
+def test_prefill_tp1_pp4_is_admitted_with_the_data_only_binding():
+    assert (
+        _refusal(
+            tp_size=1,
+            nnodes=1,
+            pp_size=4,
+            disaggregation_mode="prefill",
+            enable_linear_replayssm_spec=False,
+            moe_runner_backend="flashinfer_cutedsl",
+            flashinfer_allreduce_fusion_backend=None,
+        )
+        == ""
+    )
+
+
 BREAKABLE = with_phase(
     default_cuda_graph_config(), Phase.DECODE, backend=Backend.BREAKABLE
 )
@@ -97,9 +120,9 @@ BREAKABLE = with_phase(
 @pytest.mark.parametrize(
     "kw, want",
     [
-        (dict(tp_size=2, nnodes=1), "tp_size 2"),
+        (dict(tp_size=1, nnodes=1), "tp_size 1"),
         (dict(pp_size=2), "pipeline parallelism is in use"),
-        (dict(enable_dp_attention=True, dp_size=8), "DP attention is in use"),
+        (dict(enable_dp_attention=True, dp_size=4), "DP attention requires DEP8"),
         (dict(kv_cache_dtype="auto"), "kv_cache_dtype 'auto'"),
         (dict(speculative_algorithm=None), "speculative_algorithm None"),
         (dict(speculative_eagle_topk=4), "speculative_eagle_topk 4"),
@@ -220,7 +243,7 @@ def test_a_slot_set_that_cannot_run_is_refused_before_the_load(
 
 
 def test_every_reason_is_listed_at_once():
-    message = _refusal(tp_size=2, nnodes=1, kv_cache_dtype="auto", pp_size=2)
+    message = _refusal(tp_size=1, nnodes=1, kv_cache_dtype="auto", pp_size=2)
     assert message.count("\n  - ") == 3, message
 
 
@@ -577,7 +600,10 @@ def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
     assert dict(tiled_route.tolerances) == spec.NUMERIC_TOLERANCES["route_gemm"]
     claim = spec.numerics(frozenset({"gdn_verify", "hop", "gdn_push"}))
     assert claim.kind is NumericsKind.TOLERANCE
-    assert dict(claim.tolerances) == spec.NUMERIC_TOLERANCES["gdn_push"]
+    assert dict(claim.tolerances) == {
+        **spec.NUMERIC_TOLERANCES["gdn_push"],
+        **spec.NUMERIC_TOLERANCES["gdn_verify"],
+    }
     shared = spec.numerics(frozenset({"route", "route_shared"}))
     assert dict(shared.tolerances) == {
         **spec.NUMERIC_TOLERANCES["route"],
@@ -585,11 +611,15 @@ def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
     }
     both = spec.numerics(frozenset({"gdn_verify", "gdn_pdl", "gdn_front", "gdn_push"}))
     assert dict(both.tolerances) == {
+        **spec.NUMERIC_TOLERANCES["gdn_verify"],
         **spec.NUMERIC_TOLERANCES["gdn_push"],
         **spec.NUMERIC_TOLERANCES["gdn_front"],
     }
     core = spec.numerics(frozenset({"gdn_verify", "gdn_core"}))
-    assert dict(core.tolerances) == spec.NUMERIC_TOLERANCES["gdn_core"]
+    assert dict(core.tolerances) == {
+        **spec.NUMERIC_TOLERANCES["gdn_core"],
+        **spec.NUMERIC_TOLERANCES["gdn_verify"],
+    }
     attention = spec.numerics(frozenset({"skv2", "mka", "mka_push", "hop"}))
     assert attention.kind is NumericsKind.TOLERANCE
     assert dict(attention.tolerances) == {
@@ -628,3 +658,24 @@ def test_the_shipped_policy_claims_bitwise_numerics():
     shipped = frozenset(runtime.SHIPPED_SLOTS)
     assert spec.numerics(shipped).kind is NumericsKind.BITWISE
     assert draft.numerics(shipped).kind is NumericsKind.BITWISE
+
+
+@pytest.mark.parametrize("tp, pd", [(2, "decode"), (4, "null")])
+def test_topology_admission_is_driven_by_plugin_capabilities(tp, pd):
+    assert _refusal(tp_size=tp, nnodes=1, disaggregation_mode=pd) == ""
+
+
+def test_dep8_accepts_the_recipe_stock_moe_and_dp_lm_head():
+    assert (
+        _refusal(
+            disaggregation_mode="decode",
+            enable_dp_attention=True,
+            dp_size=8,
+            ep_size=8,
+            enable_dp_lm_head=True,
+            moe_runner_backend="flashinfer_cutedsl",
+            moe_a2a_backend="flashinfer",
+            flashinfer_allreduce_fusion_backend=None,
+        )
+        == ""
+    )

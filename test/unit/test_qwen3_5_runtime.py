@@ -242,7 +242,7 @@ def test_requested_cp_state_does_not_restore_a_device_length_gate():
     assert [cp._gate_thr(batch) for batch in (2, 4, 16)] == [None, None, None]
 
 
-def test_cp_exact_selector_keeps_r11s_unbalanced_batch_cap():
+def test_cp_exact_selector_admits_verify_and_q1_64():
     from sgl_nvidia_mega.qwen3_5.sm103.attention import q35_cp_fused as fused
     from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
 
@@ -251,13 +251,9 @@ def test_cp_exact_selector_keeps_r11s_unbalanced_batch_cap():
     cp.hq = 4
     cp.sms = 132
 
-    assert (fused.MAX_BATCH, fused.MAX_BATCH_Q1) == (32, 32)
-    assert [cp._exact_supported(7, batch) for batch in (32, 64, 128)] == [
-        True,
-        False,
-        False,
-    ]
-    assert [cp._exact_supported(1, batch) for batch in (32, 64)] == [True, False]
+    assert (fused.MAX_BATCH, fused.MAX_BATCH_Q1) == (64, 64)
+    assert [cp._exact_supported(7, batch) for batch in (64, 65)] == [True, False]
+    assert [cp._exact_supported(1, batch) for batch in (64, 65)] == [True, False]
 
 
 def test_cp_call_override_pairs_the_exact_partial_and_merge_order(monkeypatch):

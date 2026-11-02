@@ -390,6 +390,10 @@ class MkdBoundary:
         """The one-row draft logits [1, N] bf16 on this rank's shard (the exchange then
         reads the per-CTA maxima). For an armed step with the head installed."""
         x = hidden_states.to(torch.bfloat16).contiguous()
+        if self.head_part is None:
+            # TP2's BF16 head shard is wider than the fused head's 16-bit row key.
+            # The exchange selects over its full row ids, behind SGLang's linear op.
+            return torch.nn.functional.linear(x, self.lm_head_weight)
         logits = torch.empty(
             1, self.lm_head_weight.shape[0], dtype=torch.bfloat16, device=x.device
         )

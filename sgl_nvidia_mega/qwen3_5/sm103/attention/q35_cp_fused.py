@@ -47,11 +47,13 @@ _WIDE_PLAN_MAX_BATCH = 64
 _LANE_PLAN_MAX_BATCH = 32
 
 
-# Keep the production selector on R11's unbalanced lane plan.  The wide and
-# two-slot kernels remain available to explicit test hooks, but R11 did not
-# select them when SGLANG_PLB_CP_BALANCED was disabled.
-MAX_BATCH = _LANE_PLAN_MAX_BATCH
-MAX_BATCH_Q1 = _LANE_PLAN_MAX_BATCH
+# Production default: distribute the grid's CTAs by owned KV length, including
+# batches <= 32. Match R11 TEP8's 64-request admission for verify and draft.
+# This is a plugin policy, not an environment switch; explicit split-mode test
+# overrides below retain their separate counter requirement.
+_DEFAULT_BALANCED = True
+MAX_BATCH = _WIDE_PLAN_MAX_BATCH
+MAX_BATCH_Q1 = _WIDE_PLAN_MAX_BATCH
 # Pack every two-slot call; the unpacked form remains available as a test hook.
 _TWO_SLOT_PACK = True
 
@@ -275,12 +277,13 @@ def q35_cp_fused_supported(
         and batch <= sm_count
     ):
         return False
-    if batch > _LANE_PLAN_MAX_BATCH:
+    if _DEFAULT_BALANCED:
         return batch < _num_ctas(
             sm_count
         )  # the plan gives every request a CTA; it plans <= 128 requests
     return (
-        cp_partial_geometry(rows, _num_splits(batch, sm_count))["max_cov_rows"]
+        batch <= _LANE_PLAN_MAX_BATCH
+        and cp_partial_geometry(rows, _num_splits(batch, sm_count))["max_cov_rows"]
         <= _MAX_COMB_ROWS
     )
 
@@ -562,7 +565,8 @@ def q35_cp_fused_partial(
     rows, hq] FP32 (base 2). Test hooks: debug (int64 [b * splits, 16] %globaltimer stamps; [CTAs, 16] when balanced),
     unsafe_skip_wait (no dependency waits), n_splits (must come with its own ``counters``: every launch on a counter
     row must use the same split count; balanced: the grid's CTAs), fresh_margin, balanced (a test override of the
-    split mode; the wide runtime path selects it automatically and an override needs its own ``counters``), plan
+    split mode; production defaults to KV-balanced allocation at every admitted batch,
+    and an override needs its own ``counters``), plan
     ("lane", "wide", "quad" or "two": the wide split's plan variant instead of the one the batch selects; lane / wide
     / quad cover up to 32 / 64 / 128 requests and compute the same one-slot plan, "two" (up to 128) the two-slot plan,
     with [CTAs, 24] debug rows), pack (a test override of the packed two-slot plan).
@@ -620,7 +624,7 @@ def q35_cp_fused_partial(
     device = q_all.device
     sms = sm_count or _sm_count(device)
     state = _state(device, sms)
-    bal = b > _LANE_PLAN_MAX_BATCH if balanced is None else bool(balanced)
+    bal = _DEFAULT_BALANCED if balanced is None else bool(balanced)
     assert bal or b <= _LANE_PLAN_MAX_BATCH, "the equal split handles <= 32 requests"
     # plan variant: lane (<= 32 requests), wide (33..64), two-slot (65..128); `plan` overrides it in tests (also
     # "quad": the one-slot plan for 65..128)
@@ -677,7 +681,7 @@ def q35_cp_fused_partial(
         if balanced is None and not state.balanced_logged:
             state.balanced_logged = True
             logger.info(
-                f"CP-lite first wide-plan call (q_len {q_len}, batch {b}, "
+                f"CP-lite first balanced call (q_len {q_len}, batch {b}, "
                 f"cp_rank {cp_rank}, {splits} CTAs)"
             )
         if wide and balanced is None and not state.wide_logged:

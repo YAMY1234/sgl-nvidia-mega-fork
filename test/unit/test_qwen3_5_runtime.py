@@ -1694,3 +1694,54 @@ def test_the_step_state_carries_the_binding():
         "EagleBinding",
         "EagleForwardView",
     )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("mm_inputs", [None, [None]])
+def test_prefill_plan_uses_actual_chunk_rows_and_stock_when_slot_off(
+    enabled, mm_inputs
+):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), enabled)
+    fb = SimpleNamespace(mm_inputs=mm_inputs, forward_mode=ForwardMode.EXTEND)
+    step = built.plan(torch.zeros(33, dtype=torch.int64), fb)
+    if enabled:
+        assert step.mode == "prefill" and step.rows == 33
+    else:
+        assert step is None
+    fb.forward_mode = ForwardMode.TARGET_VERIFY
+    assert built.plan(torch.zeros(7, dtype=torch.int64), fb) is None
+
+
+def test_prefill_plan_keeps_real_multimodal_batches_on_stock():
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), True)
+    fb = SimpleNamespace(mm_inputs=[None, object()], forward_mode=ForwardMode.EXTEND)
+    assert built.plan(torch.zeros(33, dtype=torch.int64), fb) is None
+
+
+def test_prefill_unsupported_view_returns_the_original_before_state_writes():
+    from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), True)
+    marker = object()
+    original = lambda *a, **k: marker
+    step = Step(mode="prefill", rows=33, view=SimpleNamespace(kernel_id=0))
+    assert built.forward(step, original, None, None, None) is marker

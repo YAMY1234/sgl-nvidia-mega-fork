@@ -122,6 +122,70 @@ def _requested_slots() -> frozenset:
 SLOTS = _requested_slots()
 
 
+def slot_failure(slots, reason: str) -> str:
+    """A requested slot's failed capability, including the recovery action."""
+    names = [slots] if isinstance(slots, str) else sorted(slots)
+    label = f"slot {names[0]}" if len(names) == 1 else f"slots {names}"
+    return (
+        f"NVIDIA megakernel: {label} cannot run: {reason}; "
+        f"remove it from {SLOTS_ENV} or change the topology"
+    )
+
+
+class SlotUnavailable(RuntimeError):
+    """A build capability refusal, distinct from CUDA errors and kernel failures."""
+
+    def __init__(self, slots, reason: str):
+        self.slots, self.reason = slots, reason
+        super().__init__(slot_failure(slots, reason))
+
+
+def require_multicast(slots, pointer: int, group, device) -> None:
+    """All ranks reject an unavailable mapping before any consumer starts."""
+    import torch
+    import torch.distributed as dist
+
+    valid = torch.tensor(
+        [bool(pointer) and pointer % 16 == 0], dtype=torch.int32, device=device
+    )
+    dist.all_reduce(valid, op=dist.ReduceOp.MIN, group=group)
+    if not int(valid.item()):
+        raise SlotUnavailable(
+            slots, "needs an aligned NVLink multicast mapping on every rank"
+        )
+
+
+def unavailable_slots(slots, reason: str) -> None:
+    """Keep defaults optional at a capability check that was already strict.
+
+    Called at the capability check, before the unavailable implementation runs.
+    The caller keeps its existing stock implementation / unserved entry.
+    """
+    names = [slots] if isinstance(slots, str) else sorted(slots)
+    if names and os.environ.get(SLOTS_ENV) is not None:
+        raise RuntimeError(slot_failure(slots, reason))
+    logger.info(
+        "NVIDIA megakernel: requested slots %s use stock (default policy; %s)",
+        names,
+        reason,
+    )
+
+
+def slot_supported(slots, reason: str, *, cpu_group=None) -> bool:
+    """Agree on rank-local shard checks before an exchange's collective allocation."""
+    if cpu_group is not None:
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            reasons = [None] * dist.get_world_size(cpu_group)
+            dist.all_gather_object(reasons, reason, group=cpu_group)
+            reason = "; ".join(dict.fromkeys(r for r in reasons if r))
+    if not reason:
+        return True
+    unavailable_slots(slots, reason)
+    return False
+
+
 def apply_cp_lite_topology(attention_tp_size: int) -> frozenset:
     """Drop CP-lite slots when the attention-TP Q/KV topology cannot serve them."""
     from sgl_nvidia_mega.qwen3_5 import cp_lite_topology
@@ -165,10 +229,10 @@ def build_cp_lite(binding) -> None:
         what="Qwen3.5 CP page size and TP size",
     )
     if binding.page_size != 64:
-        raise RuntimeError(
-            "NVIDIA megakernel: Qwen3.5 CP slots need page size 64 "
-            f"(got {binding.page_size})"
+        unavailable_slots(
+            requested, f"CP slots need page size 64 (got {binding.page_size})"
         )
+        return
 
     import torch
 
@@ -176,9 +240,8 @@ def build_cp_lite(binding) -> None:
 
     cp = CpLite.maybe_create(binding, torch.device("cuda", torch.cuda.current_device()))
     if cp is None:
-        raise RuntimeError(
-            "NVIDIA megakernel: Qwen3.5 CP slots need a supported attention-TP "
-            "Q/KV-head topology"
+        unavailable_slots(
+            requested, "CP slots need a supported attention-TP Q/KV-head topology"
         )
 
 
@@ -191,6 +254,13 @@ def apply_expert_parallel(ep_size: int) -> frozenset:
         return frozenset()
     dropped = SLOTS & EP_STOCK_SLOTS
     SLOTS = SLOTS - EP_STOCK_SLOTS
+    if dropped:
+        logger.info(
+            "NVIDIA megakernel: slots %s use stock under expert parallelism "
+            "(moe_ep_size %d)",
+            sorted(dropped),
+            ep_size,
+        )
     return dropped
 
 
@@ -202,6 +272,12 @@ def apply_topology(parallel) -> frozenset:
     selected = topology.select(SLOTS, topology.from_parallel(parallel))
     dropped = SLOTS - selected
     SLOTS = selected
+    if dropped:
+        logger.info(
+            "NVIDIA megakernel: slots %s use stock (topology %s)",
+            sorted(dropped),
+            topology.from_parallel(parallel).name,
+        )
     return dropped
 
 
@@ -436,6 +512,13 @@ def build(model, ctx):
     if getattr(parallel, "pp_size", 1) == 4:
         from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
 
+        unsupported = SLOTS - {"gdn_prefill_split_conv"}
+        if unsupported:
+            logger.info(
+                "NVIDIA megakernel: slots %s use stock (PD prefill TP1/PP4 "
+                "only supports gdn_prefill_split_conv)",
+                sorted(unsupported),
+            )
         return Qwen35Prefill(model, ctx, "gdn_prefill_split_conv" in SLOTS)
 
     dropped = apply_expert_parallel(parallel.moe_ep_size)
@@ -463,9 +546,11 @@ def build(model, ctx):
         multi = slot_plan.multi_request(parallel.tp_size, SLOTS)
     widths = slot_plan.candidates(ctx.widths, ctx.tokens_per_request, multi)
     if not widths:
-        raise RuntimeError(
-            f"NVIDIA megakernel: {ctx.tokens_per_request} rows a request leave no "
-            "covered width"
+        unavailable_slots(
+            SLOTS, f"{ctx.tokens_per_request} rows a request leave no covered width"
+        )
+        return Qwen35Verify(
+            model, {}, {}, (), binding=ctx.binding, summary="none (stock)"
         )
     pctx = PackageContext(
         widths=widths,

@@ -32,6 +32,8 @@ import torch
 
 from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
 
+from sgl_nvidia_mega.qwen3_5.runtime import slot_failure
+
 logger = logging.getLogger(__name__)
 # Memo rows built per launch at construction
 _MEMO_BLOCK = 4096
@@ -185,7 +187,9 @@ class MkdBoundary:
         self.embed_weight, self.local_vocab = embed_shard, rows
         if vocab_start != rank * rows:
             raise RuntimeError(
-                "MKD draft boundary: vocabulary shard is not the rank-th equal slice"
+                slot_failure(
+                    "draft_xchg", "vocabulary shard is not the rank-th equal slice"
+                )
             )
         # Full vocabulary: candidate position p (rank-major) is vocabulary id p.
         self.hot_ids = torch.arange(rows * world, dtype=torch.int64).to(dev)
@@ -304,8 +308,10 @@ class MkdBoundary:
         dist.all_reduce(bad_t, group=self._device_group)
         if int(bad_t[0]) != 0:
             raise RuntimeError(
-                f"MKD memo table differs from the split fc on {int(bad_t[0])} of "
-                f"{int(bad_t[1])} rows"
+                slot_failure(
+                    "draft_xchg",
+                    f"MKD memo table differs from the split fc on {int(bad_t[0])} of {int(bad_t[1])} rows",
+                )
             )
         logger.info(
             "MKD memo table: %d rows on this rank (%.1f MB), equal to the split fc on all %d rows.",
@@ -524,7 +530,9 @@ class MkdBoundary:
         topk_index, topk_p = self.topk_index[step][:m], self.topk_p[step][:m]
         if not self.armed:
             raise RuntimeError(
-                "MKD draft boundary: only armed (one-row) steps take the exchange"
+                slot_failure(
+                    "draft_xchg", "only armed (one-row) steps take the exchange"
+                )
             )
         self.exchange(
             local_logits,

@@ -38,7 +38,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 from sgl_nvidia_mega.qwen3_5 import attention, boundary, gdn, logits, moe
 from sgl_nvidia_mega.qwen3_5.attention import route as _attention_route  # noqa: F401
 from sgl_nvidia_mega.qwen3_5.gdn import verify as _gdn_verify  # noqa: F401
-from sgl_nvidia_mega.qwen3_5.runtime import embedding
+from sgl_nvidia_mega.qwen3_5.runtime import embedding, slot_failure
 from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -191,33 +191,23 @@ class Qwen35Verify:
                 view.mamba, self.binding.tokens_per_request
             )
             if reasons:
-                raise RuntimeError(
-                    "NVIDIA megakernel: slot gdn_verify cannot run: "
-                    + "; ".join(reasons)
-                )
+                raise RuntimeError(slot_failure("gdn_verify", "; ".join(reasons)))
         if any(s.gdn_conv for s in self.slots.values()):
             reasons = gdn.verify.conv_pool_reasons(
                 view.mamba, self.binding.tokens_per_request
             )
             if reasons:
-                raise RuntimeError(
-                    "NVIDIA megakernel: slot gdn_conv cannot run: " + "; ".join(reasons)
-                )
+                raise RuntimeError(slot_failure("gdn_conv", "; ".join(reasons)))
         if any(s.gdn_core for s in self.slots.values()):
             reasons = gdn.verify.core_pool_reasons(view.mamba)
             if reasons:
-                raise RuntimeError(
-                    "NVIDIA megakernel: slot gdn_core cannot run: " + "; ".join(reasons)
-                )
+                raise RuntimeError(slot_failure("gdn_core", "; ".join(reasons)))
         if any(s.gdn_front for s in self.slots.values()):
             from sgl_nvidia_mega.qwen3_5.gdn import front
 
             reasons = front.pool_reasons(view.mamba)
             if reasons:
-                raise RuntimeError(
-                    "NVIDIA megakernel: slot gdn_front cannot run: "
-                    + "; ".join(reasons)
-                )
+                raise RuntimeError(slot_failure("gdn_front", "; ".join(reasons)))
             front.prepare(
                 self.lm,
                 view.mamba,
@@ -229,8 +219,10 @@ class Qwen35Verify:
             reasons = attention.pool_reasons(view, self.binding, skv2=skv2, mka=mka)
             if reasons:
                 raise RuntimeError(
-                    "NVIDIA megakernel: the attention slots cannot run: "
-                    + "; ".join(reasons)
+                    slot_failure(
+                        {n for n, on in (("skv2", skv2), ("mka", mka)) if on},
+                        "; ".join(reasons),
+                    )
                 )
         self._pools_checked = True
 

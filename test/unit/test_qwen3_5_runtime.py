@@ -112,6 +112,7 @@ def test_cp_slots_build_the_plugin_state_before_validation(monkeypatch):
 
 
 def test_cp_slots_refuse_an_incompatible_page_or_topology(monkeypatch):
+    monkeypatch.setenv(runtime.SLOTS_ENV, "skv2_cp")
     from sglang.srt.kernel_plugins.nvidia import binding as plugin_binding
 
     from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
@@ -1867,3 +1868,134 @@ def test_prefill_unsupported_view_returns_the_original_before_state_writes():
     original = lambda *a, **k: marker
     step = Step(mode="prefill", rows=33, view=SimpleNamespace(kernel_id=0))
     assert built.forward(step, original, None, None, None) is marker
+
+
+# The frozen C-arm recipe lists (A167 SLOT-INTERSECTIONS.json) and what the
+# topology filters keep of them, as evaluated on parent 1a4e8884; the TP8 plan
+# also adds route_lin and mkm_wide_bal.
+_RECIPE = frozenset(
+    """
+    route route_topk route_gemm route_shared route_lin mkm mkm_wide mkm_wide_bal
+    mkm_m32 mkm_m64 mkm_m128 mkm_m256 mkm_m512 gdn_verify gdn_pdl gdn_conv gdn_core
+    gdn_push gdn_front gdn_trt_front hop hop_mid hop_fp8 skv2 skv2_cp mka mka_push
+    lowm_in lowm_out lowm_se lowm_push multi_request sharded_gumbel draft_loop
+    draft_extend draft_multi draft_embed draft_moe draft_q1 draft_xchg draft_hop
+    draft_fin draft_front draft_skv2 draft_q1_cp draft_skv2_cp
+    """.split()
+)
+_TP8_RECIPE = _RECIPE - {"route_lin", "mkm_wide_bal"}
+_WIDE_MKM = {"mkm_wide", "mkm_m32", "mkm_m64", "mkm_m128", "mkm_m256", "mkm_m512"}
+_RECIPES = {
+    "TP2": (
+        (2, 2, 1, 1, 1),
+        _RECIPE,
+        {"gdn_verify", "gdn_pdl", "gdn_conv", "gdn_core", "mka", "multi_request"}
+        | {"route", "route_topk", "route_gemm", "sharded_gumbel"},
+    ),
+    "TP4": (
+        (4, 4, 1, 1, 1),
+        _RECIPE,
+        _RECIPE
+        - _WIDE_MKM
+        - {"mkm_wide_bal", "gdn_front", "gdn_trt_front", "route_lin"},
+    ),
+    "TP8": ((8, 8, 1, 1, 1), _TP8_RECIPE, _RECIPE),
+    "TEP8-EP4": (
+        (8, 8, 1, 4, 1),
+        _TP8_RECIPE,
+        _TP8_RECIPE - _WIDE_MKM - {"mkm", "draft_moe"},
+    ),
+    "DEP8": (
+        (8, 1, 8, 8, 1),
+        _RECIPE,
+        {"gdn_verify", "gdn_pdl", "gdn_conv", "mka", "multi_request", "sharded_gumbel"},
+    ),
+    "P-TP1-PP4": (
+        (1, 1, 1, 1, 4),
+        {"gdn_prefill_split_conv"},
+        {"gdn_prefill_split_conv"},
+    ),
+}
+
+
+def _parallel(tp, attn_tp, dp, ep, pp):
+    return SimpleNamespace(
+        tp_size=tp,
+        attn_tp_size=attn_tp,
+        attn_dp_size=dp,
+        moe_ep_size=ep,
+        pp_size=pp,
+        tp_group=SimpleNamespace(world_size=tp),
+    )
+
+
+def _empty_model():
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            start_layer=0, end_layer=0, layers=[], flashinfer_mnnvl_cutedsl_fusion=None
+        )
+    )
+
+
+@pytest.mark.parametrize("name", _RECIPES)
+def test_explicit_recipe_lists_raise_nothing_and_keep_the_parent_filter(
+    monkeypatch, caplog, name
+):
+    profile, requested, expected = _RECIPES[name]
+    monkeypatch.setenv(runtime.SLOTS_ENV, ",".join(sorted(requested)))
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    parallel = _parallel(*profile)
+    with caplog.at_level("INFO"):
+        if parallel.pp_size == 4:
+            monkeypatch.setattr(
+                "sglang.srt.runtime_context.get_parallel", lambda: parallel
+            )
+            ctx = SimpleNamespace(tokens_per_request=7)
+            assert runtime.build(_empty_model(), ctx) is not None
+        else:
+            runtime.apply_expert_parallel(parallel.moe_ep_size)
+            runtime.apply_cp_lite_topology(parallel.attn_tp_size)
+            runtime.apply_topology(parallel)
+        assert runtime.slot_reasons() == []
+    assert runtime.SLOTS == expected
+    for slot in requested - expected:
+        assert slot in caplog.text
+
+
+@pytest.mark.parametrize("name", _RECIPES)
+def test_the_default_plan_keeps_stock_for_unavailable_slots(monkeypatch, caplog, name):
+    from sgl_nvidia_mega.qwen3_5 import moe
+
+    monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    parallel = _parallel(*_RECIPES[name][0])
+    monkeypatch.setattr("sglang.srt.runtime_context.get_parallel", lambda: parallel)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(moe.route, "topk_unsupported", lambda model: "fixture router")
+    ctx = SimpleNamespace(
+        widths=(7, 14),
+        tokens_per_request=7,
+        deadline_s=60,
+        binding=SimpleNamespace(page_size=64, tp_size=parallel.tp_size),
+    )
+    with caplog.at_level("INFO"):
+        built = runtime.build(_empty_model(), ctx)
+    assert built is not None
+    if parallel.pp_size == 1:
+        assert not any(s.route_topk or s.hop for s in (built.slots or {}).values())
+        assert "stock" in caplog.text
+
+
+def test_an_explicit_unavailable_slot_raises_with_its_recovery(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.draft import moe as draft_moe
+
+    monkeypatch.setenv(runtime.SLOTS_ENV, "draft_loop,draft_moe")
+    monkeypatch.setattr(
+        draft_moe, "unsupported_reason", lambda mlp: "a TRTLLM expert layout"
+    )
+    with pytest.raises(RuntimeError) as exc:
+        draft_moe.DraftMoe.build(object(), 0)
+    assert str(exc.value) == (
+        "NVIDIA megakernel: slot draft_moe cannot run: a TRTLLM expert layout; "
+        "remove it from SGLANG_NVIDIA_MEGAKERNEL_SLOTS or change the topology"
+    )

@@ -190,7 +190,10 @@ class MtpDraft:
     def _draft_loop(self, *, num_steps: int, max_bs: int, draft_tokens):
         from sgl_nvidia_mega.qwen3_5.draft.loop import DraftLoop
 
-        self._loop = DraftLoop(self._parts(), num_steps=num_steps)
+        parts = self._parts()
+        if parts is None:
+            return lambda bs: None
+        self._loop = DraftLoop(parts, num_steps=num_steps)
         return self._loop.step_for
 
     def _begin_draft_round(self, io) -> None:
@@ -202,7 +205,10 @@ class MtpDraft:
     ):
         from sgl_nvidia_mega.qwen3_5.draft.extend import DraftExtend
 
-        extend = DraftExtend(self._parts(), tokens_per_request=tokens_per_request)
+        parts = self._parts()
+        if parts is None:
+            return lambda bs: None
+        extend = DraftExtend(parts, tokens_per_request=tokens_per_request)
         return extend.step_for
 
 

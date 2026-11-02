@@ -2751,7 +2751,7 @@ def test_draft_only_cp_slots_do_not_enable_target_multi_request(monkeypatch):
 
 @pytest.mark.parametrize(
     ("requests", "eligible"),
-    [(5, True), (32, True), (33, False), (64, False), (128, False)],
+    [(5, True), (32, True), (33, True), (64, True), (128, True), (129, False)],
 )
 def test_target_cp_multi_request_honors_fused_batch_cap(
     monkeypatch, requests, eligible

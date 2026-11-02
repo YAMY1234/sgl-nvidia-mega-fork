@@ -19,6 +19,10 @@ def _host_plan():
         "HEAD_DIM",
         "MAX_ROWS",
         "_QUAD_PLAN_MAX_BATCH",
+        "_TWO_SLOT_MAX_BATCH",
+        "_two_slot_pack_starts",
+        "_two_slot_pack_T",
+        "balanced_split_plan_two",
         "_WIDE_PLAN_MAX_BATCH",
         "_LANE_PLAN_MAX_BATCH",
         "_DEFAULT_BALANCED",
@@ -52,16 +56,53 @@ class TestBalancedCP(unittest.TestCase):
     def setUp(self):
         self.host = _host_plan()
 
-    def test_default_policy_and_64_request_admission(self):
+    def test_verify_128_and_q1_64_admission(self):
         self.assertTrue(self.host["_DEFAULT_BALANCED"])
-        self.assertEqual((self.host["MAX_BATCH"], self.host["MAX_BATCH_Q1"]), (64, 64))
+        self.assertEqual((self.host["MAX_BATCH"], self.host["MAX_BATCH_Q1"]), (128, 64))
         supported = self.host["q35_cp_fused_supported"]
-        for q_len in (1, 7):
-            for batch in (1, 8, 32, 33, 64):
-                self.assertTrue(supported(q_len, 4, 1, batch, 152), (q_len, batch))
-            self.assertFalse(supported(q_len, 4, 1, 65, 152))
-        self.assertFalse(supported(7, 4, 1, 64, 64))
+        for batch in (1, 8, 32, 33, 64, 65, 96, 128):
+            self.assertTrue(supported(7, 4, 1, batch, 152), batch)
+            # Production exact-prefix calls fold verify rows into query heads.
+            self.assertTrue(supported(1, 4, 7, batch, 152, max_batch=128), batch)
+            self.assertEqual(supported(1, 4, 1, batch, 152), batch <= 64)
+        self.assertFalse(supported(7, 4, 1, 129, 152))
+        self.assertFalse(supported(7, 4, 1, 128, 128))
         self.assertFalse(supported(7, 4, 1, 64, 152, max_batch=32))
+
+    def test_two_slot_owned_tile_coverage(self):
+        pool = (0, 1, 63, 64, 65, 512, 8192, 65536, 131072)
+        for batch in (65, 96, 128):
+            lengths = [pool[i % len(pool)] for i in range(batch)]
+            for rank in range(4):
+                for packed in (False, True):
+                    _, ctas = self.host["balanced_split_plan_two"](
+                        lengths, rank, 4, 152, pack=packed
+                    )
+                    self.assertEqual(len(ctas), 152)
+                    self.assertTrue(all(len(slots) == 2 for slots in ctas))
+                    for req, length in enumerate(lengths):
+                        tiles = ((((length + 63) // 64) - rank + 3) // 4 + 1) // 2
+                        pieces = sorted(
+                            (
+                                slot
+                                for slots in ctas
+                                for slot in slots
+                                if slot is not None and slot[0] == req
+                            ),
+                            key=lambda slot: slot[1],
+                        )
+                        actual = [
+                            t
+                            for slot in pieces
+                            for t in range(slot[4], slot[4] + slot[5])
+                        ]
+                        self.assertEqual(
+                            actual, list(range(tiles)), (batch, rank, packed, req)
+                        )
+                        self.assertEqual(
+                            [slot[1] for slot in pieces], list(range(len(pieces)))
+                        )
+                        self.assertTrue(all(slot[2] == len(pieces) for slot in pieces))
 
     def test_all_owned_tiles_appear_once_in_request_order(self):
         plan = self.host["balanced_split_plan"]

@@ -48,11 +48,12 @@ _LANE_PLAN_MAX_BATCH = 32
 
 
 # Production default: distribute the grid's CTAs by owned KV length, including
-# batches <= 32. Match R11 TEP8's 64-request admission for verify and draft.
+# batches <= 32. Cover verify through 128 requests with the existing packed
+# two-slot plan; keep draft/Q1 admission at 64, matching the TEP8 recipe.
 # This is a plugin policy, not an environment switch; explicit split-mode test
 # overrides below retain their separate counter requirement.
 _DEFAULT_BALANCED = True
-MAX_BATCH = _WIDE_PLAN_MAX_BATCH
+MAX_BATCH = _TWO_SLOT_MAX_BATCH
 MAX_BATCH_Q1 = _WIDE_PLAN_MAX_BATCH
 # Pack every two-slot call; the unpacked form remains available as a test hook.
 _TWO_SLOT_PACK = True

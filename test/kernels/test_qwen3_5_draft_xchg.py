@@ -23,7 +23,7 @@ SM100-family GPUs (GB300) with NVLink multicast, against torch on the same input
 
 The bitwise comparison with the kernels of SGLang branch nvidia/qwen35-agentx-gb300 needs that
 branch installed as ``sglang`` and is not part of this test.
-Run with ``python test/kernels/test_qwen3_5_draft_xchg.py --num-gpu 4``.
+Run with ``python test/kernels/test_qwen3_5_draft_xchg.py --num-gpu 2`` (or 4 / 8).
 """
 
 import os
@@ -279,7 +279,58 @@ def test_extend_mkd_head_is_the_scan_path(ranks, boundary):
             dist.barrier(group=cpu_group)
 
 
-@pytest.mark.parametrize("m", [1, 2, 7])
+@pytest.mark.parametrize("nan_key", ["split", "torch"])
+def test_exchange_full_row_ids_on_tp2_sized_shards(ranks, boundary, nan_key):
+    """A local winner above 65535 and NaN/tie rules survive the exchange."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, _ = ranks
+    mkd, _ = boundary
+    vocab = 124544
+    # Token-only exchange never reads the candidate payload.
+    candidates = torch.empty(vocab, H, dtype=torch.float32, device="cuda")
+    hot_ids = torch.arange(world * vocab, dtype=torch.int64, device="cuda")
+    index = torch.empty(1, 1, dtype=torch.int64, device="cuda")
+    probability = torch.empty(1, 1, dtype=torch.float32, device="cuda")
+    key = (
+        kernels.NAN_KEY_SPLIT_ARGMAX
+        if nan_key == "split"
+        else kernels.NAN_KEY_TORCH_ARGMAX
+    )
+    for case in ("high", "ties", "nan"):
+        logits = torch.zeros(1, vocab, dtype=torch.bfloat16, device="cuda")
+        logits[0, vocab - 1] = 5.0
+        if case == "ties":
+            logits[0, 65536] = 5.0
+        if case == "nan" and rank == 1:
+            logits[0, vocab - 3] = float("nan")
+        kernels.mkd_xchg(
+            logits,
+            candidates,
+            hot_ids,
+            mkd.own_partial,
+            mkd.epoch_done,
+            mkd.ext_cand,
+            mkd.ext_partials,
+            index,
+            probability,
+            None,
+            None,
+            None,
+            mkd.mc,
+            mkd.uc,
+            rank,
+            world,
+            0,
+            key,
+            token_only=True,
+            scan_part=mkd.scan_part,
+        )
+        want = _want_token(logits, group, -1e30 if nan_key == "split" else float("inf"))
+        assert int(index) == want and float(probability) == 1.0
+
+
+@pytest.mark.parametrize("m", [1, 2, 6, 7, 10, 14, 16])
 def test_split_fc_gathers_and_sums_in_rank_order(ranks, boundary, m):
     from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
 
@@ -306,6 +357,23 @@ def test_split_fc_gathers_and_sums_in_rank_order(ranks, boundary, m):
         )
         ref = (x.float() @ weights["fc"].float().T).bfloat16()
         torch.testing.assert_close(got.float(), ref.float(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("m", [1, 2])
+def test_fc_partial_partition_preserves_bits(ranks, boundary, m):
+    """TP2's smaller weight tile changes only which CTA owns each output row."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    mkd, weights = boundary
+    use_hidden, start, _ = mkd.fc_split_slice
+    norm = weights["norm_hid"] if use_hidden else weights["norm_emb"]
+    x = _randn(m, H, g=_gen(713 + m))
+    outputs = []
+    for rows in (mkd._fc_gemv_rows, max(1, mkd._fc_gemv_rows // 2)):
+        out = torch.empty(m, H, dtype=torch.float32, device="cuda")
+        kernels.draft_fc_partial(x, norm, EPS, mkd._fc_shard, start, out, rows)
+        outputs.append(out)
+    assert torch.equal(outputs[0].view(torch.int32), outputs[1].view(torch.int32))
 
 
 @pytest.fixture(scope="module")
@@ -705,4 +773,4 @@ def test_embedding_exchange_replays_from_a_cuda_graph(ranks, embedx):
 
 
 if __name__ == "__main__":
-    multigpu_pytest_main(__name__, __file__, num_gpus=(4,))
+    multigpu_pytest_main(__name__, __file__, num_gpus=(2, 4, 8))

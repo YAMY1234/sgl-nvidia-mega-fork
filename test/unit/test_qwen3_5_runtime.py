@@ -242,7 +242,7 @@ def test_requested_cp_state_does_not_restore_a_device_length_gate():
     assert [cp._gate_thr(batch) for batch in (2, 4, 16)] == [None, None, None]
 
 
-def test_cp_exact_selector_admits_verify_and_q1_64():
+def test_cp_exact_selector_admits_verify_128_and_q1_64():
     from sgl_nvidia_mega.qwen3_5.sm103.attention import q35_cp_fused as fused
     from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
 
@@ -251,8 +251,8 @@ def test_cp_exact_selector_admits_verify_and_q1_64():
     cp.hq = 4
     cp.sms = 132
 
-    assert (fused.MAX_BATCH, fused.MAX_BATCH_Q1) == (64, 64)
-    assert [cp._exact_supported(7, batch) for batch in (64, 65)] == [True, False]
+    assert (fused.MAX_BATCH, fused.MAX_BATCH_Q1) == (128, 64)
+    assert [cp._exact_supported(7, batch) for batch in (128, 129)] == [True, False]
     assert [cp._exact_supported(1, batch) for batch in (64, 65)] == [True, False]
 
 

@@ -4,8 +4,7 @@
 # of SGLang branch nvidia/qwen35-agentx-gb300 and SGLang's
 # python/sglang/srt/layers/attention/linear/gdn_backend.py (GDNAttnBackend.forward_extend).
 """Slot ``gdn_front`` (numeric): slot gdn_verify's step for one request of 7 rows with
-the fused GDN front of SGLang branch nvidia/qwen35-agentx-gb300 (SGLANG_Q35MF_MKG_FUSED +
-MKG_BA_TC + MKM_GDN_FRONT):
+the fused GDN front of SGLang branch nvidia/qwen35-agentx-gb300:
 
 1. ``sm103/gdn/front.py`` in one launch: the static-FP8 ``in_proj_qkvz`` projection of
    the BF16 rows, the conv update of its q / k / v channels, the BF16 ``in_proj_ba``

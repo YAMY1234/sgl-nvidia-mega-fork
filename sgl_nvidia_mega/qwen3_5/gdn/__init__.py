@@ -99,6 +99,7 @@ def build(model, ctx) -> Bound:
         reason = verify.unsupported(gdn)
         if reason:
             return Bound(reason=f"layer {i}: {reason}")
+    reasons = []
     packed = {}
     if "gdn_push" in SLOTS:
         import torch
@@ -115,12 +116,18 @@ def build(model, ctx) -> Bound:
             try:
                 packed[gdn.attn.layer_id] = pack_out_proj(gdn.out_proj.weight.t())
             except ValueError as e:
-                return Bound(reason=f"layer {i}: {e}")
+                reasons.append(f"gdn_push: layer {i}: {e}")
+                packed = {}
+                break
     rlin = {}
-    if packed and "route_lin" in SLOTS:
-        rlin, reason = _route_lin(m, gdns)
-        if reason:
-            return Bound(reason=f"slot route_lin: {reason}")
+    if "route_lin" in SLOTS:
+        if packed:
+            rlin, reason = _route_lin(m, gdns)
+            if reason:
+                reasons.append(f"route_lin: {reason}")
+                rlin = {}
+        else:
+            reasons.append("route_lin: requires supported gdn_push")
     front_packed, error = {}, None
     if "gdn_front" in SLOTS:
         import torch
@@ -128,13 +135,16 @@ def build(model, ctx) -> Bound:
         from sgl_nvidia_mega.qwen3_5.gdn import front
 
         if ctx.tokens_per_request != front.ROWS:
-            return Bound(reason=f"gdn_front: {ctx.tokens_per_request} rows a request")
-        for i, gdn in gdns:
-            reason = front.unsupported(gdn)
-            if reason:
-                return Bound(reason=f"gdn_front: layer {i}: {reason}")
-        front_packed = front.build(model, gdns)
-        error = torch.zeros(1, dtype=torch.int32, device="cuda")
+            reasons.append(f"gdn_front: {ctx.tokens_per_request} rows a request")
+        else:
+            for i, gdn in gdns:
+                reason = front.unsupported(gdn)
+                if reason:
+                    reasons.append(f"gdn_front: layer {i}: {reason}")
+                    break
+            else:
+                front_packed = front.build(model, gdns)
+                error = torch.zeros(1, dtype=torch.int32, device="cuda")
     core = "gdn_core" in SLOTS
     if core:
         import torch
@@ -149,6 +159,9 @@ def build(model, ctx) -> Bound:
             attn.num_v_heads,
             gdns[0][1].norm.weight.dtype == torch.float32,
         )
+    trt_front = "gdn_trt_front" in SLOTS and bool(front_packed) and core
+    if "gdn_trt_front" in SLOTS and not trt_front:
+        reasons.append("gdn_trt_front: requires supported gdn_front and gdn_core")
     return Bound(
         gdn_verify=True,
         gdn_pdl="gdn_pdl" in SLOTS,
@@ -156,9 +169,10 @@ def build(model, ctx) -> Bound:
         gdn_conv="gdn_conv" in SLOTS,
         packed=packed,
         front=front_packed,
-        gdn_trt_front="gdn_trt_front" in SLOTS,
+        gdn_trt_front=trt_front,
         rlin=rlin,
         error=error,
+        reason="; ".join(reasons),
     )
 
 
@@ -217,6 +231,12 @@ def step(layer, x, st):
     z_shape = z.shape
     core = core.reshape(-1, core.shape[-1])
     z = z.reshape(-1, z.shape[-1])
+    # DP attention may return only the real rows while the projection and z
+    # retain the graph's padded rows. Match SGLang before the gated norm.
+    if core.shape != z.shape:
+        padded = z.new_zeros(z.shape)
+        padded[: core.shape[0], :] = core
+        core = padded
     core = gdn.norm(core, z)
     core = core.reshape(z_shape)
     core = core.reshape(*core.shape[:-2], core.shape[-2] * core.shape[-1])

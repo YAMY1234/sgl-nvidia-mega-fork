@@ -201,6 +201,9 @@ def core(attn, q, st):
                     ROWS,
                 )
             return o
+    # SKV2's producer/merge serves one request; a declined batch stays batched.
+    if q.shape[0] > ROWS:
+        return attn(q, None, None, st.fb)
     label = route.label(route.verify_variants(), st.fb)
     if (label, q.shape[0]) not in _ENGAGED:
         _ENGAGED.add((label, q.shape[0]))
@@ -259,6 +262,7 @@ def cp_core(
     q_len: int,
     min_bs: int | None = 1,
     early_merge: bool | None = None,
+    stock=None,
 ):
     """CP-lite on requests of ``q_len`` FP8 query rows over the pool ``kv``:
     [rows, heads * head_dim] bf16, or None where CP-lite declines. ``min_bs`` overrides
@@ -290,6 +294,33 @@ def cp_core(
         ),
     )
     options = {} if early_merge is None else {"early_merge": early_merge}
+    if stock is None and min_bs is None:
+
+        def stock(lengths, out):
+            import flashinfer
+            from sglang.srt.environ import envs
+
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=q.reshape(-1, attn.tp_q_head_num, attn.head_dim),
+                kv_cache=caches,
+                workspace_buffer=workspace,
+                block_tables=meta.page_table,
+                seq_lens=lengths,
+                max_seq_len=meta.page_table.shape[1] * PAGE_SIZE,
+                bmm1_scale=float(kv.k_scale[i] * attn.scaling),
+                bmm2_scale=float(kv.v_scale[i]),
+                window_left=attn.sliding_window_size,
+                sinks=None,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                q_len_per_req=q_len,
+                out=out,
+                out_dtype=None,
+                kv_cache_sf=None,
+                multi_ctas_kv_counter_buffer=cp.stock_counter,
+            )
+
+    if stock is not None:
+        options["stock"] = stock
     o = cp.attend(
         q.reshape(-1, attn.tp_q_head_num, attn.head_dim),
         caches,

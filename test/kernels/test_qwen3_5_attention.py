@@ -80,7 +80,7 @@ def _inputs(length, g, spare_pages=8, heads=HEADS):
 
 
 def _reference(q, kv, table, length, qk_scale, v_scale):
-    """FP64 attention of the 7 verify rows, row t seeing the first length - 7 + t + 1
+    """FP64 attention of the query window, row t seeing length - q_len + t + 1
     tokens."""
     k, v = kv
     pages = table[0, : math.ceil(length / PAGE)].long()
@@ -88,8 +88,8 @@ def _reference(q, kv, table, length, qk_scale, v_scale):
     values = v[pages, 0].reshape(-1, DIM)[:length].double()
     scores = q.double() @ keys.T * qk_scale  # [rows, heads, length]
     tokens = torch.arange(length, device="cuda")
-    for t in range(ROWS):
-        scores[t, :, tokens > length - ROWS + t] = -math.inf
+    for t in range(q.shape[0]):
+        scores[t, :, tokens > length - q.shape[0] + t] = -math.inf
     return torch.softmax(scores, dim=-1) @ values * v_scale
 
 
@@ -736,3 +736,310 @@ def test_gate_quant_is_sglangs_sigmoid_mul_then_static_quant(rows, heads):
     scale = torch.full((1,), 0.013, device="cuda")
     want, _ = static_quant_fp8(fused_sigmoid_mul(attn, gate), scale)
     assert _bits(want, gate_quant(attn, gate, scale))
+
+
+@pytest.mark.parametrize("batch", [8, 16, 128])
+def test_gated_stock_epilogue_replay_preserves_cp_bytes(batch):
+    """A captured stock epilogue writes below the mean-KV gate, and never reads
+    the poisoned stock rows or overwrites CP's FP8 output when CP is selected."""
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.gate_quant import gate_quant
+
+    gen = torch.Generator(device="cuda").manual_seed(1700 + batch)
+    x = torch.randn(batch * ROWS, HEADS * DIM, device="cuda", generator=gen).bfloat16()
+    gate = torch.randn(x.shape, device="cuda", generator=gen).bfloat16()
+    scale = torch.full((1,), 0.013, device="cuda")
+    want = gate_quant(x, gate, scale)
+    out = torch.empty_like(want)
+    lens = torch.full((batch,), 8192, dtype=torch.int32, device="cuda")
+    threshold = 10240 * batch
+    gate_quant(x, gate, scale, out=out, seq_lens=lens, min_kv_sum=threshold)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gate_quant(x, gate, scale, out=out, seq_lens=lens, min_kv_sum=threshold)
+    for length in [10240, 10239, 16384, 8192]:
+        lens.fill_(length)
+        if length >= 10240:
+            x.fill_(float("nan"))
+            out.fill_(3.0)
+            keep = out.clone()
+            graph.replay()
+            assert _bits(keep, out)
+        else:
+            x.copy_(torch.randn(x.shape, device="cuda", generator=gen).bfloat16())
+            want = gate_quant(x, gate, scale)
+            graph.replay()
+            assert _bits(want, out)
+
+
+@pytest.fixture(scope="module")
+def cp_kv_gate_group():
+    """One complete four-rank KV group; CPU barriers never occupy CP's grid-barrier SMs."""
+    import os
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    if int(os.environ.get("WORLD_SIZE", "1")) != 4:
+        pytest.skip("run with torchrun --nproc_per_node=4")
+    rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", timeout=timedelta(seconds=90))
+    host_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=90))
+    cp = CpLite(dist.group.WORLD, rank, 4, 4, HEADS, torch.device("cuda", rank))
+    workspace = torch.zeros(512 << 20, dtype=torch.uint8, device="cuda")
+    yield SimpleNamespace(cp=cp, rank=rank, host_group=host_group, workspace=workspace)
+    torch.cuda.synchronize()
+    dist.barrier(group=host_group)
+    dist.destroy_process_group()
+
+
+def _cp_gate_sync(group):
+    import torch.distributed as dist
+
+    torch.cuda.synchronize()
+    dist.barrier(group=group.host_group)
+
+
+def _cp_gate_inputs(batch, q_len, max_length, rank):
+    from types import SimpleNamespace
+
+    class Owner:
+        pass
+
+    gen = torch.Generator(device="cuda").manual_seed(2100 + batch + q_len)
+    pages = math.ceil(max_length / PAGE) + 4
+    pools = [
+        (torch.randn(pages * PAGE, 1, DIM, device="cuda", generator=gen) * 2).to(
+            torch.float8_e4m3fn
+        )
+        for _ in range(2)
+    ]
+    table = torch.stack(
+        [
+            torch.randperm(pages, device="cuda", generator=gen).int()
+            for _ in range(batch)
+        ]
+    )
+    gen.manual_seed(3100 + rank + batch)
+    q = (torch.randn(batch * q_len, HEADS, DIM, device="cuda", generator=gen) * 2).to(
+        torch.float8_e4m3fn
+    )
+    layer = SimpleNamespace(tp_k_head_num=1, sliding_window_size=-1, layer_id=0)
+    return q, tuple(map(_hnd, pools)), table, layer, Owner()
+
+
+def _cp_gate_stock(group, q, kv, table, q_len, lengths, out=None):
+    import flashinfer
+
+    return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        query=q,
+        kv_cache=kv,
+        block_tables=table,
+        seq_lens=lengths,
+        workspace_buffer=group.workspace,
+        max_seq_len=table.shape[1] * PAGE,
+        bmm1_scale=0.75 * SCALE,
+        bmm2_scale=0.5,
+        q_len_per_req=q_len,
+        out=out,
+        out_dtype=torch.bfloat16 if out is None else None,
+        multi_ctas_kv_counter_buffer=group.cp.stock_counter,
+    )
+
+
+@pytest.mark.parametrize(
+    "batch,q_len,length",
+    [
+        (8, 7, 8192),
+        (8, 7, 12288),
+        (16, 7, 8192),
+        (64, 7, 8192),
+        (128, 7, 4096),
+        (128, 7, 8192),
+        (128, 7, 65536),
+        (8, 1, 8192),
+        (8, 1, 12288),
+        (128, 1, 4096),
+        (128, 1, 8192),
+    ],
+)
+def test_cp_kv_gate_matches_the_selected_path(cp_kv_gate_group, batch, q_len, length):
+    """Every output matches ungated CP or stock bitwise, including the two-slot plan.
+    Four requests additionally check FP64 error against the stock error bound."""
+    group, cp = cp_kv_gate_group, cp_kv_gate_group.cp
+    q, kv, table, layer, owner = _cp_gate_inputs(batch, q_len, length + 64, group.rank)
+    lengths = torch.full((batch,), length, dtype=torch.int32, device="cuda")
+    lengths[::2] -= 64
+    lengths[1::2] += 64
+    stock = lambda lens, out: _cp_gate_stock(group, q, kv, table, q_len, lens, out)
+    stock_out = stock(lengths, None).clone()
+    _cp_gate_sync(group)
+    kwargs = dict(min_bs=None, early_merge=False if q_len == 1 else None)
+    policy = cp.min_kv
+    cp.min_kv = {}
+    base = cp.attend(
+        q,
+        kv,
+        table,
+        lengths,
+        q_len,
+        0.75 * SCALE,
+        0.5,
+        group.workspace,
+        layer,
+        owner,
+        **kwargs,
+    ).clone()
+    _cp_gate_sync(group)
+    cp.min_kv = policy
+    out = cp.attend(
+        q,
+        kv,
+        table,
+        lengths,
+        q_len,
+        0.75 * SCALE,
+        0.5,
+        group.workspace,
+        layer,
+        owner,
+        stock=stock,
+        **kwargs,
+    )
+    _cp_gate_sync(group)
+    selected_cp = length * batch >= cp._gate_thr(batch)
+    assert _bits(out, base if selected_cp else stock_out)
+    assert torch.isfinite(out).all()
+    errors, stock_errors = [], []
+    for i in sorted({0, batch // 3, batch // 2, batch - 1}):
+        length_i = int(lengths[i].item())
+        sl = slice(i * q_len, (i + 1) * q_len)
+        ref = _reference(q[sl], kv, table[i : i + 1], length_i, 0.75 * SCALE, 0.5)
+        errors.append((out[sl].double() - ref).square().mean())
+        stock_errors.append((stock_out[sl].double() - ref).square().mean())
+    err = torch.stack(errors).mean().sqrt().item()
+    stock_err = torch.stack(stock_errors).mean().sqrt().item()
+    assert err <= 2 * stock_err + 1e-6, (batch, q_len, length, err, stock_err)
+    print(
+        "CP_KV_NUMERIC", group.rank, batch, q_len, length, selected_cp, err, stock_err
+    )
+    _cp_gate_sync(group)
+
+
+@pytest.mark.parametrize("batch", [8, 128])
+def test_cp_kv_gate_graph_switches_with_the_fused_epilogue(cp_kv_gate_group, batch):
+    """One graph alternates stock/CP as lengths change, including equality at the gate."""
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.gate_quant import gate_quant
+
+    group, cp = cp_kv_gate_group, cp_kv_gate_group.cp
+    q, kv, table, layer, owner = _cp_gate_inputs(batch, ROWS, 16384, group.rank)
+    lengths = torch.full((batch,), 12288, dtype=torch.int32, device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(4100 + group.rank)
+    gate = torch.randn(
+        batch * ROWS, HEADS * DIM, device="cuda", generator=gen
+    ).bfloat16()
+    scale = torch.full((1,), 0.013, device="cuda")
+    fp8_out = torch.empty(gate.shape, dtype=torch.float8_e4m3fn, device="cuda")
+    stock = lambda lens, out: _cp_gate_stock(group, q, kv, table, ROWS, lens, out)
+
+    def run():
+        cp.offer_gate_epilogue(gate, scale, fp8_out)
+        out = cp.attend(
+            q,
+            kv,
+            table,
+            lengths,
+            ROWS,
+            0.75 * SCALE,
+            0.5,
+            group.workspace,
+            layer,
+            owner,
+            stock=stock,
+            min_bs=None,
+        )
+        assert cp.take_gate_epilogue()
+        return out
+
+    run()
+    _cp_gate_sync(group)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = run()
+    _cp_gate_sync(group)
+    policy = cp.min_kv
+    threshold = cp._gate_thr(batch) // batch
+    for length in [4096, 12288, threshold, threshold - 1]:
+        lengths.fill_(length)
+        if length >= threshold:
+            cp.min_kv = {}
+            expect_fp8 = torch.empty_like(fp8_out)
+            cp.offer_gate_epilogue(gate, scale, expect_fp8)
+            expect = cp.attend(
+                q,
+                kv,
+                table,
+                lengths,
+                ROWS,
+                0.75 * SCALE,
+                0.5,
+                group.workspace,
+                layer,
+                owner,
+                min_bs=None,
+            ).clone()
+            assert cp.take_gate_epilogue()
+            cp.min_kv = policy
+        else:
+            expect = stock(lengths, None).clone()
+            expect_fp8 = gate_quant(expect.flatten(1), gate, scale)
+        _cp_gate_sync(group)
+        fp8_out.fill_(7.0)
+        graph.replay()
+        _cp_gate_sync(group)
+        assert _bits(expect, graph_out)
+        assert _bits(expect_fp8, fp8_out)
+
+
+def test_cp_kv_gate_hard_refusal_is_batched_stock(cp_kv_gate_group, monkeypatch):
+    """The B8/min_bs16 reproducer runs real batched CUDA attention, never single-request SKV2."""
+    from types import SimpleNamespace
+
+    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+    group, cp = cp_kv_gate_group, cp_kv_gate_group.cp
+    q, kv, table, _, owner = _cp_gate_inputs(8, ROWS, 8192, group.rank)
+    lengths = torch.full((8,), 8192, dtype=torch.int32, device="cuda")
+    meta = SimpleNamespace(page_table=table, cache_seqlens=lengths)
+    caches = SimpleNamespace(
+        layer_ids=(0,),
+        k=(kv[0].permute(0, 2, 1, 3).reshape(-1, 1, DIM),),
+        v=(kv[1].permute(0, 2, 1, 3).reshape(-1, 1, DIM),),
+        k_scale=(0.75,),
+        v_scale=(0.5,),
+    )
+
+    class Layer:
+        layer_id, tp_q_head_num, tp_k_head_num, tp_v_head_num = 0, HEADS, 1, 1
+        head_dim, scaling, sliding_window_size = DIM, SCALE, -1
+
+        def __call__(self, query, key, value, batch):
+            assert key is value is None and batch is owner
+            return _cp_gate_stock(
+                group, query.reshape(-1, HEADS, DIM), kv, table, ROWS, lengths
+            ).flatten(1)
+
+    monkeypatch.setattr(cp, "min_bs", 16)
+    monkeypatch.setattr(split_kv, "cp_lite", lambda: cp)
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2_cp"}))
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_buffer", lambda *args: group.workspace
+    )
+    st = SimpleNamespace(view=SimpleNamespace(kv=caches, attn=meta), fb=owner)
+    want = _cp_gate_stock(group, q, kv, table, ROWS, lengths).flatten(1)
+    got = split_kv.core(Layer(), q.flatten(1), st)
+    assert _bits(want, got)
+    _cp_gate_sync(group)

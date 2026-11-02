@@ -308,14 +308,8 @@ class Attention:
     def decode(self, q8, meta, kv, rows_per_request: int):
         """The decode of FP8 q rows over the cache (this step's rows written):
         [rows, heads * head_dim]."""
-        import flashinfer
-        from sglang.srt.environ import envs
-
-        k_cache, v_cache = kv.k[0], kv.v[0]
         q8 = q8.reshape(-1, self.heads, self.head_dim)
         attn = self.layer.attn
-        bmm1_scale = 1.0 * kv.k_scale[0] * attn.scaling
-        bmm2_scale = kv.v_scale[0]
         if self.cp_b1 is not None and self.cp_b1.takes(rows_per_request, q8.shape[0]):
             o = self.cp_b1.run(self, q8, meta, kv, rows_per_request)
             if o is not None:
@@ -335,6 +329,15 @@ class Attention:
             and self.skv2.long()
         ):
             return self.skv2.run(attn, q8, kv, meta)
+        return self.stock_decode(q8, meta, kv, rows_per_request)
+
+    def stock_decode(self, q8, meta, kv, rows_per_request, *, seq_lens=None, out=None):
+        """The original batched decode, also captured as the CP KV gate's fallback."""
+        import flashinfer
+        from sglang.srt.environ import envs
+
+        k_cache, v_cache = kv.k[0], kv.v[0]
+        attn = self.layer.attn
         kwargs = {}
         if rows_per_request != 1:
             kwargs["q_len_per_req"] = rows_per_request
@@ -343,15 +346,15 @@ class Attention:
             kv_cache=self._paged(k_cache, v_cache),
             workspace_buffer=self.workspace,
             block_tables=meta.page_table,
-            seq_lens=meta.cache_seqlens,
+            seq_lens=meta.cache_seqlens if seq_lens is None else seq_lens,
             max_seq_len=self.max_context_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
+            bmm1_scale=1.0 * kv.k_scale[0] * attn.scaling,
+            bmm2_scale=kv.v_scale[0],
             window_left=attn.sliding_window_size,
             sinks=None,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-            out=None,
-            out_dtype=torch.bfloat16,
+            out=out,
+            out_dtype=torch.bfloat16 if out is None else None,
             kv_cache_sf=None,
             multi_ctas_kv_counter_buffer=self.counters,
             **kwargs,
@@ -459,6 +462,14 @@ class DraftCP:
         layer = attention.layer
         attn = layer.attn
         multi = q8.shape[0] > rows_per_request
+        stock = None
+        if multi:
+
+            def stock(lengths, out):
+                return attention.stock_decode(
+                    q8, meta, kv, rows_per_request, seq_lens=lengths, out=out
+                )
+
         o = self.split_kv.cp_core(
             attn,
             q8,
@@ -470,6 +481,7 @@ class DraftCP:
             # R11 orders the draft-multi exact partial and merge after their waits.
             # Keep the shared CP-lite default for target and one-request draft calls.
             early_merge=False if multi else None,
+            stock=stock,
         )
         if o is not None and torch.cuda.is_current_stream_capturing():
             key = (rows_per_request, q8.shape[0])

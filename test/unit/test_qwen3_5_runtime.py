@@ -951,8 +951,19 @@ def test_the_draft_decode_keeps_cp_lite_for_cp_variants_and_multi_request(
             owner,
             min_bs=None,
             early_merge=None,
+            stock=None,
         ):
-            calls.append((tuple(q.shape), q_len, bmm1, bmm2, min_bs, early_merge))
+            calls.append(
+                (
+                    tuple(q.shape),
+                    q_len,
+                    bmm1,
+                    bmm2,
+                    min_bs,
+                    early_merge,
+                    callable(stock),
+                )
+            )
             return torch.ones(q.shape[0], heads, dim, dtype=torch.bfloat16)
 
     monkeypatch.setattr(split_kv, "cp_lite", CpLite)
@@ -998,6 +1009,7 @@ def test_the_draft_decode_keeps_cp_lite_for_cp_variants_and_multi_request(
             3.0,
             min_bs,
             False if requests > 1 else None,
+            requests > 1,
         )
     ]
 

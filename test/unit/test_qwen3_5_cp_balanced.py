@@ -7,6 +7,7 @@ different split boundaries is a separate gate, not implied by tile coverage.
 import ast
 import pathlib
 import unittest
+from types import SimpleNamespace
 
 
 def _host_plan():
@@ -68,6 +69,57 @@ class TestBalancedCP(unittest.TestCase):
         self.assertFalse(supported(7, 4, 1, 129, 152))
         self.assertFalse(supported(7, 4, 1, 128, 128))
         self.assertFalse(supported(7, 4, 1, 64, 152, max_batch=32))
+
+    def test_kv_gate_uses_the_greatest_batch_key_and_mean_length(self):
+        path = pathlib.Path(__file__).resolve().parents[2] / (
+            "sgl_nvidia_mega/qwen3_5/sm103/attention/q35_cp_lite.py"
+        )
+        cls = next(
+            n
+            for n in ast.parse(path.read_text()).body
+            if isinstance(n, ast.ClassDef) and n.name == "CpLite"
+        )
+        init = next(
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+        )
+        policy = next(
+            n.value
+            for n in ast.walk(init)
+            if isinstance(n, ast.Assign)
+            and any(
+                isinstance(t, ast.Attribute) and t.attr == "min_kv" for t in n.targets
+            )
+        )
+        policy = ast.literal_eval(policy)
+        self.assertEqual(policy, {2: 12288, 4: 10240, 16: 6144})
+        method = next(
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_gate_thr"
+        )
+        scope = {}
+        exec(
+            compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
+            scope,
+        )
+        owner = SimpleNamespace(min_kv=policy, gate_max=False)
+        for batch, mean in [
+            (1, None),
+            (2, 12288),
+            (3, 12288),
+            (4, 10240),
+            (8, 10240),
+            (15, 10240),
+            (16, 6144),
+            (64, 6144),
+            (65, 6144),
+            (128, 6144),
+        ]:
+            self.assertEqual(
+                scope["_gate_thr"](owner, batch), None if mean is None else batch * mean
+            )
 
     def test_two_slot_owned_tile_coverage(self):
         pool = (0, 1, 63, 64, 65, 512, 8192, 65536, 131072)

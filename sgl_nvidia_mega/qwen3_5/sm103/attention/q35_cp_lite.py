@@ -1227,6 +1227,8 @@ class CpLite:
         )
         # multi-CTA counters of the trtllm-gen calls: rows x heads (the chunk rows: up to 8 B x 112 at q_len 7)
         self.counter = torch.zeros(1 << 20, dtype=torch.int32, device=self.device)
+        # Gated stock and CP can overlap, so they cannot share TRT-LLM counters.
+        self.stock_counter = torch.zeros_like(self.counter)
         # exact path: the fused kernel's [cp, rows, heads, D] partials and the prefix lengths the gather writes
         self.po_x = torch.empty(
             cp, rows, q_heads, HEAD_DIM, dtype=torch.bfloat16, device=self.device
@@ -1235,7 +1237,7 @@ class CpLite:
             cp, rows, q_heads, dtype=torch.float32, device=self.device
         )
         self.pre_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
-        self.min_kv = {}
+        self.min_kv = {2: 12288, 4: 10240, 16: 6144}
         self.gate_max = False
         self.stock_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
         self.gate_overlap = 1
@@ -1448,6 +1450,7 @@ class CpLite:
                 stock,
                 gate,
                 exact,
+                early_merge=early_merge,
             )
         if exact and thr is None and self.ll and self.cp_ungated:
             return self._ungated_main(
@@ -1713,6 +1716,7 @@ class CpLite:
         stock,
         gate,
         exact,
+        early_merge=None,
     ):
         """Gated call: stock(lengths, out) on this stream beside gather + partial on the side stream (the
         TRT-LLM partial with its own workspace), then the merge after the streams join."""
@@ -1732,6 +1736,7 @@ class CpLite:
                 layer_id,
                 stock,
                 gate,
+                early_merge=early_merge,
             )
         fold_mh = self.fold_mh and not exact
         stock_lens, pre_lens = self._gate_lens_fwd(
@@ -1857,9 +1862,10 @@ class CpLite:
             out,
             gate,
         )
-        if fused is None:
-            return merge(*merge_args)
-        return merge(*merge_args, fused=fused)
+        options = {"plain": True} if fold_mh and early_merge is False else {}
+        if fused is not None:
+            options["fused"] = fused
+        return merge(*merge_args, **options)
 
     def _gated_main(
         self,
@@ -1877,6 +1883,7 @@ class CpLite:
         layer_id,
         stock,
         gate,
+        early_merge=None,
     ):
         """Gated exact call (TRT-L18): gather, fused partial and merge (all exit with the gate off) on this stream. The
         stock kernel would hold SMs the partial's grid barrier waits for, so it runs on the side stream after the
@@ -1887,6 +1894,16 @@ class CpLite:
         out = torch.empty(
             rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device
         )
+        early = self.early_merge if early_merge is None else early_merge
+        epilogue = self._gate_epilogue
+        if epilogue is not None and not (
+            self.merge_h
+            and tuple(epilogue[0].shape) == (rows, self.hq * HEAD_DIM)
+            and epilogue[0].stride(1) == 1
+            and tuple(epilogue[2].shape) == (rows, self.hq * HEAD_DIM)
+            and epilogue[2].stride(1) == 1
+        ):
+            epilogue = None
         words = self.hq * HEAD_DIM // 4
         _cp_gather_q_ll[(rows,)](
             q.view(torch.int32),
@@ -1919,11 +1936,27 @@ class CpLite:
             bmm1_scale,
             bmm2_scale,
             pdl=self.cp_pdl,
+            early_trigger=early,
         )
         main = torch.cuda.current_stream()
         self._side.wait_stream(main)
         with torch.cuda.stream(self._side):
             stock(stock_lens, out)
+            if epilogue is not None:
+                from sgl_nvidia_mega.qwen3_5.sm103.attention.gate_quant import (
+                    gate_quant,
+                )
+
+                # CP writes the fused epilogue only with its gate on; stock owns it otherwise.
+                gate_quant(
+                    out.view(rows, self.hq * HEAD_DIM),
+                    epilogue[0],
+                    epilogue[1],
+                    out=epilogue[2],
+                    seq_lens=seq_lens,
+                    min_kv_sum=gate["thr"],
+                    gate_max=gate["GMAX"],
+                )
         if self.merge_h:
             self._merge_h(
                 q,
@@ -1937,6 +1970,9 @@ class CpLite:
                 bmm2_scale,
                 out,
                 gate,
+                early=early,
+                plain=early_merge is False and epilogue is None,
+                gate_epilogue=epilogue,
             )
         else:
             self._exact_merge(
@@ -1953,6 +1989,8 @@ class CpLite:
                 gate,
             )
         main.wait_stream(self._side)
+        if epilogue is not None:
+            self._gate_epilogue_done = True
         return out
 
     def _ungated_main(

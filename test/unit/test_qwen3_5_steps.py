@@ -2694,7 +2694,12 @@ def test_the_skv2_cp_slot_runs_cp_lite_for_one_request_in_its_variant(
 
 
 @pytest.mark.parametrize("served", [True, False])
-def test_cp_slots_keep_multi_request_target_verify_in_the_plugin(monkeypatch, served):
+@pytest.mark.parametrize(
+    "label", [None, "split_kv_stock", "split_kv_long", "split_kv_cp"]
+)
+def test_cp_slots_keep_multi_request_target_verify_in_the_plugin(
+    monkeypatch, served, label
+):
     from sgl_nvidia_mega.qwen3_5 import runtime
     from sgl_nvidia_mega.qwen3_5.attention import split_kv
 
@@ -2708,7 +2713,19 @@ def test_cp_slots_keep_multi_request_target_verify_in_the_plugin(monkeypatch, se
 
     class CpLite:
         def attend(
-            self, q, kv, pages, lens, q_len, bmm1, bmm2, ws, layer, fb, min_bs=None
+            self,
+            q,
+            kv,
+            pages,
+            lens,
+            q_len,
+            bmm1,
+            bmm2,
+            ws,
+            layer,
+            fb,
+            min_bs=None,
+            stock=None,
         ):
             calls.append(
                 (
@@ -2718,6 +2735,7 @@ def test_cp_slots_keep_multi_request_target_verify_in_the_plugin(monkeypatch, se
                     q_len,
                     fb is st.fb,
                     min_bs,
+                    callable(stock),
                 )
             )
             return out if served else None
@@ -2725,17 +2743,59 @@ def test_cp_slots_keep_multi_request_target_verify_in_the_plugin(monkeypatch, se
     monkeypatch.setattr(split_kv, "cp_lite", CpLite)
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2_cp"}))
     with (
-        _skv2_kernels(log, label="split_kv_stock"),
+        _skv2_kernels(log, label=label),
         patch("sglang.srt.runtime_context.get_buffer", lambda name, make: None),
     ):
         got = split_kv.core(attn, q8, st)
 
-    assert calls == [((rows, 4, 256), (requests, 4), (requests,), 7, True, None)]
+    assert calls == [((rows, 4, 256), (requests, 4), (requests,), 7, True, None, True)]
     if served:
         assert got.shape == (rows, 1024) and bool((got == 1).all())
         assert not log
     else:
         assert got == "stock_o" and log[-1][0] == "attention"
+
+
+def test_cp_stock_callback_uses_gated_lengths_and_a_separate_counter(monkeypatch):
+    import flashinfer
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+    log = _log()
+    attn, st = _skv2_setup(log, batch_size=8, rows=56)
+    query = torch.zeros(56, 1024, dtype=torch.float8_e4m3fn)
+    lengths = torch.full((8,), 1, dtype=torch.int32)
+    output = torch.empty(56, 4, 256, dtype=torch.bfloat16)
+    workspace, counter = object(), object()
+    calls = []
+
+    class CpLite:
+        stock_counter = counter
+
+        def attend(self, *args, stock, **kwargs):
+            return stock(lengths, output)
+
+    def stock(**kwargs):
+        calls.append(kwargs)
+        return kwargs["out"]
+
+    monkeypatch.setattr(split_kv, "cp_lite", CpLite)
+    monkeypatch.setattr(flashinfer.decode, "trtllm_batch_decode_with_kv_cache", stock)
+    with patch("sglang.srt.runtime_context.get_buffer", lambda name, make: workspace):
+        result = split_kv.cp_core(
+            attn, query, st.view.kv, st.view.attn, st.fb, 7, min_bs=None
+        )
+    assert result.data_ptr() == output.data_ptr()
+    (call,) = calls
+    assert call["query"].shape == (56, 4, 256)
+    assert call["seq_lens"] is lengths
+    assert call["block_tables"] is st.view.attn.page_table
+    assert call["workspace_buffer"] is workspace
+    assert call["multi_ctas_kv_counter_buffer"] is counter
+    assert call["out"] is output and call["out_dtype"] is None
+    assert call["q_len_per_req"] == 7
+    assert call["max_seq_len"] == st.view.attn.page_table.shape[1] * 64
+    assert call["bmm1_scale"] == 0.75 * 0.0625
+    assert call["bmm2_scale"] == 0.5
 
 
 def test_draft_only_cp_slots_do_not_enable_target_multi_request(monkeypatch):

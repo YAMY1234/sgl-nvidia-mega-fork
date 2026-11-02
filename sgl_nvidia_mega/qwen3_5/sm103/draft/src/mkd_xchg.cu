@@ -175,9 +175,12 @@ SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
   constexpr int kScanUnroll = 4;
   const int nvec = p.vocab / 8;
   const bool from_head = p.head_part != nullptr;
-  const bool split = !from_head && p.scan_part != nullptr && nvec >= mkd_xchg::kSplitScanMinVecs;
+  // TP2's vocabulary shard exceeds the packed key's 16-bit row. Reuse the exact
+  // full-index scan below; narrow shards retain their packed/head fast path.
+  const bool wide = p.vocab > 65536;
+  const bool split = !wide && !from_head && p.scan_part != nullptr && nvec >= mkd_xchg::kSplitScanMinVecs;
   const int lo = split ? static_cast<int>((static_cast<int64_t>(nvec) * c) / kChunks) : 0;
-  const int hi = from_head ? 0 : split ? static_cast<int>((static_cast<int64_t>(nvec) * (c + 1)) / kChunks) : nvec;
+  const int hi = (wide || from_head) ? 0 : split ? static_cast<int>((static_cast<int64_t>(nvec) * (c + 1)) / kChunks) : nvec;
   for (int v0 = lo + static_cast<int>(threadIdx.x); v0 < hi; v0 += kThreads * kScanUnroll) {
     uint4 x[kScanUnroll];
 #pragma unroll
@@ -250,7 +253,7 @@ SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
   int32_t bidx = static_cast<int32_t>(0xffffu - (best & 0xffffu));
   const uint32_t k16 = best >> 16;
   best = (k16 << 16) | (k16 < 0x8000u ? 0xffffu : 0u);
-  if (nan_any != 0u) {
+  if (wide || nan_any != 0u) {
     __syncthreads();
     best = 0u;
     bidx = 0x7fffffff;

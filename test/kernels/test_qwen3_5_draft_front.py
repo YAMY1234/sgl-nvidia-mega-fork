@@ -109,7 +109,7 @@ def _same(a, b):
 
 
 @cuda
-@pytest.mark.parametrize("heads", [4, 8])
+@pytest.mark.parametrize("heads", [4, 8, 16])
 @pytest.mark.parametrize("rows", [1, 2, 7])
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_the_front_writes_what_sglangs_two_launches_write(rows, seed, heads):
@@ -123,7 +123,7 @@ def test_the_front_writes_what_sglangs_two_launches_write(rows, seed, heads):
 
 
 @cuda
-@pytest.mark.parametrize("heads", [4, 8])
+@pytest.mark.parametrize("heads", [4, 8, 16])
 def test_the_front_replays_in_a_graph_with_new_positions_and_slots(heads):
     rows = 1
     inputs = _inputs(rows, 5, heads)

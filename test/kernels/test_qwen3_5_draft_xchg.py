@@ -23,7 +23,7 @@ SM100-family GPUs (GB300) with NVLink multicast, against torch on the same input
 
 The bitwise comparison with the kernels of SGLang branch nvidia/qwen35-agentx-gb300 needs that
 branch installed as ``sglang`` and is not part of this test.
-Run with ``python test/kernels/test_qwen3_5_draft_xchg.py --num-gpu 4``.
+Run with ``python test/kernels/test_qwen3_5_draft_xchg.py --num-gpu 2`` (or 4 / 8).
 """
 
 import os
@@ -277,6 +277,50 @@ def test_extend_mkd_head_is_the_scan_path(ranks, boundary):
             torch.cuda.synchronize()
             same(captured, want)
             dist.barrier(group=cpu_group)
+
+
+def test_exchange_full_row_ids_on_tp2_sized_shards(ranks, boundary):
+    """A local winner above 65535 and the tie rule survive the exchange."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, _ = ranks
+    mkd, _ = boundary
+    vocab = 124544
+    # Token-only exchange never reads the candidate payload.
+    candidates = torch.empty(vocab, H, dtype=torch.float32, device="cuda")
+    hot_ids = torch.arange(world * vocab, dtype=torch.int64, device="cuda")
+    index = torch.empty(1, 1, dtype=torch.int64, device="cuda")
+    probability = torch.empty(1, 1, dtype=torch.float32, device="cuda")
+    key = kernels.NAN_KEY_SPLIT_ARGMAX
+    for ties in (False, True):
+        logits = torch.zeros(1, vocab, dtype=torch.bfloat16, device="cuda")
+        logits[0, vocab - 1] = 5.0
+        if ties:
+            logits[0, 65536] = 5.0
+        kernels.mkd_xchg(
+            logits,
+            candidates,
+            hot_ids,
+            mkd.own_partial,
+            mkd.epoch_done,
+            mkd.ext_cand,
+            mkd.ext_partials,
+            index,
+            probability,
+            None,
+            None,
+            None,
+            mkd.mc,
+            mkd.uc,
+            rank,
+            world,
+            0,
+            key,
+            token_only=True,
+            scan_part=mkd.scan_part,
+        )
+        want = _want_token(logits, group, -1e30)
+        assert int(index) == want and float(probability) == 1.0
 
 
 @pytest.mark.parametrize("m", [1, 2, 7])
@@ -705,4 +749,4 @@ def test_embedding_exchange_replays_from_a_cuda_graph(ranks, embedx):
 
 
 if __name__ == "__main__":
-    multigpu_pytest_main(__name__, __file__, num_gpus=(4,))
+    multigpu_pytest_main(__name__, __file__, num_gpus=(2, 4, 8))

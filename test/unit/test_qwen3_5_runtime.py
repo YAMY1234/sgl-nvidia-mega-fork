@@ -1511,6 +1511,38 @@ def test_the_draft_extend_writes_the_selected_rows_outputs(monkeypatch):
 # ------------------------------------------------------------------- the parity check
 
 
+@pytest.mark.parametrize("requests", [2, 6])
+def test_multi_draft_extend_uses_split_fc_only_within_its_bound(monkeypatch, requests):
+    from sgl_nvidia_mega.qwen3_5.draft import layer
+    from sgl_nvidia_mega.qwen3_5.draft.extend import DraftExtend
+
+    parts = _DraftParts()
+    calls = []
+    parts.embed = lambda ids: calls.append("embed") or ids
+    parts.mkd = SimpleNamespace(
+        split_fc=lambda embeds, hidden: calls.append("split") or hidden
+    )
+    monkeypatch.setattr(layer, "fc_input", lambda *a: calls.append("stock") or a[2])
+    monkeypatch.setattr(layer, "layer", lambda p, x, *a, **kw: x)
+    monkeypatch.setattr(layer, "top1_into", lambda *a, **kw: None)
+    rows = requests * 7
+    io = SimpleNamespace(
+        input_ids=torch.arange(rows),
+        hidden_states=torch.ones(rows, 1),
+        positions=None,
+        out_cache_loc=None,
+        attn=None,
+        kv=None,
+        tokens_per_request=7,
+        select_index=torch.arange(requests),
+        hidden_out=torch.empty(requests, 1),
+        topk_index_out=None,
+        topk_p_out=None,
+    )
+    DraftExtend(parts, tokens_per_request=7)._multi_step(io)
+    assert calls == (["embed", "split"] if rows <= 16 else ["stock"])
+
+
 @pytest.fixture
 def eager(monkeypatch):
     """Outside CUDA graph capture (a CPU build of torch has no capture to query), with

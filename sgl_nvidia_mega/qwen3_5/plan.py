@@ -61,7 +61,9 @@ ROUTE_TOPK_MAX_ROWS = MAX_ROWS
 # The router front's 16-row tiles replace SGLang's router GEMM through two
 # waves; wider route_topk rows keep the stock GEMM.
 ROUTE_GEMM_MAX_ROWS = 32
-GDN_CORE_MAX_ROWS = 896  # and gdn_core's launch (TRT-L4: checked at 64 and 128 requests)
+GDN_CORE_MAX_ROWS = (
+    896  # and gdn_core's launch (TRT-L4: checked at 64 and 128 requests)
+)
 MKM_MAX_ROWS = 7
 MKM_WIDE_MAX_ROWS = 16
 MKM_M32_MAX_ROWS = 32

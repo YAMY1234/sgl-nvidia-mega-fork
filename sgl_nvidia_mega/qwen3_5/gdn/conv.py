@@ -29,7 +29,9 @@ SGLANG_READS = {
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "kernels/ops/mamba/causal_conv1d_triton.py:causal_conv1d_update": "3394efa20c88d580",
+    # Native now opts into deduplicated window stores. This launch keeps the
+    # kernel's legacy defaults; test_contract pins those defaults separately.
+    "kernels/ops/mamba/causal_conv1d_triton.py:causal_conv1d_update": "e014f07a9fb4f68c",
 }
 
 

@@ -11,15 +11,17 @@ so its launches take the choices SGLang fixes. The chain is the backend's
 target-verify arm for the circular ReplaySSM ring (the causal conv update, the strided
 q / k / v split, the ReplaySSM verify), reading the step's GDN metadata and the mamba
 pools from the forward's view (``Step.view.gdn`` and ``.mamba``) and its request slots
-from the forward batch, then the gated norm and ``out_proj``. The choices, all bitwise
-to SGLang's own:
+from the forward batch, then the gated norm and ``out_proj``. This explicitly
+requested numeric slot changes these choices:
 
 - token-major projection views, with a token-major conv output (no split copy);
 - a 128-channel conv tile;
 - the ReplaySSM verify with 32-wide value tiles on 2 warps, on SGLang's kernel
   (``replayssm.py``), and with slot ``gdn_pdl`` launched dependent on the conv;
 - the gated norm writing the static FP8 ``out_proj`` takes (``norm_fp8.py``), which
-  ``out_proj``'s FlashInfer BMM then reads without quantizing it again.
+  ``out_proj``'s FlashInfer BMM then reads without quantizing it again. Its output
+  layout can change the FP32 reduction and BF16 midpoint rounding; the other
+  choices above retain native arithmetic.
 
 Slot ``gdn_push`` (numeric, not bitwise) runs ``out_proj`` on the decode hop's GEMM
 instead, whose epilogue pushes the partial into the hop's mailbox; the MoE input's
@@ -140,7 +142,10 @@ SGLANG_MIRRORS = {
         "28b89fa4b48b47ad",
         "739e7115c370ac01",
     ),
-    "srt/layers/linear.py:RowParallelLinear.forward": "b291a3c452e428a5",
+    # main 61d200 guards replicated layers (tp_group=None). GDN out_proj
+    # uses linear_attn_parallel_group (tp/attn_tp), so that new guard is false;
+    # the specialized collective-memory BMM below keeps the same semantics.
+    "srt/layers/linear.py:RowParallelLinear.forward": "1d5fb1eabbb87ec4",
     # The follow-up also accepts an already-quantized FP8 input, which is the path
     # _out_proj mirrors; the BF16 path remains the stock alternative.
     "srt/layers/quantization/fp8_utils.py:apply_fp8_linear_bmm_flashinfer": (
@@ -154,7 +159,7 @@ SGLANG_MIRRORS = {
     ),
 }
 
-RING_LEN, MAX_DRAFT = 16, 8  # the verify tiles' bounds, as measured
+RING_LENGTHS, MAX_DRAFT = (16, 32), 8  # aggregate and DEP8 ReplaySSM pools
 
 # the step widths that have run the slot (each logged once, as engagement evidence)
 _ENGAGED: set = set()
@@ -227,7 +232,7 @@ def pool_reasons(pools, tokens_per_request: int) -> list[str]:
     reasons = []
     if pools.ring_d is None or pools.ring_cache_base is None:
         reasons.append("no circular ReplaySSM verify ring")
-    elif pools.ring_d.shape[-2] != RING_LEN:
+    elif pools.ring_d.shape[-2] not in RING_LENGTHS:
         reasons.append(f"ring length {pools.ring_d.shape[-2]}")
     if pools.temporal.dtype != torch.bfloat16:
         reasons.append(f"{pools.temporal.dtype} checkpoints")
@@ -256,6 +261,10 @@ def core_pool_reasons(pools) -> list[str]:
     compact ring (update / key low parts, no exact-replay buffers) of BF16 checkpoints,
     int32 cursors and int8 flush flags."""
     reasons = []
+    # The fused CUDA core has two eight-entry history tiles. The generic
+    # gdn_verify path handles DEP8's 32-entry ring instead.
+    if pools.ring_d.shape[-2] != 16:
+        reasons.append(f"core ring length {pools.ring_d.shape[-2]} (serves 16)")
     if (
         pools.ring_beta is not None
         or pools.ring_rawk is None

@@ -1511,6 +1511,10 @@ def test_the_draft_extend_writes_the_selected_rows_outputs(monkeypatch):
 # ------------------------------------------------------------------- the parity check
 
 
+
+
+
+
 @pytest.fixture
 def eager(monkeypatch):
     """Outside CUDA graph capture (a CPU build of torch has no capture to query), with
@@ -1571,6 +1575,10 @@ def test_parity_counts_the_requests_own_rows_apart():
     assert int(parity.differing(a, b)) == 3 and int(parity.differing(a, b, valid)) == 0
     b[0, 1] = 1.0  # a request's row
     assert int(parity.differing(a, b, valid)) == 1
+
+
+
+
 
 
 @pytest.mark.parametrize("mode", ["1", "control"])
@@ -1677,6 +1685,8 @@ def test_the_parity_distance_reads_top1_flips_and_log_prob_gaps():
     assert parity.distance(None, None, None, None) is None
 
 
+
+
 def test_the_step_state_carries_the_binding():
     lm = SimpleNamespace(model="model")
     st = StepState(
@@ -1694,3 +1704,136 @@ def test_the_step_state_carries_the_binding():
         "EagleBinding",
         "EagleForwardView",
     )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("mm_inputs", [None, [], [None], [None, None, None, None]])
+def test_prefill_plan_uses_actual_chunk_rows_and_stock_when_slot_off(
+    enabled, mm_inputs
+):
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), enabled)
+    fb = SimpleNamespace(mm_inputs=mm_inputs, forward_mode=ForwardMode.EXTEND)
+    step = built.plan(torch.zeros(33, dtype=torch.int64), fb)
+    if enabled:
+        assert step.mode == "prefill" and step.rows == 33
+    else:
+        assert step is None
+    fb.forward_mode = ForwardMode.TARGET_VERIFY
+    assert built.plan(torch.zeros(7, dtype=torch.int64), fb) is None
+
+
+@pytest.mark.parametrize("mm_inputs", [[object()], [None, object()]])
+def test_prefill_plan_keeps_real_multimodal_batches_on_stock(mm_inputs):
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), True)
+    fb = SimpleNamespace(mm_inputs=mm_inputs, forward_mode=ForwardMode.EXTEND)
+    assert built.plan(torch.zeros(33, dtype=torch.int64), fb) is None
+
+
+def test_prefill_unsupported_view_returns_the_original_before_state_writes():
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+    from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), True)
+    marker = object()
+    original = lambda *a, **k: marker
+    step = Step(mode="prefill", rows=33, view=SimpleNamespace(kernel_id=0))
+    assert built.forward(step, original, None, None, None) is marker
+
+
+def _prefill_parity_fixture():
+    view = SimpleNamespace(
+        state=SimpleNamespace(
+            conv=(torch.zeros(1, 5, 2, 2),), temporal=torch.zeros(1, 5, 2)
+        ),
+        state_indices=torch.tensor([1]),
+        has_track=True,
+        track_conv_dst=torch.tensor([2]),
+        track_ssm_h_dst=torch.tensor([3]),
+        track_ssm_final_dst=torch.tensor([4]),
+        track_ssm_recompute_dst=None,
+    )
+
+    def forward():
+        conv, ssm = view.state.conv[0], view.state.temporal
+        conv[:, 1] += 1
+        conv[:, 2] = conv[:, 1] + 2
+        ssm[:, 1] += 2
+        ssm[:, 3] = ssm[:, 1] + 3
+        ssm[:, 4] = ssm[:, 1] + 4
+        return SimpleNamespace(tensors={"hidden": ssm[:, 1]})
+
+    return view, forward
+
+
+def test_prefill_parity_restores_committed_and_track_state_between_forwards():
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import PrefillParity
+
+    view, forward = _prefill_parity_fixture()
+    result = PrefillParity().run(33, view, forward, forward)
+    assert torch.equal(result.tensors["hidden"], torch.full((1, 2), 2.0))
+    assert torch.equal(view.state.conv[0][:, 1], torch.ones(1, 2, 2))
+    assert torch.equal(view.state.temporal[:, 4], torch.full((1, 2), 6.0))
+    assert not view.state.temporal[:, 0].any()
+
+
+def test_prefill_parity_catches_state_corruption_with_equal_output():
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import PrefillParity
+
+    view, forward = _prefill_parity_fixture()
+
+    def corrupt():
+        result = forward()
+        view.state.temporal[:, 4] += 1
+        return result
+
+    with pytest.raises(RuntimeError, match="output/state differs"):
+        PrefillParity().run(33, view, forward, corrupt)
+
+
+def test_prefill_all_slots_off_can_compare_native_twice_under_test_switch(monkeypatch):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+
+    monkeypatch.setattr(parity, "ENABLED", True)
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), False)
+    step = built.plan(
+        torch.zeros(33, dtype=torch.int64),
+        SimpleNamespace(mm_inputs=None, forward_mode=ForwardMode.EXTEND),
+    )
+    assert step.mode == "prefill" and not built.enabled

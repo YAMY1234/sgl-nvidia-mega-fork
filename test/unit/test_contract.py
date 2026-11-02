@@ -288,3 +288,58 @@ def test_the_mirrored_sglang_code_is_unchanged(path, key, digest):
         f"the mirror, then pin {got!r} in its SGLANG_MIRRORS (a tuple where the "
         "supported SGLangs differ)"
     )
+
+
+def test_qwen3_5_conv_kernel_defaults_preserve_legacy_window_stores():
+    # Q35MF conv_update calls this kernel directly, omitting the two new
+    # constexpr arguments. Updating the wrapper mirror pin must not implicitly
+    # enable native's deduplicated-window optimization in the plugin.
+    pattern = "kernels/ops/mamba/causal_conv1d_triton.py"
+    files = _files(pattern)
+    assert len(files) == 1, f"{pattern} matches {len(files)} files"
+    kernel = next(
+        node
+        for node in _tree(files[0]).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_causal_conv1d_update_kernel"
+    )
+    positional = kernel.args.posonlyargs + kernel.args.args
+    defaults = {
+        arg.arg: value
+        for arg, value in zip(
+            positional[len(positional) - len(kernel.args.defaults) :],
+            kernel.args.defaults,
+        )
+    }
+    defaults.update(
+        (arg.arg, value)
+        for arg, value in zip(kernel.args.kwonlyargs, kernel.args.kw_defaults)
+        if value is not None
+    )
+    assert ast.literal_eval(defaults["DEDUP_CONV_WINDOW"]) is False
+    assert ast.literal_eval(defaults["NP2_WINDOW_COLS"]) == 1
+
+
+def test_qwen3_5_gdn_outproj_stays_on_collective_parallel_group():
+    """The replicated-only RowParallelLinear guard cannot affect this mirror."""
+    helper = next(
+        n for n in _tree(ROOT / "srt/runtime_context.py").body
+        if isinstance(n, ast.FunctionDef) and n.name == "linear_attn_parallel_group"
+    )
+    returns = [n.value for n in ast.walk(helper) if isinstance(n, ast.Return)]
+    assert len(returns) == 1 and isinstance(returns[0], ast.IfExp)
+    assert {ast.literal_eval(returns[0].body), ast.literal_eval(returns[0].orelse)} == {"tp", "attn_tp"}
+    model = next(
+        n for n in _tree(ROOT / "srt/models/qwen3_5.py").body
+        if isinstance(n, ast.ClassDef) and n.name == "Qwen3_5GatedDeltaNet"
+    )
+    init = next(n for n in model.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    group = next(n for n in init.body if isinstance(n, ast.Assign) and any(
+        isinstance(t, ast.Name) and t.id == "parallel_group" for t in n.targets))
+    assert isinstance(group.value, ast.Call) and isinstance(group.value.func, ast.Name)
+    assert group.value.func.id == "linear_attn_parallel_group"
+    out = next(n for n in init.body if isinstance(n, ast.Assign) and any(
+        isinstance(t, ast.Attribute) and t.attr == "out_proj" for t in n.targets))
+    assert isinstance(out.value.func, ast.Name) and out.value.func.id == "RowParallelLinear"
+    parallel = next(k.value for k in out.value.keywords if k.arg == "parallel_group")
+    assert isinstance(parallel, ast.Name) and parallel.id == "parallel_group"

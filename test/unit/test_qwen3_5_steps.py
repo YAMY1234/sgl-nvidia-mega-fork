@@ -246,6 +246,10 @@ def test_the_moe_step_issues_what_sglang_issues(capture, defer, alt_stream):
     assert want == got if not isinstance(want, torch.Tensor) else torch.equal(want, got)
 
 
+
+
+
+
 def _st(route=False):
     return SimpleNamespace(slots=plan.Slots(route=route))
 
@@ -897,29 +901,8 @@ def test_the_mkm_slot_names_what_a_layer_lacks():
     assert mkm.unsupported(mlp).startswith("an expert activation")
 
 
-def test_route_topk_checks_only_materialized_routing_under_expert_parallelism(
-    monkeypatch,
-):
-    from sgl_nvidia_mega.qwen3_5.moe import mkm, route
 
-    experts = SimpleNamespace(num_experts=512, num_local_experts=128)
-    mlp = SimpleNamespace(experts=experts)
-    model = SimpleNamespace(
-        model=SimpleNamespace(
-            start_layer=0, end_layer=1, layers=[SimpleNamespace(mlp=mlp)]
-        )
-    )
-    checked = []
-    monkeypatch.setattr(route, "unsupported", lambda _: "")
-    monkeypatch.setattr(
-        mkm, "routing_unsupported", lambda _: checked.append("routing") or ""
-    )
-    monkeypatch.setattr(
-        mkm, "unsupported", lambda _: pytest.fail("full-expert engine checked under EP")
-    )
 
-    assert route.topk_unsupported(model) == ""
-    assert checked == ["routing"]
 
 
 def test_the_draft_mkm_uses_the_complete_slot_schema(monkeypatch):
@@ -962,13 +945,116 @@ def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch):
         runtime.build(model, ctx)
 
 
-def _gdn_module(log, x):
+def _gdn_build_model():
+    layer = qwen3_5.Qwen3_5LinearDecoderLayer.__new__(qwen3_5.Qwen3_5LinearDecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer.linear_attn = SimpleNamespace(
+        attn=SimpleNamespace(layer_id=0, num_k_heads=2, num_v_heads=8),
+        norm=SimpleNamespace(weight=torch.ones(128)),
+        out_proj=SimpleNamespace(weight=torch.ones(4, 4)),
+    )
+    return SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=1, layers=[layer])
+    )
+
+
+@pytest.mark.parametrize("tokens,reason", [(6, "6 rows a request"), (7, "TP 4")])
+def test_optional_gdn_front_falls_back_without_disabling_verify(
+    monkeypatch, tokens, reason
+):
+    from sgl_nvidia_mega.qwen3_5.gdn import front, verify
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core
+
+    model = _gdn_build_model()
+    monkeypatch.setattr(
+        runtime,
+        "SLOTS",
+        frozenset(
+            {
+                "gdn_verify",
+                "gdn_pdl",
+                "gdn_conv",
+                "gdn_core",
+                "gdn_front",
+                "gdn_trt_front",
+            }
+        ),
+    )
+    monkeypatch.setattr(verify, "unsupported", lambda _: "")
+    monkeypatch.setattr(front, "unsupported", lambda _: "TP 4")
+    monkeypatch.setattr(
+        front, "build", lambda *a: pytest.fail("unsupported front built")
+    )
+    monkeypatch.setattr(torch, "zeros", lambda *a, **kw: pytest.fail("front allocated"))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    compiled = []
+    monkeypatch.setattr(core, "build", lambda *a: compiled.append(a))
+
+    bound = gdn.build(model, SimpleNamespace(tokens_per_request=tokens))
+
+    assert bound.gdn_verify and bound.gdn_pdl and bound.gdn_conv and bound.gdn_core
+    assert bound.front == {} and bound.error is None and not bound.gdn_trt_front
+    assert reason in bound.reason
+    assert "gdn_trt_front: requires supported gdn_front and gdn_core" in bound.reason
+    assert compiled == [(0, tokens, 2, 8, True)]
+
+
+@pytest.mark.parametrize("bad_slot", ["gdn_push", "route_lin"])
+def test_optional_gdn_push_or_route_lin_falls_back_independently(monkeypatch, bad_slot):
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop
+
+    model = _gdn_build_model()
+    monkeypatch.setattr(
+        runtime, "SLOTS", frozenset({"gdn_verify", "gdn_pdl", "gdn_push", "route_lin"})
+    )
+    monkeypatch.setattr(verify, "unsupported", lambda _: "")
+
+    def pack(weight):
+        if bad_slot == "gdn_push":
+            raise ValueError("unsupported out_proj shape")
+        return "packed"
+
+    monkeypatch.setattr(hop, "pack_out_proj", pack)
+    checked = []
+    monkeypatch.setattr(
+        gdn, "_route_lin", lambda *a: checked.append(True) or ({}, "TP 4")
+    )
+
+    bound = gdn.build(model, SimpleNamespace(tokens_per_request=7))
+
+    assert bound.gdn_verify and bound.gdn_pdl and bound.rlin == {}
+    assert bad_slot in bound.reason
+    if bad_slot == "gdn_push":
+        assert bound.packed == {} and not checked
+        assert "route_lin: requires supported gdn_push" in bound.reason
+    else:
+        assert bound.packed == {0: "packed"} and checked == [True]
+        assert "route_lin: TP 4" in bound.reason
+
+
+def test_gdn_front_compilation_failure_is_not_treated_as_unsupported(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.gdn import front, verify
+
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"gdn_verify", "gdn_front"}))
+    monkeypatch.setattr(verify, "unsupported", lambda _: "")
+    monkeypatch.setattr(front, "unsupported", lambda _: "")
+
+    def compile_front(*args):
+        raise RuntimeError("front compilation failed")
+
+    monkeypatch.setattr(front, "build", compile_front)
+    with pytest.raises(RuntimeError, match="front compilation failed"):
+        gdn.build(_gdn_build_model(), SimpleNamespace(tokens_per_request=7))
+
+
+def _gdn_module(log, x, core_rows=7):
     """A Qwen3_5GatedDeltaNet whose projections, backend call, norm and out_proj log."""
     mod = qwen3_5.Qwen3_5GatedDeltaNet.__new__(qwen3_5.Qwen3_5GatedDeltaNet)
     torch.nn.Module.__init__(mod)
     qkvz, ba = torch.zeros(7, 10), torch.zeros(7, 2)
     z = torch.zeros(7, 2, 3)
-    core = torch.zeros(7, 2, 3)
+    core = torch.ones(core_rows, 2, 3)
     log.known.update(qkvz=qkvz, ba=ba, z=z, core=core)
     mod.__dict__.update(
         num_k_heads=16,
@@ -986,12 +1072,21 @@ def _gdn_module(log, x):
 
 
 @pytest.mark.parametrize("packed_verify", [False, True])
-def test_the_gdn_step_issues_what_sglang_issues(packed_verify):
+@pytest.mark.parametrize("core_rows", [0, 3, 7])
+def test_the_gdn_step_issues_what_sglang_issues(packed_verify, core_rows):
     runs = []
     for which in ("sglang", "plugin"):
         x = torch.zeros(7, 4)
         log = _log(x=x)
-        mod, split = _gdn_module(log, x)
+        mod, split = _gdn_module(log, x, core_rows=core_rows)
+        norm_inputs = []
+        norm = mod.norm
+
+        def checked_norm(core, z):
+            norm_inputs.append(core.clone())
+            return norm(core, z)
+
+        mod.norm = checked_norm
         backend = SimpleNamespace(
             linear_attn_backend=SimpleNamespace(supports_packed_verify=packed_verify)
         )
@@ -1027,13 +1122,18 @@ def test_the_gdn_step_issues_what_sglang_issues(packed_verify):
                     out = gdn.step(SimpleNamespace(linear_attn=mod), x, st)
             except (NotImplementedError, RuntimeError, AttributeError) as e:
                 out = type(e).__name__
-        runs.append((log, out))
-    (want_log, want), (got_log, got) = runs
+        runs.append((log, out, norm_inputs))
+    (want_log, want, want_norm), (got_log, got, got_norm) = runs
     if packed_verify:
         # SGLang folds the split and conv into such a backend; the step refuses it
         assert got == "NotImplementedError" and want != got
         return
     assert got_log == want_log and want == got == "out"
+    assert len(want_norm) == len(got_norm) == 1
+    assert torch.equal(got_norm[0], want_norm[0])
+    assert got_norm[0].shape == (14, 3)
+    assert torch.equal(got_norm[0][: core_rows * 2], torch.ones(core_rows * 2, 3))
+    assert torch.equal(got_norm[0][core_rows * 2 :], torch.zeros(14 - core_rows * 2, 3))
 
 
 def _gdn_verify_setup(log, *, ring_len=16, temporal_dtype=torch.bfloat16, draft=7):
@@ -2103,6 +2203,16 @@ def test_the_gdn_verify_slot_names_the_pools_it_cannot_serve(kw, want):
         built.forward(step, None, torch.zeros(7, dtype=torch.int64), None, None)
 
 
+@pytest.mark.parametrize("ring_len", [16, 32])
+def test_gdn_verify_accepts_aggregate_and_dep8_rings(ring_len):
+    verify, _, st = _gdn_verify_setup(_log(), ring_len=ring_len)
+    assert verify.pool_reasons(st.view.mamba, st.binding.tokens_per_request) == []
+    if ring_len == 32:
+        assert "core ring length 32 (serves 16)" in verify.core_pool_reasons(
+            st.view.mamba
+        )
+
+
 def test_the_pools_are_checked_once_at_the_first_covered_step(monkeypatch):
     verify, _, st = _gdn_verify_setup(_log())
     built = _verify(binding=st.binding)
@@ -3052,6 +3162,10 @@ def test_the_mka_slot_names_the_pools_it_cannot_write():
     assert "torch.float32" in mka.pool_reasons(kv(torch.zeros(64, 1, 256)))[0]
 
 
+
+
+
+
 class _Exit:
     def __init__(self, log, defer):
         self.log, self.defer_moe_finalize = log, defer
@@ -3133,6 +3247,8 @@ def test_a_layer_runs_what_sglangs_decoder_layer_runs(kind, defer):
         runs.append((log, out))
     (want_log, want), (got_log, got) = runs
     assert got_log == want_log and want == got == "layer_out"
+
+
 
 
 def test_the_layer_loop_opens_the_stream_scopes_each_layer_and_closes_it(monkeypatch):
@@ -3537,3 +3653,28 @@ def test_with_slot_hop_each_point_falls_back_to_sglang_where_the_hop_declines(
     assert log == [(p, "the hop") for p in ("layer_input", "moe_input", "final_norm")]
     # an auxiliary capture reads SGLang's own prepare
     assert boundary.pre(layer, "h", st, capture=[]) == "sglang layer input"
+
+
+def test_route_topk_checks_only_materialized_routing_under_expert_parallelism(
+    monkeypatch,
+):
+    from sgl_nvidia_mega.qwen3_5.moe import mkm, route
+
+    experts = SimpleNamespace(num_experts=512, num_local_experts=128)
+    mlp = SimpleNamespace(experts=experts)
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            start_layer=0, end_layer=1, layers=[SimpleNamespace(mlp=mlp)]
+        )
+    )
+    checked = []
+    monkeypatch.setattr(route, "unsupported", lambda _: "")
+    monkeypatch.setattr(
+        mkm, "routing_unsupported", lambda _: checked.append("routing") or ""
+    )
+    monkeypatch.setattr(
+        mkm, "unsupported", lambda _: pytest.fail("full-expert engine checked under EP")
+    )
+
+    assert route.topk_unsupported(model) == ""
+    assert checked == ["routing"]

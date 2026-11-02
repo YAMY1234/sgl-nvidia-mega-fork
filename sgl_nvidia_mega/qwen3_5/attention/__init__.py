@@ -55,7 +55,7 @@ class Bound(msgspec.Struct, frozen=True):
 
     skv2: bool = False  # slot skv2 serves every full-attention layer
     mka: bool = False
-    mka_wide: bool = False  # mka's wide entries serve the steps of several requests
+    mka_wide: bool = False  # mka's front path also serves steps of several requests
     mka_push: bool = False
     route_lin: bool = False  # router-before-all-reduce packed for every layer
     reason: str = ""  # why a requested slot is not built
@@ -77,34 +77,41 @@ def build(model, ctx) -> Bound:
         for i in range(m.start_layer, m.end_layer)
         if isinstance(m.layers[i], Qwen3_5AttentionDecoderLayer)
     ]
+    reasons = []
+    skv2_on, mka_on = "skv2" in SLOTS, "mka" in SLOTS
     for i, layer in layers:
-        reason = ""
-        if "skv2" in SLOTS:
+        if skv2_on:
             reason = split_kv.unsupported(layer.attn, ctx.tokens_per_request)
-        if not reason and "mka" in SLOTS:
+            if reason:
+                reasons.append(f"layer {i}: {reason}")
+                skv2_on = False
+        if mka_on:
             reason = (
                 mka.unsupported(layer)
                 if model.is_mrope_enabled
                 else "no M-RoPE positions (MKA reads them)"
             )
-        if reason:
-            return Bound(reason=f"layer {i}: {reason}")
+            if reason:
+                reasons.append(f"layer {i}: {reason}")
+                mka_on = False
     if "skv2_cp" in SLOTS:
         reason = split_kv.cp_reason()
         if reason:
-            return Bound(reason=f"slot skv2_cp: {reason}")
-    if "mka" in SLOTS:
+            reasons.append(f"slot skv2_cp: {reason}")
+    route_lin = mka_on and "route_lin" in SLOTS
+    if mka_on:
         for i, layer in layers:
-            reason = mka.pack(layer, route_lin="route_lin" in SLOTS)
+            reason = mka.pack(layer, route_lin=route_lin)
             if reason:
-                return Bound(reason=f"slot route_lin: layer {i}: {reason}")
-    mka_on = "mka" in SLOTS
+                reasons.append(f"slot route_lin: layer {i}: {reason}")
+                route_lin = False
     return Bound(
-        skv2="skv2" in SLOTS,
+        skv2=skv2_on,
         mka=mka_on,
-        mka_wide=mka_on and all(layer.num_heads == 4 for _, layer in layers),
-        mka_push="mka_push" in SLOTS,
-        route_lin="route_lin" in SLOTS,
+        mka_wide=mka_on,
+        mka_push=mka_on and "mka_push" in SLOTS,
+        route_lin=route_lin,
+        reason="; ".join(reasons),
     )
 
 

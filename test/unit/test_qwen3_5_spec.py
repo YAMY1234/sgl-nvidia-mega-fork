@@ -440,7 +440,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     # one-request step it is checked at
     assert plan.multi_request(8, frozenset({"multi_request"}))
     assert not plan.multi_request(8, frozenset())
-    assert not plan.multi_request(4, frozenset({"multi_request"}))
+    assert plan.multi_request(4, frozenset({"multi_request"}))
     assert plan.covered((7, 14, 28), every, 7) == (7, 14, 28)
     assert plan.covered((7, 448, 896), every, 7) == (7, 448, 896)
     # one request is always covered, more only where a slot runs

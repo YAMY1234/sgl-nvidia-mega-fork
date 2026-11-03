@@ -184,6 +184,10 @@ class Topology(msgspec.Struct, frozen=True):
             return "tep8"
         return f"tp{self.tp_size}"
 
+    def cp_min_length(self, site: str, default: int) -> int:
+        """B1 verify's CP crossover for this topology, resolved at graph build."""
+        return 229376 if self.name == "tp8" and site == "verify" else default
+
     @property
     def stock_widths(self) -> bool:
         """New topologies cover all offered widths even with every slot off."""

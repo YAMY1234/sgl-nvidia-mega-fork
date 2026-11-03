@@ -69,6 +69,10 @@ def registered(monkeypatch):
         plugin_binding, "megakernel_agree", lambda *args, **kwargs: None
     )
     plugin.register()
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=8, attn_dp_size=1, moe_ep_size=1),
+    )
 
 
 # ------------------------------------------------- the stock step against SGLang's
@@ -2493,8 +2497,12 @@ def test_slot_skv2_cp_adds_a_cp_variant_from_its_kv_length(monkeypatch):
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2"}))
     assert route.verify_variants() is route.VERIFY
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2", "skv2_cp"}))
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=8, attn_dp_size=1, moe_ep_size=1),
+    )
     variants = route.verify_variants()
-    crossover = route.CP_MIN_KV["verify"]
+    crossover = 229376
     assert variants.capture_labels == ("split_kv_stock", "split_kv_long", "split_kv_cp")
     assert (variants.min_length, variants.cp_min_length) == (8192, crossover)
     assert variants.max_batch_size == 1

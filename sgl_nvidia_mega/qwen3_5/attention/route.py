@@ -36,6 +36,7 @@ SGLANG_READS = {
         "get_is_capture_mode",
     ),
     "srt/model_executor/forward_batch_info.py": ("batch_size", "seq_lens_cpu"),
+    "srt/runtime_context.py": ("get_parallel",),
 }
 # select also reads ForwardBatch.attention_kv_len_lower_bound (the request's committed
 # KV length), which SGLang adds with the runners that take these variants
@@ -118,7 +119,11 @@ def cp_min_length(site: str) -> Optional[int]:
 
     if CP_SITES[site] not in SLOTS:
         return None
-    return CP_MIN_KV[site]
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.qwen3_5.topology import from_parallel
+
+    return from_parallel(get_parallel()).cp_min_length(site, CP_MIN_KV[site])
 
 
 def verify_variants() -> SplitKVGraphVariants:

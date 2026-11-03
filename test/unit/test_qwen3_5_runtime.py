@@ -2047,3 +2047,34 @@ def test_an_explicit_slot_keeps_stock_for_a_refused_mkd_build(monkeypatch, caplo
             is None
         )
     assert "MKD draft boundary disabled (needs an aligned NVLink" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "tp,dp,ep,verify",
+    [(8, 1, 1, 229376), (8, 1, 8, 139264), (8, 8, 8, 139264), (4, 1, 1, 139264)],
+)
+def test_cp_crossover_is_specific_to_tp8_b1_verify(monkeypatch, tp, dp, ep, verify):
+    from sgl_nvidia_mega.qwen3_5.attention import route
+
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=tp, attn_dp_size=dp, moe_ep_size=ep),
+    )
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(route.CP_SITES.values()))
+    assert [route.cp_min_length(site) for site in ("verify", "draft", "extend")] == [
+        verify,
+        184320,
+        245760,
+    ]
+    variants = route.verify_variants()
+    for length, label in [
+        (139264, "split_kv_long" if verify == 229376 else "split_kv_cp"),
+        (verify - 1, "split_kv_long"),
+        (verify, "split_kv_cp"),
+    ]:
+        batch = SimpleNamespace(
+            batch_size=1, attention_kv_len_lower_bound=length, seq_lens_cpu=None
+        )
+        assert variants.select(batch) == label
+        batch.batch_size = 2
+        assert variants.select(batch) == "split_kv_stock"

@@ -169,6 +169,7 @@ class _Built:
     draft_extend = None
     begin_draft_round = None
     graph_variants = None
+    speculative_runtime_hooks = None
 
     def __init__(self, model: Any, resources: Any, widths: tuple[int, ...]):
         from .executor import KimiK3MegakernelExecutor

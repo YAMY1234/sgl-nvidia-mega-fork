@@ -695,7 +695,7 @@ def test_the_numerics_claim_covers_the_slots_a_plan_can_add():
     assert claim == spec.numerics(ROUTE_LIN_SLOTS | {"route_lin"})
     assert spec.NUMERIC_TOLERANCES["route_lin"].items() <= dict(claim.tolerances).items()
     shipped = frozenset(runtime.SHIPPED_SLOTS)
-    assert topology.plannable(shipped) == shipped
+    assert topology.plannable(shipped) == shipped | {"mkm_wide_bal"}
 
 
 def test_dep8_accepts_the_recipe_stock_moe_and_dp_lm_head():

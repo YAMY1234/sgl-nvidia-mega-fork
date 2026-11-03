@@ -153,7 +153,7 @@ class Bound(msgspec.Struct, frozen=True):
     m128: bool = False  # slot mkm_m128: the 128-token engine built (on m32's maps)
     m256: bool = False  # slot mkm_m256: the 256-token engine built (on m32's maps)
     m512: bool = False  # slot mkm_m512: the 512-token engine built (on m32's maps)
-    wide_bal: bool = False  # opt-in balanced work split for mkm_m256 / mkm_m512
+    wide_bal: bool = False  # balanced work split for mkm_m256 / mkm_m512
     # A caller-specific upper bound for the 16-token engine. The draft uses 12 so
     # its alternate-stream shared expert can overlap rows 13-16 with the 32-token engine.
     m16_max_rows: int = 16

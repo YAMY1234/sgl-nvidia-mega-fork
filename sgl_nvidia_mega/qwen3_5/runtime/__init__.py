@@ -62,7 +62,7 @@ OPT_IN_SLOTS: tuple[str, ...] = (
 # shape instead of padding.
 OPT_IN_COVERAGE: tuple[str, ...] = ("multi_request",)
 # Graph or build variants of a slot, requested in the same variable: no width of their
-# own. BAL stays opt-in because its serving evidence covers TP8 only.
+# own. The TP8 plan enables BAL for its wide engines; elsewhere it stays explicit.
 # skv2_cp: one long request past the measured crossover runs CP-lite in place of SKV2,
 # in a graph variant of its own (attention/route.py)
 OPT_IN_VARIANTS: tuple[str, ...] = ("skv2_cp", "mkm_wide_bal")

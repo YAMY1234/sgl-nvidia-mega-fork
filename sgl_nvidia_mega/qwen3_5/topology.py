@@ -230,14 +230,20 @@ def _route_lin_fits(slots: frozenset) -> bool:
 def plan(requested: frozenset, topology: Topology) -> frozenset:
     """``select``, plus the slots a topology's plan turns on with the requested ones:
     the TP8 plan (aggregated and PD decode) adds route_lin wherever its slots are
-    selected. Every other topology keeps exactly its selected slots."""
+    selected, and balances the mkm_m256/mkm_m512 work split when offered.
+    Every other topology keeps exactly its selected slots."""
     selected = select(requested, topology)
     if topology.name == "tp8" and _route_lin_fits(selected):
         selected |= {"route_lin"}
+    if topology.name == "tp8" and {"mkm_m256", "mkm_m512"} & selected:
+        selected |= {"mkm_wide_bal"}
     return selected
 
 
 def plannable(requested: frozenset) -> frozenset:
     """``requested`` plus every slot some topology's plan can add to it (the numerics
     claim made before the topology is known)."""
-    return requested | ({"route_lin"} if _route_lin_fits(requested) else frozenset())
+    planned = requested | ({"route_lin"} if _route_lin_fits(requested) else frozenset())
+    if {"mkm_m256", "mkm_m512"} & requested:
+        planned |= {"mkm_wide_bal"}
+    return planned

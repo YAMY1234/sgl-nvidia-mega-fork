@@ -235,10 +235,16 @@ def build_cp_lite(binding) -> None:
         return
 
     import torch
+    from sglang.srt.runtime_context import get_parallel
 
+    from sgl_nvidia_mega.qwen3_5 import topology
     from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
 
-    cp = CpLite.maybe_create(binding, torch.device("cuda", torch.cuda.current_device()))
+    cp = CpLite.maybe_create(
+        binding,
+        torch.device("cuda", torch.cuda.current_device()),
+        topology.cp_unbalanced_batches(topology.from_parallel(get_parallel())),
+    )
     if cp is None:
         unavailable_slots(
             requested, "CP slots need a supported attention-TP Q/KV-head topology"

@@ -48,7 +48,8 @@ _LANE_PLAN_MAX_BATCH = 32
 
 
 # Production default: distribute the grid's CTAs by owned KV length, including
-# batches <= 32. Cover verify through 128 requests with the existing packed
+# batches <= 32, except TP8 batches 2..4 fixed by the startup topology plan.
+# Cover verify through 128 requests with the existing packed
 # two-slot plan; keep draft/Q1 admission at 64, matching the TEP8 recipe.
 # This is a plugin policy, not an environment switch; explicit split-mode test
 # overrides below retain their separate counter requirement.
@@ -293,7 +294,16 @@ class _DeviceState:
     """Per-device grid-barrier counters (int64 [MAX_BATCH + 1, MAX_BATCH], row b = batch size b, one epoch per
     request; zero-initialized once, never reset) and the partial workspace (sized for every supported call)."""
 
-    def __init__(self, device: torch.device, sm_count: int):
+    def __init__(
+        self,
+        device: torch.device,
+        sm_count: int,
+        unbalanced_batches: tuple[int, ...] = (),
+    ):
+        # Fixed for the lifetime of the counters: target, draft and extend share
+        # row b and must all use the same split mode for batch b.
+        self.unbalanced_batches = unbalanced_batches
+        self.unbalanced_logged = set()
         self.sm_count = sm_count
         need = 0
         for b in range(1, MAX_BATCH + 1):
@@ -333,6 +343,9 @@ class _DeviceState:
             )
             _start_dbg_dump(self.dbg_ring, device)
 
+    def balanced(self, batch: int) -> bool:
+        return _DEFAULT_BALANCED and batch not in self.unbalanced_batches
+
 
 def _start_dbg_dump(ring: torch.Tensor, device: torch.device) -> None:
     raise NotImplementedError("the debug ring is not ported (_DBG_SLOTS = 0)")
@@ -345,15 +358,30 @@ def _sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-def q35_cp_fused_prepare(device: torch.device | None = None, sm_count: int = 0) -> None:
-    """Allocate this device's counters / workspace (call before CUDA graph capture)."""
+def q35_cp_fused_prepare(
+    device: torch.device | None = None,
+    sm_count: int = 0,
+    *,
+    unbalanced_batches: tuple[int, ...] | None = None,
+) -> None:
+    """Allocate counters/workspace and fix split policy before CUDA graph capture.
+
+    Omitting the policy preserves an already prepared state. Explicit test-mode
+    overrides still need their own counters in q35_cp_fused_partial.
+    """
     device = (
         torch.device("cuda", torch.cuda.current_device()) if device is None else device
     )
     idx = device.index if device.index is not None else torch.cuda.current_device()
     if idx not in _STATES:
         _STATES[idx] = _DeviceState(
-            torch.device("cuda", idx), sm_count or _sm_count(device)
+            torch.device("cuda", idx),
+            sm_count or _sm_count(device),
+            unbalanced_batches or (),
+        )
+    elif unbalanced_batches is not None:
+        assert _STATES[idx].unbalanced_batches == unbalanced_batches, (
+            "CP split policy must be fixed before any barrier counter is used"
         )
 
 
@@ -625,7 +653,7 @@ def q35_cp_fused_partial(
     device = q_all.device
     sms = sm_count or _sm_count(device)
     state = _state(device, sms)
-    bal = _DEFAULT_BALANCED if balanced is None else bool(balanced)
+    bal = state.balanced(b) if balanced is None else bool(balanced)
     assert bal or b <= _LANE_PLAN_MAX_BATCH, "the equal split handles <= 32 requests"
     # plan variant: lane (<= 32 requests), wide (33..64), two-slot (65..128); `plan` overrides it in tests (also
     # "quad": the one-slot plan for 65..128)
@@ -666,6 +694,17 @@ def q35_cp_fused_partial(
     if n_splits or balanced is not None:
         assert counters is not None, (
             "a split-count or split-mode override needs its own counters tensor"
+        )
+    if not bal and balanced is None and b not in state.unbalanced_logged:
+        state.unbalanced_logged.add(b)
+        logger.info(
+            "CP-lite topology plan: unbalanced batch %d, q_len %d, cp_rank %d, "
+            "%d splits/request (%d CTAs)",
+            b,
+            q_len,
+            cp_rank,
+            splits,
+            splits * b,
         )
     cnt = state.counters if counters is None else counters
     assert (

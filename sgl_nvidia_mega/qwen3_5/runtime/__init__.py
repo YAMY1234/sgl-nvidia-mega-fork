@@ -155,20 +155,18 @@ def require_multicast(slots, pointer: int, group, device) -> None:
         )
 
 
-def unavailable_slots(slots, reason: str) -> None:
-    """Keep defaults optional at a capability check that was already strict.
+def unavailable_slots(slots, reason: str, *, config: bool = False) -> None:
+    """Log a refused slot; the caller keeps its stock implementation / unserved entry.
 
-    Called at the capability check, before the unavailable implementation runs.
-    The caller keeps its existing stock implementation / unserved entry.
+    A refusal that depends on the weights, the model's shapes or the environment
+    never stops the server, even for an explicit SLOTS list. Only a ``config``
+    contradiction (a server argument the slot cannot serve) raises, and only for an
+    explicitly requested slot.
     """
     names = [slots] if isinstance(slots, str) else sorted(slots)
-    if names and os.environ.get(SLOTS_ENV) is not None:
+    if config and names and os.environ.get(SLOTS_ENV) is not None:
         raise RuntimeError(slot_failure(slots, reason))
-    logger.info(
-        "NVIDIA megakernel: requested slots %s use stock (default policy; %s)",
-        names,
-        reason,
-    )
+    logger.info("NVIDIA megakernel: requested slots %s use stock (%s)", names, reason)
 
 
 def slot_supported(slots, reason: str, *, cpu_group=None) -> bool:
@@ -230,7 +228,9 @@ def build_cp_lite(binding) -> None:
     )
     if binding.page_size != 64:
         unavailable_slots(
-            requested, f"CP slots need page size 64 (got {binding.page_size})"
+            requested,
+            f"CP slots need page size 64 (got {binding.page_size})",
+            config=True,
         )
         return
 
@@ -555,7 +555,9 @@ def build(model, ctx):
     widths = slot_plan.candidates(ctx.widths, ctx.tokens_per_request, multi)
     if not widths:
         unavailable_slots(
-            SLOTS, f"{ctx.tokens_per_request} rows a request leave no covered width"
+            SLOTS,
+            f"{ctx.tokens_per_request} rows a request leave no covered width",
+            config=True,
         )
         return Qwen35Verify(
             model, {}, {}, (), binding=ctx.binding, summary="none (stock)"

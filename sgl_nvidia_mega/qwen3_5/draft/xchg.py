@@ -30,7 +30,7 @@ from typing import Callable, Optional
 
 import torch
 
-from sgl_nvidia_mega.qwen3_5.runtime import slot_failure
+from sgl_nvidia_mega.qwen3_5.runtime import SlotUnavailable, slot_failure
 from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
 
 logger = logging.getLogger(__name__)
@@ -265,8 +265,8 @@ class MkdBoundary:
 
     @classmethod
     def maybe_create(cls, *, vocab_size: int, **kwargs) -> Optional[MkdBoundary]:
-        """The boundary, or None (logged) when ``unsupported_reason`` refuses it; every
-        rank decides alike."""
+        """The boundary, or None (logged) when ``unsupported_reason`` or a build check
+        (multicast mapping, memo parity) refuses it; every rank decides alike."""
         fc_weight = kwargs["fc_weight"]
         reason = unsupported_reason(
             hidden=int(fc_weight.shape[0]),
@@ -276,12 +276,15 @@ class MkdBoundary:
             embed_shard=kwargs["embed_shard"],
             lm_head_shard=kwargs["lm_head_shard"],
         )
-        if reason is not None:
-            logger.warning(
-                "MKD draft boundary disabled (%s); using the stock path.", reason
-            )
-            return None
-        return cls(**kwargs)
+        if reason is None:
+            try:
+                return cls(**kwargs)
+            except SlotUnavailable as exc:
+                reason = exc.reason
+        logger.warning(
+            "MKD draft boundary disabled (%s); using the stock path.", reason
+        )
+        return None
 
     # ---------------------------------------------------------------- memo table
 
@@ -306,11 +309,9 @@ class MkdBoundary:
         bad_t = torch.tensor([bad, rows], dtype=torch.int64, device=emb.device)
         dist.all_reduce(bad_t, group=self._device_group)
         if int(bad_t[0]) != 0:
-            raise RuntimeError(
-                slot_failure(
-                    "draft_xchg",
-                    f"MKD memo table differs from the split fc on {int(bad_t[0])} of {int(bad_t[1])} rows",
-                )
+            raise SlotUnavailable(
+                "draft_xchg",
+                f"MKD memo table differs from the split fc on {int(bad_t[0])} of {int(bad_t[1])} rows",
             )
         logger.info(
             "MKD memo table: %d rows on this rank (%.1f MB), equal to the split fc on all %d rows.",

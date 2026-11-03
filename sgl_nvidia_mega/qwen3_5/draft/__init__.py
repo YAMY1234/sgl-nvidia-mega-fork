@@ -117,6 +117,7 @@ class MtpDraft:
 
     widths: tuple[int, ...] = ()
     draft_sampler = None  # SGLang's draft proposal
+    speculative_runtime_hooks = None
 
     def __init__(
         self,

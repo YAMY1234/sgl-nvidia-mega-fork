@@ -62,6 +62,12 @@ FLASHINFER_READS = {
         "MoeRunnerInputs",
         "alloc_trtllm_moe_output",
     ),
+    # moe/tactics.py: the table's key
+    "flashinfer/autotuner/autotuner.py": ("AutoTuner._find_nearest_profile",),
+    "flashinfer/fused_moe/backends/trtllm/sm100_runner.py": (
+        "MoERunner.get_cache_key_extras",
+    ),
+    "flashinfer/version.py": ("__version__",),
 }
 OP = "flashinfer::trtllm_fp4_block_scale_moe"  # the routed op's autotuner entry
 
@@ -179,8 +185,8 @@ def default_tile(m: int, top_k: int, local_experts: int) -> int:
 
 def width(experts, x: torch.Tensor) -> Width:
     """The width of ``x`` [m, hidden]: on first use its runner, the routed op's tactic at
-    m rows (the autotuner's; without one, FlashInfer's default, [-1, -1]) and that tile_n's
-    tables (the body buffers follow on the first ``run``)."""
+    m rows (the plugin table's, else the autotuner's; without one, FlashInfer's default,
+    [-1, -1]) and that tile_n's tables (the body buffers follow on the first ``run``)."""
     from flashinfer.autotuner import AutoTuner
     from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
     from flashinfer.tllm_enums import (
@@ -191,6 +197,7 @@ def width(experts, x: torch.Tensor) -> Width:
     )
     from sglang.srt.utils import next_power_of_2
 
+    from sgl_nvidia_mega.qwen3_5.moe import tactics
     from sgl_nvidia_mega.qwen3_5.sm103.moe import router
 
     m = x.shape[0]
@@ -233,9 +240,11 @@ def width(experts, x: torch.Tensor) -> Width:
         use_cold_l2_cache=True,
         use_cuda_graph=True,
     )
-    _, tactic = AutoTuner.get().choose_one(
-        OP, [w.runner], config, inputs.to_list(), **kw
-    )
+    tactic = tactics.pick(m, w.runner, config, inputs.to_list())
+    if tactic is None:
+        _, tactic = AutoTuner.get().choose_one(
+            OP, [w.runner], config, inputs.to_list(), **kw
+        )
     if isinstance(tactic, int) or tactic[0] <= 0 or tactic[1] < 0:
         # the launcher's fallback: the default tile_n and its default config
         w.tactic = [-1, -1]

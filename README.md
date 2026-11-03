@@ -87,6 +87,12 @@ The same TP8 plan adds `mkm_wide_bal` for `mkm_m256` / `mkm_m512`: balanced
 CTA assignment at 129–512 verify rows, with bitwise-identical outputs.
 TEP8, DEP8, TP2 and TP4 run exactly the requested slots their topology supports.
 
+TEP8's routed body takes its NVFP4 MoE tactic per token bucket from a fixed table
+(`moe/tactics.py`) on FlashInfer 0.7.1, SM103 and the routed experts' MoERunner
+signature; any other configuration or bucket asks the autotuner, and the log names
+each width's source. `SGLANG_NVIDIA_MEGAKERNEL_MOE_TACTICS` switches the table; unset,
+it follows `SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`.
+
 The router-only `route`, `route_topk` and `route_gemm` slots support TP2, TP4, TP8 and TEP8 with the TRTLLM runner and no all-to-all. PD decode TP2 uses the same local row counts: batch 6/10 gives 42/70 verify rows. These fronts leave the expert GEMMs with the stock runner, so TP2 needs no fused expert engine. `route_shared` keeps its TP8/TEP8 projection bounds; DEP8 keeps stock MoE dispatch and routing.
 
 `mka` uses the fused projection kernels through 14 verify rows on TP8 and 8 on

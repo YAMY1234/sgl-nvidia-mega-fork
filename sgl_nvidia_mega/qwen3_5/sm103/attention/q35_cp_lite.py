@@ -23,6 +23,7 @@ the stock kernel runs beside the gather and partial kernels on a second stream.
 from __future__ import annotations
 
 import logging
+import os
 import weakref
 
 import torch
@@ -1181,7 +1182,11 @@ class CpLite:
         total = self.llp_off + _MAX_ROWS * cp * _LL_PWORDS * 8
         self.cp_ungated = True
         self.gather_pdl = self.cp_ungated
-        self.early_merge = self.cp_ungated
+        self.early_merge = (
+            self.cp_ungated
+            and os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_CP_EARLY_MERGE", "0") == "1"
+        )
+        logger.info("TRT-L1 CP-lite early merge enabled: %s", self.early_merge)
         self.merge_h = True
         self.fold_mh = True
         self.fold_chunk = {33: 128, 41: 64, 65: 128}

@@ -267,6 +267,30 @@ def test_cp_exact_selector_admits_verify_128_and_q1_64():
     assert [cp._exact_supported(1, batch) for batch in (64, 65)] == [True, False]
 
 
+@pytest.mark.parametrize("value,expected", [(None, False), ("0", False), ("1", True)])
+def test_cp_early_merge_is_opt_in(monkeypatch, caplog, value, expected):
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    key = "SGLANG_NVIDIA_MEGAKERNEL_CP_EARLY_MERGE"
+    if value is None:
+        monkeypatch.delenv(key, raising=False)
+    else:
+        monkeypatch.setenv(key, value)
+
+    class BeforeAllocation(Exception):
+        pass
+
+    def no_allocation(*args, **kwargs):
+        raise BeforeAllocation
+
+    monkeypatch.setattr(torch, "zeros", no_allocation)
+    cp = CpLite.__new__(CpLite)
+    with caplog.at_level("INFO"), pytest.raises(BeforeAllocation):
+        cp.__init__(None, 0, 8, 4, 4, "cpu")
+    assert cp.early_merge is expected
+    assert f"CP-lite early merge enabled: {expected}" in caplog.text
+
+
 def test_cp_call_override_pairs_the_exact_partial_and_merge_order(monkeypatch):
     from sgl_nvidia_mega.qwen3_5.sm103.attention import q35_cp_lite as cp_module
     from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite

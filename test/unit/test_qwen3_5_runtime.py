@@ -111,7 +111,9 @@ def test_cp_slots_build_the_plugin_state_before_validation(monkeypatch):
     assert calls == [(binding, torch.device("cuda", 3))]
 
 
-def test_cp_slots_refuse_an_incompatible_page_or_topology(monkeypatch):
+def test_cp_slots_refuse_an_incompatible_page_and_skip_an_unbuilt_topology(
+    monkeypatch, caplog
+):
     monkeypatch.setenv(runtime.SLOTS_ENV, "skv2_cp")
     from sglang.srt.kernel_plugins.nvidia import binding as plugin_binding
 
@@ -121,13 +123,20 @@ def test_cp_slots_refuse_an_incompatible_page_or_topology(monkeypatch):
     monkeypatch.setattr(
         plugin_binding, "megakernel_agree", lambda *args, **kwargs: None
     )
-    with pytest.raises(RuntimeError, match="page size 64"):
+    with pytest.raises(RuntimeError) as exc:
         runtime.build_cp_lite(SimpleNamespace(page_size=32, tp_size=8))
+    assert str(exc.value) == (
+        "NVIDIA megakernel: slot skv2_cp cannot run: CP slots need page size 64 "
+        "(got 32); remove it from SGLANG_NVIDIA_MEGAKERNEL_SLOTS or change the topology"
+    )
 
+    # The model's Q/KV heads, not a server argument: stock, even when explicit.
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(CpLite, "maybe_create", lambda binding, device: None)
-    with pytest.raises(RuntimeError, match="Q/KV-head topology"):
+    with caplog.at_level("INFO"):
         runtime.build_cp_lite(SimpleNamespace(page_size=64, tp_size=8))
+    assert "['skv2_cp'] use stock" in caplog.text
+    assert "Q/KV-head topology" in caplog.text
 
 
 @pytest.mark.parametrize("attention_tp_size", [1, 2, 3, 6, 32])
@@ -1986,16 +1995,55 @@ def test_the_default_plan_keeps_stock_for_unavailable_slots(monkeypatch, caplog,
         assert "stock" in caplog.text
 
 
-def test_an_explicit_unavailable_slot_raises_with_its_recovery(monkeypatch):
+@pytest.mark.parametrize(
+    "layout", ["use_flashinfer_trtllm_moe", "w13_swiglu_interleaved"]
+)
+def test_an_explicit_slot_keeps_stock_for_a_weight_layout(monkeypatch, caplog, layout):
+    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
     from sgl_nvidia_mega.qwen3_5.draft import moe as draft_moe
 
     monkeypatch.setenv(runtime.SLOTS_ENV, "draft_loop,draft_moe")
-    monkeypatch.setattr(
-        draft_moe, "unsupported_reason", lambda mlp: "a TRTLLM expert layout"
+    method = object.__new__(UnquantizedFusedMoEMethod)
+    method.use_flashinfer_trtllm_moe = layout == "use_flashinfer_trtllm_moe"
+    method.w13_swiglu_interleaved = layout == "w13_swiglu_interleaved"
+    mlp = SimpleNamespace(
+        experts=SimpleNamespace(quant_method=method),
+        shared_expert=object(),
+        shared_expert_gate=object(),
+        layer_id=0,
     )
-    with pytest.raises(RuntimeError) as exc:
-        draft_moe.DraftMoe.build(object(), 0)
-    assert str(exc.value) == (
-        "NVIDIA megakernel: slot draft_moe cannot run: a TRTLLM expert layout; "
-        "remove it from SGLANG_NVIDIA_MEGAKERNEL_SLOTS or change the topology"
+    with caplog.at_level("INFO"):
+        assert draft_moe.DraftMoe.build(mlp, 0) is None
+    assert (
+        "requested slots ['draft_moe'] use stock "
+        "(expert weights in a kernel-specific layout)" in caplog.text
     )
+
+
+def test_an_explicit_slot_keeps_stock_for_a_refused_mkd_build(monkeypatch, caplog):
+    from sgl_nvidia_mega.qwen3_5.draft import xchg
+
+    monkeypatch.setenv(runtime.SLOTS_ENV, "draft_xchg")
+    monkeypatch.setattr(xchg, "unsupported_reason", lambda **kwargs: None)
+
+    def refuse(self, **kwargs):
+        raise runtime.SlotUnavailable(
+            "draft_xchg", "needs an aligned NVLink multicast mapping on every rank"
+        )
+
+    monkeypatch.setattr(xchg.MkdBoundary, "__init__", refuse)
+    fc = SimpleNamespace(shape=(4096, 8192))
+    with caplog.at_level("WARNING"):
+        assert (
+            xchg.MkdBoundary.maybe_create(
+                vocab_size=8,
+                fc_weight=fc,
+                world=8,
+                rank=0,
+                embed_shard=None,
+                lm_head_shard=None,
+            )
+            is None
+        )
+    assert "MKD draft boundary disabled (needs an aligned NVLink" in caplog.text

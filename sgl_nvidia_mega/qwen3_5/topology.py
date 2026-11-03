@@ -247,3 +247,12 @@ def plannable(requested: frozenset) -> frozenset:
     if {"mkm_m256", "mkm_m512"} & requested:
         planned |= {"mkm_wide_bal"}
     return planned
+
+
+def cp_unbalanced_batches(topology: Topology) -> tuple[int, ...]:
+    """Keep TP8's small-request CP plan uniform across target, draft and extend.
+
+    Each batch owns a barrier-counter row, so its split mode is fixed at startup.
+    B1 and all larger batches retain KV-balanced allocation on every topology.
+    """
+    return (2, 3, 4) if topology.name == "tp8" else ()

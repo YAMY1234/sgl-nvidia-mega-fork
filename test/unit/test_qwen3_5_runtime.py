@@ -98,7 +98,9 @@ def test_cp_slots_build_the_plugin_state_before_validation(monkeypatch):
     monkeypatch.setattr(
         CpLite,
         "maybe_create",
-        lambda binding, device: calls.append((binding, device)) or built,
+        lambda binding, device, batches: (
+            calls.append((binding, device, batches)) or built
+        ),
     )
 
     binding = SimpleNamespace(page_size=64, tp_size=8)
@@ -108,7 +110,7 @@ def test_cp_slots_build_the_plugin_state_before_validation(monkeypatch):
         (("draft_q1_cp",), "Qwen3.5 CP slots requested"),
         ((64, 8), "Qwen3.5 CP page size and TP size"),
     ]
-    assert calls == [(binding, torch.device("cuda", 3))]
+    assert calls == [(binding, torch.device("cuda", 3), (2, 3, 4))]
 
 
 def test_cp_slots_refuse_an_incompatible_page_and_skip_an_unbuilt_topology(
@@ -132,7 +134,7 @@ def test_cp_slots_refuse_an_incompatible_page_and_skip_an_unbuilt_topology(
 
     # The model's Q/KV heads, not a server argument: stock, even when explicit.
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(CpLite, "maybe_create", lambda binding, device: None)
+    monkeypatch.setattr(CpLite, "maybe_create", lambda binding, device, batches: None)
     with caplog.at_level("INFO"):
         runtime.build_cp_lite(SimpleNamespace(page_size=64, tp_size=8))
     assert "['skv2_cp'] use stock" in caplog.text
@@ -232,15 +234,15 @@ def test_cp_state_uses_the_pinned_qwen35_head_topology(monkeypatch, tp, rank, wa
     monkeypatch.setattr(
         CpLite,
         "__init__",
-        lambda self, got_group, got_rank, got_tp, cp, hq, device: calls.append(
-            (got_group, got_rank, got_tp, cp, hq, device)
+        lambda self, got_group, got_rank, got_tp, cp, hq, device, batches: calls.append(
+            (got_group, got_rank, got_tp, cp, hq, device, batches)
         ),
     )
 
     made = CpLite.maybe_create(binding, torch.device("cuda", 0))
 
     assert isinstance(made, CpLite)
-    assert calls == [(group, *want, torch.device("cuda", 0))]
+    assert calls == [(group, *want, torch.device("cuda", 0), ())]
 
 
 def test_requested_cp_state_does_not_restore_a_device_length_gate():

@@ -1162,7 +1162,14 @@ class CpLite:
     _instance: CpLite | None = None
 
     def __init__(
-        self, group, tp_rank: int, tp_size: int, cp: int, q_heads: int, device
+        self,
+        group,
+        tp_rank: int,
+        tp_size: int,
+        cp: int,
+        q_heads: int,
+        device,
+        unbalanced_batches: tuple[int, ...] = (),
     ):
         import torch.distributed._symmetric_memory as symm_mem
 
@@ -1199,7 +1206,9 @@ class CpLite:
             from sgl_nvidia_mega.qwen3_5.sm103.attention import q35_cp_fused
 
             # grid-barrier counters and workspace: persistent, allocated before any capture
-            q35_cp_fused.q35_cp_fused_prepare(self.device, self.sms)
+            q35_cp_fused.q35_cp_fused_prepare(
+                self.device, self.sms, unbalanced_batches=unbalanced_batches
+            )
         if symm_mem.get_backend(self.device) is None:
             symm_mem.set_backend("NCCL")
         self.buf = symm_mem.empty((total,), dtype=torch.uint8, device=self.device)
@@ -1305,7 +1314,9 @@ class CpLite:
         return t if self.gate_max else t * b
 
     @classmethod
-    def maybe_create(cls, binding, device) -> CpLite | None:
+    def maybe_create(
+        cls, binding, device, unbalanced_batches: tuple[int, ...] = ()
+    ) -> CpLite | None:
         """Build the Qwen3.5 CP state collectively on the attention TP group.
 
         The plugin spec pins the global Q/KV head counts and head dimension. Keeping
@@ -1320,7 +1331,7 @@ class CpLite:
             return None
         cp, q_heads = topology
         group = binding.tp_device_group
-        cls._instance = cls(group, rank, tp, cp, q_heads, device)
+        cls._instance = cls(group, rank, tp, cp, q_heads, device, unbalanced_batches)
         return cls._instance
 
     def _tables(self, page_table, seq_lens, q_len, forward_batch, layer_id, gate):

@@ -1995,18 +1995,15 @@ def test_the_default_plan_keeps_stock_for_unavailable_slots(monkeypatch, caplog,
         assert "stock" in caplog.text
 
 
-@pytest.mark.parametrize(
-    "layout", ["use_flashinfer_trtllm_moe", "w13_swiglu_interleaved"]
-)
-def test_an_explicit_slot_keeps_stock_for_a_weight_layout(monkeypatch, caplog, layout):
+def test_an_explicit_slot_keeps_stock_for_a_weight_layout(monkeypatch, caplog):
     from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
     from sgl_nvidia_mega.qwen3_5.draft import moe as draft_moe
 
     monkeypatch.setenv(runtime.SLOTS_ENV, "draft_loop,draft_moe")
     method = object.__new__(UnquantizedFusedMoEMethod)
-    method.use_flashinfer_trtllm_moe = layout == "use_flashinfer_trtllm_moe"
-    method.w13_swiglu_interleaved = layout == "w13_swiglu_interleaved"
+    method.use_flashinfer_trtllm_moe = False
+    method.w13_swiglu_interleaved = True
     mlp = SimpleNamespace(
         experts=SimpleNamespace(quant_method=method),
         shared_expert=object(),
@@ -2078,3 +2075,14 @@ def test_cp_crossover_is_specific_to_tp8_b1_verify(monkeypatch, tp, dp, ep, veri
         assert variants.select(batch) == label
         batch.batch_size = 2
         assert variants.select(batch) == "split_kv_stock"
+
+
+def test_checkpoint_expert_shapes_preserve_bf16_dimensions():
+    from sgl_nvidia_mega.qwen3_5.draft.moe import _checkpoint_shapes
+
+    experts = SimpleNamespace(
+        quant_method=SimpleNamespace(use_flashinfer_trtllm_moe=True),
+        w13_weight=torch.empty(512, 64, 256, 64, device="meta"),
+        w2_weight=torch.empty(512, 2, 4096, 64, device="meta"),
+    )
+    assert _checkpoint_shapes(experts) == ((512, 256, 4096), (512, 4096, 128))

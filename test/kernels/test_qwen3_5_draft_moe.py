@@ -216,6 +216,67 @@ def test_draft_moe_two_tokens(weights):
         assert torch.equal(got[m : m + 1], out)
 
 
+def _trtllm_layout(w13, w2):
+    """W13 / W2 as SGLang's flashinfer_trtllm path keeps them (loaded up rows first, then
+    UnquantizedFusedMoEMethod.process_weights_after_loading's row gather and K blocks)."""
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        convert_to_block_layout,
+        get_w2_permute_indices_with_cache,
+    )
+
+    inter = w2.shape[-1]
+    cache, out13, out2 = {}, [], []
+    for e in range(E):
+        w31 = torch.cat([w13[e, inter:], w13[e, :inter]]).view(torch.uint8)
+        perm = _maybe_get_cached_w3_w1_permute_indices(
+            cache, w31, 128, is_gated_act_gemm=True
+        )
+        out13.append(
+            convert_to_block_layout(w31[perm].contiguous(), 128).view(torch.bfloat16)
+        )
+        u2 = w2[e].view(torch.uint8)
+        perm = get_w2_permute_indices_with_cache(cache, u2, 128)
+        out2.append(
+            convert_to_block_layout(u2[perm].contiguous(), 128).view(torch.bfloat16)
+        )
+    return torch.stack(out13), torch.stack(out2)
+
+
+def test_draft_moe_trtllm_layout(weights):
+    """flashinfer_trtllm's layout put back in checkpoint order, bit for bit; DraftMoe on
+    that copy gives the bytes it gives on the checkpoint weights."""
+    pytest.importorskip("flashinfer.fused_moe.core")
+    pytest.importorskip("sglang.kernels.plugin_kernels.nvidia.spec")
+    from sgl_nvidia_mega.qwen3_5.draft.moe import DraftMoe, checkpoint_weights
+
+    w13, w2 = _trtllm_layout(weights["w13"], weights["w2"])
+    method = SimpleNamespace(
+        use_flashinfer_trtllm_moe=True, w13_swiglu_interleaved=False
+    )
+    experts = SimpleNamespace(w13_weight=w13, w2_weight=w2, quant_method=method)
+    got13, got2 = checkpoint_weights(experts)
+    assert torch.equal(got13, weights["w13"]) and torch.equal(got2, weights["w2"])
+    mlp = SimpleNamespace(
+        gate=SimpleNamespace(weight=weights["router_w"]),
+        experts=experts,
+        shared_expert=SimpleNamespace(
+            gate_up_proj=SimpleNamespace(weight=weights["w13_shared"]),
+            down_proj=SimpleNamespace(weight=weights["w2_shared"]),
+        ),
+        shared_expert_gate=SimpleNamespace(weight=weights["gate_w"].view(1, H)),
+        topk=SimpleNamespace(topk_config=SimpleNamespace(top_k=K)),
+    )
+    x = torch.cat([_x(7), _x(8)])
+    got = DraftMoe(mlp, torch.device("cuda"), (got13, got2))(x)
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import moe
+
+    scratch = moe.draft_moe_fused_scratch(E, K, _inter(weights), torch.device("cuda"))
+    for m in range(2):
+        *_, out = _run(weights, x[m : m + 1], scratch, _outputs())
+        assert torch.equal(got[m : m + 1], out)
+
+
 def test_rejects_bad_operands(weights):
     from sgl_nvidia_mega.qwen3_5.sm103.draft import moe
 

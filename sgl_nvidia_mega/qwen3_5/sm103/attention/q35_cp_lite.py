@@ -31,6 +31,10 @@ import triton.language as tl
 
 from sgl_nvidia_mega.qwen3_5 import CP_LITE_HEAD_DIM, cp_lite_topology
 
+SGLANG_READS = {
+    "srt/runtime_context.py": ("get_parallel", '"attn_dp_size"', '"moe_ep_size"'),
+}
+
 logger = logging.getLogger(__name__)
 
 PAGE, HEAD_DIM = 64, CP_LITE_HEAD_DIM
@@ -482,6 +486,64 @@ def _ll_wait_plain(src, n: tl.constexpr, e):
 
 
 @triton.jit
+def _tile_barrier():
+    tl.inline_asm_elementwise(
+        "fence.proxy.alias; bar.sync 0; fence.proxy.alias; mov.u32 $0, 0;",
+        "=r,~{memory}",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _tile_wait(addr, epoch, lane):
+    return tl.inline_asm_elementwise(
+        """{
+            .reg .u32 %lane_tid;
+            .reg .u64 %seen;
+            .reg .pred %skip, %done;
+            mov.u32 %lane_tid, %tid.x;
+            setp.ne.u32 %skip, %lane_tid, $3;
+            @%skip bra done;
+        wait:
+            ld.acquire.sys.global.u64 %seen, [$1];
+            setp.eq.u64 %done, %seen, $2;
+            @!%done bra wait;
+        done:
+            mov.u32 $0, 0;
+        }""",
+        "=r,l,l,r,~{memory}",
+        [addr, epoch, lane],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _tile_release(addr, epoch, lane):
+    tl.inline_asm_elementwise(
+        """{
+            .reg .u32 %lane_tid;
+            .reg .pred %skip;
+            mov.u32 %lane_tid, %tid.x;
+            setp.ne.u32 %skip, %lane_tid, $3;
+            @%skip bra done;
+            st.release.sys.global.u64 [$1], $2;
+        done:
+            mov.u32 $0, 0;
+        }""",
+        "=r,l,l,r,~{memory}",
+        [addr, epoch, lane],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def _cp_gather_q_ll(
     q,
     q_stride,
@@ -848,6 +910,9 @@ def _cp_merge_h_ll(
     o_proj_input=None,
     o_proj_input_stride=0,
     GATE_EPILOGUE: tl.constexpr = False,
+    ready_off=0,
+    ack_off=0,
+    READY_ACK: tl.constexpr = False,
 ):
     """_cp_a2a_merge_ll (gated) with one program per (row, head): pushes the head's partials, computes its causal
     block, then merges the CP partials as they arrive. One epoch per (row, head) in cnt, in an LL region of its own
@@ -866,7 +931,24 @@ def _cp_merge_h_ll(
         return
     one = tl.arange(0, 1)
     e = tl.load(cnt + i * HQ + h) + 1
-    flag = e.to(tl.int64) << 32
+    if READY_ACK:
+        e = tl.inline_asm_elementwise(
+            "{ .reg .pred %p; setp.le.s64 %p, $1, 0; @%p trap; mov.u64 $0, $1; }",
+            "=l,l",
+            [e],
+            dtype=tl.int64,
+            is_pure=False,
+            pack=1,
+        )
+        c = tl.arange(0, CP)
+        own_base = tl.load(peers + me)
+        slot = (i * HQ + h) * CP
+        ack = (own_base + ack_off + (slot + c) * 8).to(tl.pointer_type(tl.int64))
+        # Payload -> ready release.sys/acquire.sys -> reads; completed reads ->
+        # ACK release.sys/acquire.sys -> overwrite. CTA barriers join every lane.
+        _tile_wait(ack, e - 1, c)
+        _tile_barrier()
+    flag = (e.to(tl.int64) & 0xFFFFFFFF) << 32
     DW: tl.constexpr = D // 2
     NO: tl.constexpr = HQ * D // 2
     H: tl.constexpr = QL * CP * HQ
@@ -944,6 +1026,15 @@ def _cp_merge_h_ll(
         )
         tl.store(dst + h * DW + w, ow)
         tl.store(dst + NO + h + one, lw)
+    if READY_ACK:
+        _tile_barrier()
+        c = tl.arange(0, CP)
+        peer = tl.load(peers + c)
+        ready = (peer + ready_off + (slot + me) * 8).to(tl.pointer_type(tl.int64))
+        _tile_release(ready, e, c)
+        ready = (own_base + ready_off + (slot + c) * 8).to(tl.pointer_type(tl.int64))
+        _tile_wait(ready, e, c)
+        _tile_barrier()
     if not EARLY:
         acc, m, wsum = _causal_block_h(
             q,
@@ -967,8 +1058,12 @@ def _cp_merge_h_ll(
     own = tl.load(peers + me) + ll_off
     for c in tl.static_range(CP):
         src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
-        v = _ll_wait(src + h * DW, DW, e)
-        lv = _ll_wait(src + NO + h, 1, e)
+        if READY_ACK:
+            v = tl.load(src + h * DW + w, cache_modifier=".cg")
+            lv = tl.load(src + NO + h + one, cache_modifier=".cg")
+        else:
+            v = _ll_wait(src + h * DW, DW, e)
+            lv = _ll_wait(src + NO + h, 1, e)
         lc = (lv & 0xFFFFFFFF).to(tl.int32).to(
             tl.float32, bitcast=True
         ) * 0.6931471805599453
@@ -981,7 +1076,11 @@ def _cp_merge_h_ll(
         mn0 = tl.where(mn > float("-inf"), mn, 0.0)
         a_old = tl.where(m > float("-inf"), tl.exp(m - mn0), 0.0)
         a_new = tl.where(lc > float("-inf"), tl.exp(lc - mn0), 0.0)
-        acc = acc * a_old + oc * a_new
+        if READY_ACK:
+            # Keep the existing acc*a_old FMA across the payload layout conversion.
+            acc = tl.fma(acc, a_old, oc * a_new)
+        else:
+            acc = acc * a_old + oc * a_new
         wsum = wsum * a_old + a_new
         m = mn
     o = (acc / tl.where(wsum > 0, wsum, 1.0)).to(tl.bfloat16)
@@ -995,6 +1094,12 @@ def _cp_merge_h_ll(
             o_proj_input + i * o_proj_input_stride + h * D + d,
             tl.clamp(gated * scale_inv, -448.0, 448.0).to(tl.float8e4nv),
         )
+    if READY_ACK:
+        _tile_barrier()
+        c = tl.arange(0, CP)
+        peer = tl.load(peers + c)
+        ack = (peer + ack_off + (slot + me) * 8).to(tl.pointer_type(tl.int64))
+        _tile_release(ack, e, c)
     tl.store(cnt + i * HQ + h + one, e)
 
 
@@ -1165,6 +1270,12 @@ class CpLite:
         self, group, tp_rank: int, tp_size: int, cp: int, q_heads: int, device
     ):
         import torch.distributed._symmetric_memory as symm_mem
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        self.verify_ready_ack = (
+            tp_size == 8 and parallel.attn_dp_size == 1 and parallel.moe_ep_size > 1
+        )
 
         self.cp, self.hq, self.device = cp, q_heads, torch.device(device)
         self.me = tp_rank % cp
@@ -1190,6 +1301,15 @@ class CpLite:
         self.fold_fuse = True
         self.llh_off = total
         total += _MAX_ROWS * cp * _LL_PWORDS * 8
+        self.verify_off = self.ready_off = self.ack_off = self.epoch_off = total
+        if self.verify_ready_ack:
+            total += _MAX_ROWS * cp * _LL_PWORDS * 8
+            self.ready_off = total
+            total += _MAX_ROWS * q_heads * cp * 8
+            self.ack_off = total
+            total += _MAX_ROWS * q_heads * cp * 8
+            self.epoch_off = total
+            total += _MAX_ROWS * q_heads * 8
         self.ll = q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
         self.cnt = torch.zeros(_KINDS, _MAX_ROWS, dtype=torch.int32, device=self.device)
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
@@ -1213,6 +1333,11 @@ class CpLite:
             device=self.device,
         )
         self._handle = handle
+        self.verify_epoch = (
+            self.buf[self.epoch_off :].view(torch.int64)
+            if self.verify_ready_ack
+            else None
+        )
         self.q_all = (
             self.buf[: self.q_bytes]
             .view(torch.float8_e4m3fn)
@@ -2080,6 +2205,23 @@ class CpLite:
                 "GATE_EPILOGUE": True,
             }
         )
+        ready_ack = (
+            self.verify_ready_ack
+            and q_len > 1
+            and gate_epilogue is not None
+            and not plain
+        )
+        if ready_ack:
+            epilogue_args.update(
+                READY_ACK=True,
+                ready_off=self.ready_off,
+                ack_off=self.ack_off,
+            )
+            if ("ready_ack", rows) not in self._logged:
+                self._logged.add(("ready_ack", rows))
+                logger.info(
+                    "TRT-L1 CP-lite verify uses ready/completed ACK at %d rows", rows
+                )
         merge_kernel = _cp_merge_h_ll_plain if plain else _cp_merge_h_ll
         merge_options = {} if plain else {"EARLY": early and pdl, **epilogue_args}
         merge_kernel[(rows, hq)](
@@ -2102,8 +2244,8 @@ class CpLite:
             out.stride(0),
             self.peers,
             self.me,
-            self.llh_off,
-            self.cnt_h,
+            self.verify_off if ready_ack else self.llh_off,
+            self.verify_epoch if ready_ack else self.cnt_h,
             bmm1_scale,
             bmm2_scale,
             gate["nb"],

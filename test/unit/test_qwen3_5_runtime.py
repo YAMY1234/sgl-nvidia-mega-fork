@@ -340,6 +340,7 @@ def test_cp_fold_call_override_selects_the_r11_plain_merge(monkeypatch):
     cp.plse = torch.zeros(4, 7, 4, dtype=torch.float32)
     cp.peers = torch.zeros(4, dtype=torch.int64)
     cp.cnt_h = torch.zeros(7 * 4, dtype=torch.int32)
+    cp.verify_ll_shared = False
     q = torch.zeros(7, 4, 256, dtype=torch.uint8)
     cache = torch.zeros(2, 1, 64, 256, dtype=torch.uint8)
     table = torch.zeros(1, 2, dtype=torch.int32)
@@ -418,6 +419,7 @@ def test_cp_exact_plain_merge_does_not_pass_feature_constexprs(monkeypatch):
     cp.pl_x = torch.zeros(4, 7, 4, dtype=torch.float32)
     cp.peers = torch.zeros(4, dtype=torch.int64)
     cp.cnt_h = torch.zeros(7 * 4, dtype=torch.int32)
+    cp.verify_ll_shared = False
     q = torch.zeros(7, 4, 256, dtype=torch.uint8)
     cache = torch.zeros(2, 1, 64, 256, dtype=torch.uint8)
     table = torch.zeros(1, 2, dtype=torch.int32)
@@ -2250,3 +2252,65 @@ def test_an_explicit_slot_keeps_stock_for_a_refused_mkd_build(monkeypatch, caplo
             is None
         )
     assert "MKD draft boundary disabled (needs an aligned NVLink" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "tep8, q_len, fused, plain, expected",
+    [
+        (True, 7, True, False, True),
+        (False, 7, True, False, False),
+        (True, 1, True, False, False),
+        (True, 7, False, False, False),
+        (True, 7, True, True, False),
+    ],
+)
+def test_cp_shared_ll_is_only_the_tep8_fused_verify_merge(
+    monkeypatch, tep8, q_len, fused, plain, expected
+):
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import q35_cp_lite as mod
+
+    calls = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: calls.append((args, kwargs))
+
+    monkeypatch.setattr(mod, "_cp_merge_h_ll", Kernel())
+    monkeypatch.setattr(mod, "_cp_merge_h_ll_plain", Kernel())
+    cp = mod.CpLite.__new__(mod.CpLite)
+    cp.cp, cp.hq, cp.me, cp.llh_off = 4, 4, 0, 0
+    cp.verify_ll_shared, cp._logged = tep8, set()
+    cp.po_x = torch.zeros(4, 7, 4, 256, dtype=torch.bfloat16)
+    cp.pl_x = torch.zeros(4, 7, 4, dtype=torch.float32)
+    cp.peers = torch.zeros(4, dtype=torch.int64)
+    cp.cnt_h = torch.zeros(28, dtype=torch.int32)
+    q = torch.zeros(7, 4, 256, dtype=torch.uint8)
+    cache = torch.zeros(2, 1, 64, 256, dtype=torch.uint8)
+    table, lengths = torch.zeros(1, 2, dtype=torch.int32), torch.tensor([71])
+    out = torch.zeros(7, 4, 256, dtype=torch.bfloat16)
+    gate = {"nb": 1, "thr": 0, "NB": 1, "GMAX": False}
+    epilogue = (q.view(7, 1024), torch.ones(1), q.view(7, 1024)) if fused else None
+    cp._merge_h(
+        q,
+        cache,
+        cache,
+        table,
+        lengths,
+        q_len,
+        7,
+        1.0,
+        1.0,
+        out,
+        gate,
+        pdl=True,
+        early=True,
+        plain=plain,
+        gate_epilogue=epilogue,
+    )
+    args, kwargs = calls[-1]
+    assert kwargs.get("SHARED_LL", False) is expected
+    assert args[19] == cp.llh_off
+    assert args[20] is cp.cnt_h
+    if not plain:
+        assert kwargs["EARLY"] is True
+        assert kwargs.get("GATE_EPILOGUE", False) is fused

@@ -31,6 +31,10 @@ import triton.language as tl
 
 from sgl_nvidia_mega.qwen3_5 import CP_LITE_HEAD_DIM, cp_lite_topology
 
+SGLANG_READS = {
+    "srt/runtime_context.py": ("get_parallel", '"attn_dp_size"', '"moe_ep_size"'),
+}
+
 logger = logging.getLogger(__name__)
 
 PAGE, HEAD_DIM = 64, CP_LITE_HEAD_DIM
@@ -472,6 +476,62 @@ def _ll_wait(src, n: tl.constexpr, e):
 
 
 @triton.jit
+def _ll_store64(dst, value, SCALAR: tl.constexpr = False):
+    if SCALAR:
+        asm: tl.constexpr = "{ .reg .u32 %t; .reg .pred %p; mov.u32 %t, %tid.x; setp.eq.u32 %p, %t, 0; @%p st.relaxed.sys.global.b64 [$1], $2; mov.u32 $0, 0; }"
+    else:
+        asm: tl.constexpr = "st.relaxed.sys.global.b64 [$1], $2; mov.u32 $0, 0;"
+    tl.inline_asm_elementwise(
+        asm, "=r,l,l,~{memory}", [dst, value], dtype=tl.int32, is_pure=False, pack=1
+    )
+
+
+@triton.jit
+def _ll_wait_shared(src, n: tl.constexpr, e):
+    # A single owner validates epoch and payload from the same aligned 64-bit read.
+    # Other warps use only that snapshot after the shared-memory handoff.
+    v = tl.inline_asm_elementwise(
+        f"""{{
+            .shared .align 8 .b8 stage[{n * 8}];
+            .reg .u32 %owner, %word, %base, %slot, %lo, %hi;
+            .reg .u64 %offset, %addr, %value;
+            .reg .pred %skip, %again;
+            mov.u32 %owner, %tid.x;
+            mov.u32 %base, stage;
+            setp.ge.u32 %skip, %owner, 32;
+            @%skip bra handoff;
+            mov.u32 %word, %owner;
+        next_word:
+            setp.ge.u32 %skip, %word, {n};
+            @%skip bra handoff;
+            mul.wide.u32 %offset, %word, 8;
+            add.u64 %addr, $1, %offset;
+        poll:
+            ld.relaxed.sys.global.b64 %value, [%addr];
+            mov.b64 {{%lo, %hi}}, %value;
+            setp.ne.b32 %again, %hi, $2;
+            @%again bra poll;
+            mad.lo.u32 %slot, %word, 8, %base;
+            st.shared.b64 [%slot], %value;
+            add.u32 %word, %word, 32;
+            bra next_word;
+        handoff:
+            bar.sync 0;
+            mad.lo.u32 %slot, $3, 8, %base;
+            ld.shared.b64 $0, [%slot];
+        }}""",
+        "=l,l,r,r,~{memory}",
+        [src, e, tl.arange(0, n)],
+        dtype=tl.int64,
+        is_pure=False,
+        pack=1,
+    )
+    if n > 32:
+        tl.debug_barrier()
+    return v
+
+
+@triton.jit
 def _ll_wait_plain(src, n: tl.constexpr, e):
     """R11's volatile-load wait, used only by the R11 plain merge."""
     k = tl.arange(0, n)
@@ -848,6 +908,7 @@ def _cp_merge_h_ll(
     o_proj_input=None,
     o_proj_input_stride=0,
     GATE_EPILOGUE: tl.constexpr = False,
+    SHARED_LL: tl.constexpr = False,
 ):
     """_cp_a2a_merge_ll (gated) with one program per (row, head): pushes the head's partials, computes its causal
     block, then merges the CP partials as they arrive. One epoch per (row, head) in cnt, in an LL region of its own
@@ -942,8 +1003,12 @@ def _cp_merge_h_ll(
         dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(
             tl.pointer_type(tl.int64)
         )
-        tl.store(dst + h * DW + w, ow)
-        tl.store(dst + NO + h + one, lw)
+        if SHARED_LL:
+            _ll_store64(dst + h * DW + w, ow)
+            _ll_store64(dst + NO + h + one, lw, SCALAR=True)
+        else:
+            tl.store(dst + h * DW + w, ow)
+            tl.store(dst + NO + h + one, lw)
     if not EARLY:
         acc, m, wsum = _causal_block_h(
             q,
@@ -967,8 +1032,12 @@ def _cp_merge_h_ll(
     own = tl.load(peers + me) + ll_off
     for c in tl.static_range(CP):
         src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
-        v = _ll_wait(src + h * DW, DW, e)
-        lv = _ll_wait(src + NO + h, 1, e)
+        if SHARED_LL:
+            v = _ll_wait_shared(src + h * DW, DW, e)
+            lv = _ll_wait_shared(src + NO + h, 1, e)
+        else:
+            v = _ll_wait(src + h * DW, DW, e)
+            lv = _ll_wait(src + NO + h, 1, e)
         lc = (lv & 0xFFFFFFFF).to(tl.int32).to(
             tl.float32, bitcast=True
         ) * 0.6931471805599453
@@ -981,7 +1050,10 @@ def _cp_merge_h_ll(
         mn0 = tl.where(mn > float("-inf"), mn, 0.0)
         a_old = tl.where(m > float("-inf"), tl.exp(m - mn0), 0.0)
         a_new = tl.where(lc > float("-inf"), tl.exp(lc - mn0), 0.0)
-        acc = acc * a_old + oc * a_new
+        if SHARED_LL:
+            acc = tl.fma(acc, a_old, oc * a_new)
+        else:
+            acc = acc * a_old + oc * a_new
         wsum = wsum * a_old + a_new
         m = mn
     o = (acc / tl.where(wsum > 0, wsum, 1.0)).to(tl.bfloat16)
@@ -1165,6 +1237,12 @@ class CpLite:
         self, group, tp_rank: int, tp_size: int, cp: int, q_heads: int, device
     ):
         import torch.distributed._symmetric_memory as symm_mem
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        self.verify_ll_shared = (
+            tp_size == 8 and parallel.attn_dp_size == 1 and parallel.moe_ep_size > 1
+        )
 
         self.cp, self.hq, self.device = cp, q_heads, torch.device(device)
         self.me = tp_rank % cp
@@ -2080,6 +2158,20 @@ class CpLite:
                 "GATE_EPILOGUE": True,
             }
         )
+        shared_ll = (
+            self.verify_ll_shared
+            and q_len > 1
+            and gate_epilogue is not None
+            and not plain
+        )
+        if shared_ll:
+            epilogue_args["SHARED_LL"] = True
+            if ("shared_ll", rows) not in self._logged:
+                self._logged.add(("shared_ll", rows))
+                logger.info(
+                    "TRT-L1 CP-lite verify uses unique-owner LL staging at %d rows",
+                    rows,
+                )
         merge_kernel = _cp_merge_h_ll_plain if plain else _cp_merge_h_ll
         merge_options = {} if plain else {"EARLY": early and pdl, **epilogue_args}
         merge_kernel[(rows, hq)](

@@ -75,11 +75,12 @@ SGLANG_READS = {
 }
 
 SGLANG_MIRRORS = {
-    # v3 routes committed state via STATE_PART. LinearPrefillView already carries
-    # those exact committed conv/temporal buffers; no recurrence/order change.
+    # Upstream #48004 reserves staging row 0 for padding; this slot rejects strided
+    # pools before writes and passes the native pool indices unchanged.
     "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": (
         "12a835fc4f78af33",
         "6ed4eb6a818f7e20",
+        "bfd997695f32d409",
     ),
     "srt/layers/attention/hybrid_linear_attn_backend.py:MambaAttnBackendBase._track_mamba_state_extend": "84c447ca707eba64",
 }

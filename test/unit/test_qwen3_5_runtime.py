@@ -1879,6 +1879,209 @@ def test_prefill_unsupported_view_returns_the_original_before_state_writes():
     assert built.forward(step, original, None, None, None) is marker
 
 
+def _gdn_prefill_state_case(monkeypatch, strided):
+    from sglang.srt.layers.attention.linear import gdn_backend
+
+    indices = torch.tensor([5, 2, -1, 0], dtype=torch.int32)
+    conv = torch.zeros(1, 8, 6, 6)[..., ::2]
+    temporal = torch.zeros(1, 8, 1, 2, 4)[..., ::2]
+    if strided != "conv":
+        conv = conv.contiguous()
+    if strided != "temporal":
+        temporal = temporal.contiguous()
+    for row in range(1, 8):
+        conv[:, row].fill_(row)
+        temporal[:, row].fill_(row)
+    view = SimpleNamespace(
+        kernel_id=1,
+        is_graph=False,
+        has_mis=False,
+        has_track=False,
+        state=SimpleNamespace(layer_ids=(0,), conv=(conv,), temporal=temporal),
+        state_indices=indices,
+        query_start_loc=torch.arange(5, dtype=torch.int32),
+        conv_block_table=None,
+        track_ssm_recompute_dst=None,
+    )
+    fb = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+        extend_prefix_lens=torch.ones(4, dtype=torch.int32),
+        extend_seq_lens_cpu=[1] * 4,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        num_q_heads=1,
+        num_k_heads=1,
+        num_v_heads=1,
+        head_q_dim=2,
+        head_k_dim=2,
+        head_v_dim=2,
+        q_dim=2,
+        k_dim=2,
+        v_dim=2,
+        conv_weights=torch.zeros(6, 4),
+        bias=None,
+        activation="silu",
+        A_log=torch.zeros(1),
+        dt_bias=torch.zeros(1),
+    )
+    calls = []
+
+    def update(state, rows, amount):
+        calls.append(rows.clone())
+        for row in rows.tolist():
+            if row > 0:
+                state[row].add_(amount)
+
+    def convolve(x, weight, bias, **kw):
+        update(kw["conv_states"], kw["cache_indices"], 1)
+        return x
+
+    def recurrence(**kw):
+        update(kw["ssm_states"], kw["cache_indices"], 2)
+        return kw["v"], None, None
+
+    monkeypatch.setattr(gdn_backend, "causal_conv1d_fn", convolve)
+    for name in ("is_cpu", "is_cuda", "is_hip", "is_xpu", "is_npu"):
+        monkeypatch.setattr(gdn_backend, name, lambda: False)
+    meta = SimpleNamespace(
+        query_start_loc=view.query_start_loc,
+        mamba_cache_indices=indices,
+        retrieve_next_token=None,
+        retrieve_next_sibling=None,
+        retrieve_parent_token=None,
+        conv_block_table=None,
+        has_mamba_track_mask=False,
+        state_checkpoint_cu_starts=None,
+        num_state_checkpoints=None,
+        state_checkpoint_every_n_tokens=None,
+    )
+    backend = SimpleNamespace(
+        prefill_graph_metadata=None,
+        forward_metadata=meta,
+        mis_metadata=None,
+        requires_contiguous_prefill_state=True,
+        state_layer_cache=lambda _: SimpleNamespace(
+            conv=(conv[0],), temporal=temporal[0]
+        ),
+        kernel_dispatcher=SimpleNamespace(extend=recurrence),
+        _prefill_gates=lambda *args: (torch.zeros(1, 4, 1), torch.zeros(1, 4, 1)),
+    )
+    backend._convolve_prefill = lambda *args: (
+        gdn_backend.GDNAttnBackend._convolve_prefill(backend, *args)
+    )
+
+    def native():
+        return gdn_backend.GDNAttnBackend.forward_extend(
+            backend, layer, fb, torch.zeros(4, 6), torch.zeros(4, 1), torch.zeros(4, 1)
+        )
+
+    return view, fb, layer, calls, native, convolve, recurrence
+
+
+@pytest.mark.parametrize("strided", ["conv", "temporal"])
+def test_strided_prefill_falls_back_before_writes_and_preserves_the_sink(
+    monkeypatch, strided
+):
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+
+    view, fb, _, calls, native, _, _ = _gdn_prefill_state_case(monkeypatch, strided)
+    conv, temporal = view.state.conv[0], view.state.temporal
+    before = (conv.clone(), temporal.clone())
+    built = Qwen35Prefill(
+        SimpleNamespace(model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])),
+        SimpleNamespace(tokens_per_request=7),
+        True,
+    )
+    monkeypatch.setattr(
+        built, "_forward", lambda *args: pytest.fail("strided plugin write")
+    )
+    entered = []
+
+    def original(*args, **kwargs):
+        assert calls == []
+        torch.testing.assert_close(conv, before[0])
+        torch.testing.assert_close(temporal, before[1])
+        entered.append(True)
+        return native()
+
+    built.forward(Step(mode="prefill", rows=4, view=view), original, None, None, fb)
+    assert entered == [True]
+    assert len(calls) == 2
+    assert all(torch.equal(rows, torch.tensor([1, 2, 0, 0])) for rows in calls)
+    for state, old, amount in ((conv, before[0], 1), (temporal, before[1], 2)):
+        expected = old.clone()
+        expected[:, 5].add_(amount)
+        expected[:, 2].add_(amount)
+        torch.testing.assert_close(state, expected)
+
+
+def test_contiguous_prefill_keeps_main_request_indices_without_zero_based_staging(
+    monkeypatch,
+):
+    from sglang.srt.layers.attention.linear.kernels import state_pool_io
+
+    from sgl_nvidia_mega.qwen3_5.gdn import prefill
+
+    view, fb, layer, calls, native, convolve, recurrence = _gdn_prefill_state_case(
+        monkeypatch, None
+    )
+    conv, temporal = view.state.conv[0], view.state.temporal
+    before = (conv.clone(), temporal.clone())
+    native_out = native()
+    expected = (conv.clone(), temporal.clone())
+    conv.copy_(before[0])
+    temporal.copy_(before[1])
+    calls.clear()
+    for name in ("stage_pool_states", "unstage_pool_states"):
+        monkeypatch.setattr(
+            state_pool_io, name, lambda *args: pytest.fail("unexpected staging")
+        )
+    monkeypatch.setattr(
+        "sglang.kernels.ops.mamba.causal_conv1d_triton.causal_conv1d_fn", convolve
+    )
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.triton_gdn_fused_proj.qwen3_5_gdn_prefill_projection_views",
+        lambda *args: (
+            torch.zeros(4, 6),
+            torch.zeros(4, 1, 2),
+            torch.zeros(4, 1),
+            torch.zeros(4, 1),
+        ),
+    )
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.linear.fused_gdn_gating.fused_gdn_gating",
+        lambda *args: (torch.zeros(1, 4, 1), torch.zeros(1, 4, 1)),
+    )
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.fla.chunk.chunk_gated_delta_rule",
+        lambda **kw: recurrence(
+            ssm_states=kw["initial_state"],
+            cache_indices=kw["initial_state_indices"],
+            v=kw["v"],
+        ),
+    )
+    gdn = SimpleNamespace(
+        attn=layer,
+        num_k_heads=1,
+        num_v_heads=1,
+        attn_tp_size=1,
+        head_k_dim=2,
+        head_v_dim=2,
+        _forward_input_proj=lambda _: (torch.zeros(4, 8), torch.zeros(4, 2)),
+        norm=lambda core, z: core,
+        out_proj=lambda core: (core, None),
+    )
+    assert prefill.unsupported(view) == ""
+    got = prefill.step(gdn, torch.zeros(4, 2), view, fb)
+    torch.testing.assert_close(got, native_out.reshape(4, 2))
+    torch.testing.assert_close(conv, expected[0])
+    torch.testing.assert_close(temporal, expected[1])
+    assert len(calls) == 4
+    assert all(torch.equal(rows, view.state_indices) for rows in calls)
+    assert calls[0][0].item() == 5
+
+
 # The frozen C-arm recipe lists (A167 SLOT-INTERSECTIONS.json) and what the
 # topology filters keep of them, as evaluated on parent 1a4e8884; the TP8 plan
 # also adds route_lin and mkm_wide_bal.

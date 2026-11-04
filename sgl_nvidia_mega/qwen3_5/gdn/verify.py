@@ -135,10 +135,12 @@ SGLANG_READS = {
 SGLANG_MIRRORS = {
     # Without and with the early return of the GDN extend in breakable prefill graphs,
     # which target verify never takes; the first goes once all supported SGLangs have it
+    # Upstream #48004 changes strided prefill staging, which target verify never takes.
     "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": (
         "ab7b048fafb07d0e",
         "12a835fc4f78af33",
         "6ed4eb6a818f7e20",
+        "bfd997695f32d409",
     ),
     # Importing the ReplaySSM kernel from fla/ and, after sgl-project/sglang#45112, from
     # linear/; the first goes once all supported SGLangs have the move

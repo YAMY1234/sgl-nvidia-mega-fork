@@ -1391,6 +1391,22 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows(
 
     with (
         patch(
+            "sglang.srt.layers.attention.linear.kernels.state_pool_io.stage_pool_states",
+            side_effect=AssertionError("target verify must not stage prefill state"),
+        ),
+        patch(
+            "sglang.srt.layers.attention.linear.kernels.state_pool_io.unstage_pool_states",
+            side_effect=AssertionError("target verify must not unstage prefill state"),
+        ),
+        patch(
+            "sglang.srt.layers.attention.linear.gdn_backend.stage_pool_states",
+            side_effect=AssertionError("target verify must not stage prefill state"),
+        ),
+        patch(
+            "sglang.srt.layers.attention.linear.gdn_backend.unstage_pool_states",
+            side_effect=AssertionError("target verify must not unstage prefill state"),
+        ),
+        patch(
             "sglang.kernels.ops.attention.triton_gdn_fused_proj.qwen3_5_gdn_prefill_projection_views",
             views,
         ),

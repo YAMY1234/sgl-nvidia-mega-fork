@@ -31,6 +31,10 @@ import triton.language as tl
 
 from sgl_nvidia_mega.qwen3_5 import CP_LITE_HEAD_DIM, cp_lite_topology
 
+SGLANG_READS = {
+    "srt/runtime_context.py": ("get_parallel", '"attn_dp_size"', '"moe_ep_size"'),
+}
+
 logger = logging.getLogger(__name__)
 
 PAGE, HEAD_DIM = 64, CP_LITE_HEAD_DIM
@@ -1039,6 +1043,7 @@ def _cp_merge_h_ll_plain(
     vstart=None,
     vcnt=None,
     CHUNK: tl.constexpr = False,
+    SAFE_WAIT: tl.constexpr = False,
 ):
     """R11's plain non-EARLY merge, kept separate from EARLY/gate epilogues.
 
@@ -1133,8 +1138,12 @@ def _cp_merge_h_ll_plain(
     own = tl.load(peers + me) + ll_off
     for c in tl.static_range(CP):
         src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
-        v = _ll_wait_plain(src + h * DW, DW, e)
-        lv = _ll_wait_plain(src + NO + h, 1, e)
+        if SAFE_WAIT:
+            v = _ll_wait(src + h * DW, DW, e)
+            lv = _ll_wait(src + NO + h, 1, e)
+        else:
+            v = _ll_wait_plain(src + h * DW, DW, e)
+            lv = _ll_wait_plain(src + NO + h, 1, e)
         lc = (lv & 0xFFFFFFFF).to(tl.int32).to(
             tl.float32, bitcast=True
         ) * 0.6931471805599453
@@ -1165,6 +1174,12 @@ class CpLite:
         self, group, tp_rank: int, tp_size: int, cp: int, q_heads: int, device
     ):
         import torch.distributed._symmetric_memory as symm_mem
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        self.plain_verify = (
+            tp_size == 8 and parallel.attn_dp_size == 1 and parallel.moe_ep_size > 1
+        )
 
         self.cp, self.hq, self.device = cp, q_heads, torch.device(device)
         self.me = tp_rank % cp
@@ -1972,6 +1987,20 @@ class CpLite:
     ):
         """Run an ungated exact call with PDL and the per-head merge."""
         early = self.early_merge if early_merge is None else early_merge
+        epilogue = self._gate_epilogue
+        if epilogue is not None and not (
+            tuple(epilogue[0].shape) == (rows, self.hq * HEAD_DIM)
+            and epilogue[0].stride(1) == 1
+            and tuple(epilogue[2].shape) == (rows, self.hq * HEAD_DIM)
+            and epilogue[2].stride(1) == 1
+        ):
+            epilogue = None
+        plain_verify = self.plain_verify and q_len > 1 and epilogue is not None
+        if plain_verify:
+            # Keep the BF16 merge boundary; mka's existing fallback applies the
+            # identical sigmoid/FP8 gate after this smaller non-EARLY merge.
+            early = False
+            epilogue = None
         words = self.hq * HEAD_DIM // 4
         _cp_gather_q_ll[(rows,)](
             q.view(torch.int32),
@@ -2012,15 +2041,7 @@ class CpLite:
         out = torch.empty(
             rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device
         )
-        epilogue = self._gate_epilogue
-        if epilogue is not None and not (
-            tuple(epilogue[0].shape) == (rows, self.hq * HEAD_DIM)
-            and epilogue[0].stride(1) == 1
-            and tuple(epilogue[2].shape) == (rows, self.hq * HEAD_DIM)
-            and epilogue[2].stride(1) == 1
-        ):
-            epilogue = None
-        plain = early_merge is False and epilogue is None
+        plain = plain_verify or (early_merge is False and epilogue is None)
         self._merge_h(
             q,
             k_cache,
@@ -2036,8 +2057,15 @@ class CpLite:
             pdl=True,
             early=early,
             plain=plain,
+            safe_plain_wait=plain_verify,
             gate_epilogue=epilogue,
         )
+        if plain_verify and ("plain_verify", rows) not in self._logged:
+            self._logged.add(("plain_verify", rows))
+            logger.info(
+                "TRT-L1 CP-lite verify uses plain merge with safe LL wait and standalone FP8 gate at %d rows",
+                rows,
+            )
         if epilogue is not None:
             self._gate_epilogue_done = True
             if ("gate_epilogue", rows) not in self._logged:
@@ -2064,6 +2092,7 @@ class CpLite:
         pdl=None,
         early=False,
         plain=False,
+        safe_plain_wait=False,
         gate_epilogue=None,
     ):
         pdl = self.cp_pdl if pdl is None else pdl
@@ -2081,7 +2110,11 @@ class CpLite:
             }
         )
         merge_kernel = _cp_merge_h_ll_plain if plain else _cp_merge_h_ll
-        merge_options = {} if plain else {"EARLY": early and pdl, **epilogue_args}
+        merge_options = (
+            ({"SAFE_WAIT": True} if safe_plain_wait else {})
+            if plain
+            else {"EARLY": early and pdl, **epilogue_args}
+        )
         merge_kernel[(rows, hq)](
             self.po_x.view(torch.int32),
             self.pl_x.view(torch.int32),

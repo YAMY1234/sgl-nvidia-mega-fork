@@ -283,6 +283,7 @@ def test_cp_call_override_pairs_the_exact_partial_and_merge_order(monkeypatch):
     cp.cnt = torch.zeros(2, 14, dtype=torch.int32)
     cp.pre_lens = cp.stock_lens = torch.zeros(2, dtype=torch.int32)
     cp.gather_pdl, cp.early_merge = True, True
+    cp.plain_verify = False
     cp._gate_epilogue, cp._gate_epilogue_done, cp._logged = None, False, set()
     calls = []
     cp._exact_partial = lambda *args, **kwargs: calls.append(
@@ -317,6 +318,28 @@ def test_cp_call_override_pairs_the_exact_partial_and_merge_order(monkeypatch):
             ("partial", expected),
             ("merge", expected, override is False),
         ]
+
+    # Only TEP8 verify with a valid offered gate switches both producer and
+    # merge order; declining the offer selects mka's existing standalone gate.
+    cp._merge_h = lambda *args, **kw: calls.append(kw)
+    for enabled, q_len, offered, expected in (
+        (True, 7, True, True),
+        (False, 7, True, False),
+        (True, 1, True, False),
+        (True, 7, False, False),
+    ):
+        cp.plain_verify = enabled
+        cp._logged.clear()
+        epilogue = (torch.zeros(14, 1024), torch.ones(1), torch.empty(14, 1024))
+        cp.offer_gate_epilogue(*epilogue) if offered else None
+        calls.clear()
+        cp._ungated_main(q, cache, cache, table, lengths, q_len, 2, 14, 1.0, 1.0, gate)
+        assert calls[0] == ("partial", not expected)
+        merge = calls[1]
+        assert merge["early"] is (not expected)
+        assert merge["plain"] is expected
+        assert merge["safe_plain_wait"] is expected
+        assert cp.take_gate_epilogue() is (offered and not expected)
 
 
 def test_cp_fold_call_override_selects_the_r11_plain_merge(monkeypatch):

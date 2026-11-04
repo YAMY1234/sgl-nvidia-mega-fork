@@ -155,9 +155,9 @@ def _sms(device_index: int) -> int:
 
 
 def _min_blocks(device_index: int, ctas: int) -> int:
-    """Three CTAs an SM (168 registers) once two an SM take more than two waves (128 requests
-    at TP8): past that the third resident CTA wins; below it the uncapped registers do."""
-    return 3 if ctas > 4 * _sms(device_index) else 1
+    """Cap registers where three CTAs/SM fit one wave or save later waves."""
+    sms = _sms(device_index)
+    return 3 if 2 * sms < ctas <= 3 * sms or ctas > 4 * sms else 1
 
 
 def _slot_stride(t: Optional[torch.Tensor]) -> int:

@@ -1888,6 +1888,25 @@ def test_the_gdn_front_leaves_out_its_l2_prefetch_ahead_of_a_pinned_or_early_cor
     assert seen["prefetch"] is prefetch
 
 
+def test_the_gdn_core_caps_registers_for_the_three_cta_wave():
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core
+
+    with patch.object(core, "_sms", return_value=148):
+        for batch in range(1, 129):
+            ctas = batch * 8
+            old = 3 if ctas > 4 * 148 else 1
+            assert core._min_blocks(0, ctas) == (3 if 38 <= batch <= 55 else old)
+        for ctas, expected in (
+            (296, 1),
+            (297, 3),
+            (444, 3),
+            (445, 1),
+            (592, 1),
+            (593, 3),
+        ):
+            assert core._min_blocks(0, ctas) == expected
+
+
 @pytest.mark.parametrize("trt, wants", [(False, False), (True, True)])
 def test_the_hop_quantizes_a_gdn_layers_input_for_the_trt_front_only(trt, wants):
     """Slot hop_fp8 writes the input consumed by slot gdn_trt_front."""

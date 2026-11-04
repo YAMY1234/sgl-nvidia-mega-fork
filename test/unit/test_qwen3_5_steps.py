@@ -269,7 +269,80 @@ def test_empty_dp_rank_skips_gate_and_shared_but_runs_experts(capture):
 
 
 def _st(route=False):
-    return SimpleNamespace(slots=plan.Slots(route=route))
+    return SimpleNamespace(
+        slots=plan.Slots(route=route), bound={"moe": moe.route.Bound()}
+    )
+
+
+@pytest.mark.parametrize(
+    "topology,pre,reason,want",
+    [
+        ((8, 1, 8), True, "", True),
+        ((8, 1, 4), True, "", True),
+        ((8, 1, 8), False, "", False),
+        ((8, 1, 1), True, "", False),
+        ((8, 8, 8), True, "", False),
+        ((4, 1, 4), True, "", False),
+        ((8, 1, 8), True, "BF16 down projection", False),
+    ],
+)
+def test_ordinary_shared_act_quant_builds_only_for_eligible_tep8(
+    monkeypatch, topology, pre, reason, want
+):
+    from sglang.srt import runtime_context
+
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import shared_act_quant
+
+    monkeypatch.setattr(
+        runtime_context,
+        "get_parallel",
+        lambda: SimpleNamespace(
+            tp_size=topology[0], attn_dp_size=topology[1], moe_ep_size=topology[2]
+        ),
+    )
+    expert = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(weight=_CudaMeta((4096, 256), torch.float8_e4m3fn))
+    )
+    mlp = SimpleNamespace(shared_expert=expert)
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            start_layer=0, end_layer=2, layers=[SimpleNamespace(mlp=mlp)] * 2
+        )
+    )
+    monkeypatch.setattr(moe.route, "shared_unsupported", lambda _: reason)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    built = []
+    monkeypatch.setattr(shared_act_quant, "build", lambda *args: built.append(args))
+    bound = moe._build_shared_act_quant(model, moe.route.Bound(pre=pre))
+    assert bound.shared_act_quant is want
+    assert built == ([(0, 256)] if want else [])
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ordinary_shared_act_quant_preserves_the_gate_and_streams(
+    monkeypatch, capture, enabled
+):
+    x = torch.zeros(448, 4)
+    log = _log(x=x)
+    mlp = _moe_block(log, x)
+    mlp.shared_expert.gate_up_proj = log.op("shared_up", ("gate_up", None))
+    monkeypatch.setattr(
+        moe.route,
+        "shared_expert_tail",
+        lambda se, gu: log.op("act_quant_tail", "shared_out")(gu),
+    )
+    st = _st()
+    st.bound["moe"] = moe.route.Bound(shared_act_quant=enabled)
+    with _streams(log, capture), _moe_kernels(log):
+        assert moe.step(SimpleNamespace(mlp=mlp), x, st, defer=True) == "handoff"
+    names = [e[0] for e in log]
+    assert ("act_quant_tail" in names) == (capture and enabled)
+    assert ("shared" in names) == (not (capture and enabled))
+    assert names.count("gate_mul") == 1
+    assert [e for e in log if e[0] == "wait"] == (
+        [("wait", "alt", "main"), ("wait", "main", "alt")] if capture else []
+    )
 
 
 def _router_front(log, mlp):
@@ -818,6 +891,7 @@ def test_the_mkm_slot_runs_the_routed_experts_on_the_router_fronts_outputs(captu
             mkm={3: "maps"},
             identity=torch.arange(70, dtype=torch.int32),
             m16_max_rows=16,
+            shared_act_quant=False,
         )
         st = SimpleNamespace(slots=slots, bound={"moe": bound})
         fused = patch.object(

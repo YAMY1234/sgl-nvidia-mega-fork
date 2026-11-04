@@ -63,7 +63,12 @@ SGLANG_READS = {
     ),
     "kernels/ops/elementwise/elementwise.py": ("fused_gate_sigmoid_mul_add",),
     "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
-    "srt/runtime_context.py": ("get_parallel", '"tp_size"', '"moe_ep_size"'),
+    "srt/runtime_context.py": (
+        "get_parallel",
+        '"tp_size"',
+        '"attn_dp_size"',
+        '"moe_ep_size"',
+    ),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
@@ -150,7 +155,38 @@ def build(model, ctx) -> route.Bound:
                 router.build_big(
                     torch.cuda.current_device(), mlp.experts.num_local_experts
                 )
-    return bound
+    return _build_shared_act_quant(model, bound)
+
+
+def _build_shared_act_quant(model, bound):
+    """Prebuild the ordinary TEP8 shared MLP's tail, independently of route_shared."""
+    import msgspec
+    from sglang.srt.runtime_context import get_parallel
+
+    if not bound.pre:
+        return bound
+    p = get_parallel()
+    if (p.tp_size, p.attn_dp_size) != (8, 1) or p.moe_ep_size <= 1:
+        return bound
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import shared_act_quant
+
+    m = model.model
+    layers = [m.layers[i].mlp for i in range(m.start_layer, m.end_layer)]
+    if not layers or any(route.shared_unsupported(mlp) for mlp in layers):
+        return bound
+    for columns in sorted(
+        {int(mlp.shared_expert.gate_up_proj.weight.shape[1]) for mlp in layers}
+    ):
+        shared_act_quant.build(torch.cuda.current_device(), columns)
+    return msgspec.structs.replace(bound, shared_act_quant=True)
+
+
+def _shared_expert(mlp, x, st):
+    """Keep the stock projection and gate; fuse only the eligible activation tail."""
+    if st.bound["moe"].shared_act_quant:
+        gate_up, _ = mlp.shared_expert.gate_up_proj(x)
+        return route.shared_expert_tail(mlp.shared_expert, gate_up)
+    return mlp._forward_shared_experts(x, apply_gate=False)
 
 
 def step(layer, x: torch.Tensor, st, defer: bool, reduce=None):
@@ -238,7 +274,7 @@ def _dual_stream(mlp, x, use_fused_gate: bool, defer: bool, st):
                 x8 = lowm.take_fp8(st, x) if st.slots.hop_fp8 else None
                 shared = lowm.shared_expert(mlp, x, st.bound["lowm"], x8)
             else:
-                shared = mlp._forward_shared_experts(x, apply_gate=False)
+                shared = _shared_expert(mlp, x, st)
                 if shared is not None:
                     shared = mlp._gate_shared_output_out_of_place(x, shared)
         current.wait_stream(mlp.alt_stream)

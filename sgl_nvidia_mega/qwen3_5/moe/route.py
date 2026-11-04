@@ -142,6 +142,7 @@ class Bound(msgspec.Struct, frozen=True):
     # [160] int32 0, 1, ...: slot mkm's rows are in expert order
     identity: object = None
     shared: bool = False  # slot route_shared: the shared gate/up in the router launch
+    shared_act_quant: bool = False  # TEP8's ordinary shared MLP uses the fused tail
     topk: bool = False  # slot route_topk: the top-10 + NVFP4 input launch built
     gemm: bool = (
         False  # slot route_gemm: the router front's 16-row tiles stand in for the GEMM
@@ -430,12 +431,11 @@ def shared_expert_tail(expert, gate_up: torch.Tensor) -> torch.Tensor:
         quantized = silu_and_mul_static_quant_fp8(
             gate_up, expert.down_proj.input_scale.reshape(1)
         )
-        key = ("route_shared_act_quant", gate_up.shape[0])
+        key = ("shared_act_quant", gate_up.shape[0])
         if key not in _ENGAGED:
             _ENGAGED.add(key)
             logger.info(
-                "NVIDIA megakernel: Qwen3.5 slot route_shared shared_act_quant "
-                "runs at %d rows",
+                "NVIDIA megakernel: Qwen3.5 shared_act_quant runs at %d rows",
                 gate_up.shape[0],
             )
         x, _ = expert.down_proj(quantized)

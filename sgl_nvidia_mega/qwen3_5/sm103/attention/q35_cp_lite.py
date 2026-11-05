@@ -1155,6 +1155,9 @@ def _cp_merge_h_ll_plain(
     tl.store(cnt + i * HQ + h + one, e)
 
 
+_VERIFY_EXACT_MAX_BATCH = 32
+
+
 class CpLite:
     """One process's exchange buffer and scratch, shared by the Qwen3.5 target and
     draft slots; built collectively on the plugin binding's TP group."""
@@ -1415,7 +1418,14 @@ class CpLite:
         k_cache, v_cache = kv_cache
         q = q if q.is_contiguous() else q.contiguous()
         words = self.hq * HEAD_DIM // 4
-        exact = self.exact and self._exact_supported(q_len, b)
+        verify_fold = (
+            b > _VERIFY_EXACT_MAX_BATCH
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        exact = self.exact and not verify_fold and self._exact_supported(q_len, b)
+        if verify_fold and ("verify-fold", b) not in self._logged:
+            self._logged.add(("verify-fold", b))
+            logger.info("CP verify fold: batch=%d, FMHA partial and a2a merge", b)
         # Every path but the non-exact fused one can be gated; exact batches above
         # the fused kernel's limit take the TRT-LLM partial.
         thr = (
@@ -1549,7 +1559,7 @@ class CpLite:
             out = torch.empty(
                 rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device
             )
-        if self.ll and self.fold_mh:
+        if self.ll and self.fold_mh and not verify_fold:
             fold_gate = gate if gate["GATE"] else {**gate, "thr": 0}
             self._fold_merge_h(
                 q,

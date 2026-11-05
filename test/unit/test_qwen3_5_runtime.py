@@ -2250,3 +2250,48 @@ def test_an_explicit_slot_keeps_stock_for_a_refused_mkd_build(monkeypatch, caplo
             is None
         )
     assert "MKD draft boundary disabled (needs an aligned NVLink" in caplog.text
+
+
+@pytest.mark.parametrize("batch", [32, 64, 128])
+@pytest.mark.parametrize("verify", [False, True])
+def test_large_verify_uses_fold_a2a_without_changing_other_modes(
+    monkeypatch, batch, verify
+):
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import q35_cp_lite as mod
+
+    calls = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: calls.append("gather")
+
+    monkeypatch.setattr(mod, "_cp_gather_q_ll", Kernel())
+    cp = mod.CpLite.__new__(mod.CpLite)
+    cp.hq, cp.cp, cp.me, cp.min_bs, cp.llq_off = 4, 4, 0, 2, 0
+    cp.ll, cp.fused, cp.exact, cp.cp_ungated, cp.fold_mh = (True,) * 5
+    cp.gate_max, cp.gate_overlap, cp._logged = False, 1, set()
+    cp._exact_supported = lambda q_len, b: True
+    cp._ungated_main = lambda *a, **k: calls.append("exact")
+    cp._fold_partial = lambda *a, **k: calls.append("partial")
+    cp._fold_merge = lambda *a, **k: calls.append("a2a")
+    cp._fold_merge_h = lambda *a, **k: calls.append("per-head")
+    rows = batch * 7
+    cp.q_all = torch.empty(rows, 16, 256, dtype=torch.uint8)
+    cp.cnt = torch.zeros(3, rows, dtype=torch.int32)
+    cp.peers = torch.zeros(4, dtype=torch.int64)
+    cp.pre_lens = cp.stock_lens = torch.zeros(rows, dtype=torch.int32)
+    cp.attend(
+        torch.empty(rows, 4, 256, dtype=torch.float8_e4m3fn),
+        (None, None),
+        torch.zeros(batch, 1, dtype=torch.int32),
+        torch.ones(batch, dtype=torch.int32),
+        7,
+        1.0,
+        1.0,
+        None,
+        SimpleNamespace(tp_k_head_num=1, sliding_window_size=None, layer_id=3),
+        SimpleNamespace(forward_mode=SimpleNamespace(is_target_verify=lambda: verify)),
+    )
+    assert calls == (
+        ["gather", "partial", "a2a"] if verify and batch > 32 else ["exact"]
+    )

@@ -3,7 +3,7 @@ name: Unit Test
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, 'ci-probe/**']
   workflow_dispatch:
 
 permissions:
@@ -17,7 +17,7 @@ env:
   # Includes the hybrid preparation/views API from sgl-project/sglang#45406.
   # Pin source until a published nightly contains this interface; updating the
   # pin is a normal PR and must pass the static mirror/contract tests.
-  SGLANG_COMMIT: aa3e34aaebf880d72482cea74dbbfef54da728e2
+  SGLANG_COMMIT: 7be9900fb0b71bebd26ab87a3340014522d7ed04
 
 jobs:
   unit:

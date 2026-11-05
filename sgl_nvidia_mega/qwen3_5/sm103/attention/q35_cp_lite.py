@@ -1381,6 +1381,7 @@ class CpLite:
         stock=None,
         min_bs: int | None = None,
         early_merge: bool | None = None,
+        target_verify: bool = False,
     ) -> torch.Tensor | None:
         """CP-lite attention of this rank's heads: [rows, heads, head_dim] bf16, or None
         where the call is not served (decided by shapes only, so every rank agrees).
@@ -1418,10 +1419,7 @@ class CpLite:
         k_cache, v_cache = kv_cache
         q = q if q.is_contiguous() else q.contiguous()
         words = self.hq * HEAD_DIM // 4
-        verify_fold = (
-            b > _VERIFY_EXACT_MAX_BATCH
-            and forward_batch.forward_mode.is_target_verify()
-        )
+        verify_fold = target_verify and b > _VERIFY_EXACT_MAX_BATCH
         exact = self.exact and not verify_fold and self._exact_supported(q_len, b)
         if verify_fold and ("verify-fold", b) not in self._logged:
             self._logged.add(("verify-fold", b))

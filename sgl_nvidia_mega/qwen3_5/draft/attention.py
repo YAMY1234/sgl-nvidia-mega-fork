@@ -478,6 +478,7 @@ class DraftCP:
             # R11 orders the draft-multi exact partial and merge after their waits.
             # Keep the shared CP-lite default for target and one-request draft calls.
             early_merge=False if multi else None,
+            target_verify=False,
         )
         if o is not None and torch.cuda.is_current_stream_capturing():
             key = (rows_per_request, q8.shape[0])

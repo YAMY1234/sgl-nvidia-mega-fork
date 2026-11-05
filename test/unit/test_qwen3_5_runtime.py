@@ -960,7 +960,9 @@ def test_the_draft_decode_keeps_cp_lite_for_cp_variants_and_multi_request(
             owner,
             min_bs=None,
             early_merge=None,
+            target_verify=False,
         ):
+            assert target_verify is False
             calls.append((tuple(q.shape), q_len, bmm1, bmm2, min_bs, early_merge))
             return torch.ones(q.shape[0], heads, dim, dtype=torch.bfloat16)
 
@@ -2254,8 +2256,9 @@ def test_an_explicit_slot_keeps_stock_for_a_refused_mkd_build(monkeypatch, caplo
 
 @pytest.mark.parametrize("batch", [32, 64, 128])
 @pytest.mark.parametrize("verify", [False, True])
+@pytest.mark.parametrize("q_len", [1, 7])
 def test_large_verify_uses_fold_a2a_without_changing_other_modes(
-    monkeypatch, batch, verify
+    monkeypatch, batch, verify, q_len
 ):
     from sgl_nvidia_mega.qwen3_5.sm103.attention import q35_cp_lite as mod
 
@@ -2275,7 +2278,7 @@ def test_large_verify_uses_fold_a2a_without_changing_other_modes(
     cp._fold_partial = lambda *a, **k: calls.append("partial")
     cp._fold_merge = lambda *a, **k: calls.append("a2a")
     cp._fold_merge_h = lambda *a, **k: calls.append("per-head")
-    rows = batch * 7
+    rows = batch * q_len
     cp.q_all = torch.empty(rows, 16, 256, dtype=torch.uint8)
     cp.cnt = torch.zeros(3, rows, dtype=torch.int32)
     cp.peers = torch.zeros(4, dtype=torch.int64)
@@ -2285,13 +2288,35 @@ def test_large_verify_uses_fold_a2a_without_changing_other_modes(
         (None, None),
         torch.zeros(batch, 1, dtype=torch.int32),
         torch.ones(batch, dtype=torch.int32),
-        7,
+        q_len,
         1.0,
         1.0,
         None,
         SimpleNamespace(tp_k_head_num=1, sliding_window_size=None, layer_id=3),
-        SimpleNamespace(forward_mode=SimpleNamespace(is_target_verify=lambda: verify)),
+        object(),  # Draft callers provide an Attention, with no forward_mode.
+        target_verify=verify,
     )
     assert calls == (
         ["gather", "partial", "a2a"] if verify and batch > 32 else ["exact"]
     )
+
+
+@pytest.mark.parametrize("multi", [False, True])
+def test_target_verify_cp_caller_marks_its_mode_explicitly(monkeypatch, multi):
+    from sgl_nvidia_mega.qwen3_5.attention import route, split_kv
+
+    calls = []
+    monkeypatch.setattr(split_kv, "cp_multi", lambda rows: multi)
+    monkeypatch.setattr(route, "label", lambda *args: route.SPLIT_KV_CP)
+    monkeypatch.setattr(route, "verify_variants", lambda: ())
+    monkeypatch.setattr(route, "cp_min_length", lambda mode: 0)
+
+    def cp_core(*args, **kwargs):
+        calls.append(kwargs["target_verify"])
+        return args[1]
+
+    monkeypatch.setattr(split_kv, "cp_core", cp_core)
+    st = SimpleNamespace(view=SimpleNamespace(kv=object(), attn=object()), fb=object())
+    q = torch.empty(448, 4, 256)
+    assert split_kv.core(object(), q, st) is q
+    assert calls == [True]

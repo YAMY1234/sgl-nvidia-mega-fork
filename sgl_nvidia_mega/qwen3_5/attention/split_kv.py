@@ -192,6 +192,7 @@ def core(attn, q, st):
             st.fb,
             ROWS,
             min_bs=None,
+            target_verify=True,
         )
         if o is not None:
             key = (route.SPLIT_KV_CP, q.shape[0])
@@ -225,7 +226,7 @@ def core(attn, q, st):
     if label == route.SPLIT_KV_STOCK:
         return attn(q, None, None, st.fb)
     if label == route.SPLIT_KV_CP:
-        o = cp_core(attn, q, st.view.kv, st.view.attn, st.fb, ROWS)
+        o = cp_core(attn, q, st.view.kv, st.view.attn, st.fb, ROWS, target_verify=True)
         if o is not None:
             return o
     return skv2(attn, q, st.view.kv, st.view.attn)
@@ -262,6 +263,7 @@ def cp_core(
     q_len: int,
     min_bs: int | None = 1,
     early_merge: bool | None = None,
+    target_verify: bool = False,
 ):
     """CP-lite on requests of ``q_len`` FP8 query rows over the pool ``kv``:
     [rows, heads * head_dim] bf16, or None where CP-lite declines. ``min_bs`` overrides
@@ -305,6 +307,7 @@ def cp_core(
         attn,
         forward_batch,
         min_bs=min_bs,
+        target_verify=target_verify,
         **options,
     )
     return None if o is None else o.view(-1, attn.tp_q_head_num * attn.head_dim)

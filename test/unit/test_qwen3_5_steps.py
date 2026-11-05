@@ -3796,3 +3796,37 @@ def test_with_slot_hop_each_point_falls_back_to_sglang_where_the_hop_declines(
     assert log == [(p, "the hop") for p in ("layer_input", "moe_input", "final_norm")]
     # an auxiliary capture reads SGLang's own prepare
     assert boundary.pre(layer, "h", st, capture=[]) == "sglang layer input"
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_shared_expert_tail_uses_sglang_fp4_helpers(monkeypatch, fused):
+    from sglang.srt.models import utils
+
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    gate_up = torch.ones((2, 4))
+    calls = []
+    expert = SimpleNamespace(
+        act_fn=lambda x: calls.append(("activation", x)) or "activated",
+        down_proj=lambda x: (calls.append(("down", x)) or x, None),
+    )
+    monkeypatch.setattr(
+        utils,
+        "can_run_silu_fp4_quant_fusion",
+        lambda mlp, x: calls.append(("eligible", mlp, x)) or fused,
+    )
+    monkeypatch.setattr(
+        utils,
+        "silu_and_mul_fp4_quant",
+        lambda mlp, x: calls.append(("quantize", mlp, x)) or "quantized",
+    )
+    monkeypatch.setattr(route, "_down_takes_static_fp8", lambda _: False)
+    assert route.shared_expert_tail(expert, gate_up) == (
+        "quantized" if fused else "activated"
+    )
+    assert [c[0] for c in calls] == (
+        ["eligible", "quantize", "down"]
+        if fused
+        else ["eligible", "activation", "down"]
+    )
+    assert calls[0][1] is expert and calls[0][2] is gate_up

@@ -18,7 +18,7 @@ env:
   # speculative runtime hooks from sgl-project/sglang#47201.
   # Pin source until a published nightly contains this interface; updating the
   # pin is a normal PR and must pass the static mirror/contract tests.
-  SGLANG_COMMIT: 8df0cd51e1afbcf2a67358ab559f4a9046ff5782
+  SGLANG_COMMIT: cf6133a16cd7b705077fa4e05366d3a2ce5e8e72
 
 jobs:
   unit:

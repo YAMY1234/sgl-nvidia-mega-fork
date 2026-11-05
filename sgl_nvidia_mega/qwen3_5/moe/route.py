@@ -65,8 +65,10 @@ SGLANG_READS = {
         "gate_up_proj",
         "down_proj",
         "act_fn",
-        "_enable_silu_fp4_quant_fusion",
-        "_silu_fp4_quant_fused",
+    ),
+    "srt/models/utils.py": (
+        "can_run_silu_fp4_quant_fusion",
+        "silu_and_mul_fp4_quant",
     ),
     "srt/models/qwen3_5.py": ("layers", "start_layer", "end_layer", "mlp"),
     "srt/layers/moe/topk.py": (
@@ -122,10 +124,7 @@ SGLANG_READS = {
 SGLANG_MIRRORS = {
     "srt/layers/moe/fused_moe_triton/layer.py:FusedMoE.forward_deferred_finalize": "af4b474cbaf33493",
     "srt/layers/moe/fused_moe_triton/layer.py:FusedMoE._dispatch_with_pre_quant": "dcdefc28cf643081",
-    "srt/models/qwen2_moe.py:Qwen2MoeMLP.forward": (
-        "bb4c9fb2d7994e97",  # runtime v2: temporary core shared-act fast path
-        "6091ffb613568a10",  # runtime v3: the policy and kernel live in this slot
-    ),
+    "srt/models/qwen2_moe.py:Qwen2MoeMLP.forward": "60b6d1e897d94ed9",
 }
 
 
@@ -420,8 +419,13 @@ def shared_unsupported(mlp) -> str:
 
 def shared_expert_tail(expert, gate_up: torch.Tensor) -> torch.Tensor:
     """``Qwen2MoeMLP.forward`` after its gate_up projection."""
-    if expert._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
-        x, _ = expert.down_proj(expert._silu_fp4_quant_fused(gate_up))
+    from sglang.srt.models.utils import (
+        can_run_silu_fp4_quant_fusion,
+        silu_and_mul_fp4_quant,
+    )
+
+    if can_run_silu_fp4_quant_fusion(expert, gate_up):
+        x, _ = expert.down_proj(silu_and_mul_fp4_quant(expert, gate_up))
         return x
     if _down_takes_static_fp8(expert) and gate_up.dtype == torch.bfloat16:
         from sgl_nvidia_mega.qwen3_5.sm103.moe.shared_act_quant import (

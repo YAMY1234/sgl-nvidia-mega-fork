@@ -185,6 +185,67 @@ With the megakernel on, all shipped slots run; none needs to be listed. `SGLANG_
   paths; expiry likewise stores through address 0x0 and traps.
 - **No silent fallback.** With `--enable-nvidia-megakernel`, an unsupported setup stops the server at startup, before the weights load, listing every reason; a model the loaded weights do not fit stops every rank after the load.
 
+### Qwen3.8 numeric slots
+
+Qwen3.8 publishes only the finite numeric capabilities prepared by SGLang. With
+`SGLANG_NVIDIA_MEGAKERNEL_SLOTS` unset, all supported prepared capabilities remain
+eligible. An explicit comma-separated list publishes only the listed slots; an
+empty list publishes none and keeps the stock operations. Selection is fixed at
+startup, before JIT preparation or capture. Slots for other architecture families
+do not enable a Qwen3.8 operation. Unsupported shapes still keep stock.
+
+| Numeric operation | Slot |
+| --- | --- |
+| HC_GATE | `hc_gate` |
+| HC_APPLY_NORM | `hc_apply_norm` |
+| HC_APPLY_NORM_GATE | `hc_apply_norm_gate` |
+| HC_MIX | `hc_mix` |
+| FINALIZE_SHARED | `finalize_shared` |
+| LOCAL_EXPERTS | `mkm` |
+| GDN_CORE | `gdn_mk` |
+| DIRECT_POOL_ATTENTION | `qsa_core` |
+| SPARSE_SCORE | `qsa_score` |
+| SPARSE_SELECT | `qsa_select` |
+| GDN_FRONT | `gdn_front` |
+| GDN_VERIFY_GLUE | `gdn_verify_glue` |
+| GDN_NATIVE_PDL | `gdn_native_pdl` |
+| FINALIZE_PERMUTED_SHARED | `finalize_permuted_shared` |
+| ROUTER_QUANT | `router_quant` |
+| MTP_CAPTURE_SEED | `mtp_capture_seed` |
+| MTP_DEFERRED_KV_PREPARE | `mtp_deferred_kv` |
+
+An explicit list produces one startup log of enabled/disabled numeric slots.
+
+Sparse score/select restores the paired MK route for prepared M4/Q8/KV1/D128,
+page16, K512, compression4 layouts. The framework owns capacity declarations,
+layout conversions, counts, outputs and scratch. Score variants are MK (0) and
+MK SHORT32 (3); SELECT uses variant0. Non-MK Q4/N16 routes remain stock. The
+framework selects both offers together and preserves split-topk precedence.
+Pool-resolved capabilities are registered during pre-capture preparation;
+their exact layouts must finish eager warmup before capture. A cold capture
+fails rather than compiling. Kernels write the supplied score/index buffers;
+the selector preserves supplied framework-prepared `counts_out` metadata and
+does not produce counts when that optional output is not requested.
+
+For the FP8 indexer, SGLang retains its native FP8 scorer and may prepare only
+SPARSE_SELECT variant1 for its FP32 score buffer. The selector does not consume
+query/cache tensors or register an FP8 score capability. The caller owns lengths,
+indices and optional counts; capture still requires an eagerly warmed exact key.
+
+The native TP1 pair uses grouped V7/W4 (score variant 4, M4..64 in steps of 4)
+or the original per-row/W1 scorer (variant 5, M1..64), with split selection
+(variant 1, M1..64). Padded query heads are declared exactly as 8 or 16. Original
+factories and the source's default CTA/cluster formulas are reused; unsupported
+configuration overrides stay stock. Grouped scoring reuses the migrated kernel
+from the same source as SGLang's GROUPED_SCORE implementation, without a second
+arithmetic implementation. Queries use only a zero-allocation input view;
+non-MK scoring does not require request indices. Split JIT source generation
+requires an explicit `SGLANG_QSA_SPLIT_TOPK_SRC_DIR` on node-local storage; it
+has no implicit home-cache fallback. Deployment must verify the actual mount.
+
+A published capability is not proof that its kernel ran: inspect actual operation
+calls or captured kernels separately.
+
 ## Quick Start
 
 ### Requirements

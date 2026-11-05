@@ -31,9 +31,14 @@ def test_register_registers_every_spec_and_no_hook(hooks, monkeypatch):
     assert registry._REGISTRY == dict(plugin.SPECS)
     assert hooks == []
     # Every registered path resolves to the spec SGLang checks.
-    for architecture, _ in plugin.SPECS:
-        spec, why = registry.find_spec(architectures=[architecture], isa="sm_103")
-        assert spec is not None, (architecture, why)
+    import importlib
+
+    for architecture, path in plugin.SPECS:
+        module, _, attr = path.partition(":")
+        expected = getattr(importlib.import_module(module), attr)
+        for isa in expected.requires.isas:
+            spec, why = registry.find_spec(architectures=[architecture], isa=isa)
+            assert spec is expected, (architecture, isa, why)
 
 
 def test_the_parity_sort_hook_registers_only_for_its_test(hooks, monkeypatch):

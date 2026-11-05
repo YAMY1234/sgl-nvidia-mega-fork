@@ -56,7 +56,15 @@ SGLANG_READS = {
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/models/qwen3_5.py:Qwen3_5GatedDeltaNet.forward": "a5e9e3bd054ff18f",
+    "srt/models/qwen3_5.py:Qwen3_5GatedDeltaNet.forward": (
+        "a5e9e3bd054ff18f",
+        "098d62c5d4dcbaf4",
+        "103ba5ab4134e962",
+        "dcb17527f75b4ce7",
+        "a4680caed736c525",
+        "fef05061e3986ead",
+        "336d8b0724589d88",
+    ),
 }
 
 

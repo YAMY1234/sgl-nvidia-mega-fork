@@ -1,0 +1,245 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Prefix-cache track copies for the CUDA-graph captured GDN extend.
+
+The eager GDN extend picks the tracked rows on the host and scatters with
+data-dependent shapes. Under a breakable prefill CUDA graph these kernels walk
+the bucket's fixed row bound and read a per-row mode instead:
+
+* ``track_mode[r] == 0``: row ``r`` is not tracked (or is padding); no-op.
+* ``track_mode[r] == 1``: the tracked length is chunk aligned; the snapshot is
+  the post-extend state of the row's own cache slot.
+* ``track_mode[r] == 2``: the snapshot is the chunk-boundary state stored in
+  ``h[track_h_row[r]]`` (activation dtype), as the eager Triton path reads it.
+
+Every tracked row also snapshots its conv window: the ``STATE_LEN`` raw
+pre-conv input rows ending at the tracked boundary.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+TRACK_NONE = 0
+TRACK_FINAL_STATE = 1
+TRACK_CHUNK_STATE = 2
+
+
+@triton.jit
+def _gdn_track_conv_window_kernel(
+    conv_pool,
+    x,
+    track_mode,
+    track_conv_start,
+    track_dst,
+    num_tokens,
+    stride_pool_slot,
+    stride_pool_dim,
+    stride_pool_pos,
+    stride_x_token,
+    dim,
+    STATE_LEN: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    r = tl.program_id(0)
+    mode = tl.load(track_mode + r)
+    if mode == 0:
+        return
+    dst = tl.load(track_dst + r).to(tl.int64)
+    start = tl.load(track_conv_start + r)
+    total = tl.load(num_tokens)
+    offs = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = offs < dim
+    for j in tl.static_range(STATE_LEN):
+        t = tl.minimum(tl.maximum(start + j, 0), total - 1).to(tl.int64)
+        val = tl.load(x + t * stride_x_token + offs, mask=mask)
+        tl.store(
+            conv_pool
+            + dst * stride_pool_slot
+            + offs.to(tl.int64) * stride_pool_dim
+            + j * stride_pool_pos,
+            val.to(conv_pool.dtype.element_ty),
+            mask=mask,
+        )
+
+
+@triton.jit
+def _gdn_track_ssm_kernel(
+    ssm_pool,
+    h,
+    track_mode,
+    track_h_row,
+    track_dst,
+    cache_indices,
+    stride_ssm_slot,
+    stride_h_row,
+    numel,
+    BLOCK: tl.constexpr,
+):
+    r = tl.program_id(0)
+    mode = tl.load(track_mode + r)
+    if mode == 0:
+        return
+    dst = tl.load(track_dst + r).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    if mode == 1:
+        src = tl.load(cache_indices + r).to(tl.int64)
+        val = tl.load(ssm_pool + src * stride_ssm_slot + offs, mask=mask)
+    else:
+        row = tl.load(track_h_row + r).to(tl.int64)
+        val = tl.load(h + row * stride_h_row + offs, mask=mask)
+        val = val.to(ssm_pool.dtype.element_ty)
+    tl.store(ssm_pool + dst * stride_ssm_slot + offs, val, mask=mask)
+
+
+@triton.jit
+def _gdn_cp_tail_kernel(
+    q,
+    k,
+    v,
+    alpha,
+    beta,
+    cu_seqlens,
+    num_rows,
+    stride_q,
+    stride_k,
+    stride_v,
+    stride_alpha,
+    stride_beta,
+    QK: tl.constexpr,
+    V: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_QK: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    end = tl.load(cu_seqlens + 1)
+    row = end + tl.program_id(0)
+    if row >= tl.minimum((end + 63) // 64 * 64, num_rows):
+        return
+    row = row.to(tl.int64)
+    offs = tl.arange(0, BLOCK_QK)
+    mask = offs < QK
+    tl.store(
+        q + row * stride_q + offs, tl.zeros([BLOCK_QK], q.dtype.element_ty), mask=mask
+    )
+    tl.store(
+        k + row * stride_k + offs, tl.zeros([BLOCK_QK], k.dtype.element_ty), mask=mask
+    )
+    offs = tl.arange(0, BLOCK_V)
+    tl.store(
+        v + row * stride_v + offs,
+        tl.zeros([BLOCK_V], v.dtype.element_ty),
+        mask=offs < V,
+    )
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+    tl.store(
+        alpha + row * stride_alpha + offs,
+        tl.full([BLOCK_H], 1.0, alpha.dtype.element_ty),
+        mask=mask,
+    )
+    tl.store(
+        beta + row * stride_beta + offs,
+        tl.zeros([BLOCK_H], beta.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def gdn_cp_tail_neutralize(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> None:
+    """Rows [T, ceil64(T)) of a one-sequence batch as an exact-size eager call sees them:
+    q / k / v zero (TMA fill past the tensor end), alpha 1, beta 0 (the kernels' out-of-range
+    values). FlashInfer's CP state kernel loads whole 64-token K / V blocks; in a graph those
+    rows are bucket padding, i.e. stale graph-pool memory that may not be finite."""
+    rows = q.shape[0]
+    assert q[0].is_contiguous() and k[0].is_contiguous() and v[0].is_contiguous()
+    assert alpha.stride(-1) == 1 and beta.stride(-1) == 1
+    qk, vn, h = q[0].numel(), v[0].numel(), alpha.shape[-1]
+    _gdn_cp_tail_kernel[(64,)](
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        cu_seqlens,
+        rows,
+        q.stride(0),
+        k.stride(0),
+        v.stride(0),
+        alpha.stride(0),
+        beta.stride(0),
+        QK=qk,
+        V=vn,
+        H=h,
+        BLOCK_QK=triton.next_power_of_2(qk),
+        BLOCK_V=triton.next_power_of_2(vn),
+        BLOCK_H=triton.next_power_of_2(h),
+    )
+
+
+def gdn_track_conv_window(
+    conv_pool: torch.Tensor,
+    x: torch.Tensor,
+    track_mode: torch.Tensor,
+    track_conv_start: torch.Tensor,
+    track_dst: torch.Tensor,
+    num_tokens: torch.Tensor,
+) -> None:
+    """``conv_pool[track_dst[r]] = x[clamp(start[r] + arange(STATE_LEN))].T`` for
+    every tracked row ``r``; the grid depends only on the row bound."""
+    rows = track_mode.shape[0]
+    dim, state_len = conv_pool.shape[-2], conv_pool.shape[-1]
+    assert x.shape[-1] == dim and x.stride(-1) == 1
+    block_d = 1024
+    _gdn_track_conv_window_kernel[(rows, triton.cdiv(dim, block_d))](
+        conv_pool,
+        x,
+        track_mode,
+        track_conv_start,
+        track_dst,
+        num_tokens,
+        conv_pool.stride(0),
+        conv_pool.stride(1),
+        conv_pool.stride(2),
+        x.stride(0),
+        dim,
+        STATE_LEN=state_len,
+        BLOCK_D=block_d,
+    )
+
+
+def gdn_track_ssm_state(
+    ssm_pool: torch.Tensor,
+    h: torch.Tensor,
+    track_mode: torch.Tensor,
+    track_h_row: torch.Tensor,
+    track_dst: torch.Tensor,
+    cache_indices: torch.Tensor,
+) -> None:
+    """Snapshot the tracked rows' SSM state into their track slots (mode 1:
+    the row's final state, mode 2: its chunk-boundary state in ``h``)."""
+    rows = track_mode.shape[0]
+    numel = ssm_pool[0].numel()
+    assert ssm_pool[0].is_contiguous(), "per-slot SSM state must be contiguous"
+    h = h.flatten(0, 1)
+    assert h[0].is_contiguous() and h[0].numel() == numel
+    block = 1024
+    _gdn_track_ssm_kernel[(rows, triton.cdiv(numel, block))](
+        ssm_pool,
+        h,
+        track_mode,
+        track_h_row,
+        track_dst,
+        cache_indices,
+        ssm_pool.stride(0),
+        h.stride(0),
+        numel,
+        BLOCK=block,
+    )

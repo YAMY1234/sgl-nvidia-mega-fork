@@ -81,6 +81,8 @@ SGLANG_MIRRORS = {
         "12a835fc4f78af33",
         "6ed4eb6a818f7e20",
         "bfd997695f32d409",
+        # Strided pools are refused before this slot writes any state.
+        "4216c770a110e224",
     ),
     "srt/layers/attention/hybrid_linear_attn_backend.py:MambaAttnBackendBase._track_mamba_state_extend": "84c447ca707eba64",
 }

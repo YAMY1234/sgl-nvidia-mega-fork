@@ -27,7 +27,11 @@ SGLANG_READS = {
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
     "kernels/ops/attention/fla/layernorm_gated.py:_layer_norm_fwd_1pass_kernel": "80c8989ca591478d",
-    "kernels/ops/attention/fla/layernorm_gated.py:_layer_norm_fwd": "01a3c1896f273538",
+    "kernels/ops/attention/fla/layernorm_gated.py:_layer_norm_fwd": (
+        "01a3c1896f273538",
+        # + the extend-size launch (SGLANG_OPT_GDN_PREFILL_NORM_RETILE); same stock launch
+        "e0d1dbdf2c5ee414",
+    ),
 }
 
 

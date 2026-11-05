@@ -141,12 +141,34 @@ SGLANG_MIRRORS = {
         "12a835fc4f78af33",
         "6ed4eb6a818f7e20",
         "bfd997695f32d409",
+        # Pool staging changes only the non-verify strided-state branch.
+        "4216c770a110e224",
+        # Numeric dispatch adds no work to the no-offer fallback mirrored here.
+        "17911e45c671bb0a",
+        # Source target-view routing and PP-off metadata preserve this boundary.
+        "d7ef7a4a92630786",
+        # Optional source TP4 M32 normalization forwards four explicit operands.
+        "c900f2e6946545e3",
+        # Source native verify adds only a linear/non-tree eligibility keyword.
+        "ff6e244f8e9543bc",
     ),
     # Importing the ReplaySSM kernel from fla/ and, after sgl-project/sglang#45112, from
     # linear/; the first goes once all supported SGLangs have the move
     "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend._replayssm_target_verify": (
         "28b89fa4b48b47ad",
         "739e7115c370ac01",
+        "9a98ee8df02e8ce9",
+        # Preflighted M32 CORE1; native/no-offer recurrence and raw0 IO unchanged.
+        "faeeaf62c90b9004",
+        # Preflighted native PDL follows existing MK returns and native conv.
+        "d4045cd6b4f9413d",
+        # Exact declared-program caches; native continuation remains unchanged.
+        "3e74f07d9dafa32c",
+        "5f2781987e7b570a",
+        # The runtime's ReplaySSM verify pipeline depth (3 stages under
+        # SGLANG_OPT_GDN_REPLAYSSM_VERIFY_3_STAGES) keeps the stock bits; this slot
+        # keeps its own launch.
+        "9f91cbe844d99580",
     ),
     "srt/layers/linear.py:RowParallelLinear.forward": (
         "b291a3c452e428a5",
@@ -365,6 +387,8 @@ def _out_proj(
     its own quantization returns), the TP-partial output in SGLang's symmetric pool; with
     slot lowm_out (``Slots.lowm_outproj``) the low-M launch instead (numeric), pushing into the hop with
     ``push`` (slot lowm_push)."""
+    if fp8.dtype != torch.float8_e4m3fn:
+        raise ValueError("the fused norm must provide prequantized E4M3 input")
     # A prequantized E4M3 tensor does not carry the activation dtype that ModelOpt's
     # linear must produce.  Match ModelOptFp8LinearMethod.apply's v3 contract rather
     # than inheriting the GDN recurrence's (potentially different) working dtype.

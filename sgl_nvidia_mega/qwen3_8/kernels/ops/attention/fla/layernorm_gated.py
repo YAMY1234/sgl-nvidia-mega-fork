@@ -1,0 +1,700 @@
+# SPDX-License-Identifier: Apache-2.0
+
+
+import os
+from contextlib import nullcontext
+from functools import lru_cache
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+from einops import rearrange
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
+from sglang.srt.utils import (
+    cdiv,
+    cpu_has_amx_support,
+    device_context,
+    is_cpu,
+    is_npu,
+    next_power_of_2,
+)
+
+from sgl_nvidia_mega.qwen3_8._jit import is_arch_support_pdl
+from sgl_nvidia_mega.qwen3_8.kernels.ops.extend_fastpath import (
+    GDN_NORM_ENABLED as _Q38_EXTEND_PATH,
+)
+
+_is_npu = is_npu()
+_use_cpu = is_cpu() and cpu_has_amx_support()
+
+
+MAX_ROWS_PER_BLOCK = 4
+
+
+_GDN_FRONT_NORM = _Q38_EXTEND_PATH
+NORM_BIG_ROWS = 32768
+NORM_BIG_CFG = (32, 4)
+
+
+def rms_norm_ref(
+    x,
+    weight,
+    bias,
+    z=None,
+    eps=1e-6,
+    group_size=None,
+    norm_before_gate=True,
+    upcast=True,
+):
+    dtype = x.dtype
+    N = x.shape[-1]
+    weight = weight.float()
+    bias = bias.float() if bias is not None else None
+    if upcast:
+        x = x.float()
+        z = z.float() if z is not None else z
+    if z is not None and not norm_before_gate:
+        x = x * F.silu(z)
+    if group_size is None:
+        rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
+        out = (x * rstd * weight) + bias if bias is not None else (x * rstd * weight)
+    else:
+        x_group = rearrange(x, "... (g d) -> ... g d", d=group_size)
+        rstd = 1 / torch.sqrt((x_group.square()).mean(dim=-1, keepdim=True) + eps)
+        out = rearrange(x_group * rstd, "... g d -> ... (g d)") * weight
+        if bias is not None:
+            out = out + bias
+    if z is not None and norm_before_gate:
+        out *= F.silu(z)
+    return out.to(dtype)
+
+
+@triton.jit
+def _layer_norm_fwd_1pass_kernel(
+    X,
+    Y,
+    W,
+    B,
+    Z,
+    Mean,
+    Rstd,
+    stride_x_row,
+    stride_y_row,
+    stride_z_row,
+    stride_z_token,
+    stride_z_head,
+    M,
+    N: tl.constexpr,
+    eps,
+    BLOCK_N: tl.constexpr,
+    ROWS_PER_BLOCK: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_Z: tl.constexpr,
+    Z_IS_3D: tl.constexpr,
+    Z_HEADS: tl.constexpr,
+    NORM_BEFORE_GATE: tl.constexpr,
+    IS_RMS_NORM: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+    EARLY_DEPENDENTS: tl.constexpr = False,
+    Q=None,
+    S=None,
+    QUANT: tl.constexpr = False,
+):
+    if USE_GDC:
+        if EARLY_DEPENDENTS:
+            tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
+
+    row_start = tl.program_id(0) * ROWS_PER_BLOCK
+    group = tl.program_id(1)
+
+    rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
+    cols = tl.arange(0, BLOCK_N)
+
+    row_offsets = rows[:, None] * stride_x_row
+    col_offsets = cols[None, :] + group * N
+
+    X_base = X + row_offsets + col_offsets
+    Y_base = Y + rows[:, None] * stride_y_row + col_offsets
+
+    row_mask = rows[:, None] < M
+    col_mask = cols[None, :] < N
+    mask = row_mask & col_mask
+
+    x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
+
+    if HAS_Z and not NORM_BEFORE_GATE:
+        if Z_IS_3D:
+            z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
+                rows[:, None] % Z_HEADS
+            ) * stride_z_head
+        else:
+            z_row_offsets = rows[:, None] * stride_z_row
+        Z_base = Z + z_row_offsets + col_offsets
+        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            x *= z * tl.sigmoid(z)
+        elif ACTIVATION == "sigmoid":
+            x *= tl.sigmoid(z)
+
+    if not IS_RMS_NORM:
+        mean = tl.sum(x, axis=1) / N
+
+        mean_offsets = group * M + rows
+        mean_mask = rows < M
+        tl.store(Mean + mean_offsets, mean, mask=mean_mask)
+
+        xbar = tl.where(mask, x - mean[:, None], 0.0)
+        var = tl.sum(xbar * xbar, axis=1) / N
+    else:
+        xbar = tl.where(mask, x, 0.0)
+        var = tl.sum(xbar * xbar, axis=1) / N
+        mean = 0.0
+
+    rstd = tl.rsqrt(var + eps)
+
+    rstd_offsets = group * M + rows
+    rstd_mask = rows < M
+    tl.store(Rstd + rstd_offsets, rstd, mask=rstd_mask)
+
+    w_offsets = cols + group * N
+    w_mask = cols < N
+    w = tl.load(W + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+
+    if HAS_BIAS:
+        b = tl.load(B + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+
+    if not IS_RMS_NORM:
+        x_hat = (x - mean[:, None]) * rstd[:, None]
+    else:
+        x_hat = x * rstd[:, None]
+
+    y = x_hat * w[None, :] + b[None, :] if HAS_BIAS else x_hat * w[None, :]
+
+    if HAS_Z and NORM_BEFORE_GATE:
+        if Z_IS_3D:
+            z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
+                rows[:, None] % Z_HEADS
+            ) * stride_z_head
+        else:
+            z_row_offsets = rows[:, None] * stride_z_row
+        Z_base = Z + z_row_offsets + col_offsets
+        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            y *= z * tl.sigmoid(z)
+        elif ACTIVATION == "sigmoid":
+            y *= tl.sigmoid(z)
+
+    if QUANT:
+        y = tl.where(mask, y.to(Y.dtype.element_ty).to(tl.float32), 0.0)
+        y_s = tl.maximum(tl.max(tl.abs(y)), 1e-10) / 448.0
+        y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(Q.dtype.element_ty)
+        tl.store(Q + rows[:, None] * N + col_offsets, y_q, mask=mask)
+        tl.store(S + tl.program_id(0), y_s)
+    else:
+        tl.store(Y_base, y, mask=mask)
+
+    if USE_GDC and not EARLY_DEPENDENTS:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@lru_cache
+def _get_sm_count(device: torch.device) -> int:
+    """Get and cache the SM count for a given device."""
+    if device.type == "xpu":
+        assert torch.xpu.is_available(), "XPU device is not available"
+        return torch.xpu.get_device_properties(device).gpu_subslice_count
+    props = torch.cuda.get_device_properties(device)
+    return props.multi_processor_count
+
+
+def calc_rows_per_block(M: int, device: torch.device) -> int:
+
+    if is_batch_invariant_mode_enabled() or check_cuda_graph_backend(
+        Phase.PREFILL, Backend.TC_PIECEWISE
+    ):
+        return MAX_ROWS_PER_BLOCK
+    sm_count = _get_sm_count(device)
+    rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
+    rows_per_block = min(rows_per_block, MAX_ROWS_PER_BLOCK)
+    return rows_per_block
+
+
+if _Q38_EXTEND_PATH:
+
+    def _layer_norm_fwd(
+        x,
+        weight,
+        bias,
+        eps,
+        z=None,
+        out=None,
+        group_size=None,
+        norm_before_gate=True,
+        is_rms_norm=False,
+        activation: str = "swish",
+        quant_heads: int = 0,
+        launch_cfg=None,
+    ):
+        M, N = x.shape
+        if group_size is None:
+            group_size = N
+        assert N % group_size == 0
+        ngroups = N // group_size
+        assert x.stride(-1) == 1
+        z_is_3d = z is not None and z.ndim == 3
+        if z is not None:
+            assert z.stride(-1) == 1
+            if z_is_3d:
+                assert z.shape[0] * z.shape[1] == M
+                assert z.shape[2] == N
+            else:
+                assert z.shape == (M, N)
+        assert weight.shape == (N,)
+        assert weight.stride(-1) == 1
+        if bias is not None:
+            assert bias.stride(-1) == 1
+            assert bias.shape == (N,)
+
+        if out is not None:
+            assert out.shape == x.shape
+        else:
+            out = torch.empty_like(x)
+        assert out.stride(-1) == 1
+        mean = (
+            torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+            if not is_rms_norm
+            else None
+        )
+        rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+
+        MAX_FUSED_SIZE = 65536 // x.element_size()
+        BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
+        if group_size > BLOCK_N:
+            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+
+        num_warps = min(max(BLOCK_N // 256, 1), 8)
+
+        rows_per_block = calc_rows_per_block(M, x.device)
+        quant = {}
+
+        if quant_heads:
+            assert ngroups == 1 and M % quant_heads == 0
+
+            num_warps = min(num_warps * quant_heads // rows_per_block, 16)
+            rows_per_block = quant_heads
+            q = torch.empty(
+                (M // quant_heads, quant_heads * N),
+                dtype=torch.float8_e4m3fn,
+                device=x.device,
+            )
+            s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
+            quant = {"Q": q, "S": s, "QUANT": True}
+        if launch_cfg is not None:
+            rows_per_block, num_warps = launch_cfg
+        elif (
+            _GDN_FRONT_NORM
+            and not quant_heads
+            and ngroups == 1
+            and BLOCK_N == 128
+            and M >= NORM_BIG_ROWS
+            and not is_batch_invariant_mode_enabled()
+        ):
+            rows_per_block, num_warps = NORM_BIG_CFG
+
+        grid = (cdiv(M, rows_per_block), ngroups)
+        pdl_kwargs = (
+            {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+        )
+
+        if (
+            pdl_kwargs
+            and os.environ.get("Q38_GDN_NORM_EARLY") == "1"
+            and x.dtype == torch.bfloat16
+            and is_rms_norm
+            and norm_before_gate
+            and activation == "sigmoid"
+            and M == 192
+            and N == 128
+            and z_is_3d
+            and z.shape[1] == 48
+        ):
+            pdl_kwargs["EARLY_DEPENDENTS"] = True
+
+        device_ctx = (
+            nullcontext()
+            if x.device.type == "xpu" and torch.compiler.is_compiling()
+            else device_context(x.device)
+        )
+        with device_ctx:
+            _layer_norm_fwd_1pass_kernel[grid](
+                x,
+                out,
+                weight,
+                bias,
+                z,
+                mean,
+                rstd,
+                x.stride(0),
+                out.stride(0),
+                z.stride(0) if z is not None and not z_is_3d else 0,
+                z.stride(0) if z_is_3d else 0,
+                z.stride(1) if z_is_3d else 0,
+                M,
+                group_size,
+                eps,
+                BLOCK_N=BLOCK_N,
+                ROWS_PER_BLOCK=rows_per_block,
+                HAS_BIAS=bias is not None,
+                HAS_Z=z is not None,
+                Z_IS_3D=z_is_3d,
+                Z_HEADS=z.shape[1] if z_is_3d else 1,
+                NORM_BEFORE_GATE=norm_before_gate,
+                IS_RMS_NORM=is_rms_norm,
+                num_warps=num_warps,
+                ACTIVATION=activation,
+                **pdl_kwargs,
+                **quant,
+            )
+        return ((q, s) if quant_heads else out), mean, rstd
+else:
+
+    def _layer_norm_fwd(
+        x,
+        weight,
+        bias,
+        eps,
+        z=None,
+        out=None,
+        group_size=None,
+        norm_before_gate=True,
+        is_rms_norm=False,
+        activation: str = "swish",
+        quant_heads: int = 0,
+    ):
+        M, N = x.shape
+        if group_size is None:
+            group_size = N
+        assert N % group_size == 0
+        ngroups = N // group_size
+        assert x.stride(-1) == 1
+        z_is_3d = z is not None and z.ndim == 3
+        if z is not None:
+            assert z.stride(-1) == 1
+            if z_is_3d:
+                assert z.shape[0] * z.shape[1] == M
+                assert z.shape[2] == N
+            else:
+                assert z.shape == (M, N)
+        assert weight.shape == (N,)
+        assert weight.stride(-1) == 1
+        if bias is not None:
+            assert bias.stride(-1) == 1
+            assert bias.shape == (N,)
+
+        if out is not None:
+            assert out.shape == x.shape
+        else:
+            out = torch.empty_like(x)
+        assert out.stride(-1) == 1
+        mean = (
+            torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+            if not is_rms_norm
+            else None
+        )
+        rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+
+        MAX_FUSED_SIZE = 65536 // x.element_size()
+        BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
+        if group_size > BLOCK_N:
+            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+
+        num_warps = min(max(BLOCK_N // 256, 1), 8)
+
+        rows_per_block = calc_rows_per_block(M, x.device)
+        quant = {}
+
+        if quant_heads:
+            assert ngroups == 1 and M % quant_heads == 0
+
+            num_warps = min(num_warps * quant_heads // rows_per_block, 16)
+            rows_per_block = quant_heads
+            q = torch.empty(
+                (M // quant_heads, quant_heads * N),
+                dtype=torch.float8_e4m3fn,
+                device=x.device,
+            )
+            s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
+            quant = {"Q": q, "S": s, "QUANT": True}
+
+        grid = (cdiv(M, rows_per_block), ngroups)
+        pdl_kwargs = (
+            {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+        )
+
+        if (
+            pdl_kwargs
+            and os.environ.get("Q38_GDN_NORM_EARLY") == "1"
+            and x.dtype == torch.bfloat16
+            and is_rms_norm
+            and norm_before_gate
+            and activation == "sigmoid"
+            and M == 192
+            and N == 128
+            and z_is_3d
+            and z.shape[1] == 48
+        ):
+            pdl_kwargs["EARLY_DEPENDENTS"] = True
+
+        device_ctx = (
+            nullcontext()
+            if x.device.type == "xpu" and torch.compiler.is_compiling()
+            else device_context(x.device)
+        )
+        with device_ctx:
+            _layer_norm_fwd_1pass_kernel[grid](
+                x,
+                out,
+                weight,
+                bias,
+                z,
+                mean,
+                rstd,
+                x.stride(0),
+                out.stride(0),
+                z.stride(0) if z is not None and not z_is_3d else 0,
+                z.stride(0) if z_is_3d else 0,
+                z.stride(1) if z_is_3d else 0,
+                M,
+                group_size,
+                eps,
+                BLOCK_N=BLOCK_N,
+                ROWS_PER_BLOCK=rows_per_block,
+                HAS_BIAS=bias is not None,
+                HAS_Z=z is not None,
+                Z_IS_3D=z_is_3d,
+                Z_HEADS=z.shape[1] if z_is_3d else 1,
+                NORM_BEFORE_GATE=norm_before_gate,
+                IS_RMS_NORM=is_rms_norm,
+                num_warps=num_warps,
+                ACTIVATION=activation,
+                **pdl_kwargs,
+                **quant,
+            )
+        return ((q, s) if quant_heads else out), mean, rstd
+
+
+if _is_npu:
+    from sgl_kernel_npu.fla.layernorm_gated import layer_norm_fwd_npu as _layer_norm_fwd
+
+
+def rms_norm_gated(
+    *,
+    x,
+    weight,
+    bias,
+    z=None,
+    eps=1e-6,
+    group_size=None,
+    norm_before_gate=True,
+    is_rms_norm=False,
+    activation: str = "swish",
+):
+    """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+
+    x_shape_og = x.shape
+
+    x = x.reshape(-1, x.shape[-1])
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if z is not None:
+        if z.shape == x_shape_og:
+            z = z.reshape(-1, z.shape[-1])
+            if z.stride(-1) != 1:
+                z = z.contiguous()
+        else:
+            assert len(x_shape_og) == 2
+            assert z.ndim == 3
+            assert z.shape[0] * z.shape[1] == x.shape[0]
+            assert z.shape[2] == x.shape[1]
+            assert z.stride(-1) == 1
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+    if _is_npu:
+        assert activation == "swish", "NPU only supports swish activation"
+    y, mean, rstd = _layer_norm_fwd(
+        x,
+        weight,
+        bias,
+        eps,
+        z=z,
+        group_size=group_size,
+        norm_before_gate=norm_before_gate,
+        is_rms_norm=is_rms_norm,
+        activation=activation,
+    )
+    return y.reshape(x_shape_og)
+
+
+class LayerNormFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        weight,
+        bias,
+        z=None,
+        eps=1e-6,
+        group_size=None,
+        norm_before_gate=True,
+        is_rms_norm=False,
+        activation: str = "swish",
+    ):
+        return rms_norm_gated(
+            x=x,
+            weight=weight,
+            bias=bias,
+            eps=eps,
+            z=z,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+            is_rms_norm=is_rms_norm,
+            activation=activation,
+        )
+
+
+def layernorm_fn(
+    x,
+    weight,
+    bias,
+    z=None,
+    eps=1e-6,
+    group_size=None,
+    norm_before_gate=True,
+    is_rms_norm=False,
+    activation: str = "swish",
+):
+    return LayerNormFn.apply(
+        x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm, activation
+    )
+
+
+class LayerNorm(torch.nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        eps=1e-5,
+        group_size=None,
+        norm_before_gate=True,
+        device=None,
+        dtype=None,
+    ):
+        """If group_size is not None, we do GroupNorm with each group having group_size elements.
+        group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
+        """
+
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.bias = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.group_size = group_size
+        self.norm_before_gate = norm_before_gate
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.ones_(self.weight)
+        torch.nn.init.zeros_(self.bias)
+
+    def forward(self, x, z=None):
+        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+        return layernorm_fn(
+            x,
+            self.weight,
+            self.bias,
+            z=z,
+            group_size=self.group_size,
+            eps=self.eps,
+            norm_before_gate=self.norm_before_gate,
+            is_rms_norm=False,
+        )
+
+
+class RMSNorm(torch.nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        eps=1e-5,
+        group_size=None,
+        norm_before_gate=True,
+        device=None,
+        dtype=None,
+        activation: str = "swish",
+    ):
+        """If group_size is not None, we do GroupNorm with each group having group_size elements.
+        group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
+        """
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.eps = eps
+        self.activation = activation
+        self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.register_parameter("bias", None)
+        self.group_size = group_size
+        self.norm_before_gate = norm_before_gate
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.ones_(self.weight)
+
+    def forward(self, x, z=None):
+        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+        if _use_cpu:
+            assert (
+                self.norm_before_gate
+                and self.group_size is None
+                and self.activation == "swish"
+            ), (
+                "CPU rmsnorm_gated currently only supports norm before gate without group size or activation other than swish"
+            )
+            return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
+                x, self.weight, z, self.eps
+            )
+        else:
+            return layernorm_fn(
+                x,
+                self.weight,
+                self.bias,
+                z=z,
+                eps=self.eps,
+                group_size=self.group_size,
+                norm_before_gate=self.norm_before_gate,
+                is_rms_norm=True,
+                activation=self.activation,
+            )
+
+
+SGLANG_READS = {
+    "srt/batch_invariant_ops/__init__.py": ("is_batch_invariant_mode_enabled",),
+    "srt/model_executor/cuda_graph_config.py": (
+        "Backend",
+        "Phase",
+        "check_cuda_graph_backend",
+    ),
+    "srt/utils/*.py": (
+        "cdiv",
+        "cpu_has_amx_support",
+        "device_context",
+        "is_cpu",
+        "is_npu",
+        "next_power_of_2",
+    ),
+}

@@ -1536,33 +1536,19 @@ def test_gdn_prequantized_out_proj_uses_v3_model_dtype(
 
     if model_dtype == torch.float32:
         with pytest.raises(ValueError, match="explicit BF16 or FP16"):
-            fp8_utils.apply_fp8_linear_bmm_flashinfer(
-                fp8,
-                layer.weight,
-                layer.weight_scale,
-                layer.input_scale,
-                pre_quant_output_dtype=model_dtype,
-            )
-        with pytest.raises(ValueError, match="explicit BF16 or FP16"):
             verify._out_proj(layer, fp8, recurrence_dtype)
         assert calls == []
         return
 
-    expected = fp8_utils.apply_fp8_linear_bmm_flashinfer(
-        fp8,
-        layer.weight,
-        layer.weight_scale,
-        layer.input_scale,
-        pre_quant_output_dtype=model_dtype,
-    )
     actual = verify._out_proj(layer, fp8, recurrence_dtype)
 
-    assert actual.dtype == expected.dtype == model_dtype
-    assert torch.equal(actual, expected)
-    assert len(calls) == 2
-    assert calls[0][-1] == calls[1][-1] == model_dtype
-    assert calls[0][0].data_ptr() == calls[1][0].data_ptr() == fp8.data_ptr()
-    assert all(left is right for left, right in zip(calls[0][1:4], calls[1][1:4]))
+    assert actual.dtype == model_dtype
+    assert len(calls) == 1
+    x, weight, x_scale, weight_scale, output_dtype = calls[0]
+    assert output_dtype == model_dtype
+    assert x.data_ptr() == fp8.data_ptr()
+    assert weight is layer.weight
+    assert x_scale is layer.input_scale and weight_scale is layer.weight_scale
 
 
 def test_gdn_bf16_out_proj_can_use_lowm(monkeypatch):

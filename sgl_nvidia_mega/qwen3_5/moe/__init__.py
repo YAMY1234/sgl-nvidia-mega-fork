@@ -74,9 +74,39 @@ SGLANG_READS = {
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock.forward": "633ff9a686d3ea28",
-    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock.forward_normal_dual_stream": "afae959064cc8cd7",
-    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_router_experts": "32d09f01b77d76b5",
+    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock.forward": (
+        "633ff9a686d3ea28",
+        "5b50807fdab24328",
+        "4c0f4e3be461ad07",
+        "cd86bed7218f8fcd",
+        "2a1b7fa094eacabd",
+        "df21760b838ef390",
+        "3acf231d69c07c6a",
+    ),
+    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock.forward_normal_dual_stream": (
+        "afae959064cc8cd7",
+        "8e538cac7f937162",
+        "d05b74253af487bf",
+        "f7f843af525e4f74",
+        "45f6648034e8f2b8",
+        "f690a77da315f611",
+        # The runtime's NVFP4 routed-input prequant (TP1 TRT-LLM NVFP4 experts, under
+        # SGLANG_OPT_MOE_NVFP4_PREQUANT_OVERLAP) keeps the stock bits; this path keeps
+        # its own quantize on the routed stream.
+        "55787c76b74024fe",
+        # The runtime's shared-expert input without a clone (inplace=False routed experts,
+        # under SGLANG_OPT_MOE_SHARED_EXPERT_NO_CLONE) keeps the stock bits; this path keeps
+        # its own clone.
+        "7cc7c60275ce1643",
+        # The runtime skips that prequant where its fused decode routing quantizes the
+        # routed input (SGLANG_OPT_MOE_FUSED_ROUTING); this path quantizes on its own.
+        "b8daac57ea9e3cf3",
+    ),
+    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_router_experts": (
+        "32d09f01b77d76b5",
+        "98c432785047f561",
+        "3f8fc98cc60a898b",
+    ),
 }
 
 

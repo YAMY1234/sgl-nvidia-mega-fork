@@ -65,6 +65,7 @@ SGLANG_READS = {
         "gate_up_proj",
         "down_proj",
         "act_fn",
+        "_enable_silu_fp4_quant_fusion",
     ),
     "srt/models/utils.py": (
         "can_run_silu_fp4_quant_fusion",
@@ -124,7 +125,12 @@ SGLANG_READS = {
 SGLANG_MIRRORS = {
     "srt/layers/moe/fused_moe_triton/layer.py:FusedMoE.forward_deferred_finalize": "af4b474cbaf33493",
     "srt/layers/moe/fused_moe_triton/layer.py:FusedMoE._dispatch_with_pre_quant": "dcdefc28cf643081",
-    "srt/models/qwen2_moe.py:Qwen2MoeMLP.forward": "60b6d1e897d94ed9",
+    "srt/models/qwen2_moe.py:Qwen2MoeMLP.forward": (
+        "bb4c9fb2d7994e97",  # runtime v2: temporary core shared-act fast path
+        "6091ffb613568a10",  # runtime v3: the policy and kernel live in this slot
+        "60b6d1e897d94ed9",  # shared tail delegates to the same public helpers
+        "a5613536d367bb1d",  # SM107 fused shared act ahead of the unchanged tail
+    ),
 }
 
 

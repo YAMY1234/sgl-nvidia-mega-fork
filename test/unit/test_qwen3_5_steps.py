@@ -673,6 +673,53 @@ def test_route_shared_normalizes_modelopts_scalar_down_scale(monkeypatch):
     assert tuple(seen[0][1].shape) == (1,)
 
 
+@pytest.mark.parametrize(
+    "sp_active,has_lora", [(False, False), (True, False), (False, True)]
+)
+def test_route_shared_uses_the_public_fp4_tail_policy(monkeypatch, sp_active, has_lora):
+    from sglang.srt.models import utils
+
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    gate_up = torch.ones((2, 4), dtype=torch.bfloat16)
+    packed = (object(), object())
+    seen = []
+
+    class Down:
+        def __call__(self, value):
+            seen.append(value)
+            return value, None
+
+    down = Down()
+    if has_lora:
+        down.base_layer = object()
+    expert = SimpleNamespace(
+        _enable_silu_fp4_quant_fusion=True,
+        down_proj=down,
+        act_fn=lambda value: "stock_activation",
+    )
+    monkeypatch.setattr(
+        utils, "get_forward", lambda: SimpleNamespace(sp_active=sp_active)
+    )
+    calls = []
+
+    def quantize(mlp, value):
+        calls.append((mlp, value))
+        return packed
+
+    monkeypatch.setattr(utils, "silu_and_mul_fp4_quant", quantize)
+    monkeypatch.setattr(route, "_down_takes_static_fp8", lambda unused: False)
+    result = route.shared_expert_tail(expert, gate_up)
+    if not sp_active and not has_lora:
+        assert result is packed
+        assert calls == [(expert, gate_up)]
+        assert seen == [packed]
+    else:
+        assert result == "stock_activation"
+        assert calls == []
+        assert seen == ["stock_activation"]
+
+
 @pytest.mark.parametrize("scale_name", ["input_scale", "weight_scale"])
 @pytest.mark.parametrize(
     "scale",
@@ -1136,6 +1183,7 @@ def _gdn_module(log, x, core_rows=7):
         attn_tp_size=8,
         head_k_dim=128,
         head_v_dim=128,
+        _fused_in_proj_weight=None,
         _forward_input_proj=log.op("in_proj", (qkvz, ba)),
         attn=log.op("linear_attention", core),
         norm=log.op("gated_norm", torch.ones(14, 3)),
@@ -1340,7 +1388,7 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows(
                 tuple(sorted(kw.items())),
             )
         )
-        return torch.zeros(1, 7, 32).transpose(1, 2)
+        return torch.zeros(1, 7, 32, dtype=torch.bfloat16).transpose(1, 2)
 
     names = (
         "q",
@@ -1380,7 +1428,7 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows(
                 tuple(sorted(kw.items())),
             )
         )
-        return torch.zeros(28, 4)
+        return torch.zeros(28, 4, dtype=torch.float8_e4m3fn)
 
     @contextlib.contextmanager
     def symmetric(group, disabled=False):

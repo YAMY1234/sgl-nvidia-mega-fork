@@ -1,0 +1,490 @@
+# SPDX-License-Identifier: Apache-2.0
+
+
+"""TP4 FN selected-KV TCGEN05 attention and BF16-boundary gate.
+
+Adapt the qualified TP1 partial/merge algorithm to six Q heads and one KV head.
+The TP1 code is unchanged. The service caller owns shape/mode dispatch.
+"""
+
+import torch
+import triton
+import triton.language as tl
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.nvidia.blackwell import (
+    TensorMemoryLayout,
+    allocate_tensor_memory,
+    fence_async_shared,
+    mbarrier,
+    tcgen05_commit,
+    tcgen05_mma,
+)
+
+from sgl_nvidia_mega.qwen3_8.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
+
+try:
+    from triton.experimental.gluon.language.nvidia.blackwell import get_tmem_reg_layout
+except ImportError:
+    from triton.experimental.gluon.language.nvidia.blackwell import (
+        tensor_memory_descriptor_type,
+    )
+    from triton.runtime.jit import constexpr_function
+
+    @constexpr_function
+    def get_tmem_reg_layout(element_ty, shape, layout, num_warps):
+        ty = tensor_memory_descriptor_type(element_ty, shape, layout, shape)
+        return ty.get_reg_layout(num_warps=num_warps)
+
+
+@triton.jit
+def _store_tp4(
+    K,
+    V,
+    NK,
+    NV,
+    LOC,
+    KS: tl.constexpr,
+    VS: tl.constexpr,
+    NKS: tl.constexpr,
+    NVS: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    PDL_SMALL: tl.constexpr = False,
+):
+
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_wait()
+    row = tl.program_id(0)
+    h = tl.program_id(1)
+    d = tl.arange(0, D)
+    slot = tl.load(LOC + row).to(tl.int64)
+    k = tl.load(NK + row * NKS + h * D + d)
+    v = tl.load(NV + row * NVS + h * D + d)
+    tl.store(K + slot * KS + h * D + d, k, slot != 0)
+    tl.store(V + slot * VS + h * D + d, v, slot != 0)
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@gluon.jit
+def _partial_tp4(
+    Q,
+    K,
+    V,
+    NK,
+    NV,
+    LOC,
+    MAP,
+    REQ,
+    IDX,
+    LENGTH,
+    QPOS,
+    PART,
+    MAX,
+    SUM,
+    QS: gl.constexpr,
+    QH: gl.constexpr,
+    KS: gl.constexpr,
+    VS: gl.constexpr,
+    NKS: gl.constexpr,
+    NVS: gl.constexpr,
+    MS: gl.constexpr,
+    IS: gl.constexpr,
+    NT: gl.constexpr,
+    GROUP: gl.constexpr,
+    WIDTH: gl.constexpr,
+    SCALE: gl.constexpr,
+    KVH: gl.constexpr,
+    PDL_SMALL: gl.constexpr = False,
+):
+
+    if PDL_SMALL:
+        gl.inline_asm_elementwise(
+            "griddepcontrol.wait; mov.u32 $0, 0;",
+            constraints="=r,~{memory}",
+            args=[],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+    row, tile, head = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    kv_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
+    n = gl.arange(0, 64, gl.SliceLayout(1, kv_layout))
+    d = gl.arange(0, 256, gl.SliceLayout(0, kv_layout))
+    col = tile * 64 + n
+    req = gl.load(REQ + row).to(gl.int64)
+    length = gl.load(LENGTH + row)
+    qpos = gl.load(QPOS + row)
+    active = gl.load(LOC + row) != 0
+    selected = gl.minimum(length // 4, 512) * 4
+    tail_start = (qpos + 1) // 4 * 4
+    tail_count = gl.maximum(0, gl.minimum(qpos + 1, length) - tail_start)
+    count = gl.where(active, selected + tail_count, 0)
+    block = gl.load(IDX + row * IS + col // 4, col < 2048, -1)
+    expanded = block * 4 + col % 4
+    tail_off = col - selected
+    tail = tail_start + tail_off
+    pos = gl.where(
+        (col < selected) & (block >= 0),
+        expanded,
+        gl.where((tail_off >= 0) & (tail_off < 3) & (tail < qpos + 1), tail, -1),
+    )
+    valid = (col < count) & (pos >= 0) & (pos < length)
+    slot = gl.load(MAP + req * MS + pos, valid, 0).to(gl.int64)
+    first_pos = length - 1 - row % WIDTH
+    relative = pos - first_pos
+    fresh = valid & (relative >= 0)
+    fresh_row = gl.where(fresh, row // WIDTH * WIDTH + relative, 0).to(gl.int64)
+    kp = gl.where(
+        fresh[:, None],
+        NK + fresh_row[:, None] * NKS + head * 256 + d[None, :],
+        K + slot[:, None] * KS + head * 256 + d[None, :],
+    )
+    k = gl.load(kp, valid[:, None], 0)
+    h = gl.arange(0, 16, gl.SliceLayout(1, kv_layout))
+    q = gl.load(
+        Q + row * QS + (head * GROUP + h[:, None]) * QH + d[None, :],
+        (h < GROUP)[:, None],
+        0,
+    )
+    q_smem = gl.allocate_shared_memory(
+        gl.bfloat16,
+        [16, 256],
+        gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16),
+        value=q,
+    )
+    k_smem = gl.allocate_shared_memory(
+        gl.bfloat16,
+        [64, 256],
+        gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16),
+        value=k,
+    )
+    score_tmem = allocate_tensor_memory(
+        gl.float32,
+        [64, 16],
+        TensorMemoryLayout(block=(64, 16), col_stride=1),
+    )
+    bar = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
+    mbarrier.init(bar, count=1)
+    fence_async_shared()
+
+    tcgen05_mma(k_smem, q_smem.permute((1, 0)), score_tmem, use_acc=False)
+    tcgen05_commit(bar)
+
+    vp = gl.where(
+        fresh[:, None],
+        NV + fresh_row[:, None] * NVS + head * 256 + d[None, :],
+        V + slot[:, None] * VS + head * 256 + d[None, :],
+    )
+    v = gl.load(vp, valid[:, None], 0)
+
+    mbarrier.wait(bar, phase=0)
+    v_smem = gl.allocate_shared_memory(
+        gl.bfloat16,
+        [64, 256],
+        gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16),
+        value=v,
+    )
+    score_layout: gl.constexpr = get_tmem_reg_layout(
+        gl.float32,
+        (64, 16),
+        TensorMemoryLayout(block=(64, 16), col_stride=1),
+        4,
+    )
+    scores = score_tmem.load(score_layout) * SCALE
+    valid_scores = gl.convert_layout(valid, gl.SliceLayout(1, score_layout))
+    scores = gl.where(valid_scores[:, None], scores, -float("inf"))
+    mx = gl.max(scores, 0)
+    safe_max = gl.where(mx == -float("inf"), 0.0, mx)
+    prob = gl.exp(scores - safe_max[None, :])
+    denom = gl.sum(prob, 0)
+    p_hi = prob.to(gl.bfloat16)
+    p_smem = gl.allocate_shared_memory(
+        gl.bfloat16,
+        [64, 16],
+        gl.NVMMASharedLayout(swizzle_byte_width=32, element_bitwidth=16),
+        value=p_hi,
+    )
+    out_tmem = allocate_tensor_memory(
+        gl.float32,
+        [256, 16],
+        TensorMemoryLayout(block=(128, 16), col_stride=1),
+    )
+    fence_async_shared()
+    tcgen05_mma(v_smem.permute((1, 0)), p_smem, out_tmem, use_acc=False)
+    tcgen05_commit(bar)
+    mbarrier.wait(bar, phase=1)
+
+    p_lo = (prob - p_hi.to(gl.float32)).to(gl.bfloat16)
+    p_smem.store(p_lo)
+    fence_async_shared()
+    tcgen05_mma(v_smem.permute((1, 0)), p_smem, out_tmem, use_acc=True)
+    tcgen05_commit(bar)
+    mbarrier.wait(bar, phase=0)
+    mbarrier.invalidate(bar)
+    out_layout: gl.constexpr = get_tmem_reg_layout(
+        gl.float32,
+        (256, 16),
+        TensorMemoryLayout(block=(128, 16), col_stride=1),
+        4,
+    )
+    value = out_tmem.load(out_layout)
+    hd_layout: gl.constexpr = gl.BlockedLayout([1, 4], [4, 8], [4, 1], [1, 0])
+    value_hd = gl.convert_layout(value.permute((1, 0)), hd_layout)
+    hh = gl.arange(0, 16, gl.SliceLayout(1, hd_layout))
+    dd = gl.arange(0, 256, gl.SliceLayout(0, hd_layout))
+    state = (row * KVH + head) * NT + tile
+    gl.store(
+        PART + (state * 16 + hh[:, None]) * 256 + dd[None, :],
+        value_hd,
+        (hh < GROUP)[:, None],
+    )
+    stat_layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
+    hs = gl.arange(0, 16, stat_layout)
+    gl.store(MAX + state * 16 + hs, gl.convert_layout(mx, stat_layout), hs < GROUP)
+    gl.store(SUM + state * 16 + hs, gl.convert_layout(denom, stat_layout), hs < GROUP)
+    if PDL_SMALL:
+        gl.inline_asm_elementwise(
+            "griddepcontrol.launch_dependents; mov.u32 $0, 0;",
+            constraints="=r,~{memory}",
+            args=[],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+
+
+@gluon.jit
+def _merge_gate_tp4(
+    P,
+    MAX,
+    SUM,
+    OUT,
+    GATE,
+    GS: gl.constexpr,
+    GH: gl.constexpr,
+    NT: gl.constexpr,
+    ST: gl.constexpr,
+    QHEADS: gl.constexpr,
+    KVH: gl.constexpr,
+    GROUP: gl.constexpr,
+):
+
+    gl.static_assert(ST == 64)
+    gl.static_assert(gl.num_warps() == 4)
+    gl.inline_asm_elementwise(
+        "griddepcontrol.launch_dependents; griddepcontrol.wait; mov.u32 $0, 0;",
+        constraints="=r,~{memory}",
+        args=[],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    row, head, dim_tile = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    scalar_layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
+    t = gl.arange(0, ST, scalar_layout)
+    state = (row * KVH + head // GROUP) * NT + t
+    hh = head % GROUP
+    mx = gl.load(MAX + state * 16 + hh, t < NT, -float("inf"))
+    denom = gl.load(SUM + state * 16 + hh, t < NT, 0.0)
+    maximum = gl.inline_asm_elementwise(
+        """{
+        .reg .b32 tid, lane, warp, off, ptr, peer;
+        .reg .f32 v, a, b, c, d;
+        .reg .pred owner, active;
+        .shared .align 4 .b32 max_partials[4];
+        mov.u32 tid, %tid.x;
+        and.b32 lane, tid, 31;
+        shr.u32 warp, tid, 5;
+        setp.lt.u32 active, warp, 2;
+        selp.f32 v, $1, 0fFF800000, active;
+        shfl.sync.bfly.b32 peer, v, 16, 31, -1; max.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 8, 31, -1; max.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 4, 31, -1; max.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 2, 31, -1; max.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 1, 31, -1; max.f32 v, v, peer;
+        mov.u32 ptr, max_partials;
+        shl.b32 off, warp, 2;
+        add.u32 off, ptr, off;
+        setp.eq.u32 owner, lane, 0;
+        @owner st.shared.b32 [off], v;
+        bar.sync 0;
+        ld.shared.f32 a, [ptr]; ld.shared.f32 b, [ptr+4];
+        ld.shared.f32 c, [ptr+8]; ld.shared.f32 d, [ptr+12];
+        max.f32 a, a, b; max.f32 c, c, d; max.f32 $0, a, c;
+        // All readers finish before the compiler can reuse this scratch.
+        bar.sync 0;
+        }""",
+        constraints="=f,f,~{memory}",
+        args=[mx],
+        dtype=gl.float32,
+        is_pure=False,
+        pack=1,
+    )
+    safe_max = gl.where(maximum > -float("inf"), maximum, 0.0)
+    weights = gl.exp(mx - safe_max)
+    total = gl.inline_asm_elementwise(
+        """{
+        .reg .b32 tid, lane, warp, off, ptr, peer;
+        .reg .f32 v, a, b, c, d;
+        .reg .pred owner, active;
+        .shared .align 4 .b32 sum_partials[4];
+        mov.u32 tid, %tid.x;
+        and.b32 lane, tid, 31;
+        shr.u32 warp, tid, 5;
+        setp.lt.u32 active, warp, 2;
+        mul.rn.f32 v, $1, $2;
+        selp.f32 v, v, 0f00000000, active;
+        shfl.sync.bfly.b32 peer, v, 16, 31, -1; add.rn.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 8, 31, -1; add.rn.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 4, 31, -1; add.rn.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 2, 31, -1; add.rn.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 1, 31, -1; add.rn.f32 v, v, peer;
+        mov.u32 ptr, sum_partials;
+        shl.b32 off, warp, 2;
+        add.u32 off, ptr, off;
+        setp.eq.u32 owner, lane, 0;
+        @owner st.shared.b32 [off], v;
+        bar.sync 0;
+        ld.shared.f32 a, [ptr]; ld.shared.f32 b, [ptr+4];
+        ld.shared.f32 c, [ptr+8]; ld.shared.f32 d, [ptr+12];
+        add.rn.f32 a, a, b; add.rn.f32 c, c, d; add.rn.f32 $0, a, c;
+        bar.sync 0;
+        }""",
+        constraints="=f,f,f,~{memory}",
+        args=[denom, weights],
+        dtype=gl.float32,
+        is_pure=False,
+        pack=1,
+    )
+
+    pv_layout: gl.constexpr = gl.BlockedLayout([1, 1], [32, 1], [1, 4], [0, 1])
+    tt = gl.arange(0, ST, gl.SliceLayout(1, pv_layout))
+    dd = dim_tile * 64 + gl.arange(0, 64, gl.SliceLayout(0, pv_layout))
+    states = (row * KVH + head // GROUP) * NT + tt
+    w = gl.convert_layout(weights, gl.SliceLayout(1, pv_layout))
+    partial = gl.load(
+        P + (states[:, None] * 16 + hh) * 256 + dd[None, :], (tt < NT)[:, None], 0.0
+    )
+
+    product = gl.inline_asm_elementwise(
+        "mul.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[partial, w[:, None]],
+        dtype=gl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    total_d = gl.convert_layout(total, gl.SliceLayout(0, pv_layout))
+    value = gl.sum(product, 0) / gl.where(total_d > 0, total_d, 1.0)
+    rounded = value.to(gl.bfloat16).to(gl.float32)
+    gate = gl.load(GATE + row * GS + head * GH + dd).to(gl.float32)
+    sigmoid = 1.0 / (1.0 + gl.exp(-gate))
+    gl.store(OUT + (row * QHEADS + head) * 256 + dd, rounded * sigmoid)
+
+
+def run_gated(
+    q,
+    k_pool,
+    v_pool,
+    k_new,
+    v_new,
+    loc,
+    req_to_token,
+    row_requests,
+    block_indices,
+    lengths,
+    qpos,
+    scale,
+    gate,
+    width=4,
+    store_new_kv=True,
+):
+    """TARGET_VERIFY M4/Q6/KV1 only; retain current-KV store and fresh/tail ABI."""
+    m, qheads, dim = q.shape
+    kvheads = k_pool.shape[1]
+    assert (m, qheads, kvheads, dim, width) == (4, 6, 1, 256, 4)
+    assert block_indices.shape == (m, 512) and block_indices.dtype == torch.int32
+    assert all(
+        t.dtype == torch.bfloat16 for t in (q, k_pool, v_pool, k_new, v_new, gate)
+    )
+    assert all(
+        t.stride(-1) == 1 and t.stride(-2) == dim
+        for t in (q, k_pool, v_pool, k_new, v_new)
+    )
+    assert tuple(gate.shape) in ((4, 6, 256), (4, 1536)) and gate.stride(-1) == 1
+    assert block_indices.stride(1) == 1
+    nt = triton.cdiv(512 * 4 + 3, 64)
+    partial = torch.empty(
+        (m, kvheads, nt, 16, dim), dtype=torch.float32, device=q.device
+    )
+    maximum = torch.empty((m, kvheads, nt, 16), dtype=torch.float32, device=q.device)
+    sums = torch.empty_like(maximum)
+    output = torch.empty_like(q, memory_format=torch.contiguous_format)
+    if store_new_kv:
+        _store_tp4[(m, kvheads)](
+            k_pool,
+            v_pool,
+            k_new,
+            v_new,
+            loc,
+            k_pool.stride(0),
+            v_pool.stride(0),
+            k_new.stride(0),
+            v_new.stride(0),
+            kvheads,
+            dim,
+            num_warps=4,
+            launch_pdl=_PDL_SMALL,
+            PDL_SMALL=_PDL_SMALL,
+        )
+    _partial_tp4[(m, nt, kvheads)](
+        q,
+        k_pool,
+        v_pool,
+        k_new,
+        v_new,
+        loc,
+        req_to_token,
+        row_requests,
+        block_indices,
+        lengths,
+        qpos,
+        partial,
+        maximum,
+        sums,
+        QS=q.stride(0),
+        QH=q.stride(1),
+        KS=k_pool.stride(0),
+        VS=v_pool.stride(0),
+        NKS=k_new.stride(0),
+        NVS=v_new.stride(0),
+        MS=req_to_token.stride(0),
+        IS=block_indices.stride(0),
+        NT=nt,
+        GROUP=qheads // kvheads,
+        WIDTH=width,
+        SCALE=float(scale),
+        KVH=kvheads,
+        num_warps=4,
+        launch_pdl=_PDL_SMALL,
+        PDL_SMALL=_PDL_SMALL,
+    )
+    _merge_gate_tp4[(m, qheads, triton.cdiv(dim, 64))](
+        partial,
+        maximum,
+        sums,
+        output,
+        gate,
+        gate.stride(0),
+        gate.stride(1) if gate.ndim == 3 else 256,
+        nt,
+        triton.next_power_of_2(nt),
+        qheads,
+        kvheads,
+        qheads // kvheads,
+        num_warps=4,
+        launch_pdl=True,
+    )
+    return output

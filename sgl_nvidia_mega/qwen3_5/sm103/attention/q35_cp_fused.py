@@ -47,12 +47,15 @@ _WIDE_PLAN_MAX_BATCH = 64
 _LANE_PLAN_MAX_BATCH = 32
 
 
-# Production default: distribute the grid's CTAs by owned KV length, including
-# batches <= 32. Cover verify through 128 requests with the existing packed
-# two-slot plan; keep draft/Q1 admission at 64, matching the TEP8 recipe.
-# This is a plugin policy, not an environment switch; explicit split-mode test
-# overrides below retain their separate counter requirement.
-_DEFAULT_BALANCED = True
+# Keep one split count per counter row across verify, draft and extend. Small
+# batches use equal shares; larger batches keep the KV-balanced plans.
+_EQUAL_MAX_BATCH = 16
+
+
+def _use_balanced(batch: int) -> bool:
+    return batch > _EQUAL_MAX_BATCH
+
+
 MAX_BATCH = _TWO_SLOT_MAX_BATCH
 MAX_BATCH_Q1 = _WIDE_PLAN_MAX_BATCH
 # Pack every two-slot call; the unpacked form remains available as a test hook.
@@ -278,7 +281,7 @@ def q35_cp_fused_supported(
         and batch <= sm_count
     ):
         return False
-    if _DEFAULT_BALANCED:
+    if _use_balanced(batch):
         return batch < _num_ctas(
             sm_count
         )  # the plan gives every request a CTA; it plans <= 128 requests
@@ -313,6 +316,7 @@ class _DeviceState:
         self.ws_balanced = (
             None  # test calls that override the split mode (_balanced_workspace)
         )
+        self.equal_logged = False
         self.balanced_logged = (
             False  # runtime evidence: one INFO line at the first balanced call
         )
@@ -566,7 +570,7 @@ def q35_cp_fused_partial(
     rows, hq] FP32 (base 2). Test hooks: debug (int64 [b * splits, 16] %globaltimer stamps; [CTAs, 16] when balanced),
     unsafe_skip_wait (no dependency waits), n_splits (must come with its own ``counters``: every launch on a counter
     row must use the same split count; balanced: the grid's CTAs), fresh_margin, balanced (a test override of the
-    split mode; production defaults to KV-balanced allocation at every admitted batch,
+    split mode; production uses equal shares through batch 16 and KV-balanced allocation above,
     and an override needs its own ``counters``), plan
     ("lane", "wide", "quad" or "two": the wide split's plan variant instead of the one the batch selects; lane / wide
     / quad cover up to 32 / 64 / 128 requests and compute the same one-slot plan, "two" (up to 128) the two-slot plan,
@@ -625,7 +629,7 @@ def q35_cp_fused_partial(
     device = q_all.device
     sms = sm_count or _sm_count(device)
     state = _state(device, sms)
-    bal = _DEFAULT_BALANCED if balanced is None else bool(balanced)
+    bal = _use_balanced(b) if balanced is None else bool(balanced)
     assert bal or b <= _LANE_PLAN_MAX_BATCH, "the equal split handles <= 32 requests"
     # plan variant: lane (<= 32 requests), wide (33..64), two-slot (65..128); `plan` overrides it in tests (also
     # "quad": the one-slot plan for 65..128)
@@ -705,6 +709,12 @@ def q35_cp_fused_partial(
                 f"batch {b}, cp_rank {cp_rank}, {splits} CTAs)"
             )
     else:
+        if balanced is None and not state.equal_logged:
+            state.equal_logged = True
+            logger.info(
+                f"CP-lite first equal call (q_len {q_len}, batch {b}, "
+                f"cp_rank {cp_rank}, {splits} splits per request)"
+            )
         need = b * cp_partial_geometry(R, splits)["ws_req_bytes"]
         ws = state.workspace
         assert ws.numel() * 4 >= need, "CP partial workspace too small"

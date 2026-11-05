@@ -267,6 +267,56 @@ def test_cp_exact_selector_admits_verify_128_and_q1_64():
     assert [cp._exact_supported(1, batch) for batch in (64, 65)] == [True, False]
 
 
+@pytest.mark.parametrize("batch", [1, 4, 16, 17, 32])
+def test_cp_small_batch_split_shares_counter_mode_across_steps(monkeypatch, batch):
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import q35_cp_fused as fused
+
+    workspace = torch.empty(4 * 1024 * 1024, dtype=torch.float32)
+    state = SimpleNamespace(
+        counters=torch.zeros(fused.MAX_BATCH + 1, fused.MAX_BATCH, dtype=torch.int64),
+        workspace=workspace,
+        dbg_ring=None,
+        equal_logged=False,
+        balanced_logged=False,
+        wide_logged=False,
+        quad_logged=False,
+        pack_logged=False,
+    )
+    monkeypatch.setattr(fused, "_state", lambda *args: state)
+    monkeypatch.setattr(fused, "_balanced_workspace", lambda *args: workspace)
+    monkeypatch.setattr(fused, "_ptr", lambda tensor, *args: tensor)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda: SimpleNamespace(cuda_stream=0)
+    )
+    calls = []
+
+    def compile_partial(*args):
+        return lambda *launch: calls.append((args[15], args[4], launch[22].data_ptr()))
+
+    monkeypatch.setattr(fused, "_compiled", compile_partial)
+    # Verify, draft and extend share row `batch`, regardless of their query width.
+    for q_len in (7, 1, 7):
+        assert fused.q35_cp_fused_supported(q_len, 4, 4, batch, 156)
+        q = torch.zeros((4, batch * q_len, 4, 256), dtype=torch.float8_e4m3fn)
+        fused.q35_cp_fused_partial(
+            q,
+            torch.zeros((1, 1, 64, 256), dtype=torch.uint8),
+            torch.zeros((batch, 2, 1), dtype=torch.int32),
+            torch.full((batch,), 8192, dtype=torch.int32),
+            q_len,
+            0,
+            4,
+            1.0,
+            1.0,
+            torch.empty(q.shape, dtype=torch.bfloat16),
+            torch.empty(q.shape[:-1], dtype=torch.float32),
+            sm_count=156,
+        )
+    balanced = batch > 16
+    splits = fused._num_ctas(156) if balanced else fused._num_splits(batch, 156)
+    assert calls == [(balanced, splits, state.counters[batch].data_ptr())] * 3
+
+
 def test_cp_call_override_pairs_the_exact_partial_and_merge_order(monkeypatch):
     from sgl_nvidia_mega.qwen3_5.sm103.attention import q35_cp_lite as cp_module
     from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite

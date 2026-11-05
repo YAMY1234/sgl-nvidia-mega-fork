@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+from sgl_nvidia_mega.qwen3_8.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
+
+_DRAFT_TOPK1_BLOCK = 8192
+
+
+@triton.jit
+def _draft_topk1_partial_argmax_kernel(
+    logits,
+    partial_vals,
+    partial_indices,
+    logits_row_stride,
+    vocab_size: tl.constexpr,
+    num_splits: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PDL_SMALL: tl.constexpr = False,
+):
+
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_wait()
+    row = tl.program_id(0).to(tl.int64)
+    split = tl.program_id(1)
+    offsets = split * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < vocab_size
+    vals = tl.load(
+        logits + row * logits_row_stride + offsets,
+        mask=mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+
+    vals = tl.where(vals == vals, vals, -1e30)
+
+    max_val = tl.max(vals, axis=0)
+    local_index = tl.argmax(vals, axis=0)
+    out_offset = row * num_splits + split
+    tl.store(partial_vals + out_offset, max_val)
+    tl.store(partial_indices + out_offset, split * BLOCK + local_index)
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
+def _draft_topk1_finalize_kernel(
+    partial_vals,
+    partial_indices,
+    topk_p,
+    topk_index,
+    positions,
+    draft_tokens,
+    draft_tokens_stride,
+    draft_token_column,
+    mrope,
+    mrope_axis_stride,
+    mrope_row_stride,
+    num_splits: tl.constexpr,
+    WRITE_DRAFT_TOKEN: tl.constexpr,
+    WRITE_MROPE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PDL_SMALL: tl.constexpr = False,
+):
+
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_wait()
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < num_splits
+    vals = tl.load(
+        partial_vals + row * num_splits + offsets,
+        mask=mask,
+        other=-float("inf"),
+    )
+
+    split = tl.argmax(vals, axis=0)
+    index = tl.load(partial_indices + row * num_splits + split).to(tl.int64)
+    tl.store(topk_index + row, index)
+    tl.store(topk_p + row, 1.0)
+    if WRITE_DRAFT_TOKEN:
+        tl.store(draft_tokens + row * draft_tokens_stride + draft_token_column, index)
+
+    position = tl.load(positions + row)
+    tl.store(positions + row, position + 1)
+    if WRITE_MROPE:
+        for axis in tl.static_range(3):
+            ptr = mrope + axis * mrope_axis_stride + row * mrope_row_stride
+            tl.store(ptr, tl.load(ptr) + 1)
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def draft_topk1_postprocess(
+    next_token_logits: torch.Tensor,
+    positions: torch.Tensor,
+    draft_tokens: torch.Tensor | None = None,
+    draft_token_column: int = 0,
+    mrope_positions: torch.Tensor | None = None,
+):
+    """Argmax draft logits for topk=1 and advance positions.
+
+    PyTorch eager argmax reduces each row with too little parallelism for the
+    GLM/DSV4 vocab widths in CUDA graph replay. This split reduction exposes
+    the vocab dimension across CTAs, then finalizes one token per row.
+
+    If ``draft_tokens`` is given, the finalize kernel also stores the argmax
+    into ``draft_tokens[:, draft_token_column]``, mutating the caller-owned
+    buffer in place. ``topk_p`` is returned as constant 1.0: topk=1 drafting
+    is greedy and the chain probabilities are unused downstream.
+    """
+    assert next_token_logits.ndim == 2
+    assert next_token_logits.stride(1) == 1
+    assert positions.ndim == 1
+    assert positions.is_contiguous()
+    assert positions.shape[0] == next_token_logits.shape[0]
+    assert positions.device == next_token_logits.device
+    write_draft_token = draft_tokens is not None
+    if write_draft_token:
+        assert draft_tokens.ndim == 2
+        assert draft_tokens.dtype == torch.long
+        assert draft_tokens.device == next_token_logits.device
+        assert draft_tokens.shape[0] == next_token_logits.shape[0]
+        assert draft_tokens.stride(1) == 1
+        assert 0 <= draft_token_column < draft_tokens.shape[1]
+
+    bs, vocab_size = next_token_logits.shape
+    topk_p = torch.empty((bs, 1), dtype=torch.float32, device=next_token_logits.device)
+    topk_index = torch.empty(
+        (bs, 1), dtype=torch.int64, device=next_token_logits.device
+    )
+    if bs == 0:
+        return topk_p, topk_index
+
+    block = _DRAFT_TOPK1_BLOCK
+    num_splits = triton.cdiv(vocab_size, block)
+    partial_vals = torch.empty(
+        (bs, num_splits), dtype=torch.float32, device=next_token_logits.device
+    )
+    partial_indices = torch.empty(
+        (bs, num_splits), dtype=torch.int32, device=next_token_logits.device
+    )
+
+    _draft_topk1_partial_argmax_kernel[(bs, num_splits)](
+        next_token_logits,
+        partial_vals,
+        partial_indices,
+        next_token_logits.stride(0),
+        vocab_size,
+        num_splits,
+        BLOCK=block,
+        num_warps=8,
+        launch_pdl=_PDL_SMALL,
+        PDL_SMALL=_PDL_SMALL,
+    )
+
+    _draft_topk1_finalize_kernel[(bs,)](
+        partial_vals,
+        partial_indices,
+        topk_p,
+        topk_index,
+        positions,
+        draft_tokens if write_draft_token else topk_index,
+        draft_tokens.stride(0) if write_draft_token else 0,
+        draft_token_column,
+        mrope_positions,
+        mrope_positions.stride(0) if mrope_positions is not None else 0,
+        mrope_positions.stride(1) if mrope_positions is not None else 0,
+        num_splits,
+        WRITE_DRAFT_TOKEN=write_draft_token,
+        WRITE_MROPE=mrope_positions is not None,
+        BLOCK=triton.next_power_of_2(num_splits),
+        num_warps=1,
+        launch_pdl=_PDL_SMALL,
+        PDL_SMALL=_PDL_SMALL,
+    )
+    return topk_p, topk_index
+
+
+def draft_topk1_argmax_only(next_token_logits: torch.Tensor):
+    """Select top-k=1 without mutating caller-owned positions."""
+
+    scratch_positions = torch.zeros(
+        next_token_logits.shape[0],
+        dtype=torch.long,
+        device=next_token_logits.device,
+    )
+    return draft_topk1_postprocess(next_token_logits, scratch_positions)

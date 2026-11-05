@@ -1155,7 +1155,7 @@ def _cp_merge_h_ll_plain(
     tl.store(cnt + i * HQ + h + one, e)
 
 
-_VERIFY_EXACT_MAX_BATCH = 32
+_VERIFY_EXACT_MAX_BATCH = 64
 
 
 class CpLite:

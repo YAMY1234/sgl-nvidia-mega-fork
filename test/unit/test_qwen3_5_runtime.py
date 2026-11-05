@@ -2254,7 +2254,7 @@ def test_an_explicit_slot_keeps_stock_for_a_refused_mkd_build(monkeypatch, caplo
     assert "MKD draft boundary disabled (needs an aligned NVLink" in caplog.text
 
 
-@pytest.mark.parametrize("batch", [32, 64, 128])
+@pytest.mark.parametrize("batch", [32, 64, 65, 96, 128])
 @pytest.mark.parametrize("verify", [False, True])
 @pytest.mark.parametrize("q_len", [1, 7])
 def test_large_verify_uses_fold_a2a_without_changing_other_modes(
@@ -2297,7 +2297,7 @@ def test_large_verify_uses_fold_a2a_without_changing_other_modes(
         target_verify=verify,
     )
     assert calls == (
-        ["gather", "partial", "a2a"] if verify and batch > 32 else ["exact"]
+        ["gather", "partial", "a2a"] if verify and batch > 64 else ["exact"]
     )
 
 

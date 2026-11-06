@@ -48,6 +48,10 @@ SGLANG_READS = {
 def supported(s):
     """False means no offer; stock stays selected before any output is written."""
     op = s.operation
+    if op == NumericOperation.POOL_UNION_ATTENTION:
+        from ._providers.pool_union import supported as union_supported
+
+        return enabled(op) and union_supported(s)
     if not enabled(op):
         return False
     if s.rows <= 0:
@@ -154,7 +158,11 @@ def _cached_offer(signature):
     log_selection()
     if not supported(signature):
         return None
-    if isinstance(signature, MtpDeferredKvSignature):
+    if signature.operation == NumericOperation.POOL_UNION_ATTENTION:
+        from ._providers.pool_union import build
+
+        run = build(signature)
+    elif isinstance(signature, MtpDeferredKvSignature):
         from ._providers.mtp_deferred_kv import build
 
         run = build(signature)
@@ -218,6 +226,11 @@ def _cached_offer(signature):
 
 
 def make_offer(signature):
+    if signature.operation == NumericOperation.POOL_UNION_ATTENTION:
+        from ._providers.pool_union import supported as union_supported
+
+        if not union_supported(signature):
+            return None
     if isinstance(signature, MtpDeferredKvSignature):
         from ._providers.mtp_deferred_kv import supported as deferred_supported
 

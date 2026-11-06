@@ -79,6 +79,7 @@ _GDN_CONTEXT = (
 )
 _SPARSE_CONTEXT = ("tp_size", "sm100_supported", "page_size", "unpadded_query_heads")
 _SCHEMAS = {
+    NumericOperation.POOL_UNION_ATTENTION: (NumericSignature, ("tp_size",)),
     **{
         op: (HcSignature, ())
         for op in (
@@ -144,6 +145,8 @@ def _source_supported(s, actual):
     op = s.operation
     if op == NumericOperation.HC_MIX:
         return s.rows <= 32
+    if op == NumericOperation.POOL_UNION_ATTENTION:
+        return actual["tp_size"] == 1
     fixed = _FIXED_CONTEXTS.get(op, {})
     if any(actual[name] != value for name, value in fixed.items()):
         return False

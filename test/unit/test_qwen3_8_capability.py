@@ -105,6 +105,10 @@ ROUTER_CONTEXT = dict(tp_size=4, ep_size=1, wide_enabled=0, k4_enabled=0)
 def representatives():
     """Typed CPU ABI examples, not measured tensors or per-role declarations."""
     return (
+        (
+            NumericSignature(O.POOL_UNION_ATTENTION, 64, 24, 2, 256, 512, 4, D.BF16),
+            dict(tp_size=1),
+        ),
         *(
             (HcSignature(op, 4, 4, 2560, D.BF16, parts=2), {})
             for op in (O.HC_GATE, O.HC_APPLY_NORM, O.HC_APPLY_NORM_GATE)
@@ -262,7 +266,7 @@ def test_all_selected_operations_complete_query_and_exact_keys(signature, contex
 def test_query_catalogue_does_not_add_or_remove_slots():
     operations = {s.operation for s, _ in representatives()}
     assert operations == set(slots.OPERATION_SLOTS) == set(capabilities._SCHEMAS)
-    assert len(operations) == 17 and O.PACKED_ATTENTION not in operations
+    assert len(operations) == 18 and O.PACKED_ATTENTION not in operations
 
 
 @pytest.mark.parametrize("tp_size", [1, 4])

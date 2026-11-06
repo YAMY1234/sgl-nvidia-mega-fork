@@ -19,11 +19,12 @@ from sglang.kernels.plugin_kernels.nvidia.numeric import NumericOperation as O
 from sglang.kernels.plugin_kernels.nvidia.numeric import (
     NumericRegistry,
     NumericSignature,
+    PoolUnionAttentionIO,
 )
 from sglang.kernels.plugin_kernels.nvidia.numeric import ScalarType as D
 
 from sgl_nvidia_mega.qwen3_8 import providers
-from sgl_nvidia_mega.qwen3_8._providers import pool
+from sgl_nvidia_mega.qwen3_8._providers import pool, pool_union
 
 
 def signature(rows=4, variant=1):
@@ -438,3 +439,135 @@ def test_cold_pointer_alignment_capture_rejects_before_write(monkeypatch):
     with pytest.raises(RuntimeError, match="before capture"):
         run(io)
     assert not state.calls
+
+
+def union_signature(rows=64):
+    return NumericSignature(O.POOL_UNION_ATTENTION, rows, 24, 2, 256, 512, 4, D.BF16)
+
+
+@pytest.mark.parametrize("rows", [64, 68, 128, 416, 576])
+def test_union_supported_rows(rows):
+    assert pool_union.supported(union_signature(rows))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        dict(rows=0),
+        dict(rows=63),
+        dict(rows=578),
+        dict(query_heads=6),
+        dict(kv_heads=1),
+        dict(scalar_type=D.FP8_E4M3),
+        dict(variant=1),
+        dict(context_bound=1),
+        dict(rotary_dim=1),
+        dict(rows=True),
+        dict(rows=64.0),
+    ],
+)
+def test_union_refusal(change):
+    assert not pool_union.supported(replace(union_signature(), **change))
+
+
+class CudaMetadata(torch.Tensor):
+    @property
+    def is_cuda(self):
+        return True
+
+
+def union_view():
+    def empty(shape, dtype):
+        return torch.empty(shape, dtype=dtype).as_subclass(CudaMetadata)
+
+    q = empty((64, 24, 256), torch.bfloat16)
+    k = empty((80, 2, 256), torch.float8_e4m3fn)
+    nk = empty((64, 2, 256), torch.float8_e4m3fn)
+    loc = empty((64,), torch.int64)
+    sel = DirectPoolSelection(
+        empty((2, 80), torch.int32), loc, empty((64, 512), torch.int32), loc, loc
+    )
+    return PoolUnionAttentionIO(
+        q,
+        None,
+        nk,
+        nk,
+        loc,
+        KvTensors(k, k, 1.0, 1.0, 1),
+        sel,
+        0.0625,
+        4,
+        True,
+        torch.empty_like(q),
+        empty((16 * 2 * 2 * 64 * 258,), torch.float32),
+        empty((16 * (2 * 8208 + 2048 + 1) + 64,), torch.int32),
+        2,
+    )
+
+
+def raw_union(monkeypatch, launch):
+    import sgl_nvidia_mega.qwen3_8.qsa as package
+
+    module = ModuleType(package.__name__ + ".pool_union_decode")
+    module.qsa_pool_union_decode = launch
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(package, "pool_union_decode", module, raising=False)
+
+
+def test_union_launch_caller_output_and_capture(monkeypatch):
+    calls = []
+    capture = [False]
+    raw_union(monkeypatch, lambda *a, **kw: calls.append((a, kw)))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capture[0])
+    run = pool_union.build(union_signature())
+    io = union_view()
+    capture[0] = True
+    with pytest.raises(RuntimeError, match="warmed"):
+        run(io)
+    assert not calls
+    capture[0] = False
+    run(io)
+    assert calls[-1][1]["out"].data_ptr() == io.output.data_ptr()
+    workspace = calls[-1][1]["workspace"]
+    capture[0] = True
+    run(replace(io, output=torch.empty_like(io.output)))
+    assert calls[-1][1]["workspace"] is not workspace
+    assert calls[-1][1]["workspace"][0].data_ptr() == workspace[0].data_ptr()
+    with pytest.raises(ValueError):
+        run(replace(io, query_width=1))
+    assert len(calls) == 2
+
+
+def test_union_failed_launch_does_not_publish(monkeypatch):
+    def fail(*a, **kw):
+        raise RuntimeError("launch failure")
+
+    raw_union(monkeypatch, fail)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    run = pool_union.build(union_signature())
+    with pytest.raises(RuntimeError, match="launch failure"):
+        run(union_view())
+    assert not run._resources
+
+
+@pytest.mark.parametrize("bad", ["zero", "nan", "large_error"])
+def test_union_numeric_gate_rejects_bad_output(bad):
+    path = Path(__file__).parents[1] / "kernels/test_qwen3_8_pool_union.py"
+    node = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "check_tolerance"
+    )
+    scope = {"torch": torch}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
+    reference = torch.linspace(0.001, 0.01, 128).reshape(8, 16)
+    out = reference.to(torch.bfloat16)
+    scope["check_tolerance"](out, reference)
+    if bad == "zero":
+        out.zero_()
+    elif bad == "nan":
+        out[0, 0] = float("nan")
+    else:
+        out += 0.002
+    with pytest.raises(AssertionError):
+        scope["check_tolerance"](out, reference)

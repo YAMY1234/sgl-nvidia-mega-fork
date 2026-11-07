@@ -2,14 +2,14 @@
 
 | GPU | Tensor parallel | Coverage |
 | --- | --- | --- |
-| GB300 (SM103) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
+| GB300 (SM103); GB200 (SM100) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
 
 The draft spec provides the EAGLE entries. Qwen3.5 also offers the explicit GDN prefill slot below.
 
 ## Requirements
 
 - An SGLang with `sglang.srt.kernel_plugins.nvidia.eagle_binding`
-- 8 x GB300, two trays of one NVLink domain
+- 8 x GB300 or 8 x GB200, two trays of one NVLink domain
 
 ## Launch
 

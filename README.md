@@ -15,7 +15,7 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | Model | GPU | Tensor parallel | Coverage |
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | GB300 (SM103); 148-SM B300 (SM103) with `sm148` | 4 | DSpark target verify steps of 1 to 384 rows (batch 1 to 64 at 6 rows a request); on B300, speed was measured at one request only, serving passed a GSM8K canary at client concurrency 12 and 16 with decode CUDA graphs up to batch 16 (DSpark block 5), and larger batches and other block sizes rely on the kernel tests |
-| Qwen3.5-397B-A17B (NVFP4) | GB300 (SM103) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
+| Qwen3.5-397B-A17B (NVFP4) | GB300 (SM103); GB200 (SM100) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
 | Kimi K3 (packed MXFP4) | GB300 (SM103, 152 SMs) | 8 | Decode rows 1–8, 16, 32 and 64; fixed q4–q8 verification within 64 token rows. Admission and tested configurations differ; see [`spec.py`](sgl_nvidia_mega/kimi_k3/spec.py) |
 
 For DeepSeek-V4.1-Flash, larger verify steps, prefill and extend run
@@ -164,7 +164,7 @@ The sampling and acceptance after the verify stay SGLang's own code. `gdn_prefil
 - An SGLang with the megakernels framework (`sglang.kernels.plugin_kernels.nvidia`, or `sglang.srt.megakernels` before sgl-project/sglang#45389; `--enable-nvidia-megakernel`); Qwen3.5 also needs `sglang.srt.kernel_plugins.nvidia.eagle_binding`
 - SGLang's CUDA 13 image: FlashInfer (its low-latency block-scaled GEMM as in 0.7.0 to 0.7.2), CuTe DSL (`nvidia-cutlass-dsl`) and the CUDA Python bindings
 - DeepSeek-V4.1-Flash: 4 x GB300, or 4 x 148-SM B300 (SM103) with `sm148` in `SGLANG_NVIDIA_MEGAKERNEL_SLOTS`
-- Qwen3.5: 8 x GB300, two trays of one NVLink domain
+- Qwen3.5: 8 x GB300 or 8 x GB200, two trays of one NVLink domain
 - Kimi K3: 8 x GB300 (SM103, 152 SMs), BF16, context length up to 262144 within the
   native model limit, TP8, DP1 and DCP off,
   FP8 E4M3 KV cache with page size 64, `trtllm_mla` for prefill and decode,

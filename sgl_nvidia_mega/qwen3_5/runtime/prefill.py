@@ -77,6 +77,7 @@ SGLANG_MIRRORS = {
 class Qwen35Prefill:
     draft_sampler = draft_loop = draft_extend = begin_draft_round = None
     graph_variants = None
+    speculative_runtime_hooks = None
 
     def __init__(self, model, ctx, enabled):
         from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer

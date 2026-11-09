@@ -1879,6 +1879,22 @@ def test_prefill_unsupported_view_returns_the_original_before_state_writes():
     assert built.forward(step, original, None, None, None) is marker
 
 
+def test_prefill_keeps_stock_speculative_hooks_under_the_runtime_switch(monkeypatch):
+    from sglang.srt.kernel_plugins.nvidia import binding as plugin_binding
+
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+    )
+    built = Qwen35Prefill(model, SimpleNamespace(tokens_per_request=7), True)
+    # A PD prefill worker with MTP binds its target's hooks at scheduler init.
+    monkeypatch.setenv("SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION", "1")
+    monkeypatch.setattr(plugin_binding, "built_megakernel", lambda lm: built)
+    defaults = object()
+    assert plugin_binding.bind_speculative_runtime_hooks(model, defaults) is defaults
+
+
 def _gdn_prefill_state_case(monkeypatch, strided):
     from sglang.srt.layers.attention.linear import gdn_backend
 

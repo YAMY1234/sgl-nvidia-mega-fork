@@ -42,6 +42,8 @@ def model_disable_reasons(model: Any) -> list[str]:
 class BuiltMuseSpark:
     """What SGLang calls for a covered step."""
 
+    speculative_runtime_hooks = None
+
     def __init__(self, *, widths: tuple[int, ...], facts: Facts):
         self.widths = tuple(sorted(widths))
         self.facts = facts

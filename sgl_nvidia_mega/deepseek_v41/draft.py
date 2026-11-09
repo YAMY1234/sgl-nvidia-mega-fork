@@ -63,6 +63,7 @@ class DraftProposal:
     draft_extend = None
     begin_draft_round = None
     graph_variants = None
+    speculative_runtime_hooks = None
 
     def __init__(self, lm, *, deadline_s: float, slots: frozenset[str]):
         self.lm, self.deadline_s = lm, deadline_s

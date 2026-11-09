@@ -328,3 +328,60 @@ def test_the_mirrored_sglang_code_is_unchanged(path, key, digest):
         f"the mirror, then pin {got!r} in its SGLANG_MIRRORS (a tuple where the "
         "supported SGLangs differ)"
     )
+
+
+def _built_classes() -> dict:
+    """Each package class SGLang may hold as a built megakernel (one with plan,
+    forward and summary, its own or a package base's), with what it assigns."""
+    classes = {}
+    for path in sorted(PACKAGE.rglob("*.py")):
+        for node in ast.walk(_tree(path)):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            names, methods = set(), set()
+            for item in node.body:
+                if isinstance(item, ast.AnnAssign):
+                    names |= {
+                        n.id for n in ast.walk(item.target) if isinstance(n, ast.Name)
+                    }
+                elif isinstance(item, ast.Assign):
+                    names |= {
+                        n.id
+                        for target in item.targets
+                        for n in ast.walk(target)
+                        if isinstance(n, ast.Name)
+                    }
+                elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    methods.add(item.name)
+                    names |= {
+                        n.attr
+                        for n in ast.walk(item)
+                        if isinstance(n, ast.Attribute)
+                        and isinstance(n.ctx, ast.Store)
+                        and isinstance(n.value, ast.Name)
+                        and n.value.id == "self"
+                    }
+            bases = [b.id for b in node.bases if isinstance(b, ast.Name)]
+            classes[node.name] = (path, bases, names, methods)
+
+    def inherited(name: str, index: int) -> set:
+        if name not in classes:
+            return set()
+        entry = classes[name]
+        return set(entry[index]).union(*(inherited(b, index) for b in entry[1]))
+
+    return {
+        f"{_id(entry[0])}::{name}": inherited(name, 2)
+        for name, entry in classes.items()
+        if {"plan", "forward", "summary"} <= inherited(name, 3)
+    }
+
+
+BUILT = _built_classes()
+
+
+@pytest.mark.parametrize("name", sorted(BUILT))
+def test_every_built_object_defines_speculative_runtime_hooks(name):
+    # SGLang's BuiltMegakernel requires the member (None without a factory) and
+    # reads it unguarded under SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.
+    assert "speculative_runtime_hooks" in BUILT[name], name

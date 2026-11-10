@@ -515,6 +515,41 @@ def test_native_score_and_select_keep_separate_admission(op, variant, tp, accept
     assert capabilities.numeric_capability(query(s, context)) is accepted
 
 
+@pytest.mark.parametrize(
+    "rows,variant,ctas,tp,actual,accepted",
+    [
+        (68, 7, 128, 1, 4, True),
+        (576, 6, 512, 1, 4, True),
+        (88, 7, 128, 4, 4, False),
+        (88, 7, 128, 1, 8, False),
+        (88, 7, 0, 1, 4, False),
+        (64, 7, 128, 1, 4, False),
+        (580, 6, 512, 1, 4, False),
+        (32, 4, 128, 1, 4, False),
+    ],
+)
+def test_grouped4_score_admission_carries_its_cta_count(
+    rows, variant, ctas, tp, actual, accepted
+):
+    s = NumericSignature(
+        O.SPARSE_SCORE,
+        rows,
+        8,
+        1,
+        128,
+        512,
+        4,
+        D.BF16,
+        context_bound=65536,
+        variant=variant,
+        ctas_per_group=ctas,
+    )
+    context = dict(
+        tp_size=tp, sm100_supported=1, page_size=16, unpadded_query_heads=actual
+    )
+    assert capabilities.numeric_capability(query(s, context)) is accepted
+
+
 def test_sparse_unpadded_fact_is_mandatory():
     s = NumericSignature(
         O.SPARSE_SCORE, 4, 8, 1, 128, 512, 4, D.BF16, context_bound=65536

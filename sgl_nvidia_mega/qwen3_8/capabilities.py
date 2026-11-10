@@ -227,11 +227,11 @@ def _source_supported(s, actual):
         if not 0 < heads <= 16 or s.query_heads != ((heads + 7) // 8) * 8:
             return False
         if (
-            (op == NumericOperation.SPARSE_SCORE and s.variant in (0, 3))
+            (op == NumericOperation.SPARSE_SCORE and s.variant in (0, 3, 6, 7))
             or (op == NumericOperation.SPARSE_SELECT and s.variant == 0)
         ) and heads != 4:
             return False
-        if (op == NumericOperation.SPARSE_SCORE and s.variant in (4, 5)) or (
+        if (op == NumericOperation.SPARSE_SCORE and s.variant in (4, 5, 6, 7)) or (
             op == NumericOperation.SPARSE_SELECT and s.variant == 1
         ):
             return actual["tp_size"] == 1

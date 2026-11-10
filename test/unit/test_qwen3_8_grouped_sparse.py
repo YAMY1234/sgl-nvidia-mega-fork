@@ -34,7 +34,7 @@ def source_functions(path, names, namespace):
     return namespace
 
 
-def signature(rows=32, heads=16, variant=4, select=False, capacity=8208):
+def signature(rows=32, heads=16, variant=4, select=False, capacity=8208, ctas=0):
     return NumericSignature(
         O.SPARSE_SELECT if select else O.SPARSE_SCORE,
         rows,
@@ -46,6 +46,7 @@ def signature(rows=32, heads=16, variant=4, select=False, capacity=8208):
         D.FP32 if select else D.BF16,
         context_bound=capacity,
         variant=variant,
+        ctas_per_group=ctas,
     )
 
 
@@ -132,6 +133,8 @@ def grouped_spies(monkeypatch):
 
     mqa["_tilelang_qsa_mqa_decode_grouped_v7_kernel"] = factory("v7")
     mqa["_tilelang_qsa_mqa_decode_kernel"] = factory("row")
+    mqa["_tilelang_qsa_mqa_decode_grouped4_chain_kernel"] = factory("chain")
+    mqa["_tilelang_qsa_mqa_decode_grouped4_pipe_kernel"] = factory("pipe")
 
     def module(threads, cluster, iters, vec):
         calls.append(("split-prepare", (threads, cluster, iters, vec)))
@@ -204,6 +207,68 @@ def test_per_row_uses_original_device_sm_policy(grouped_spies, rows, heads):
         ),
     )
     assert calls[1][1][0].data_ptr() == io.query.data_ptr()
+
+
+@pytest.mark.parametrize(
+    "variant,kind,extra", ((7, "pipe", dict(num_stages=2)), (6, "chain", {}))
+)
+@pytest.mark.parametrize("rows,ctas", ((68, 128), (88, 512), (576, 128)))
+def test_grouped4_launches_the_declared_cta_count(
+    grouped_spies, variant, kind, extra, rows, ctas
+):
+    calls, state, _, _ = grouped_spies
+    s = signature(rows, 8, variant=variant, ctas=ctas)
+    assert providers.supported(s)
+    io = score_io(rows, 8)
+    run = sparse.build(s)
+    assert run(io) is None
+    assert calls[0] == (
+        kind + "-prepare",
+        dict(
+            heads=8,
+            head_dim=128,
+            page_size=16,
+            min_scored_len=512,
+            dtype="bfloat16",
+            ctas_per_row=ctas,
+            **extra,
+        ),
+    )
+    q, keys, table, lengths, output, scale = calls[1][1]
+    assert q.shape == (rows, 1, 8, 128) and q.data_ptr() == io.query.data_ptr()
+    assert keys is io.compressed_keys and table is io.compressed_slot_map
+    assert lengths is io.compressed_lengths and output is io.scores_out
+    assert scale == io.scale
+    state.capturing = True
+    run(io)
+    assert sum(name.endswith("prepare") for name, _ in calls) == 1
+
+
+def test_grouped4_cold_layout_refuses_during_capture(grouped_spies):
+    calls, state, _, _ = grouped_spies
+    state.capturing = True
+    with pytest.raises(RuntimeError, match="before capture"):
+        sparse.build(signature(88, 8, variant=7, ctas=128))(score_io(88, 8))
+    assert calls == []
+
+
+def test_grouped4_domain_and_cta_count_are_exact():
+    from dataclasses import replace
+
+    s = signature(88, 8, variant=7, ctas=128)
+    assert providers.supported(s) and providers.supported(replace(s, variant=6))
+    for bad in (
+        replace(s, rows=64),
+        replace(s, rows=580),
+        replace(s, rows=90),
+        replace(s, query_heads=16),
+        replace(s, ctas_per_group=0),
+        replace(s, variant=8),
+        replace(s, scalar_type=D.FP16),
+        signature(32, 8, variant=4, ctas=128),
+        signature(32, 8, variant=1, select=True, ctas=128),
+    ):
+        assert providers.make_offer(bad) is None
 
 
 @pytest.mark.parametrize("rows", range(1, 65))

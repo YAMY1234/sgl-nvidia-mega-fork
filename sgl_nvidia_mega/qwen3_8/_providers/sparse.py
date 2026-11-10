@@ -32,10 +32,16 @@ def supported(s):
     ) or not 0 < s.context_bound <= 131072:
         return False
     variant = getattr(s, "variant", 0)
+    grouped4 = s.operation == NumericOperation.SPARSE_SCORE and variant in (6, 7)
+    if (s.ctas_per_group > 0) != grouped4:
+        return False
     if (
         s.operation == NumericOperation.SPARSE_SCORE
         and s.scalar_type == ScalarType.BF16
     ):
+        if grouped4:
+            # The source's grouped4 domain: 17..144 four-row verify requests.
+            return 64 < s.rows <= 576 and s.rows % 4 == 0 and s.query_heads == 8
         if variant in (0, 3):
             return s.rows == 4 and s.query_heads == 8
         if variant == 4:
@@ -139,7 +145,19 @@ class SparseScore:
                     min_scored_len=512,
                     dtype="bfloat16",
                 )
-                if variant == 4:
+                if variant in (6, 7):
+                    kernel = (
+                        mqa._tilelang_qsa_mqa_decode_grouped4_pipe_kernel(
+                            **args,
+                            ctas_per_row=self.signature.ctas_per_group,
+                            num_stages=2,
+                        )
+                        if variant == 7
+                        else mqa._tilelang_qsa_mqa_decode_grouped4_chain_kernel(
+                            **args, ctas_per_row=self.signature.ctas_per_group
+                        )
+                    )
+                elif variant == 4:
                     ctas = max(
                         level
                         for level in (16, 32, 64, 128, 256, 512, 1024)

@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 SLOT_NAMES = (
     "qsa_pool_union",
+    "qsa_prefill_select",
     "hc_gate",
     "hc_apply_norm",
     "hc_apply_norm_gate",
@@ -55,6 +56,7 @@ router_quant.build = cpu_build
 providers.numeric_registry = registry = NumericRegistry()
 signatures = (
     NumericSignature(O.POOL_UNION_ATTENTION, 64, 24, 2, 256, 512, 4, D.BF16),
+    NumericSignature(O.PREFILL_SELECT, 0, 4, 1, 128, 512, 4, D.BF16, context_bound=8192),
     HcSignature(O.HC_GATE, 4, 4, 2560, D.BF16, parts=2),
     HcSignature(O.HC_APPLY_NORM, 4, 4, 2560, D.BF16, parts=2),
     HcSignature(O.HC_APPLY_NORM_GATE, 4, 4, 2560, D.BF16, parts=2),
@@ -74,7 +76,7 @@ signatures = (
     MtpDeferredKvSignature(O.MTP_DEFERRED_KV_PREPARE,1,1,256,D.BF16,2055,2112,4,8,32,8,4096,4096,512,512,0),
 )
 expected_names = (
-    'qsa_pool_union',
+    'qsa_pool_union', 'qsa_prefill_select',
     'hc_gate', 'hc_apply_norm', 'hc_apply_norm_gate', 'hc_mix',
     'finalize_shared', 'mkm', 'gdn_mk', 'qsa_core',
     'qsa_score', 'qsa_select', 'gdn_front', 'gdn_verify_glue',
@@ -167,8 +169,8 @@ def test_fresh_process_slot_matrix():
     cases.append("qk_front,ple_hash,ple_gather")
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(run_case, cases))
-    assert len(results) == 44
-    assert results[0]["offers"] == 18 and results[1]["offers"] == 0
-    assert [r["offers"] for r in results[6:24]] == [17] * 18
-    assert [r["offers"] for r in results[24:-2]] == [1] * 18
+    assert len(results) == 46
+    assert results[0]["offers"] == 19 and results[1]["offers"] == 0
+    assert [r["offers"] for r in results[6:25]] == [18] * 19
+    assert [r["offers"] for r in results[25:-2]] == [1] * 19
     assert results[-1]["offers"] == results[-2]["offers"] == 0

@@ -366,3 +366,205 @@ def test_prepare_rejects_capture_before_registering(monkeypatch):
     with pytest.raises(RuntimeError, match="before capture"):
         SPEC.prepare(built, view)
     assert not built.offers and registry.get(signature()) is None
+
+
+def prefill_signature(**kw):
+    return replace(
+        NumericSignature(
+            O.PREFILL_SELECT, 0, 4, 1, 128, 512, 4, D.BF16, context_bound=8208
+        ),
+        **kw,
+    )
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(rows=33),
+        dict(query_heads=8),
+        dict(context_bound=0),
+        dict(context_bound=131073),
+        dict(scalar_type=D.FP8_E4M3),
+        dict(variant=1),
+        dict(ctas_per_group=128),
+    ],
+)
+def test_prefill_select_declaration_is_row_independent_and_exact(kw):
+    from sgl_nvidia_mega.qwen3_8._providers import prefill_select
+
+    assert providers.supported(prefill_signature())
+    assert providers.make_offer(prefill_signature(**kw)) is None
+    assert not prefill_select.supported(prefill_signature(**kw))
+
+
+def prefill_io(rows=33, width=8193, sms=148, chunk=None):
+    from sglang.kernels.plugin_kernels.nvidia.numeric import PrefillSelectIO
+
+    class Cuda(torch.Tensor):
+        @property
+        def is_cuda(self):
+            return True
+
+    chunk = rows if chunk is None else chunk
+    padded = (chunk + 31) // 32 * 32
+
+    def empty(shape, dtype=torch.int32):
+        return torch.empty(shape, dtype=dtype)
+
+    starts = torch.zeros(rows, dtype=torch.int32)
+    ends = torch.full((rows,), width, dtype=torch.int32)
+    return PrefillSelectIO(
+        empty((rows, 4, 128), torch.bfloat16).as_subclass(Cuda),
+        empty((2 * width, 1, 128), torch.bfloat16),
+        starts,
+        ends,
+        starts.clone(),
+        ends.clone(),
+        empty((rows, 2051)),
+        empty((padded, 4, 128), torch.bfloat16),
+        empty(padded),
+        empty(padded),
+        ends - starts,
+        torch.zeros(chunk, dtype=torch.int32),
+        empty((rows, 512)),
+        empty((padded, width), torch.float32),
+        empty(4096),
+        chunk,
+        sms,
+    )
+
+
+@pytest.fixture
+def prefill_raw(monkeypatch):
+    import sgl_nvidia_mega.qwen3_8.qsa as package
+
+    raw = ModuleType(package.__name__ + ".prefill_select")
+    calls = []
+    raw.plan_chunk_rows = lambda rows, width, slots, budget: (
+        calls.append(("plan", rows, width, slots, budget)) or rows
+    )
+    raw._topk_impl_for = lambda width, impl: "stock" if width <= 4096 else impl
+    raw.select_into = lambda io, width: calls.append(("select", io, width))
+    monkeypatch.setitem(sys.modules, raw.__name__, raw)
+    monkeypatch.setattr(package, "prefill_select", raw, raising=False)
+    capturing = SimpleNamespace(value=False)
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: capturing.value
+    )
+    return calls, capturing
+
+
+def test_prefill_select_launches_with_call_width_and_capture_warmup(prefill_raw):
+    from sgl_nvidia_mega.qwen3_8._providers import prefill_select
+
+    calls, capturing = prefill_raw
+    run = prefill_select.build(prefill_signature())
+    io = prefill_io()
+    capturing.value = True
+    with pytest.raises(RuntimeError, match="warmed before capture"):
+        run(io)
+    capturing.value = False
+    assert run(io) is None
+    capturing.value = True
+    assert run(io) is None
+    narrow = prefill_io(width=4000)
+    with pytest.raises(RuntimeError, match="warmed before capture"):
+        run(narrow)
+    assert ("plan", 33, 8193, 296, 128 * 1024 * 1024) in calls
+    assert [c for c in calls if c[0] == "select"] == [("select", io, 8193)] * 2
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        dict(width=8209),
+        dict(chunk=32),
+        dict(field="row_starts", value=torch.zeros(33, dtype=torch.int64)),
+        dict(field="logits_out", value=torch.empty((32, 8193))),
+        dict(field="split_tag", value=torch.empty(2048, dtype=torch.int32)),
+        dict(field="selected_indices_out", value=torch.empty((33, 2048))),
+    ],
+)
+def test_prefill_select_refuses_incomplete_workspace_before_launch(prefill_raw, bad):
+    from sgl_nvidia_mega.qwen3_8._providers import prefill_select
+
+    calls, _ = prefill_raw
+    if "field" in bad:
+        io = replace(prefill_io(), **{bad["field"]: bad["value"]})
+    else:
+        io = prefill_io(**bad)
+    with pytest.raises(ValueError):
+        prefill_select.build(prefill_signature())(io)
+    assert not [c for c in calls if c[0] == "select"]
+
+
+def raw_functions(names, scope):
+    path = Path(providers.__file__).parent / "qsa" / "prefill_select.py"
+    tree = ast.parse(path.read_text())
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    assert {n.name for n in nodes} == set(names)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), scope)
+    return scope
+
+
+def test_prefill_select_source_chunk_and_split_plans():
+    scope = raw_functions(("plan_chunk_rows", "plan_key_splits"), {"_BLOCK_Q": 32})
+    plan = scope["plan_chunk_rows"]
+    assert plan(17, 8192, 424, 128 * 1024 * 1024) == 17
+    n = plan(20000, 32768, 424, 128 * 1024 * 1024)
+    assert n % 416 == 0 and n * 32768 * 4 <= 128 * 1024 * 1024
+    assert scope["plan_key_splits"](2, 65, 128, 212) == 1
+    assert scope["plan_key_splits"](1, 8192, 128, 212) == 64
+
+
+@pytest.mark.parametrize("rows", [31, 32, 33, 65])
+def test_prefill_select_raw_chunks_pad_from_caller_scratch(monkeypatch, rows):
+    import sgl_nvidia_mega.qwen3_8.qsa as package
+
+    fake = ModuleType(package.__name__ + ".kernel")
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    monkeypatch.setattr(package, "kernel", fake, raising=False)
+    io = prefill_io(rows, width=16, chunk=32)
+    q = (
+        torch.arange(rows, dtype=torch.bfloat16)[:, None, None]
+        .expand(rows, 4, 128)
+        .contiguous()
+    )
+    starts = torch.arange(rows, dtype=torch.int32)
+    io = replace(io, query=q, row_starts=starts, row_ends=starts + 16)
+    calls = []
+
+    def score(q, keys, logits, s, e, width, config, **kw):
+        calls.append((q.clone(), s.clone(), e.clone()))
+        logits[:, 0].copy_(q[:, 0, 0])
+
+    def topk(logits, zeros, output, lengths):
+        assert torch.all(zeros == 0)
+        output.copy_(logits[:, 0, None].int().expand_as(output))
+
+    def expand(kernel, blocks, positions, lengths, output, ratio, topk):
+        output.copy_(blocks[:, 0, None].expand_as(output))
+
+    scope = raw_functions(
+        ("select_into",),
+        dict(
+            __package__=package.__name__,
+            CONFIG=(128, 512, 2, "Square", 1),
+            score_chunk=score,
+            _topk_launcher=lambda impl: topk,
+            _topk_impl_for=lambda *a: "sampled",
+            _expand_into=expand,
+        ),
+    )
+    before = q.clone()
+    scope["select_into"](io, 16)
+    assert torch.equal(q, before)
+    assert torch.equal(io.selected_indices_out[:, 0], torch.arange(rows))
+    assert len(calls) == (rows + 31) // 32
+    tail = rows % 32
+    if tail:
+        last, s, e = calls[-1]
+        assert torch.count_nonzero(last[tail:]) == 0
+        assert torch.all(s[tail:] == starts[-1]) and torch.all(
+            e[tail:] == starts[-1] + 16
+        )

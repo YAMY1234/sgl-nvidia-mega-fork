@@ -101,6 +101,7 @@ _SCHEMAS = {
         for op in (
             NumericOperation.SPARSE_SCORE,
             NumericOperation.SPARSE_SELECT,
+            NumericOperation.PREFILL_SELECT,
         )
     },
     NumericOperation.GDN_CORE: (
@@ -147,6 +148,12 @@ def _source_supported(s, actual):
         return s.rows <= 32
     if op == NumericOperation.POOL_UNION_ATTENTION:
         return actual["tp_size"] == 1
+    if op == NumericOperation.PREFILL_SELECT:
+        return (
+            actual["tp_size"] > 0
+            and actual["sm100_supported"] == 1
+            and actual["unpadded_query_heads"] == s.query_heads
+        )
     fixed = _FIXED_CONTEXTS.get(op, {})
     if any(actual[name] != value for name, value in fixed.items()):
         return False

@@ -52,6 +52,10 @@ def supported(s):
         from ._providers.pool_union import supported as union_supported
 
         return enabled(op) and union_supported(s)
+    if op == NumericOperation.PREFILL_SELECT:
+        from ._providers.prefill_select import supported as prefill_supported
+
+        return enabled(op) and prefill_supported(s)
     if not enabled(op):
         return False
     if s.rows <= 0:
@@ -162,6 +166,10 @@ def _cached_offer(signature):
         from ._providers.pool_union import build
 
         run = build(signature)
+    elif signature.operation == NumericOperation.PREFILL_SELECT:
+        from ._providers.prefill_select import build
+
+        run = build(signature)
     elif isinstance(signature, MtpDeferredKvSignature):
         from ._providers.mtp_deferred_kv import build
 
@@ -230,6 +238,11 @@ def make_offer(signature):
         from ._providers.pool_union import supported as union_supported
 
         if not union_supported(signature):
+            return None
+    if signature.operation == NumericOperation.PREFILL_SELECT:
+        from ._providers.prefill_select import supported as prefill_supported
+
+        if not prefill_supported(signature):
             return None
     if isinstance(signature, MtpDeferredKvSignature):
         from ._providers.mtp_deferred_kv import supported as deferred_supported

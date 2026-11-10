@@ -32,6 +32,7 @@ SGLANG_READS = {
 }
 
 # This bounds framework enumeration; every registration is still an exact tuple.
+# Rows 0 is one row-independent declaration (prefill select), not an enumeration.
 NUMERIC_MAX_ROWS = 1024
 
 
@@ -61,7 +62,7 @@ class BuiltNumeric:
 def build(model, hf_config, ctx):
     # Model and runner objects never reach an operator adapter.
     signatures = tuple(
-        s for s in ctx.numeric_signatures if 0 < s.rows <= NUMERIC_MAX_ROWS
+        s for s in ctx.numeric_signatures if 0 <= s.rows <= NUMERIC_MAX_ROWS
     )
     return BuiltNumeric(register_signatures(signatures))
 
@@ -76,7 +77,7 @@ def prepare(built, view):
     if not isinstance(signatures, tuple):
         raise TypeError("prepared numeric signatures must be a frozen tuple")
     offers = register_signatures(
-        tuple(s for s in signatures if 0 < s.rows <= NUMERIC_MAX_ROWS)
+        tuple(s for s in signatures if 0 <= s.rows <= NUMERIC_MAX_ROWS)
     )
     existing = {offer.signature for offer in built.offers}
     built.offers += tuple(offer for offer in offers if offer.signature not in existing)

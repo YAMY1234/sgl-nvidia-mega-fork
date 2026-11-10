@@ -109,6 +109,12 @@ def representatives():
             NumericSignature(O.POOL_UNION_ATTENTION, 64, 24, 2, 256, 512, 4, D.BF16),
             dict(tp_size=1),
         ),
+        (
+            NumericSignature(
+                O.PREFILL_SELECT, 0, 4, 1, 128, 512, 4, D.BF16, context_bound=65536
+            ),
+            dict(tp_size=1, sm100_supported=1, page_size=16, unpadded_query_heads=4),
+        ),
         *(
             (HcSignature(op, 4, 4, 2560, D.BF16, parts=2), {})
             for op in (O.HC_GATE, O.HC_APPLY_NORM, O.HC_APPLY_NORM_GATE)
@@ -257,8 +263,10 @@ def test_all_selected_operations_complete_query_and_exact_keys(signature, contex
         assert (
             capabilities.numeric_capability(replace(q, attributes=incomplete)) is False
         ), key
+    # Prefill select declares rows 0 (per-call rows); any other count is refused.
+    rows = 1 if signature.operation == O.PREFILL_SELECT else 0
     assert (
-        capabilities.numeric_capability(query(replace(signature, rows=0), context))
+        capabilities.numeric_capability(query(replace(signature, rows=rows), context))
         is False
     )
 
@@ -266,7 +274,7 @@ def test_all_selected_operations_complete_query_and_exact_keys(signature, contex
 def test_query_catalogue_does_not_add_or_remove_slots():
     operations = {s.operation for s, _ in representatives()}
     assert operations == set(slots.OPERATION_SLOTS) == set(capabilities._SCHEMAS)
-    assert len(operations) == 18 and O.PACKED_ATTENTION not in operations
+    assert len(operations) == 19 and O.PACKED_ATTENTION not in operations
 
 
 @pytest.mark.parametrize("tp_size", [1, 4])

@@ -80,6 +80,7 @@ _GDN_CONTEXT = (
 _SPARSE_CONTEXT = ("tp_size", "sm100_supported", "page_size", "unpadded_query_heads")
 _SCHEMAS = {
     NumericOperation.POOL_UNION_ATTENTION: (NumericSignature, ("tp_size",)),
+    NumericOperation.PACKED_PREFILL_ATTENTION: (NumericSignature, ("tp_size",)),
     **{
         op: (HcSignature, ())
         for op in (
@@ -148,6 +149,8 @@ def _source_supported(s, actual):
         return s.rows <= 32
     if op == NumericOperation.POOL_UNION_ATTENTION:
         return actual["tp_size"] == 1
+    if op == NumericOperation.PACKED_PREFILL_ATTENTION:
+        return actual["tp_size"] > 0
     if op == NumericOperation.PREFILL_SELECT:
         return (
             actual["tp_size"] > 0

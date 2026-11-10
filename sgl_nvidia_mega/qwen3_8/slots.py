@@ -15,6 +15,7 @@ SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 OPERATION_SLOTS = {
     NumericOperation.POOL_UNION_ATTENTION: "qsa_pool_union",
     NumericOperation.PREFILL_SELECT: "qsa_prefill_select",
+    NumericOperation.PACKED_PREFILL_ATTENTION: "qsa_prefill_attention",
     NumericOperation.MTP_DEFERRED_KV_PREPARE: "mtp_deferred_kv",
     NumericOperation.MTP_CAPTURE_SEED: "mtp_capture_seed",
     NumericOperation.HC_GATE: "hc_gate",

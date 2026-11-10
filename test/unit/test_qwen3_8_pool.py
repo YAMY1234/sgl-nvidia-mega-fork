@@ -571,3 +571,93 @@ def test_union_numeric_gate_rejects_bad_output(bad):
         out += 0.002
     with pytest.raises(AssertionError):
         scope["check_tolerance"](out, reference)
+
+
+def packed_signature(**kw):
+    return replace(
+        NumericSignature(
+            O.PACKED_PREFILL_ATTENTION, 0, 24, 2, 256, 2051, 4, D.BF16, variant=3
+        ),
+        **kw,
+    )
+
+
+@pytest.mark.parametrize("qh,kh", [(24, 2), (6, 1), (16, 1), (32, 2)])
+def test_packed_prefill_head_groups(qh, kh):
+    assert providers.supported(packed_signature(query_heads=qh, kv_heads=kh))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        dict(rows=513),
+        dict(kv_heads=0),
+        dict(query_heads=25),
+        dict(query_heads=34),
+        dict(head_dim=128),
+        dict(selected_count=512),
+        dict(context_bound=257),
+        dict(ctas_per_group=128),
+        dict(variant=0),
+        dict(variant=9),
+        dict(scalar_type=D.FP8_E4M3),
+    ],
+)
+def test_packed_prefill_refusal(change):
+    assert providers.make_offer(packed_signature(**change)) is None
+
+
+def packed_view(rows=513, max_q=257):
+    from sglang.kernels.plugin_kernels.nvidia.numeric import PackedPrefillAttentionIO
+
+    def empty(shape, dtype):
+        return torch.empty(shape, dtype=dtype).as_subclass(CudaMetadata)
+
+    q = empty((rows, 24, 256), torch.bfloat16)
+    k = empty((1024, 2, 256), torch.bfloat16)
+    return PackedPrefillAttentionIO(
+        q,
+        k,
+        k,
+        empty((rows, 2051), torch.int32),
+        empty((3,), torch.int64),
+        empty((3,), torch.int64),
+        empty((2,), torch.int32),
+        0.0625,
+        max_q,
+        torch.empty_like(q),
+    )
+
+
+def test_packed_prefill_launch_grid_stages_and_capture(monkeypatch):
+    import sgl_nvidia_mega.qwen3_8.qsa as package
+    from sgl_nvidia_mega.qwen3_8._providers import packed_prefill
+
+    raw = ModuleType(package.__name__ + ".tma_prefill")
+    calls = []
+    raw.launch = lambda io, *, max_q, stages: calls.append((io, max_q, stages))
+    monkeypatch.setitem(sys.modules, raw.__name__, raw)
+    monkeypatch.setattr(package, "tma_prefill", raw, raising=False)
+    capturing = SimpleNamespace(value=True)
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: capturing.value
+    )
+    run = packed_prefill.build(packed_signature(variant=2))
+    io = packed_view()
+    with pytest.raises(RuntimeError, match="warmed before capture"):
+        run(io)
+    capturing.value = False
+    run(io)
+    capturing.value = True
+    longer = packed_view(rows=600, max_q=600)
+    run(longer)
+    assert calls == [(io, 257, 2), (longer, 600, 2)]
+    for bad in (
+        replace(io, max_query_rows=0),
+        replace(io, max_query_rows=514),
+        replace(io, selected_indices=io.selected_indices[:, :512]),
+        replace(io, cu_key=io.cu_key[:2]),
+    ):
+        with pytest.raises(ValueError, match="declared layout"):
+            run(bad)
+    assert len(calls) == 2

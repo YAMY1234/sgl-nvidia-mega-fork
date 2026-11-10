@@ -115,6 +115,12 @@ def representatives():
             ),
             dict(tp_size=1, sm100_supported=1, page_size=16, unpadded_query_heads=4),
         ),
+        (
+            NumericSignature(
+                O.PACKED_PREFILL_ATTENTION, 0, 24, 2, 256, 2051, 4, D.BF16, variant=3
+            ),
+            dict(tp_size=1),
+        ),
         *(
             (HcSignature(op, 4, 4, 2560, D.BF16, parts=2), {})
             for op in (O.HC_GATE, O.HC_APPLY_NORM, O.HC_APPLY_NORM_GATE)
@@ -263,8 +269,12 @@ def test_all_selected_operations_complete_query_and_exact_keys(signature, contex
         assert (
             capabilities.numeric_capability(replace(q, attributes=incomplete)) is False
         ), key
-    # Prefill select declares rows 0 (per-call rows); any other count is refused.
-    rows = 1 if signature.operation == O.PREFILL_SELECT else 0
+    # Prefill ops declare rows 0 (per-call rows); any other count is refused.
+    rows = (
+        1
+        if signature.operation in (O.PREFILL_SELECT, O.PACKED_PREFILL_ATTENTION)
+        else 0
+    )
     assert (
         capabilities.numeric_capability(query(replace(signature, rows=rows), context))
         is False
@@ -274,7 +284,7 @@ def test_all_selected_operations_complete_query_and_exact_keys(signature, contex
 def test_query_catalogue_does_not_add_or_remove_slots():
     operations = {s.operation for s, _ in representatives()}
     assert operations == set(slots.OPERATION_SLOTS) == set(capabilities._SCHEMAS)
-    assert len(operations) == 19 and O.PACKED_ATTENTION not in operations
+    assert len(operations) == 20 and O.PACKED_ATTENTION not in operations
 
 
 @pytest.mark.parametrize("tp_size", [1, 4])
@@ -521,6 +531,14 @@ def test_native_score_and_select_keep_separate_admission(op, variant, tp, accept
     )
     context = dict(tp_size=tp, sm100_supported=1, page_size=16, unpadded_query_heads=4)
     assert capabilities.numeric_capability(query(s, context)) is accepted
+
+
+@pytest.mark.parametrize("tp", [1, 4])
+def test_prefill_providers_admit_any_tp_like_the_source(tp):
+    for s, context in representatives():
+        if s.operation in (O.PREFILL_SELECT, O.PACKED_PREFILL_ATTENTION):
+            context = context | {"tp_size": tp}
+            assert capabilities.numeric_capability(query(s, context)) is True
 
 
 @pytest.mark.parametrize(

@@ -270,9 +270,12 @@ def test_all_selected_operations_complete_query_and_exact_keys(signature, contex
             capabilities.numeric_capability(replace(q, attributes=incomplete)) is False
         ), key
     # Prefill ops declare rows 0 (per-call rows); any other count is refused.
+    # The permuted finalize declares rows 0 too, above its graph widths.
     rows = (
         1
         if signature.operation in (O.PREFILL_SELECT, O.PACKED_PREFILL_ATTENTION)
+        else 1025
+        if signature.operation == O.FINALIZE_PERMUTED_SHARED
         else 0
     )
     assert (

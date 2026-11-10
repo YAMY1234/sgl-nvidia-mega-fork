@@ -60,6 +60,10 @@ def supported(s):
         from ._providers.packed_prefill import supported as packed_supported
 
         return enabled(op) and packed_supported(s)
+    if op == NumericOperation.FINALIZE_PERMUTED_SHARED:
+        from ._providers.finalize_permuted import supported as finalize_supported
+
+        return enabled(op) and finalize_supported(s)
     if not enabled(op):
         return False
     if s.rows <= 0:
@@ -80,10 +84,6 @@ def supported(s):
         from ._providers.router_quant import supported as router_supported
 
         return router_supported(s)
-    if isinstance(s, FinalizePermutedSignature):
-        from ._providers.finalize_permuted import supported as finalize_supported
-
-        return finalize_supported(s)
     if isinstance(s, HcSignature):
         if s.scalar_type != ScalarType.BF16:
             return False

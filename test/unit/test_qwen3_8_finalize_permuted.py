@@ -111,7 +111,7 @@ def test_canonical_unions_and_seven_field_identity():
     )
 
 
-@pytest.mark.parametrize("rows", range(1, 65))
+@pytest.mark.parametrize("rows", (0, *range(1, 66), 480, 576, 1023, 1024))
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
 def test_finite_both_weight_capabilities(setup, rows, dtype):
     s = signature(rows, dtype)
@@ -127,8 +127,8 @@ def test_finite_both_weight_capabilities(setup, rows, dtype):
     "changes",
     (
         {"operation": O.FINALIZE_SHARED},
-        {"rows": 0},
-        {"rows": 65},
+        {"rows": -1},
+        {"rows": 1025},
         {"hidden_size": 1280},
         {"topk": 8},
         {"scalar_type": D.FP32},
@@ -148,21 +148,27 @@ def test_unsupported_never_binds_or_offers(setup, changes):
     assert not setup.launch.calls
 
 
-@pytest.mark.parametrize("rows", (1, 4, 8, 16, 32, 64))
+@pytest.mark.parametrize(
+    "rows,io_rows",
+    ((1, 1), (4, 4), (8, 8), (16, 16), (32, 32), (64, 64), (480, 480), (1024, 1024))
+    + ((0, 1025), (0, 16384)),
+)
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
 @pytest.mark.parametrize("padding", (0, 64))
 @pytest.mark.parametrize("warps", (8, 16))
 @pytest.mark.parametrize("pdl", (False, True))
-def test_original_raw_launch_caller_identity(setup, rows, dtype, padding, warps, pdl):
+def test_original_raw_launch_caller_identity(
+    setup, rows, io_rows, dtype, padding, warps, pdl
+):
     s = signature(rows, dtype, warps, pdl)
-    io = make_io(rows, dtype, padding)
+    io = make_io(io_rows, dtype, padding)
     offer = providers.register_signatures((s,))[0]
     assert offer.run(io) is None
     setup.state.capturing = True
     assert offer.run(io) is None
     assert len(setup.launch.calls) == 2
     for grid, args, kwargs in setup.launch.calls:
-        assert grid == (rows,)
+        assert grid == (io_rows,)
         expected = (
             io.hidden,
             io.gate_weight,
@@ -326,6 +332,13 @@ def test_layout_fail_before_raw(setup, mutation):
     field, bad = changes[mutation]
     with pytest.raises(ValueError, match="layout"):
         build(signature())(replace(io, **{field: bad}))
+    assert not setup.launch.calls
+
+
+@pytest.mark.parametrize("io_rows", (479, 481))
+def test_exact_rows_must_match_the_call(setup, io_rows):
+    with pytest.raises(ValueError, match="layout"):
+        build(signature(480))(make_io(io_rows))
     assert not setup.launch.calls
 
 

@@ -55,11 +55,14 @@ def run(device=0):
 
     torch.cuda.set_device(device)
     records = []
-    for rows, dtype, warps, pdl in product(
-        (1, 4, 8, 16, 32, 64), (torch.bfloat16, torch.float32), (8, 16), (False, True)
+    # Rows 0 is the declaration above the graph widths; the call carries its rows.
+    shapes = ((1, 1), (4, 4), (8, 8), (16, 16), (32, 32), (64, 64))
+    shapes += ((65, 65), (480, 480), (1024, 1024), (0, 4096))
+    for (rows, io_rows), dtype, warps, pdl in product(
+        shapes, (torch.bfloat16, torch.float32), (8, 16), (False, True)
     ):
         s = signature(rows, dtype, warps, pdl)
-        io = make_io(rows, dtype, f"cuda:{device}")
+        io = make_io(io_rows, dtype, f"cuda:{device}")
         offers = providers.register_signatures((s,))
         assert len(offers) == 1
         assert providers.numeric_registry.get(s) is offers[0]
@@ -74,6 +77,7 @@ def run(device=0):
             {
                 "operation": s.operation.name,
                 "rows": rows,
+                "io_rows": io_rows,
                 "weight_dtype": str(dtype),
                 "num_warps": warps,
                 "use_pdl": pdl,
@@ -82,7 +86,7 @@ def run(device=0):
                 "eager_capture_replay": True,
             }
         )
-    assert len(records) == 48
+    assert len(records) == 80
     return {
         "records": records,
         "model_qualification": False,

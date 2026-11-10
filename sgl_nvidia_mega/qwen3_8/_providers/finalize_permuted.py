@@ -22,7 +22,7 @@ def supported(signature):
     return (
         isinstance(signature, FinalizePermutedSignature)
         and signature.operation == NumericOperation.FINALIZE_PERMUTED_SHARED
-        and 1 <= signature.rows <= 64
+        and 0 <= signature.rows <= 1024
         and signature.hidden_size == 2560
         and signature.topk == 10
         and signature.scalar_type == ScalarType.BF16
@@ -76,7 +76,8 @@ class _FinalizePermuted:
         if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
             raise ValueError("native permuted finalize requires seven tensors")
         s = self.signature
-        m, h, k = s.rows, s.hidden_size, s.topk
+        # Rows 0 is declared for every call above the graph widths.
+        m, h, k = s.rows or io.hidden.shape[0], s.hidden_size, s.topk
         device = io.hidden.device
         if (
             device.type != "cuda"

@@ -44,7 +44,7 @@ import torch
 import triton
 
 from . import pool_union_decode as union
-from .pool_decode import LAST_KERNEL, LOG2E, _qsa_write_new_kv
+from .pool_decode import LAST_KERNEL, LOG2E, _qsa_write_new_kv, write_new_kv_e4m3
 
 logger = logging.getLogger(__name__)
 
@@ -872,7 +872,8 @@ def qsa_pool_union_decode_ws(
     assert rows % width == 0
     assert q3.stride(2) == 1 and q3.stride(1) == dim
     assert k_new.stride(-1) == 1 and k_new.shape[-1] * k_new.shape[-2] == kv_heads * dim
-    assert k_new.dtype == v_new.dtype == k_cache.dtype == v_cache.dtype
+    assert k_new.dtype == v_new.dtype and k_cache.dtype == v_cache.dtype
+    assert k_new.dtype in (k_cache.dtype, torch.bfloat16)
     if out is None or workspace is None or splits is None:
         raise ValueError(
             "union launch requires prepared workspace, split count and caller output"
@@ -886,20 +887,25 @@ def qsa_pool_union_decode_ws(
     if write_new_kv:
         nk = k_new.reshape(rows, kv_heads * dim) if k_new.dim() == 3 else k_new
         nv = v_new.reshape(rows, kv_heads * dim) if v_new.dim() == 3 else v_new
-        _qsa_write_new_kv[(rows, kv_heads)](
-            k_cache,
-            v_cache,
-            nk,
-            nv,
-            loc,
-            nk.stride(0),
-            nv.stride(0),
-            kv_heads,
-            dim,
-            pdl,
-            num_warps=1,
-            **pdl_kw,
-        )
+        if nk.dtype != k_cache.dtype:  # BF16 rows, cast in the write (variant bit 8)
+            write_new_kv_e4m3(
+                k_cache, v_cache, nk, nv, loc, rows, kv_heads, dim, pdl, pdl_kw
+            )
+        else:
+            _qsa_write_new_kv[(rows, kv_heads)](
+                k_cache,
+                v_cache,
+                nk,
+                nv,
+                loc,
+                nk.stride(0),
+                nv.stride(0),
+                kv_heads,
+                dim,
+                pdl,
+                num_warps=1,
+                **pdl_kw,
+            )
     union._qsa_union_tokens[(requests,)](
         block_indices,
         block_indices.stride(0),

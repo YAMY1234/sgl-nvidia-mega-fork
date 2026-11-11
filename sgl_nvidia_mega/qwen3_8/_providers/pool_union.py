@@ -4,8 +4,10 @@
 The variant carries the source options the caller resolved: bits 0-5 kernel U's warp
 count (SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS; 0 is the source's 8; its output does not
 depend on it), bit 6 the warp-specialized attention kernel
-(SGLANG_QSA_FP8_POOL_VERIFY_WS), whose split count the caller resolves, and bit 7 (with
-bit 6 only) PDL into that kernel (SGLANG_QSA_FP8_POOL_VERIFY_WS_PDL; same math).
+(SGLANG_QSA_FP8_POOL_VERIFY_WS), whose split count the caller resolves, bit 7 (with
+bit 6 only) PDL into that kernel (SGLANG_QSA_FP8_POOL_VERIFY_WS_PDL; same math), and bit 8
+BF16 new K/V cast to E4M3 in the pool write (SGLANG_QSA_FUSED_FP8_KV_WRITE; the cast is
+checked against torch's on every BF16 pattern before first use, so the pool bytes match).
 """
 
 from dataclasses import fields
@@ -28,19 +30,25 @@ SGLANG_READS = {
 _UNION_WARPS_MASK = 0x3F
 _WS = 1 << 6
 _WS_PDL = 1 << 7
+_FP8_KV_WRITE = 1 << 8
 
 
 def _options(variant):
-    """(kernel U warps, warp-specialized, PDL into it) of a declared variant, or None
-    for an unknown one."""
+    """(kernel U warps, warp-specialized, PDL into it, BF16 new K/V cast in the write)
+    of a declared variant, or None for an unknown one."""
     warps = variant & _UNION_WARPS_MASK
     if (
-        variant & ~(_UNION_WARPS_MASK | _WS | _WS_PDL)
+        variant & ~(_UNION_WARPS_MASK | _WS | _WS_PDL | _FP8_KV_WRITE)
         or warps not in (0, 1, 2, 4, 8, 16, 32)
         or (variant & _WS_PDL and not variant & _WS)
     ):
         return None
-    return warps or 8, bool(variant & _WS), bool(variant & _WS_PDL)
+    return (
+        warps or 8,
+        bool(variant & _WS),
+        bool(variant & _WS_PDL),
+        bool(variant & _FP8_KV_WRITE),
+    )
 
 
 def supported(s):
@@ -78,7 +86,9 @@ def build(s):
 class PoolUnion:
     def __init__(self, signature):
         self.signature = signature
-        self._union_warps, self._ws, self._ws_pdl = _options(signature.variant)
+        self._union_warps, self._ws, self._ws_pdl, self._cast_write = _options(
+            signature.variant
+        )
         self._resources = {}
 
     def __call__(self, io):
@@ -108,9 +118,19 @@ class PoolUnion:
             or k.shape[1:] != (2, 256)
             or v.shape != k.shape
             or any(
-                t.dtype != torch.float8_e4m3fn or not t.is_contiguous()
-                for t in (k, v, nk, nv)
+                t.dtype != torch.float8_e4m3fn or not t.is_contiguous() for t in (k, v)
             )
+            or not all(
+                (t.dtype == torch.float8_e4m3fn and t.is_contiguous())
+                or (
+                    self._cast_write
+                    and t.dtype == torch.bfloat16
+                    and t.stride(1) == 256
+                    and t.stride(2) == 1
+                )
+                for t in (nk, nv)
+            )
+            or nk.dtype != nv.dtype
             or nk.shape != (s.rows, 2, 256)
             or nv.shape != nk.shape
             or out.shape != q.shape
@@ -177,6 +197,16 @@ class PoolUnion:
             fp[stats : 2 * stats],
             fp[2 * stats : 2 * stats + stats * 256],
         )
+        if nk.dtype == torch.bfloat16:
+            from ..qsa import pool_decode
+
+            # Checked once per device, eagerly (an unchecked pool under capture refuses).
+            if not pool_decode.write_new_kv_e4m3_ok(k, v):
+                raise ValueError(
+                    "the E4M3 cast write differs from torch's cast on this device "
+                    "(or was not checked before capture): unset "
+                    "SGLANG_QSA_FUSED_FP8_KV_WRITE"
+                )
         from ..qsa import pool_union_decode as raw
 
         launch, options = raw.qsa_pool_union_decode, {}

@@ -67,6 +67,114 @@ def _qsa_write_new_kv(
 
 
 @triton.jit
+def _qsa_write_new_kv_e4m3(
+    K,
+    V,
+    NK,
+    NV,
+    LOC,
+    NK_STRIDE,
+    NV_STRIDE,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    # _qsa_write_new_kv with BF16 k/v_new, cast in the write: BF16 -> FP32 is exact, then one
+    # round-to-nearest-even, satfinite conversion to E4M3 (the pool's dtype).
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    d = tl.arange(0, D)
+    slot = tl.load(LOC + row).to(tl.int64)
+    k = (
+        tl.load(NK + row.to(tl.int64) * NK_STRIDE + head * D + d)
+        .to(tl.float32)
+        .to(K.dtype.element_ty)
+    )
+    v = (
+        tl.load(NV + row.to(tl.int64) * NV_STRIDE + head * D + d)
+        .to(tl.float32)
+        .to(V.dtype.element_ty)
+    )
+    tl.store(K + slot * H * D + head * D + d, k, mask=slot != 0)
+    tl.store(V + slot * H * D + head * D + d, v, mask=slot != 0)
+
+
+# Per (device, heads, dim): whether _qsa_write_new_kv_e4m3's cast equals torch's.
+_E4M3_CHECKED = {}
+
+
+def write_new_kv_e4m3_ok(k_cache, v_cache) -> bool:
+    """Whether the cast write may serve this FP8 pool: once per (device, heads, dim),
+    outside stream capture, every BF16 bit pattern goes through _qsa_write_new_kv_e4m3 at
+    the pool's head layout and is compared byte for byte with torch's
+    .to(torch.float8_e4m3fn). Not yet checked under capture: False, nothing cached."""
+    if not (
+        k_cache.is_cuda
+        and k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn
+        and k_cache.dim() == 3
+        and k_cache.shape[1:] == v_cache.shape[1:]
+    ):
+        return False
+    heads, dim = int(k_cache.shape[1]), int(k_cache.shape[2])
+    key = (k_cache.device.index, heads, dim)
+    if key in _E4M3_CHECKED:
+        return _E4M3_CHECKED[key]
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    if dim & (dim - 1) or dim > 4096:
+        _E4M3_CHECKED[key] = False
+        return False
+    dev = k_cache.device
+    width = heads * dim
+    rows = triton.cdiv(1 << 16, width)
+    bits = torch.zeros(rows * width, dtype=torch.int16)
+    bits[: 1 << 16] = torch.arange(1 << 16, dtype=torch.int32).to(torch.int16)
+    nk = bits.to(dev).view(torch.bfloat16).view(rows, width)
+    nv = nk.flip(0).contiguous()
+    loc = torch.arange(1, rows + 1, dtype=torch.int64, device=dev)
+    kc = torch.zeros(rows + 1, heads, dim, dtype=torch.float8_e4m3fn, device=dev)
+    vc = torch.zeros_like(kc)
+    _qsa_write_new_kv_e4m3[(rows, heads)](
+        kc, vc, nk, nv, loc, nk.stride(0), nv.stride(0), heads, dim, False, num_warps=1
+    )
+    ok = bool(
+        torch.equal(
+            kc[1:].reshape(rows, width).view(torch.uint8),
+            nk.to(torch.float8_e4m3fn).view(torch.uint8),
+        )
+        and torch.equal(
+            vc[1:].reshape(rows, width).view(torch.uint8),
+            nv.to(torch.float8_e4m3fn).view(torch.uint8),
+        )
+        and not kc[0].view(torch.uint8).any().item()
+    )
+    _E4M3_CHECKED[key] = ok
+    return ok
+
+
+def write_new_kv_e4m3(k_cache, v_cache, nk, nv, loc, rows, kv_heads, dim, pdl, pdl_kw):
+    """The cast write for [rows, kv_heads * dim] BF16 nk/nv (unit last stride) into the
+    FP8 pool."""
+    _qsa_write_new_kv_e4m3[(rows, kv_heads)](
+        k_cache,
+        v_cache,
+        nk,
+        nv,
+        loc,
+        nk.stride(0),
+        nv.stride(0),
+        kv_heads,
+        dim,
+        pdl,
+        num_warps=1,
+        **pdl_kw,
+    )
+
+
+@triton.jit
 def _qsa_pool_splitk(
     Q,
     K,

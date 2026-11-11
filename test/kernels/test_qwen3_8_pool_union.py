@@ -211,3 +211,80 @@ def test_pool_merge_gate_is_the_separate_sigmoid_mul(rows, variant):
     sigmoid_mul[(rows, 24)](outputs[0], gate, gate.stride(0), gate.stride(1), 256)
     torch.cuda.synchronize()
     assert torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="explicit CUDA qualification")
+@pytest.mark.parametrize("variant", [0, 64 | 16])
+def test_pool_union_cast_write_is_the_torch_cast(variant):
+    """Variant bit 8 (the source's SGLANG_QSA_FUSED_FP8_KV_WRITE): BF16 new K/V cast to
+    E4M3 in the pool write give the same pool bytes and output as torch's cast first."""
+    from sglang.srt.kernel_plugins.nvidia.qsa_union import workspace_plan
+
+    from sgl_nvidia_mega.qwen3_8.qsa import pool_decode
+
+    torch.manual_seed(5)
+    device, rows, width, length = "cuda", 64, 4, 2051
+    requests = rows // width
+    q = torch.randn(rows, 24, 256, device=device, dtype=torch.bfloat16) * 0.25
+    k = (torch.randn(requests * length + 1, 2, 256, device=device) * 0.25).to(
+        torch.float8_e4m3fn
+    )
+    v = (torch.randn_like(k, dtype=torch.bfloat16) * 0.25).to(torch.float8_e4m3fn)
+    table = torch.arange(
+        1, requests * length + 1, device=device, dtype=torch.int32
+    ).reshape(requests, length)
+    req = torch.arange(requests, device=device, dtype=torch.int32).repeat_interleave(
+        width
+    )
+    positions = 2047 + torch.arange(rows, device=device, dtype=torch.int32) % width
+    loc = table[req.long(), positions.long()].long()
+    idx = torch.arange(512, device=device, dtype=torch.int32).expand(rows, -1)
+    idx = idx.contiguous()
+    packed = torch.randn(rows, 3, 2, 256, device=device).bfloat16() * 8
+    sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    splits, ni, nf = workspace_plan(rows, sms)
+    if variant & 64:
+        from sgl_nvidia_mega.qwen3_8.qsa.pool_union_ws import choose_ws_splits
+
+        splits = choose_ws_splits(requests, 2, sms)
+        nf = requests * 2 * splits * 64 * 258
+    assert pool_decode.write_new_kv_e4m3_ok(k, v)
+    fp8 = torch.float8_e4m3fn
+    results = []
+    for bit, nk, nv in (
+        (0, packed[:, 0].to(fp8), packed[:, 1].to(fp8)),
+        (256, packed[:, 0], packed[:, 1]),
+    ):
+        kc, vc, out = k.clone(), v.clone(), torch.empty_like(q)
+        io = PoolUnionAttentionIO(
+            q,
+            None,
+            nk,
+            nv,
+            loc,
+            KvTensors(kc, vc, 1.0, 1.0, 1),
+            DirectPoolSelection(table, req, idx, positions + 1, positions),
+            0.0625,
+            4,
+            True,
+            out,
+            torch.empty(nf, device=device, dtype=torch.float32),
+            torch.empty(ni, device=device, dtype=torch.int32),
+            splits,
+        )
+        signature = NumericSignature(
+            O.POOL_UNION_ATTENTION,
+            rows,
+            24,
+            2,
+            256,
+            512,
+            4,
+            D.BF16,
+            variant=variant | bit,
+        )
+        build(signature)(io)
+        results.append((kc, vc, out))
+    torch.cuda.synchronize()
+    for a, b in zip(*results):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))

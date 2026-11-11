@@ -535,7 +535,7 @@ def test_union_supported_rows(rows):
         dict(variant=3),
         dict(variant=1 << 7),
         dict(variant=1 << 7 | 16),
-        dict(variant=1 << 8 | 64),
+        dict(variant=1 << 9 | 64),
         dict(context_bound=1),
         dict(rotary_dim=1),
         dict(rows=True),
@@ -547,7 +547,7 @@ def test_union_refusal(change):
 
 
 @pytest.mark.parametrize(
-    "variant", [16, 32, 64, 64 | 16, 8, 4, 128 | 64, 128 | 64 | 16]
+    "variant", [16, 32, 64, 64 | 16, 8, 4, 128 | 64, 128 | 64 | 16, 256, 256 | 64 | 16]
 )
 def test_union_declared_options(variant):
     # Bits 0-5: kernel U warps (0 = 8); bit 6: the warp-specialized kernel; bit 7:
@@ -655,6 +655,55 @@ def test_union_launch_takes_the_declared_options(
     assert kw["splits"] == io.split_count and len(kw["workspace"]) == 8
     # Only the warp-specialized wrapper takes ws_pdl; kernel 2's never sees it.
     assert kw.get("ws_pdl") is ws_pdl
+
+
+def bf16_new_kv(io):
+    """The projection's BF16 k/v rows: [rows, 2, 256] views with a wider row stride."""
+    rows = torch.empty((64, 3, 2, 256), dtype=torch.bfloat16).as_subclass(CudaMetadata)
+    return replace(io, new_k=rows[:, 0], new_v=rows[:, 1])
+
+
+@pytest.mark.parametrize("variant", [0, 64])
+def test_union_bf16_new_kv_needs_the_cast_write_bit(monkeypatch, variant):
+    calls = []
+    raw_union(monkeypatch, lambda *a, **kw: calls.append(kw))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    with pytest.raises(ValueError):
+        pool_union.build(replace(union_signature(), variant=variant))(
+            bf16_new_kv(union_view())
+        )
+    assert not calls
+
+
+@pytest.mark.parametrize("checked", [True, False])
+def test_union_cast_write_runs_only_after_the_cast_check(monkeypatch, checked):
+    from sgl_nvidia_mega.qwen3_8.qsa import pool_decode
+
+    calls, seen = [], []
+    raw_union(monkeypatch, lambda *a, **kw: calls.append((a, kw)))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        pool_decode,
+        "write_new_kv_e4m3_ok",
+        lambda k, v: seen.append((k, v)) or checked,
+    )
+    io = bf16_new_kv(union_view())
+    run = pool_union.build(replace(union_signature(), variant=256 | 64))
+    if checked:
+        run(io)
+        ((args, _),) = calls
+        assert args[3] is io.new_k and args[4] is io.new_v
+    else:
+        with pytest.raises(ValueError, match="SGLANG_QSA_FUSED_FP8_KV_WRITE"):
+            run(io)
+        assert not calls
+    assert seen == [(io.kv.k, io.kv.v)]
+    # FP8 rows under the bit skip the check and keep the plain copy.
+    seen.clear()
+    calls.clear()
+    if checked:
+        run(union_view())
+        assert not seen and len(calls) == 1
 
 
 def test_union_failed_launch_does_not_publish(monkeypatch):

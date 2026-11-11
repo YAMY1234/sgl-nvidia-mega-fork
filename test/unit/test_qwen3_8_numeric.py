@@ -50,6 +50,9 @@ def hc(op, **kw):
             O.GDN_CORE, 4, 4, 12, 128, 128, 4, D.BF16, gate_scalar_type=D.BF16
         ),
         NumericSignature(O.DIRECT_POOL_ATTENTION, 4, 6, 1, 256, 512, 4, D.BF16),
+        NumericSignature(
+            O.DIRECT_POOL_ATTENTION, 4, 24, 2, 256, 512, 4, D.BF16, variant=16
+        ),
     ],
 )
 def test_exact_supported_shapes(s):
@@ -70,6 +73,12 @@ def test_exact_supported_shapes(s):
         hc(O.HC_MIX),
         GdnSignature(O.GDN_CORE, 1, 4, 12, 128, 128, 4, D.BF16),
         NumericSignature(O.DIRECT_POOL_ATTENTION, 4, 6, 1, 128, 512, 4, D.BF16),
+        # The TCGEN05 core is the TP1 width-4 verify layout only.
+        NumericSignature(O.DIRECT_POOL_ATTENTION, 4, 6, 1, 256, 512, 4, D.BF16, variant=16),
+        NumericSignature(O.DIRECT_POOL_ATTENTION, 8, 24, 2, 256, 512, 4, D.BF16, variant=16),
+        NumericSignature(O.DIRECT_POOL_ATTENTION, 4, 24, 2, 256, 256, 4, D.BF16, variant=16),
+        NumericSignature(O.DIRECT_POOL_ATTENTION, 4, 24, 2, 256, 512, 4, D.BF16, variant=20),
+        NumericSignature(O.DIRECT_POOL_ATTENTION, 4, 24, 2, 256, 512, 4, D.BF16, variant=17),
     ],
 )
 def test_unsupported_declares_no_offer(s):
@@ -264,6 +273,110 @@ def test_direct_attention_sequence_length_and_scratch_abi(monkeypatch):
     assert partial.calls[0][2]["WIDTH"] == 4
     assert merge.calls[0][1][3] is io.output
     assert merge.calls[0][1][7:9] == (33, 64)
+
+
+@pytest.mark.parametrize("store", [True, False])
+@pytest.mark.parametrize("gate_shape", [(4, 24, 256), (4, 6144)])
+def test_tcgen05_core_keeps_the_source_launches_on_caller_scratch(
+    monkeypatch, store, gate_shape
+):
+    from sgl_nvidia_mega.qwen3_8._providers.qsa import TCGEN05_CORE, direct_core_tp1
+
+    store_k, partial, merge = Launch(), Launch(), Launch()
+    install(
+        monkeypatch,
+        "sgl_nvidia_mega.qwen3_8.kernels.ops.attention.qsa_tcgen05_v1",
+        _store=store_k,
+        partial_tcgen05=partial,
+    )
+    install(
+        monkeypatch,
+        "sgl_nvidia_mega.qwen3_8.kernels.ops.attention.qsa_gate_epilogue_v2",
+        _merge_gate_pdl_v2=merge,
+        _Q38_QSA_PDL_FIX=True,
+    )
+    s = NumericSignature(
+        O.DIRECT_POOL_ATTENTION, 4, 24, 2, 256, 512, 4, D.BF16, variant=TCGEN05_CORE
+    )
+    assert providers.make_offer(s).run is direct_core_tp1
+    tensor = lambda *shape: Tensor(shape)
+    selection = DirectPoolSelection(
+        full_slot_map=tensor(32, 65536),
+        row_requests=tensor(4),
+        selected_indices=tensor(4, 512),
+        sequence_lengths=tensor(4),
+        query_positions=tensor(4),
+    )
+    gate = tensor(*gate_shape)
+    io = DirectPoolAttentionIO(
+        q=tensor(4, 24, 256),
+        gate=gate,
+        kv=KvTensors(
+            k=tensor(65536, 2, 256),
+            v=tensor(65536, 2, 256),
+            k_scale=1.0,
+            v_scale=1.0,
+            page_size=1,
+        ),
+        new_k=tensor(4, 2, 256),
+        new_v=tensor(4, 2, 256),
+        out_cache_loc=tensor(4),
+        selection=selection,
+        scale=0.0625,
+        query_width=4,
+        store_new_kv=store,
+        output=tensor(4, 24, 256),
+        scratch_out=Tensor((4 * 2 * 33 * 16 * (256 + 2),), "torch.float32"),
+    )
+    assert direct_core_tp1(io) is None
+    assert [c[0] for c in store_k.calls] == ([(4, 2)] if store else [])
+    grid, args, kw = partial.calls[0]
+    assert grid == (4, 33, 2)
+    assert args[6:11] == (
+        selection.full_slot_map,
+        selection.row_requests,
+        selection.selected_indices,
+        selection.sequence_lengths,
+        selection.query_positions,
+    )
+    assert args[11].shape == (4, 2, 33, 16, 256)
+    assert (kw["NT"], kw["GROUP"], kw["WIDTH"], kw["SCALE"]) == (33, 12, 4, 0.0625)
+    assert "launch_pdl" not in kw
+    grid, args, kw = merge.calls[0]
+    assert grid == (4, 24, 4)
+    assert args[3] is io.output and args[4] is gate
+    assert args[6] == (256 if len(gate_shape) == 2 else gate.stride(1))
+    assert args[7:9] == (33, 64)
+    assert kw == {"WAIT_PRIMARY": True, "num_warps": 4, "launch_pdl": True}
+
+
+def test_tcgen05_core_refuses_short_scratch_and_missing_gate(monkeypatch):
+    from sgl_nvidia_mega.qwen3_8._providers.qsa import direct_core_tp1
+
+    tensor = lambda *shape: Tensor(shape)
+    selection = DirectPoolSelection(
+        tensor(32, 65536), tensor(4), tensor(4, 512), tensor(4), tensor(4)
+    )
+    kv = KvTensors(tensor(64, 2, 256), tensor(64, 2, 256), 1.0, 1.0, 1)
+    base = dict(
+        q=tensor(4, 24, 256),
+        gate=tensor(4, 6144),
+        kv=kv,
+        new_k=tensor(4, 2, 256),
+        new_v=tensor(4, 2, 256),
+        out_cache_loc=tensor(4),
+        selection=selection,
+        scale=0.0625,
+        query_width=4,
+        store_new_kv=True,
+        output=tensor(4, 24, 256),
+        # One KV head's worth: the TP4 size, short by half for TP1.
+        scratch_out=Tensor((4 * 33 * 16 * (256 + 2),), "torch.float32"),
+    )
+    with pytest.raises(ValueError, match="scratch"):
+        direct_core_tp1(DirectPoolAttentionIO(**base))
+    with pytest.raises(ValueError, match="layout"):
+        direct_core_tp1(DirectPoolAttentionIO(**base | {"gate": None}))
 
 
 def test_capture_cannot_prepare_expert_descriptors(monkeypatch):

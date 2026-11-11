@@ -24,6 +24,7 @@ from sglang.kernels.plugin_kernels.nvidia.numeric import (
     numeric_registry,
 )
 
+from ._providers.qsa import TCGEN05_CORE, supported_tcgen05_core
 from .slots import enabled, log_selection
 
 SGLANG_READS = {
@@ -144,6 +145,8 @@ def supported(s):
             from ._providers.pool import supported as pool_supported
 
             return pool_supported(s)
+        if op == NumericOperation.DIRECT_POOL_ATTENTION and s.variant == TCGEN05_CORE:
+            return s.scalar_type == ScalarType.BF16 and supported_tcgen05_core(s)
         return (
             op == NumericOperation.DIRECT_POOL_ATTENTION
             and s.variant == 0
@@ -236,6 +239,8 @@ def _cached_offer(signature):
             from ._providers.pool import build
 
             run = build(signature)
+        elif signature.variant == TCGEN05_CORE:
+            from ._providers.qsa import direct_core_tp1 as run
         else:
             from ._providers.qsa import direct_pool as run
     return NumericOffer(signature, run)

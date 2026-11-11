@@ -182,7 +182,7 @@ def test_finite_exact_capability(operation, capacity):
 @pytest.mark.parametrize("operation", (O.SPARSE_SCORE, O.SPARSE_SELECT))
 def test_source_variants_are_exact(operation, variant):
     s = signature(operation, variant=variant)
-    expected = variant in ((0, 3, 4, 5) if operation == O.SPARSE_SCORE else (0, 1))
+    expected = variant in ((0, 3, 4, 5) if operation == O.SPARSE_SCORE else (0, 1, 2))
     assert sparse.supported(s) == expected
     assert (providers.make_offer(s) is not None) == expected
 
@@ -680,3 +680,95 @@ def test_prefill_select_raw_one_pass_flags_use_the_starts_scratch(monkeypatch, i
     scope["select_into"](io, 16, topk_impl=impl)
     scratch = [io.starts_scratch_out.data_ptr()] if impl == "onepass" else []
     assert launched == [(impl, 32, scratch), (impl, 8, scratch)]
+
+
+def verify_io(rows=4, capacity=8208, scratch=None):
+    io = select_io(capacity=capacity)
+    scratch = torch.zeros(8 * rows, dtype=torch.uint8) if scratch is None else scratch
+    return replace(io, counts_out=None, scratch_out=scratch)
+
+
+def test_verify_select_variant_is_any_verify_width():
+    for rows in (4, 64, 260, 576):
+        assert sparse.supported(
+            replace(signature(O.SPARSE_SELECT, variant=2), rows=rows)
+        )
+    assert not sparse.supported(signature(O.SPARSE_SELECT, variant=3))
+    assert not sparse.supported(signature(O.SPARSE_SCORE, variant=2))
+
+
+@pytest.fixture
+def verify_spies(monkeypatch):
+    import sgl_nvidia_mega.qwen3_8.qsa as package
+
+    calls = []
+    state = SimpleNamespace(capturing=False)
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: state.capturing
+    )
+    fake = install(
+        monkeypatch,
+        package.__name__ + ".verify_topk",
+        impl_for=lambda rows, device: "half" if rows > 2 else "sampled",
+        select_into=lambda *a: calls.append(a),
+    )
+    monkeypatch.setattr(package, "verify_topk", fake, raising=False)
+    return calls, state
+
+
+def test_verify_select_passes_two_int32_scratch_views(verify_spies):
+    calls, state = verify_spies
+    run = sparse.build(signature(O.SPARSE_SELECT, variant=2))
+    io = verify_io()
+    state.capturing = True
+    with pytest.raises(RuntimeError, match="before capture"):
+        run(io)
+    state.capturing = False
+    assert run(io) is None
+    state.capturing = True
+    assert run(io) is None
+    (scores, lengths, output, scratch, impl), _ = calls
+    assert (scores, lengths, output) == (io.scores, io.lengths, io.selected_indices_out)
+    assert scratch.dtype == torch.int32 and scratch.shape == (8,)
+    assert scratch.data_ptr() == io.scratch_out.data_ptr() and impl == "half"
+
+
+@pytest.mark.parametrize(
+    "scratch",
+    [
+        torch.zeros(31, dtype=torch.uint8),
+        torch.zeros(8, dtype=torch.int32),
+        torch.zeros(64, dtype=torch.uint8)[1:33],
+    ],
+)
+def test_verify_select_refuses_a_short_or_misaligned_scratch(verify_spies, scratch):
+    calls, _ = verify_spies
+    with pytest.raises(ValueError, match="prepared capability"):
+        sparse.build(signature(O.SPARSE_SELECT, variant=2))(verify_io(scratch=scratch))
+    assert calls == []
+
+
+@pytest.mark.parametrize("impl", ["sampled", "half"])
+def test_verify_select_zeroes_row_starts_and_flags_only_the_half_kernel(
+    monkeypatch, impl
+):
+    import sgl_nvidia_mega.qwen3_8.qsa as package
+    from sgl_nvidia_mega.qwen3_8.qsa import verify_topk
+
+    launched = []
+    fake = install(
+        monkeypatch,
+        package.__name__ + ".prefill_select",
+        _topk_launcher=lambda name: lambda *a: launched.append((name, a)),
+    )
+    monkeypatch.setattr(package, "prefill_select", fake, raising=False)
+    scores, lengths = torch.zeros(3, 16), torch.ones(3, dtype=torch.int32)
+    out = torch.empty(3, 512, dtype=torch.int32)
+    scratch = torch.full((6,), 7, dtype=torch.int32)
+    verify_topk.select_into(scores, lengths, out, scratch, impl)
+    ((name, args),) = launched
+    assert name == impl and torch.equal(scratch[:3], torch.zeros(3, dtype=torch.int32))
+    assert args[0] is scores and args[2] is out and args[3] is lengths
+    assert args[1].data_ptr() == scratch.data_ptr()
+    flags = [a.data_ptr() for a in args[4:]]
+    assert flags == ([scratch[3:].data_ptr()] if impl == "half" else [])

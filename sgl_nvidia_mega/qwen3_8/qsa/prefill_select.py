@@ -184,6 +184,15 @@ def _topk_launcher(impl: str):
         return _jit_fast_topk_module(512, False).fast_topk
 
     args = make_cpp_args(is_arch_support_pdl())
+    if impl == "half":
+        # The sampled select on 512-thread blocks, the same output; also takes the
+        # per-row flags (int32 [rows] scratch) of the rows its 1024-thread launch serves.
+        return load_jit(
+            "qsa_prefill_topk_half",
+            *args,
+            cuda_files=["elementwise/qsa_prefill_topk_half.cuh"],
+            cuda_wrappers=[("topk", f"QsaPrefillTopKHalfKernel<{args}>::run")],
+        ).topk
     if impl == "onepass":
         # Also takes per-row flags (int32 [rows] scratch) of the rows its second,
         # 1024-thread launch serves.

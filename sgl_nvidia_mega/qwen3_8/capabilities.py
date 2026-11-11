@@ -242,7 +242,7 @@ def _source_supported(s, actual):
         ) and heads != 4:
             return False
         if (op == NumericOperation.SPARSE_SCORE and s.variant in (4, 5, 6, 7)) or (
-            op == NumericOperation.SPARSE_SELECT and s.variant == 1
+            op == NumericOperation.SPARSE_SELECT and s.variant in (1, 2)
         ):
             return actual["tp_size"] == 1
         return True

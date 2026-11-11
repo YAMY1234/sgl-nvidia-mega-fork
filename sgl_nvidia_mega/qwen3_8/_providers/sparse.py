@@ -56,6 +56,9 @@ def supported(s):
             return s.rows == 4 and s.query_heads == 8
         if variant == 1:
             return s.rows in range(1, 65) and s.query_heads in (8, 16)
+        if variant == 2:
+            # The source's sampled target-verify top-k, at any verify width.
+            return s.rows > 0 and s.query_heads in (8, 16)
     return False
 
 
@@ -198,8 +201,11 @@ class SparseSelect:
 
         capacity = self.signature.context_bound
         rows = self.signature.rows
-        split = getattr(self.signature, "variant", 0) == 1
+        variant = getattr(self.signature, "variant", 0)
+        split = variant == 1
         scores, lengths, output = io.scores, io.lengths, io.selected_indices_out
+        if variant == 2:
+            return self._verify(io, rows, capacity)
         if (
             scores.shape != (rows, capacity)
             or scores.dtype != torch.float32
@@ -250,3 +256,44 @@ class SparseSelect:
             module.select_rows(scores, lengths, None, output)
         if cold:
             self._resources[key] = module
+
+    def _verify(self, io, rows, capacity):
+        """Variant 2: the source's sampled target-verify select. ``scratch_out`` holds
+        two int32 [rows] views (zero row starts, then the 512-thread flags)."""
+        import torch
+
+        from ..qsa import verify_topk
+
+        scores, lengths, output = io.scores, io.lengths, io.selected_indices_out
+        scratch = io.scratch_out
+        if (
+            scores.shape != (rows, capacity)
+            or scores.dtype != torch.float32
+            or lengths.shape != (rows,)
+            or lengths.dtype != torch.int32
+            or output.shape != (rows, 512)
+            or output.dtype != torch.int32
+            or io.selected_count != 512
+            or scratch.dtype != torch.uint8
+            or scratch.numel() < 8 * rows
+            or scratch.data_ptr() % 4 != 0
+            or any(
+                not t.is_contiguous() or t.device != scores.device
+                for t in (scores, lengths, output, scratch)
+            )
+        ):
+            raise ValueError(
+                "sparse select view does not match its prepared capability"
+            )
+        impl = verify_topk.impl_for(rows, scores.device)
+        key = scores.device, impl
+        cold = key not in self._resources
+        if cold and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "sparse select cold layout must be warmed before capture"
+            )
+        verify_topk.select_into(
+            scores, lengths, output, scratch[: 8 * rows].view(torch.int32), impl
+        )
+        if cold:
+            self._resources[key] = impl

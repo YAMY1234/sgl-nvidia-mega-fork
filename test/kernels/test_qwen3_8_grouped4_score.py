@@ -99,3 +99,63 @@ def test_grouped4_score_bits(rows, variant, ctas):
     graph.replay()
     torch.cuda.synchronize()
     check()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="explicit CUDA qualification")
+@pytest.mark.parametrize("rows", [68, 256, 576])
+@pytest.mark.parametrize("ties", [False, True])
+def test_verify_select_variant_matches_the_source_top_k(monkeypatch, rows, ties):
+    # Variant 2 (SGLANG_QSA_VERIFY_TOPK=sampled): both block sizes give the same
+    # ordered output, the 512 largest scores with smallest-index ties.
+    from sglang.kernels.plugin_kernels.nvidia.numeric import SparseSelectIO
+
+    from sgl_nvidia_mega.qwen3_8.qsa import verify_topk
+
+    torch.manual_seed(311)
+    capacity = 32768
+    scores = torch.randn(rows, capacity, device="cuda")
+    if ties:
+        scores = scores.round(decimals=1)
+    lengths = (
+        torch.arange(rows, device="cuda", dtype=torch.int32) * 977 % capacity
+    ) + 1
+    signature = NumericSignature(
+        O.SPARSE_SELECT,
+        rows,
+        8,
+        1,
+        128,
+        512,
+        4,
+        D.FP32,
+        context_bound=capacity,
+        variant=2,
+    )
+
+    def select(impl):
+        monkeypatch.setattr(verify_topk, "impl_for", lambda r, d: impl)
+        out = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
+        build(signature)(
+            SparseSelectIO(
+                scores,
+                lengths,
+                512,
+                out,
+                None,
+                torch.empty(8 * rows, device="cuda", dtype=torch.uint8),
+            )
+        )
+        return out
+
+    sampled, half = select("sampled"), select("half")
+    assert torch.equal(sampled, half)
+    for row in range(0, rows, max(1, rows // 8)):
+        n = int(lengths[row])
+        if n <= 512:
+            expected = torch.arange(512, device="cuda", dtype=torch.int32)
+            expected[n:] = -1
+            assert torch.equal(sampled[row], expected)
+            continue
+        keys = scores[row, :n]
+        order = sorted(range(n), key=lambda i: (-float(keys[i]), i))[:512]
+        assert sorted(sampled[row].tolist()) == sorted(order)

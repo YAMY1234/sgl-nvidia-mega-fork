@@ -534,6 +534,8 @@ def test_union_supported_rows(rows):
         dict(scalar_type=D.FP8_E4M3),
         dict(variant=3),
         dict(variant=1 << 7),
+        dict(variant=1 << 7 | 16),
+        dict(variant=1 << 8 | 64),
         dict(context_bound=1),
         dict(rotary_dim=1),
         dict(rows=True),
@@ -544,9 +546,12 @@ def test_union_refusal(change):
     assert not pool_union.supported(replace(union_signature(), **change))
 
 
-@pytest.mark.parametrize("variant", [16, 32, 64, 64 | 16, 8, 4])
+@pytest.mark.parametrize(
+    "variant", [16, 32, 64, 64 | 16, 8, 4, 128 | 64, 128 | 64 | 16]
+)
 def test_union_declared_options(variant):
-    # Bits 0-5: kernel U warps (0 = 8); bit 6: the warp-specialized kernel.
+    # Bits 0-5: kernel U warps (0 = 8); bit 6: the warp-specialized kernel; bit 7:
+    # PDL into it (with bit 6 only).
     assert pool_union.supported(replace(union_signature(), variant=variant))
 
 
@@ -623,9 +628,19 @@ def test_union_launch_caller_output_and_capture(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "variant,warps,ws", [(0, 8, False), (16, 16, False), (64, 8, True), (80, 16, True)]
+    "variant,warps,ws,ws_pdl",
+    [
+        (0, 8, False, None),
+        (16, 16, False, None),
+        (64, 8, True, False),
+        (80, 16, True, False),
+        (192, 8, True, True),
+        (208, 16, True, True),
+    ],
 )
-def test_union_launch_takes_the_declared_options(monkeypatch, variant, warps, ws):
+def test_union_launch_takes_the_declared_options(
+    monkeypatch, variant, warps, ws, ws_pdl
+):
     calls = []
     raw_union(
         monkeypatch,
@@ -638,6 +653,8 @@ def test_union_launch_takes_the_declared_options(monkeypatch, variant, warps, ws
     ((name, kw),) = calls
     assert name == ("ws" if ws else "union") and kw["union_warps"] == warps
     assert kw["splits"] == io.split_count and len(kw["workspace"]) == 8
+    # Only the warp-specialized wrapper takes ws_pdl; kernel 2's never sees it.
+    assert kw.get("ws_pdl") is ws_pdl
 
 
 def test_union_failed_launch_does_not_publish(monkeypatch):

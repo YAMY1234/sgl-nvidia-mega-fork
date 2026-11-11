@@ -48,7 +48,8 @@ from .pool_decode import LAST_KERNEL, LOG2E, _qsa_write_new_kv
 
 logger = logging.getLogger(__name__)
 
-# The source's default: no PDL into this kernel (its _PDL knob is not carried over).
+# The source's default: no PDL into this kernel; the provider's variant bit 7 (the
+# source's SGLANG_QSA_FP8_POOL_VERIFY_WS_PDL) passes ws_pdl=True.
 PDL = False
 RESCALE_LOG2 = 8.0
 _LOGGED_ROWS: set = set()
@@ -99,7 +100,9 @@ def choose_ws_splits(requests, kv_heads, sms):
     return max(1, min(4, sms // pairs))
 
 
-def _log_engaged(rows: int, width: int, splits: int, served: bool) -> None:
+def _log_engaged(
+    rows: int, width: int, splits: int, served: bool, pdl: bool = PDL
+) -> None:
     """One line per verify row count, printed at graph capture (the runner's engagement check)."""
     if rows in _LOGGED_ROWS:
         return
@@ -112,7 +115,7 @@ def _log_engaged(rows: int, width: int, splits: int, served: bool) -> None:
             width,
             requests,
             splits,
-            int(PDL),
+            int(pdl),
         )
     else:
         logger.info(
@@ -829,13 +832,15 @@ def qsa_pool_union_decode_ws(
     union_warps=8,
     pdl=True,
     write_new_kv=True,
+    ws_pdl=PDL,
     **launch,
 ):
     """union.qsa_pool_union_decode with kernel 2 warp-specialized; the same arguments, workspace and
     result. Shapes the kernel does not serve (see supported) take union.qsa_pool_union_decode
-    unchanged, with ``launch`` as its launch config."""
+    unchanged, with ``launch`` as its launch config. ``ws_pdl`` launches the warp-specialized
+    kernel with PDL (it waits on its predecessor after its setup)."""
     served = supported(q, k_cache, width)
-    _log_engaged(block_indices.shape[0], width, splits, served)
+    _log_engaged(block_indices.shape[0], width, splits, served, pdl and ws_pdl)
     if not served:
         return union.qsa_pool_union_decode(
             q,
@@ -936,5 +941,5 @@ def qsa_pool_union_decode_ws(
         l_buf,
         acc_buf,
         splits,
-        pdl=pdl and PDL,
+        pdl=pdl and ws_pdl,
     )

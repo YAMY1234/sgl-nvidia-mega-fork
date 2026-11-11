@@ -33,8 +33,9 @@ def check_tolerance(out, reference):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="explicit CUDA qualification")
 @pytest.mark.parametrize("rows", [64, 128, 416, 576])
-# Variant bits 0-5: kernel U warps (0 = 8); bit 6: the warp-specialized kernel 2.
-@pytest.mark.parametrize("variant", [0, 16, 64 | 16])
+# Variant bits 0-5: kernel U warps (0 = 8); bit 6: the warp-specialized kernel 2;
+# bit 7: PDL into it.
+@pytest.mark.parametrize("variant", [0, 16, 64 | 16, 128 | 64 | 16])
 def test_pool_union_tolerance(rows, variant, record_property):
     torch.manual_seed(942)
     device = "cuda"

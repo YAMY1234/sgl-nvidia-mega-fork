@@ -3,8 +3,9 @@
 
 The variant carries the source options the caller resolved: bits 0-5 kernel U's warp
 count (SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS; 0 is the source's 8; its output does not
-depend on it) and bit 6 the warp-specialized attention kernel
-(SGLANG_QSA_FP8_POOL_VERIFY_WS), whose split count the caller resolves.
+depend on it), bit 6 the warp-specialized attention kernel
+(SGLANG_QSA_FP8_POOL_VERIFY_WS), whose split count the caller resolves, and bit 7 (with
+bit 6 only) PDL into that kernel (SGLANG_QSA_FP8_POOL_VERIFY_WS_PDL; same math).
 """
 
 from dataclasses import fields
@@ -26,14 +27,20 @@ SGLANG_READS = {
 
 _UNION_WARPS_MASK = 0x3F
 _WS = 1 << 6
+_WS_PDL = 1 << 7
 
 
 def _options(variant):
-    """(kernel U warps, warp-specialized) of a declared variant, or None for an unknown one."""
+    """(kernel U warps, warp-specialized, PDL into it) of a declared variant, or None
+    for an unknown one."""
     warps = variant & _UNION_WARPS_MASK
-    if variant & ~(_UNION_WARPS_MASK | _WS) or warps not in (0, 1, 2, 4, 8, 16, 32):
+    if (
+        variant & ~(_UNION_WARPS_MASK | _WS | _WS_PDL)
+        or warps not in (0, 1, 2, 4, 8, 16, 32)
+        or (variant & _WS_PDL and not variant & _WS)
+    ):
         return None
-    return warps or 8, bool(variant & _WS)
+    return warps or 8, bool(variant & _WS), bool(variant & _WS_PDL)
 
 
 def supported(s):
@@ -71,7 +78,7 @@ def build(s):
 class PoolUnion:
     def __init__(self, signature):
         self.signature = signature
-        self._union_warps, self._ws = _options(signature.variant)
+        self._union_warps, self._ws, self._ws_pdl = _options(signature.variant)
         self._resources = {}
 
     def __call__(self, io):
@@ -172,12 +179,13 @@ class PoolUnion:
         )
         from ..qsa import pool_union_decode as raw
 
-        launch = raw.qsa_pool_union_decode
+        launch, options = raw.qsa_pool_union_decode, {}
         if self._ws:
             from ..qsa import pool_union_ws
 
             # Shapes it does not serve run kernel 2 with the same workspace and splits.
             launch = pool_union_ws.qsa_pool_union_decode_ws
+            options = {"ws_pdl": self._ws_pdl}
         launch(
             q,
             k,
@@ -203,5 +211,6 @@ class PoolUnion:
             pdl=True,
             write_new_kv=io.store_new_kv,
             union_warps=self._union_warps,
+            **options,
         )
         self._resources[key] = True

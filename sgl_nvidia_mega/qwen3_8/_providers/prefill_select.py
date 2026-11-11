@@ -5,8 +5,12 @@ The signature fixes the head geometry and bounds a row's compressed keys; the
 packed rows and the call's width are per-call shapes the caller sizes. The
 producer resolves the scale-fold and source gates. The variant carries the
 source options the caller resolved: bits 0-3 the top-k
-(SGLANG_QSA_PREFILL_FAST_SELECT_TOPK: 0 sampled, 1 onepass) and bit 4 the
-tensor-core scorer (SGLANG_QSA_PREFILL_SCORER_TC).
+(SGLANG_QSA_PREFILL_FAST_SELECT_TOPK: 0 sampled, 1 onepass), bit 4 the
+tensor-core scorer (SGLANG_QSA_PREFILL_SCORER_TC), bits 8-19 a wide logits
+budget in MiB (SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_LOGITS_MB, 0 for none) and
+bits 20-30 the call width from which it applies, in 256-key units
+(SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_MIN_KEYS). The caller's chunk plan must
+follow the same budget.
 """
 
 from sglang.kernels.plugin_kernels.nvidia.numeric import (
@@ -26,14 +30,36 @@ _LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
 _TOPK_IMPLS = ("sampled", "onepass")
 _TOPK_MASK = 0xF
 _SCORER_TC = 1 << 4
+_WIDE_MIB_SHIFT, _WIDE_MIB_MASK = 8, 0xFFF
+_WIDE_KEYS_SHIFT, _WIDE_KEYS_MASK, _WIDE_KEYS_UNIT = 20, 0x7FF, 256
+_KNOWN_BITS = (
+    _TOPK_MASK
+    | _SCORER_TC
+    | _WIDE_MIB_MASK << _WIDE_MIB_SHIFT
+    | _WIDE_KEYS_MASK << _WIDE_KEYS_SHIFT
+)
 
 
 def _options(variant):
-    """(top-k, tensor-core scorer) of a declared variant, or None for an unknown one."""
+    """(top-k, tensor-core scorer, wide budget bytes, wide from keys) of a declared
+    variant, or None for an unknown one."""
     topk = variant & _TOPK_MASK
-    if variant & ~(_TOPK_MASK | _SCORER_TC) or topk >= len(_TOPK_IMPLS):
+    wide_mib = variant >> _WIDE_MIB_SHIFT & _WIDE_MIB_MASK
+    wide_keys = (variant >> _WIDE_KEYS_SHIFT & _WIDE_KEYS_MASK) * _WIDE_KEYS_UNIT
+    if (
+        variant & ~_KNOWN_BITS
+        or topk >= len(_TOPK_IMPLS)
+        or bool(wide_mib) != bool(wide_keys)
+    ):
         return None
-    return _TOPK_IMPLS[topk], bool(variant & _SCORER_TC)
+    return _TOPK_IMPLS[topk], bool(variant & _SCORER_TC), wide_mib << 20, wide_keys
+
+
+def logits_budget(width, wide_bytes, wide_keys):
+    """The source budget rule: the wide budget for calls at least wide_keys wide."""
+    if wide_bytes and width >= wide_keys:
+        return wide_bytes
+    return _LOGITS_BUDGET_BYTES
 
 
 def supported(s):
@@ -66,7 +92,12 @@ def build(s):
 class PrefillSelect:
     def __init__(self, signature):
         self.signature = signature
-        self._topk_impl, self._scorer_tc = _options(signature.variant)
+        (
+            self._topk_impl,
+            self._scorer_tc,
+            self._wide_bytes,
+            self._wide_keys,
+        ) = _options(signature.variant)
         self._prepared = set()
 
     def __call__(self, io):
@@ -102,9 +133,8 @@ class PrefillSelect:
             or io.scorer_sms <= 0
         ):
             raise ValueError("fast prefill input differs from its declared layout")
-        if io.chunk_rows != raw.plan_chunk_rows(
-            rows, width, 2 * io.scorer_sms, _LOGITS_BUDGET_BYTES
-        ):
+        budget = logits_budget(width, self._wide_bytes, self._wide_keys)
+        if io.chunk_rows != raw.plan_chunk_rows(rows, width, 2 * io.scorer_sms, budget):
             raise ValueError("caller chunk plan differs from source policy")
         padded = (io.chunk_rows + 31) // 32 * 32
         work = (

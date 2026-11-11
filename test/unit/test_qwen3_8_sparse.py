@@ -387,6 +387,9 @@ def prefill_signature(**kw):
         dict(scalar_type=D.FP8_E4M3),
         dict(variant=2),
         dict(variant=32),
+        dict(variant=256 << 8),
+        dict(variant=96 << 20),
+        dict(variant=1 << 31),
         dict(ctas_per_group=128),
     ],
 )
@@ -394,8 +397,9 @@ def test_prefill_select_declaration_is_row_independent_and_exact(kw):
     from sgl_nvidia_mega.qwen3_8._providers import prefill_select
 
     assert providers.supported(prefill_signature())
-    # Bits 0-3: the top-k (1 one-pass); bit 4: the tensor-core scorer.
-    for variant in (1, 16, 17):
+    # Bits 0-3: the top-k (1 one-pass); bit 4: the tensor-core scorer; bits 8-19 and
+    # 20-30: a wide logits budget (MiB) and the width it starts at (256-key units).
+    for variant in (1, 16, 17, 256 << 8 | 96 << 20, 17 | 256 << 8 | 96 << 20):
         assert providers.supported(prefill_signature(variant=variant))
     assert providers.make_offer(prefill_signature(**kw)) is None
     assert not prefill_select.supported(prefill_signature(**kw))
@@ -478,6 +482,26 @@ def test_prefill_select_launches_with_call_width_and_capture_warmup(prefill_raw)
     assert [c for c in calls if c[0] == "select"] == [
         ("select", io, 8193, dict(scorer_tc=False, topk_impl="sampled"))
     ] * 2
+
+
+@pytest.mark.parametrize(
+    "variant,width,budget",
+    [
+        (0, 30000, 128),
+        (256 << 8 | 96 << 20, 24575, 128),
+        (256 << 8 | 96 << 20, 24576, 256),
+        (1 | 64 << 8 | 4 << 20, 8193, 64),
+    ],
+)
+def test_prefill_select_checks_the_caller_plan_against_the_declared_budget(
+    prefill_raw, variant, width, budget
+):
+    from sgl_nvidia_mega.qwen3_8._providers import prefill_select
+
+    calls, _ = prefill_raw
+    signature = prefill_signature(variant=variant, context_bound=32768)
+    prefill_select.build(signature)(prefill_io(width=width))
+    assert ("plan", 33, width, 296, budget << 20) in calls
 
 
 @pytest.mark.parametrize(

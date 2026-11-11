@@ -140,7 +140,7 @@ def supported(s):
             from ._providers.sparse import supported as sparse_supported
 
             return sparse_supported(s)
-        if op == NumericOperation.DIRECT_POOL_ATTENTION and s.variant in (1, 2):
+        if op == NumericOperation.DIRECT_POOL_ATTENTION and s.variant & ~4 in (1, 2):
             from ._providers.pool import supported as pool_supported
 
             return pool_supported(s)
@@ -232,7 +232,7 @@ def _cached_offer(signature):
             from ._providers.sparse import build
 
             run = build(signature)
-        elif signature.variant in (1, 2):
+        elif signature.variant & ~4 in (1, 2):
             from ._providers.pool import build
 
             run = build(signature)

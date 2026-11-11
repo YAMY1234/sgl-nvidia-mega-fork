@@ -16,6 +16,11 @@ SGLANG_READS = {
 }
 
 
+# Variant bit 2: the attention output gate rides the split-K merge (the source's
+# SGLANG_ENABLE_QSA_POOL_MERGE_GATE); bits 0-1: 1 = width-4 verify, 2 = decode.
+MERGE_GATE = 4
+
+
 def supported(s):
     return (
         isinstance(s, NumericSignature)
@@ -32,8 +37,8 @@ def supported(s):
         )
         == (24, 2, 256, 512, 4, ScalarType.BF16, 0, 0)
         and (
-            (s.variant == 1 and 4 <= s.rows <= 64 and s.rows % 4 == 0)
-            or (s.variant == 2 and 1 <= s.rows <= 64)
+            (s.variant & ~MERGE_GATE == 1 and 4 <= s.rows <= 64 and s.rows % 4 == 0)
+            or (s.variant & ~MERGE_GATE == 2 and 1 <= s.rows <= 64)
         )
     )
 
@@ -51,7 +56,8 @@ class PoolAttention:
         if not supported(signature):
             raise ValueError("unsupported TP1 pool signature")
         self.signature = signature
-        self.width = 4 if signature.variant == 1 else 1
+        self.width = 4 if signature.variant & ~MERGE_GATE == 1 else 1
+        self.gated = bool(signature.variant & MERGE_GATE)
         self._prepared = set()
         self._configs = {}
 
@@ -63,7 +69,7 @@ class PoolAttention:
         s = self.signature
         q, k, v = io.q, io.kv.k, io.kv.v
         nk, nv, loc = io.new_k, io.new_v, io.out_cache_loc
-        sel, out, scratch = io.selection, io.output, io.scratch_out
+        sel, out, scratch, gate = io.selection, io.output, io.scratch_out, io.gate
         integers = (
             loc,
             sel.full_slot_map,
@@ -72,8 +78,19 @@ class PoolAttention:
             sel.query_positions,
         )
         borrowed = (q, k, v, nk, nv, *integers, sel.selected_indices, out, scratch)
+        if self.gated:
+            borrowed += (gate,)
         if (
-            io.gate is not None
+            (gate is not None) != self.gated
+            or (
+                self.gated
+                and (
+                    not isinstance(gate, torch.Tensor)
+                    or gate.shape != (s.rows, 24, 256)
+                    or gate.dtype != torch.bfloat16
+                    or gate.stride(2) != 1
+                )
+            )
             or io.query_width != self.width
             or not isinstance(io.store_new_kv, bool)
             or q.shape != (s.rows, 24, 256)
@@ -226,6 +243,16 @@ class PoolAttention:
             sb,
             True,
             num_warps=2,
+            **(
+                dict(
+                    GATE=gate,
+                    GATE_STRIDE_ROW=gate.stride(0),
+                    GATE_STRIDE_HEAD=gate.stride(1),
+                    HAS_GATE=True,
+                )
+                if self.gated
+                else {}
+            ),
             launch_pdl=True,
         )
         # A failed launch never authorizes capture or a fallback after KV writes.

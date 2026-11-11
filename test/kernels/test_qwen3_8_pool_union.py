@@ -129,3 +129,84 @@ def test_pool_union_tolerance(rows, variant, record_property):
     record_property("max_abs", (out.double() - ref).abs().max().item())
     record_property("rel_l2", ((out.double() - ref).norm() / ref.norm()).item())
     check_tolerance(out, ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="explicit CUDA qualification")
+@pytest.mark.parametrize("rows,variant", [(4, 1), (64, 1), (1, 2), (48, 2)])
+def test_pool_merge_gate_is_the_separate_sigmoid_mul(rows, variant):
+    """Variant bit 2 (the source's SGLANG_ENABLE_QSA_POOL_MERGE_GATE): the merge
+    stores bf16(bf16(attn) * sigmoid(gate)), fused_sigmoid_mul's arithmetic."""
+    import triton
+    import triton.language as tl
+    from sglang.kernels.plugin_kernels.nvidia.numeric import DirectPoolAttentionIO
+    from sglang.srt.kernel_plugins.nvidia.pool_attention import pool_scratch_elements
+
+    from sgl_nvidia_mega.qwen3_8._providers import pool
+
+    @triton.jit
+    def sigmoid_mul(out, gate, row_stride, head_stride, D: tl.constexpr):
+        row, head = tl.program_id(0).to(tl.int64), tl.program_id(1)
+        d = tl.arange(0, D)
+        o = out + (row * tl.num_programs(1) + head) * D + d
+        g = tl.load(gate + row * row_stride + head * head_stride + d).to(tl.float32)
+        tl.store(o, (tl.load(o).to(tl.float32) * tl.sigmoid(g)).to(tl.bfloat16))
+
+    torch.manual_seed(7)
+    device, width = "cuda", 4 if variant == 1 else 1
+    requests, length = max(1, rows // width), 4096
+    q = torch.randn(rows, 24, 256, device=device, dtype=torch.bfloat16) * 0.25
+    k = torch.randn(requests * length + 1, 2, 256, device=device).bfloat16() * 0.25
+    v = torch.randn_like(k) * 0.25
+    table = torch.arange(1, requests * length + 1, device=device).reshape(
+        requests, length
+    )
+    req = torch.arange(requests, device=device).repeat_interleave(width)[:rows]
+    positions = 4000 + torch.arange(rows, device=device) % width
+    loc = table[req, positions]
+    idx = torch.randperm(990, device=device)[:512].int().expand(rows, -1).contiguous()
+    nk, nv = k[loc].contiguous(), v[loc].contiguous()
+    q_gate = torch.randn(rows, 24, 512, device=device, dtype=torch.bfloat16)
+    gate = q_gate[:, :, 256:]
+    sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    scratch = pool_scratch_elements(
+        rows,
+        sms,
+        kv_heads=2,
+        head_dim=256,
+        query_heads=24,
+        selected_count=512,
+        compress_ratio=4,
+    )
+    outputs = []
+    for bit, g in ((0, None), (pool.MERGE_GATE, gate)):
+        out = torch.empty_like(q)
+        io = DirectPoolAttentionIO(
+            q,
+            g,
+            nk,
+            nv,
+            loc,
+            KvTensors(k, v, None, None, 1),
+            DirectPoolSelection(table, req, idx, positions + 1, positions),
+            0.0625,
+            width,
+            True,
+            out,
+            torch.empty(scratch, device=device, dtype=torch.float32),
+        )
+        signature = NumericSignature(
+            O.DIRECT_POOL_ATTENTION,
+            rows,
+            24,
+            2,
+            256,
+            512,
+            4,
+            D.BF16,
+            variant=variant | bit,
+        )
+        pool.build(signature)(io)
+        outputs.append(out)
+    sigmoid_mul[(rows, 24)](outputs[0], gate, gate.stride(0), gate.stride(1), 256)
+    torch.cuda.synchronize()
+    assert torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16))

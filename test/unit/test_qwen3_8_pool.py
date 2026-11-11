@@ -226,6 +226,79 @@ def test_original_wrapper_exact_launch_abi(
     assert all(call[-1]["launch_pdl"] is True for call in state.calls)
 
 
+@pytest.mark.parametrize("rows,variant", [(4, 5), (64, 5), (1, 6), (64, 6)])
+def test_merge_gate_variants_are_supported(rows, variant):
+    s = signature(rows, variant)
+    assert providers.supported(s)
+    assert isinstance(providers.make_offer(s).run, pool.PoolAttention)
+
+
+@pytest.mark.parametrize("rows,variant", [(4, 4), (4, 7), (4, 8), (4, 13), (2, 5)])
+def test_merge_gate_needs_a_route_bit(rows, variant):
+    assert not providers.supported(signature(rows, variant))
+
+
+def gated(io, rows):
+    """The model's gate: a [rows, 24, 256] view of the interleaved Q+gate rows."""
+    q_gate = torch.empty((rows, 24, 512), dtype=torch.bfloat16)
+    return replace(io, gate=q_gate[:, :, 256:])
+
+
+@pytest.mark.parametrize("rows,variant", [(4, 1), (64, 1), (1, 2), (32, 2)])
+def test_merge_gate_launch_is_the_wrappers(monkeypatch, rows, variant):
+    raw, state = raw_spy(monkeypatch)
+    io = gated(view(rows, 4 if variant == 1 else 1), rows)
+    expected = raw.qsa_pool_sparse_decode(
+        io.q,
+        io.kv.k,
+        io.kv.v,
+        io.new_k,
+        io.new_v,
+        io.out_cache_loc,
+        io.selection.full_slot_map,
+        io.selection.row_requests,
+        io.selection.selected_indices,
+        io.selection.sequence_lengths,
+        io.selection.query_positions,
+        io.query_width,
+        io.scale,
+        out=io.output.view(rows, 6144),
+        workspace=io.scratch_out,
+        gate=io.gate,
+    )
+    calls = normalize(state.calls)
+    state.calls.clear()
+    assert pool.build(signature(rows, variant | pool.MERGE_GATE))(io) is None
+    assert normalize(state.calls) == calls
+    merge = state.calls[-1]
+    assert merge[0] == "merge" and merge[3]["HAS_GATE"] is True
+    assert merge[3]["GATE"] is io.gate
+    assert (merge[3]["GATE_STRIDE_ROW"], merge[3]["GATE_STRIDE_HEAD"]) == (
+        24 * 512,
+        512,
+    )
+    assert expected.data_ptr() == io.output.data_ptr()
+
+
+@pytest.mark.parametrize("case", ["missing", "unexpected", "shape", "dtype", "inner"])
+def test_merge_gate_refusal_before_any_write(monkeypatch, case):
+    _, state = raw_spy(monkeypatch)
+    io, variant = gated(view(), 4), 1 | pool.MERGE_GATE
+    if case == "missing":
+        io = replace(io, gate=None)
+    elif case == "unexpected":
+        variant = 1
+    elif case == "shape":
+        io = replace(io, gate=io.gate[:, :12])
+    elif case == "dtype":
+        io = replace(io, gate=io.gate.float())
+    else:
+        io = replace(io, gate=io.gate.transpose(1, 2).contiguous().transpose(1, 2))
+    with pytest.raises(ValueError):
+        pool.build(signature(4, variant))(io)
+    assert state.calls == []
+
+
 def test_changed_activation_capture_uses_warm_layout_no_owners(monkeypatch):
     _, state = raw_spy(monkeypatch)
     run = pool.build(signature())

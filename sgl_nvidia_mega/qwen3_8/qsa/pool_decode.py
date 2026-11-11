@@ -309,6 +309,10 @@ def _qsa_pool_merge(
     SPLITS: tl.constexpr,
     SB: tl.constexpr,
     USE_PDL: tl.constexpr,
+    GATE=None,
+    GATE_STRIDE_ROW=0,
+    GATE_STRIDE_HEAD=0,
+    HAS_GATE: tl.constexpr = False,
 ):
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -346,7 +350,21 @@ def _qsa_pool_merge(
         acc += tl.sum(a * w[:, None], 0)
     Ls = tl.sum(L, 0)
     out = tl.where(Ls > 0, acc / Ls, 0.0)
-    tl.store(O + row.to(tl.int64) * O_STRIDE + qh * D + d, out.to(O.dtype.element_ty))
+    if HAS_GATE:
+        # fused_sigmoid_mul's arithmetic on the stored value: bf16 output, fp32 sigmoid gate.
+        attn = out.to(O.dtype.element_ty).to(tl.float32)
+        g = tl.load(
+            GATE + row.to(tl.int64) * GATE_STRIDE_ROW + qh * GATE_STRIDE_HEAD + d
+        ).to(tl.float32)
+        result = attn * tl.sigmoid(g)
+        tl.store(
+            O + row.to(tl.int64) * O_STRIDE + qh * D + d,
+            result.to(O.dtype.element_ty),
+        )
+    else:
+        tl.store(
+            O + row.to(tl.int64) * O_STRIDE + qh * D + d, out.to(O.dtype.element_ty)
+        )
 
 
 _SMS = {}
@@ -415,6 +433,7 @@ def qsa_pool_sparse_decode(
     workspace=None,
     pdl=True,
     write_new_kv=True,
+    gate=None,
 ):
     """q [rows, QH, 256] bf16 (or [rows, QH*256]); k/v_cache [slots, H, 256];
     k/v_new [rows, H, 256] (row stride arbitrary, inner contiguous); loc [rows] int32;
@@ -513,6 +532,15 @@ def qsa_pool_sparse_decode(
     )
     if not fused_merge:
         sb = min(16, triton.next_power_of_2(splits))
+        gate_kw = {}
+        if gate is not None:
+            # [rows, q_heads, dim] view (any row/head stride), as fused_sigmoid_mul reads it.
+            gate_kw = dict(
+                GATE=gate,
+                GATE_STRIDE_ROW=gate.stride(0),
+                GATE_STRIDE_HEAD=gate.stride(1),
+                HAS_GATE=True,
+            )
         _qsa_pool_merge[(rows * qh,)](
             m_buf,
             l_buf,
@@ -527,6 +555,7 @@ def qsa_pool_sparse_decode(
             sb,
             pdl,
             num_warps=2,
+            **gate_kw,
             **pdl_kw,
         )
     return out

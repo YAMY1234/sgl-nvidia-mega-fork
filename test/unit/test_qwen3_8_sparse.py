@@ -386,6 +386,7 @@ def prefill_signature(**kw):
         dict(context_bound=131073),
         dict(scalar_type=D.FP8_E4M3),
         dict(variant=1),
+        dict(variant=32),
         dict(ctas_per_group=128),
     ],
 )
@@ -393,6 +394,8 @@ def test_prefill_select_declaration_is_row_independent_and_exact(kw):
     from sgl_nvidia_mega.qwen3_8._providers import prefill_select
 
     assert providers.supported(prefill_signature())
+    # Bit 4: the tensor-core scorer.
+    assert providers.supported(prefill_signature(variant=16))
     assert providers.make_offer(prefill_signature(**kw)) is None
     assert not prefill_select.supported(prefill_signature(**kw))
 
@@ -444,7 +447,7 @@ def prefill_raw(monkeypatch):
         calls.append(("plan", rows, width, slots, budget)) or rows
     )
     raw._topk_impl_for = lambda width, impl: "stock" if width <= 4096 else impl
-    raw.select_into = lambda io, width: calls.append(("select", io, width))
+    raw.select_into = lambda io, width, **kw: calls.append(("select", io, width, kw))
     monkeypatch.setitem(sys.modules, raw.__name__, raw)
     monkeypatch.setattr(package, "prefill_select", raw, raising=False)
     capturing = SimpleNamespace(value=False)
@@ -471,7 +474,18 @@ def test_prefill_select_launches_with_call_width_and_capture_warmup(prefill_raw)
     with pytest.raises(RuntimeError, match="warmed before capture"):
         run(narrow)
     assert ("plan", 33, 8193, 296, 128 * 1024 * 1024) in calls
-    assert [c for c in calls if c[0] == "select"] == [("select", io, 8193)] * 2
+    assert [c for c in calls if c[0] == "select"] == [
+        ("select", io, 8193, dict(scorer_tc=False))
+    ] * 2
+
+
+def test_prefill_select_passes_the_declared_scorer_to_the_launch(prefill_raw):
+    from sgl_nvidia_mega.qwen3_8._providers import prefill_select
+
+    calls, _ = prefill_raw
+    io = prefill_io()
+    assert prefill_select.build(prefill_signature(variant=16))(io) is None
+    assert calls[-1] == ("select", io, 8193, dict(scorer_tc=True))
 
 
 @pytest.mark.parametrize(
@@ -568,3 +582,37 @@ def test_prefill_select_raw_chunks_pad_from_caller_scratch(monkeypatch, rows):
         assert torch.all(s[tail:] == starts[-1]) and torch.all(
             e[tail:] == starts[-1] + 16
         )
+
+
+@pytest.mark.parametrize("covered", [False, True])
+def test_prefill_select_raw_scores_with_the_tensor_core_scorer(monkeypatch, covered):
+    import sgl_nvidia_mega.qwen3_8.qsa as package
+
+    fake = ModuleType(package.__name__ + ".kernel")
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    monkeypatch.setattr(package, "kernel", fake, raising=False)
+    io = prefill_io(64, width=16, chunk=32)
+    stock, tc = [], []
+
+    def score_tc(q, keys, logits, starts, ends, width, sms):
+        tc.append((q.shape[0], logits.shape[0], width, sms))
+        return covered
+
+    scope = raw_functions(
+        ("select_into",),
+        dict(
+            __package__=package.__name__,
+            CONFIG=(128, 512, 2, "Square", 1),
+            score_chunk=lambda q, *a, **kw: stock.append(q.shape[0]),
+            _score_tc=score_tc,
+            _topk_launcher=lambda impl: lambda *a: None,
+            _topk_impl_for=lambda *a: "sampled",
+            _expand_into=lambda *a: None,
+        ),
+    )
+    scope["select_into"](io, 16)
+    assert stock == [32, 32] and tc == []
+    scope["select_into"](io, 16, scorer_tc=True)
+    # A chunk the tensor-core scorer does not cover keeps the source scorer.
+    assert tc == [(32, 32, 16, 148)] * 2
+    assert stock == [32, 32] + ([] if covered else [32, 32])

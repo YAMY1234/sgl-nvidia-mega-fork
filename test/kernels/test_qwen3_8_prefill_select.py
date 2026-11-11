@@ -103,3 +103,30 @@ def test_prefill_select_ordered_bits(rows, width, ties):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, reference)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="SM100-family tcgen05",
+)
+@pytest.mark.parametrize("rows,width", [(32, 4096), (96, 8193)])
+def test_prefill_scorer_tc_matches_the_source_scorer(rows, width):
+    # The tensor-core variant (bit 4) is the source scorer up to the hardware's
+    # 128-wide dot-product sum, on every cell the top-k reads.
+    from sgl_nvidia_mega.qwen3_8.qsa import prefill_scorer_tc
+    from sgl_nvidia_mega.qwen3_8.qsa import prefill_select as raw
+
+    torch.manual_seed(7)
+    q = torch.randn(rows, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(width * 2, 128, device="cuda", dtype=torch.bfloat16)
+    starts = (torch.arange(rows, device="cuda", dtype=torch.int32) % 2) * width
+    ends = starts + torch.linspace(1, width, rows, device="cuda").int()
+    sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    expected = torch.full((rows, width), float("nan"), device="cuda")
+    actual = expected.clone()
+    tag = torch.empty(4096, device="cuda", dtype=torch.int32)
+    raw.score_chunk(q, k, expected, starts, ends, width, split_tag=tag, sms=sms)
+    assert prefill_scorer_tc.applies(q, k)
+    prefill_scorer_tc.score(q, k, actual, starts, ends, width, sms)
+    read = torch.arange(width, device="cuda")[None, :] < (ends - starts)[:, None]
+    torch.testing.assert_close(actual[read], expected[read], rtol=1e-5, atol=1e-5)

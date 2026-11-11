@@ -3,7 +3,9 @@
 
 The signature fixes the head geometry and bounds a row's compressed keys; the
 packed rows and the call's width are per-call shapes the caller sizes. The
-producer resolves the scale-fold and source gates.
+producer resolves the scale-fold and source gates. The variant carries the
+source options the caller resolved: bit 4 is the tensor-core scorer
+(SGLANG_QSA_PREFILL_SCORER_TC).
 """
 
 from sglang.kernels.plugin_kernels.nvidia.numeric import (
@@ -20,6 +22,14 @@ SGLANG_READS = {
     ),
 }
 _LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+_SCORER_TC = 1 << 4
+
+
+def _options(variant):
+    """(tensor-core scorer,) of a declared variant, or None for an unknown one."""
+    if variant & ~_SCORER_TC:
+        return None
+    return (bool(variant & _SCORER_TC),)
 
 
 def supported(s):
@@ -35,11 +45,11 @@ def supported(s):
             s.compress_ratio,
             s.scalar_type,
             s.rotary_dim,
-            s.variant,
             s.ctas_per_group,
         )
-        == (0, 4, 1, 128, 512, 4, ScalarType.BF16, 0, 0, 0)
+        == (0, 4, 1, 128, 512, 4, ScalarType.BF16, 0, 0)
         and 0 < s.context_bound <= 131072
+        and _options(s.variant) is not None
     )
 
 
@@ -52,6 +62,7 @@ def build(s):
 class PrefillSelect:
     def __init__(self, signature):
         self.signature = signature
+        (self._scorer_tc,) = _options(signature.variant)
         self._prepared = set()
 
     def __call__(self, io):
@@ -110,5 +121,5 @@ class PrefillSelect:
         key = q.device, raw._topk_impl_for(width, "sampled")
         if key not in self._prepared and torch.cuda.is_current_stream_capturing():
             raise RuntimeError("fast prefill layout must be warmed before capture")
-        raw.select_into(io, width)
+        raw.select_into(io, width, scorer_tc=self._scorer_tc)
         self._prepared.add(key)

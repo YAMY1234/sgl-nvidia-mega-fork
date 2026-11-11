@@ -224,7 +224,17 @@ def _expand_into(
     )
 
 
-def select_into(io, width, block_topk=512, ratio=4):
+def _score_tc(q, keys_2d, logits, starts, ends, width, sms):
+    """The tensor-core scorer into ``logits``; False when it does not cover the chunk."""
+    from . import prefill_scorer_tc
+
+    if not prefill_scorer_tc.applies(q, keys_2d):
+        return False
+    prefill_scorer_tc.score(q, keys_2d, logits, starts, ends, width, sms)
+    return True
+
+
+def select_into(io, width, block_topk=512, ratio=4, scorer_tc=False):
     from . import kernel as qsa_kernel
 
     chunk = io.chunk_rows
@@ -248,17 +258,21 @@ def select_into(io, width, block_topk=512, ratio=4):
             epad[:n].copy_(ends)
             epad[n:].copy_(ends[-1:].expand(pad))
             q, starts, ends = qpad, spad, epad
-        score_chunk(
-            q,
-            io.compressed_keys[:, 0],
-            io.logits_out[: n + pad],
-            starts,
-            ends,
-            width,
-            CONFIG,
-            split_tag=io.split_tag,
-            sms=io.scorer_sms,
-        )
+        keys, logits = io.compressed_keys[:, 0], io.logits_out[: n + pad]
+        if not (
+            scorer_tc and _score_tc(q, keys, logits, starts, ends, width, io.scorer_sms)
+        ):
+            score_chunk(
+                q,
+                keys,
+                logits,
+                starts,
+                ends,
+                width,
+                CONFIG,
+                split_tag=io.split_tag,
+                sms=io.scorer_sms,
+            )
         topk(
             io.logits_out[:n],
             io.zero_offsets[:n],

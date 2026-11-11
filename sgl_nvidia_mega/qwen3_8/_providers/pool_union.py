@@ -3,7 +3,8 @@
 
 The variant carries the source options the caller resolved: bits 0-5 kernel U's warp
 count (SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS; 0 is the source's 8; its output does not
-depend on it).
+depend on it) and bit 6 the warp-specialized attention kernel
+(SGLANG_QSA_FP8_POOL_VERIFY_WS), whose split count the caller resolves.
 """
 
 from dataclasses import fields
@@ -24,14 +25,15 @@ SGLANG_READS = {
 
 
 _UNION_WARPS_MASK = 0x3F
+_WS = 1 << 6
 
 
 def _options(variant):
-    """(kernel U warps,) of a declared variant, or None for an unknown one."""
+    """(kernel U warps, warp-specialized) of a declared variant, or None for an unknown one."""
     warps = variant & _UNION_WARPS_MASK
-    if variant & ~_UNION_WARPS_MASK or warps not in (0, 1, 2, 4, 8, 16, 32):
+    if variant & ~(_UNION_WARPS_MASK | _WS) or warps not in (0, 1, 2, 4, 8, 16, 32):
         return None
-    return (warps or 8,)
+    return warps or 8, bool(variant & _WS)
 
 
 def supported(s):
@@ -69,7 +71,7 @@ def build(s):
 class PoolUnion:
     def __init__(self, signature):
         self.signature = signature
-        (self._union_warps,) = _options(signature.variant)
+        self._union_warps, self._ws = _options(signature.variant)
         self._resources = {}
 
     def __call__(self, io):
@@ -170,7 +172,13 @@ class PoolUnion:
         )
         from ..qsa import pool_union_decode as raw
 
-        raw.qsa_pool_union_decode(
+        launch = raw.qsa_pool_union_decode
+        if self._ws:
+            from ..qsa import pool_union_ws
+
+            # Shapes it does not serve run kernel 2 with the same workspace and splits.
+            launch = pool_union_ws.qsa_pool_union_decode_ws
+        launch(
             q,
             k,
             v,

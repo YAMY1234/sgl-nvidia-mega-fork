@@ -460,7 +460,7 @@ def test_union_supported_rows(rows):
         dict(kv_heads=1),
         dict(scalar_type=D.FP8_E4M3),
         dict(variant=3),
-        dict(variant=1 << 6),
+        dict(variant=1 << 7),
         dict(context_bound=1),
         dict(rotary_dim=1),
         dict(rows=True),
@@ -471,9 +471,9 @@ def test_union_refusal(change):
     assert not pool_union.supported(replace(union_signature(), **change))
 
 
-@pytest.mark.parametrize("variant", [16, 32, 8, 4])
+@pytest.mark.parametrize("variant", [16, 32, 64, 64 | 16, 8, 4])
 def test_union_declared_options(variant):
-    # Bits 0-5: kernel U warps (0 = 8).
+    # Bits 0-5: kernel U warps (0 = 8); bit 6: the warp-specialized kernel.
     assert pool_union.supported(replace(union_signature(), variant=variant))
 
 
@@ -512,13 +512,17 @@ def union_view():
     )
 
 
-def raw_union(monkeypatch, launch):
+def raw_union(monkeypatch, launch, ws_launch=None):
     import sgl_nvidia_mega.qwen3_8.qsa as package
 
     module = ModuleType(package.__name__ + ".pool_union_decode")
     module.qsa_pool_union_decode = launch
     monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(package, "pool_union_decode", module, raising=False)
+    ws = ModuleType(package.__name__ + ".pool_union_ws")
+    ws.qsa_pool_union_decode_ws = ws_launch or launch
+    monkeypatch.setitem(sys.modules, ws.__name__, ws)
+    monkeypatch.setattr(package, "pool_union_ws", ws, raising=False)
 
 
 def test_union_launch_caller_output_and_capture(monkeypatch):
@@ -545,10 +549,16 @@ def test_union_launch_caller_output_and_capture(monkeypatch):
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("variant,warps,ws", [(0, 8, False), (16, 16, False)])
+@pytest.mark.parametrize(
+    "variant,warps,ws", [(0, 8, False), (16, 16, False), (64, 8, True), (80, 16, True)]
+)
 def test_union_launch_takes_the_declared_options(monkeypatch, variant, warps, ws):
     calls = []
-    raw_union(monkeypatch, lambda *a, **kw: calls.append(("union", kw)))
+    raw_union(
+        monkeypatch,
+        lambda *a, **kw: calls.append(("union", kw)),
+        lambda *a, **kw: calls.append(("ws", kw)),
+    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     io = union_view()
     pool_union.build(replace(union_signature(), variant=variant))(io)

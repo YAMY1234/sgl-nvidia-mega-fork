@@ -33,7 +33,9 @@ def check_tolerance(out, reference):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="explicit CUDA qualification")
 @pytest.mark.parametrize("rows", [64, 128, 416, 576])
-def test_pool_union_tolerance(rows, record_property):
+# Variant bits 0-5: kernel U warps (0 = 8); bit 6: the warp-specialized kernel 2.
+@pytest.mark.parametrize("variant", [0, 16, 64 | 16])
+def test_pool_union_tolerance(rows, variant, record_property):
     torch.manual_seed(942)
     device = "cuda"
     width = 4
@@ -67,9 +69,14 @@ def test_pool_union_tolerance(rows, record_property):
     out = torch.empty_like(q)
     from sglang.srt.kernel_plugins.nvidia.qsa_union import workspace_plan
 
-    splits, ni, nf = workspace_plan(
-        rows, torch.cuda.get_device_properties(q.device).multi_processor_count
-    )
+    sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    splits, ni, nf = workspace_plan(rows, sms)
+    if variant & 64:
+        from sgl_nvidia_mega.qwen3_8.qsa.pool_union_ws import choose_ws_splits
+
+        # The caller resolves the warp-specialized kernel's own split count.
+        splits = choose_ws_splits(requests, 2, sms)
+        nf = requests * 2 * splits * 64 * 258
     io = PoolUnionAttentionIO(
         q,
         None,
@@ -87,7 +94,9 @@ def test_pool_union_tolerance(rows, record_property):
         splits,
     )
     run = build(
-        NumericSignature(O.POOL_UNION_ATTENTION, rows, 24, 2, 256, 512, 4, D.BF16)
+        NumericSignature(
+            O.POOL_UNION_ATTENTION, rows, 24, 2, 256, 512, 4, D.BF16, variant=variant
+        )
     )
     run(io)
     torch.cuda.synchronize()

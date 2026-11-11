@@ -21,7 +21,10 @@ def supported(s):
     return isinstance(s, GdnSignature) and (
         s.operation == NumericOperation.GDN_VERIFY_GLUE
         and s.variant == 0
-        and s.rows in (8, 12, 16)
+        # 2..8 requests: the grid is one program per (request, value head); SGLang
+        # declares rows up to its SGLANG_GDN_FUSED_VERIFY_GLUE_MAX_BS (default 4).
+        and 8 <= s.rows <= 32
+        and s.rows % 4 == 0
         and (s.key_heads, s.value_heads) in ((4, 12), (16, 48))
         and s.key_dim == s.value_dim == 128
         and s.tokens_per_request == 4

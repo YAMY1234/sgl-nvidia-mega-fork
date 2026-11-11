@@ -53,8 +53,8 @@ def test_unapproved_raw_or_TP1_geometry_has_no_offer(rows, hk, hv, variant):
         (O.GDN_FRONT, 16, 4, 12, 1),
         (O.GDN_FRONT, 16, 4, 12, 2),
         (O.GDN_FRONT, 16, 4, 12, 3),
-        (O.GDN_VERIFY_GLUE, 32, 4, 12, 0),
-        (O.GDN_VERIFY_GLUE, 32, 16, 48, 0),
+        (O.GDN_VERIFY_GLUE, 36, 4, 12, 0),
+        (O.GDN_VERIFY_GLUE, 36, 16, 48, 0),
     ],
 )
 def test_no_M32_front_glue_or_changed_front_family(operation, rows, hk, hv, variant):

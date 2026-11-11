@@ -200,7 +200,8 @@ def test_original_full_abi_and_store_modes(monkeypatch, m, h, hv, norm, mode, dt
     "field,value",
     [
         ("rows", 4),
-        ("rows", 32),
+        ("rows", 10),
+        ("rows", 36),
         ("key_dim", 64),
         ("value_dim", 64),
         ("key_heads", 8),
@@ -214,6 +215,14 @@ def test_original_full_abi_and_store_modes(monkeypatch, m, h, hv, norm, mode, dt
 def test_unsupported_signature_stays_stock(field, value):
     bad = replace(signature(), **{field: value})
     assert not providers.supported(bad) and providers.make_offer(bad) is None
+
+
+@pytest.mark.parametrize("m", [8, 12, 16, 20, 24, 28, 32])
+@pytest.mark.parametrize("h,hv", [(4, 12), (16, 48)])
+def test_two_to_eight_requests_are_one_launch(m, h, hv):
+    """The source's SGLANG_GDN_FUSED_VERIFY_GLUE_MAX_BS reaches 8 requests; the grid is
+    one program per (request, value head), so only the grid grows."""
+    assert providers.supported(signature(m, h, hv))
 
 
 @pytest.mark.parametrize(

@@ -425,7 +425,10 @@ def test_unknown_operation_wrong_type_and_slot_off(monkeypatch):
         (O.GDN_FRONT, 32, 0, 4, 2560, 1, 1, False),
         (O.GDN_VERIFY_GLUE, 16, 0, 1, 1024, 0, 0, True),
         (O.GDN_VERIFY_GLUE, 16, 0, 4, 2560, 1, 1, False),
-        (O.GDN_VERIFY_GLUE, 32, 0, 1, 2560, 1, 1, False),
+        (O.GDN_VERIFY_GLUE, 32, 0, 1, 2560, 1, 1, True),
+        (O.GDN_VERIFY_GLUE, 20, 0, 1, 2560, 0, 0, True),
+        (O.GDN_VERIFY_GLUE, 32, 0, 4, 2560, 0, 0, False),
+        (O.GDN_VERIFY_GLUE, 36, 0, 1, 2560, 0, 0, False),
     ],
 )
 def test_gdn_projection_and_recurrence_source_envelopes(

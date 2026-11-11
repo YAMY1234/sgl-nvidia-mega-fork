@@ -18,6 +18,9 @@ SGLANG_READS = {
 }
 
 
+COLUMN_CHUNKS = (128, 256, 512, 1024)
+
+
 def supported(signature):
     return (
         isinstance(signature, FinalizePermutedSignature)
@@ -30,7 +33,11 @@ def supported(signature):
         and signature.num_warps in (8, 16)
         and type(signature.use_pdl) is int
         and signature.use_pdl in (0, 1)
-        and signature.variant == 0
+        # Variant: the column chunk of a (row, chunk) grid at 1..64 rows; 0 is one program per row.
+        and (
+            signature.variant == 0
+            or (signature.variant in COLUMN_CHUNKS and 0 < signature.rows <= 64)
+        )
     )
 
 
@@ -46,12 +53,18 @@ class _FinalizePermuted:
 
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("native permuted finalize must bind before capture")
-        from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.elementwise import (
-            _fused_finalize_gate_sigmoid_mul_add_kernel,
-        )
+        import importlib
 
+        elementwise = importlib.import_module(
+            "sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.elementwise"
+        )
         self.signature = signature
-        self._kernel = _fused_finalize_gate_sigmoid_mul_add_kernel
+        self._kernel = getattr(
+            elementwise,
+            "_fused_finalize_gate_sigmoid_mul_add_chunked_kernel"
+            if signature.variant
+            else "_fused_finalize_gate_sigmoid_mul_add_kernel",
+        )
         self._weight_dtype = (
             torch.bfloat16
             if signature.weight_scalar_type == ScalarType.BF16
@@ -135,7 +148,11 @@ class _FinalizePermuted:
                 "native permuted finalize ABI must warm eagerly before capture"
             )
         pdl = {"launch_pdl": True} if s.use_pdl else {}
-        self._kernel[(m,)](
+        # A column chunk keeps each element's arithmetic and the row's gate reduction;
+        # only the grid changes.
+        chunk = {"CHUNK": s.variant} if s.variant else {}
+        grid = (m, -(-h // s.variant)) if s.variant else (m,)
+        self._kernel[grid](
             io.hidden,
             io.gate_weight,
             io.shared,
@@ -149,6 +166,7 @@ class _FinalizePermuted:
             BLOCK_SIZE=4096,
             USE_PDL=bool(s.use_pdl),
             num_warps=s.num_warps,
+            **chunk,
             **pdl,
         )
         if not capturing:

@@ -61,14 +61,15 @@ def setup(monkeypatch):
     )
     raw = ModuleType("sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.elementwise")
     raw._fused_finalize_gate_sigmoid_mul_add_kernel = launch = Launch()
+    raw._fused_finalize_gate_sigmoid_mul_add_chunked_kernel = chunked = Launch()
     monkeypatch.setitem(sys.modules, raw.__name__, raw)
     monkeypatch.setattr(providers, "numeric_registry", NumericRegistry())
     providers.make_offer.cache_clear()
-    yield SimpleNamespace(state=state, launch=launch)
+    yield SimpleNamespace(state=state, launch=launch, chunked=chunked)
     providers.make_offer.cache_clear()
 
 
-def signature(rows=4, weight_dtype=torch.bfloat16, warps=16, pdl=True):
+def signature(rows=4, weight_dtype=torch.bfloat16, warps=16, pdl=True, variant=0):
     return FinalizePermutedSignature(
         O.FINALIZE_PERMUTED_SHARED,
         rows,
@@ -78,6 +79,7 @@ def signature(rows=4, weight_dtype=torch.bfloat16, warps=16, pdl=True):
         D.BF16 if weight_dtype == torch.bfloat16 else D.FP32,
         num_warps=warps,
         use_pdl=int(pdl),
+        variant=variant,
     )
 
 
@@ -477,3 +479,33 @@ def test_bool_must_not_alias_cached_integer_offer(setup, value):
     assert bad == good and not providers.supported(bad)
     assert providers.make_offer(bad) is None
     assert providers.make_offer(good) is offer
+
+
+@pytest.mark.parametrize("chunk", (128, 256, 512, 1024))
+@pytest.mark.parametrize("rows", (1, 16, 64))
+def test_column_chunk_variant_launches_the_chunked_grid(setup, chunk, rows):
+    s = signature(rows, variant=chunk)
+    assert providers.supported(s)
+    io = make_io(rows)
+    offer = providers.register_signatures((s,))[0]
+    assert offer.run(io) is None
+    assert not setup.launch.calls
+    ((grid, args, kwargs),) = setup.chunked.calls
+    assert grid == (rows, -(-2560 // chunk))
+    assert args[7] == 2560
+    assert kwargs == dict(
+        hidden_dim=2560,
+        TOP_K=10,
+        BLOCK_SIZE=4096,
+        USE_PDL=True,
+        num_warps=16,
+        CHUNK=chunk,
+        launch_pdl=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "rows,chunk", ((0, 1024), (65, 1024), (1024, 512), (4, 64), (4, 2048), (4, 1))
+)
+def test_column_chunk_only_at_small_rows_and_listed_widths(setup, rows, chunk):
+    assert not providers.supported(signature(rows, variant=chunk))

@@ -46,6 +46,7 @@ def caller_io(q, k, starts, ends, positions, seqlens, out, width):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="explicit CUDA qualification")
+@pytest.mark.parametrize("variant", [0, 1])  # sampled, one-pass top-k
 @pytest.mark.parametrize(
     "rows,width,ties",
     [
@@ -56,7 +57,7 @@ def caller_io(q, k, starts, ends, positions, seqlens, out, width):
         (2049, 8193, False),
     ],
 )
-def test_prefill_select_ordered_bits(rows, width, ties):
+def test_prefill_select_ordered_bits(rows, width, ties, variant):
     from sglang.srt.environ import envs
     from sglang.srt.layers.attention.qsa.kernel import (
         expand_qsa_block_indices,
@@ -88,7 +89,16 @@ def test_prefill_select_ordered_bits(rows, width, ties):
     io = caller_io(q, k, starts, ends, positions, seqlens, out, width)
     run = build(
         NumericSignature(
-            O.PREFILL_SELECT, 0, 4, 1, 128, 512, 4, D.BF16, context_bound=width
+            O.PREFILL_SELECT,
+            0,
+            4,
+            1,
+            128,
+            512,
+            4,
+            D.BF16,
+            context_bound=width,
+            variant=variant,
         )
     )
     for _ in range(2):

@@ -385,7 +385,7 @@ def prefill_signature(**kw):
         dict(context_bound=0),
         dict(context_bound=131073),
         dict(scalar_type=D.FP8_E4M3),
-        dict(variant=1),
+        dict(variant=2),
         dict(variant=32),
         dict(ctas_per_group=128),
     ],
@@ -394,8 +394,9 @@ def test_prefill_select_declaration_is_row_independent_and_exact(kw):
     from sgl_nvidia_mega.qwen3_8._providers import prefill_select
 
     assert providers.supported(prefill_signature())
-    # Bit 4: the tensor-core scorer.
-    assert providers.supported(prefill_signature(variant=16))
+    # Bits 0-3: the top-k (1 one-pass); bit 4: the tensor-core scorer.
+    for variant in (1, 16, 17):
+        assert providers.supported(prefill_signature(variant=variant))
     assert providers.make_offer(prefill_signature(**kw)) is None
     assert not prefill_select.supported(prefill_signature(**kw))
 
@@ -475,17 +476,27 @@ def test_prefill_select_launches_with_call_width_and_capture_warmup(prefill_raw)
         run(narrow)
     assert ("plan", 33, 8193, 296, 128 * 1024 * 1024) in calls
     assert [c for c in calls if c[0] == "select"] == [
-        ("select", io, 8193, dict(scorer_tc=False))
+        ("select", io, 8193, dict(scorer_tc=False, topk_impl="sampled"))
     ] * 2
 
 
-def test_prefill_select_passes_the_declared_scorer_to_the_launch(prefill_raw):
+@pytest.mark.parametrize(
+    "variant,options",
+    [
+        (16, dict(scorer_tc=True, topk_impl="sampled")),
+        (1, dict(scorer_tc=False, topk_impl="onepass")),
+        (17, dict(scorer_tc=True, topk_impl="onepass")),
+    ],
+)
+def test_prefill_select_passes_the_declared_options_to_the_launch(
+    prefill_raw, variant, options
+):
     from sgl_nvidia_mega.qwen3_8._providers import prefill_select
 
     calls, _ = prefill_raw
     io = prefill_io()
-    assert prefill_select.build(prefill_signature(variant=16))(io) is None
-    assert calls[-1] == ("select", io, 8193, dict(scorer_tc=True))
+    assert prefill_select.build(prefill_signature(variant=variant))(io) is None
+    assert calls[-1] == ("select", io, 8193, options)
 
 
 @pytest.mark.parametrize(
@@ -616,3 +627,32 @@ def test_prefill_select_raw_scores_with_the_tensor_core_scorer(monkeypatch, cove
     # A chunk the tensor-core scorer does not cover keeps the source scorer.
     assert tc == [(32, 32, 16, 148)] * 2
     assert stock == [32, 32] + ([] if covered else [32, 32])
+
+
+@pytest.mark.parametrize("impl", ["sampled", "onepass"])
+def test_prefill_select_raw_one_pass_flags_use_the_starts_scratch(monkeypatch, impl):
+    import sgl_nvidia_mega.qwen3_8.qsa as package
+
+    fake = ModuleType(package.__name__ + ".kernel")
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    monkeypatch.setattr(package, "kernel", fake, raising=False)
+    io = prefill_io(40, width=16, chunk=32)
+    launched = []
+
+    def topk(logits, zeros, output, lengths, *flags):
+        launched.append((impl, logits.shape[0], [f.data_ptr() for f in flags]))
+
+    scope = raw_functions(
+        ("select_into",),
+        dict(
+            __package__=package.__name__,
+            CONFIG=(128, 512, 2, "Square", 1),
+            score_chunk=lambda *a, **kw: None,
+            _topk_launcher=lambda name: topk,
+            _topk_impl_for=lambda width, name: name,
+            _expand_into=lambda *a: None,
+        ),
+    )
+    scope["select_into"](io, 16, topk_impl=impl)
+    scratch = [io.starts_scratch_out.data_ptr()] if impl == "onepass" else []
+    assert launched == [(impl, 32, scratch), (impl, 8, scratch)]

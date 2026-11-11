@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Audited a29 BF16 scorer and exact ordered sampled top-k; source math retained."""
+"""Audited a29 BF16 scorer and exact ordered sampled / one-pass top-k; source math retained."""
 
 import functools
 
@@ -170,7 +170,9 @@ def score_chunk(
 def _topk_impl_for(width: int, impl: str) -> str:
     # No row is longer than the width; rows of 4096 or fewer keys take fast_topk's own
     # select inside qsa_prefill_topk anyway, under its 32-register cap (about 5% slower).
-    return "stock" if impl == "sampled" and width <= _SAMPLED_MIN_KEYS else impl
+    if impl in ("sampled", "onepass") and width <= _SAMPLED_MIN_KEYS:
+        return "stock"
+    return impl
 
 
 @functools.lru_cache(maxsize=None)
@@ -182,6 +184,15 @@ def _topk_launcher(impl: str):
         return _jit_fast_topk_module(512, False).fast_topk
 
     args = make_cpp_args(is_arch_support_pdl())
+    if impl == "onepass":
+        # Also takes per-row flags (int32 [rows] scratch) of the rows its second,
+        # 1024-thread launch serves.
+        return load_jit(
+            "qsa_topk_onepass",
+            *args,
+            cuda_files=["elementwise/qsa_topk_onepass.cuh"],
+            cuda_wrappers=[("topk", f"QsaTopKOnePassKernel<{args}>::run")],
+        ).topk
     return load_jit(
         "qsa_prefill_topk",
         *args,
@@ -234,12 +245,15 @@ def _score_tc(q, keys_2d, logits, starts, ends, width, sms):
     return True
 
 
-def select_into(io, width, block_topk=512, ratio=4, scorer_tc=False):
+def select_into(
+    io, width, block_topk=512, ratio=4, scorer_tc=False, topk_impl="sampled"
+):
     from . import kernel as qsa_kernel
 
     chunk = io.chunk_rows
     rows = io.query.shape[0]
-    topk = _topk_launcher(_topk_impl_for(width, "sampled"))
+    impl = _topk_impl_for(width, topk_impl)
+    topk = _topk_launcher(impl)
     for r0 in range(0, rows, chunk):
         r1 = min(rows, r0 + chunk)
         n = r1 - r0
@@ -273,11 +287,15 @@ def select_into(io, width, block_topk=512, ratio=4, scorer_tc=False):
                 split_tag=io.split_tag,
                 sms=io.scorer_sms,
             )
+        # The one-pass flags go to the starts scratch: the chunk's scorer, queued
+        # before it on this stream, is its only reader.
+        flags = (io.starts_scratch_out[:n],) if impl == "onepass" else ()
         topk(
             io.logits_out[:n],
             io.zero_offsets[:n],
             io.block_indices_out[r0:r1],
             io.row_lengths[r0:r1],
+            *flags,
         )
     _expand_into(
         qsa_kernel,

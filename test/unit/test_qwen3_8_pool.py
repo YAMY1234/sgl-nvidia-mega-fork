@@ -459,7 +459,8 @@ def test_union_supported_rows(rows):
         dict(query_heads=6),
         dict(kv_heads=1),
         dict(scalar_type=D.FP8_E4M3),
-        dict(variant=1),
+        dict(variant=3),
+        dict(variant=1 << 6),
         dict(context_bound=1),
         dict(rotary_dim=1),
         dict(rows=True),
@@ -468,6 +469,12 @@ def test_union_supported_rows(rows):
 )
 def test_union_refusal(change):
     assert not pool_union.supported(replace(union_signature(), **change))
+
+
+@pytest.mark.parametrize("variant", [16, 32, 8, 4])
+def test_union_declared_options(variant):
+    # Bits 0-5: kernel U warps (0 = 8).
+    assert pool_union.supported(replace(union_signature(), variant=variant))
 
 
 class CudaMetadata(torch.Tensor):
@@ -536,6 +543,18 @@ def test_union_launch_caller_output_and_capture(monkeypatch):
     with pytest.raises(ValueError):
         run(replace(io, query_width=1))
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("variant,warps,ws", [(0, 8, False), (16, 16, False)])
+def test_union_launch_takes_the_declared_options(monkeypatch, variant, warps, ws):
+    calls = []
+    raw_union(monkeypatch, lambda *a, **kw: calls.append(("union", kw)))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    io = union_view()
+    pool_union.build(replace(union_signature(), variant=variant))(io)
+    ((name, kw),) = calls
+    assert name == ("ws" if ws else "union") and kw["union_warps"] == warps
+    assert kw["splits"] == io.split_count and len(kw["workspace"]) == 8
 
 
 def test_union_failed_launch_does_not_publish(monkeypatch):

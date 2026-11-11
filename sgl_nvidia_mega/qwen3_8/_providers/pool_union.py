@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FP8 pool union target verify; its reordered FP32 reduction is not bitwise stock."""
+"""FP8 pool union target verify; its reordered FP32 reduction is not bitwise stock.
+
+The variant carries the source options the caller resolved: bits 0-5 kernel U's warp
+count (SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS; 0 is the source's 8; its output does not
+depend on it).
+"""
 
 from dataclasses import fields
 
@@ -16,6 +21,17 @@ SGLANG_READS = {
         "ScalarType",
     ),
 }
+
+
+_UNION_WARPS_MASK = 0x3F
+
+
+def _options(variant):
+    """(kernel U warps,) of a declared variant, or None for an unknown one."""
+    warps = variant & _UNION_WARPS_MASK
+    if variant & ~_UNION_WARPS_MASK or warps not in (0, 1, 2, 4, 8, 16, 32):
+        return None
+    return (warps or 8,)
 
 
 def supported(s):
@@ -36,9 +52,9 @@ def supported(s):
             s.scalar_type,
             s.rotary_dim,
             s.context_bound,
-            s.variant,
         )
-        == (24, 2, 256, 512, 4, ScalarType.BF16, 0, 0, 0)
+        == (24, 2, 256, 512, 4, ScalarType.BF16, 0, 0)
+        and _options(s.variant) is not None
         and 64 <= s.rows <= 576
         and s.rows % 4 == 0
     )
@@ -53,6 +69,7 @@ def build(s):
 class PoolUnion:
     def __init__(self, signature):
         self.signature = signature
+        (self._union_warps,) = _options(signature.variant)
         self._resources = {}
 
     def __call__(self, io):
@@ -177,5 +194,6 @@ class PoolUnion:
             num_stages=3,
             pdl=True,
             write_new_kv=io.store_new_kv,
+            union_warps=self._union_warps,
         )
         self._resources[key] = True

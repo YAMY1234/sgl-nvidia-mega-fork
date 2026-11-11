@@ -324,6 +324,7 @@ def qsa_pool_union_decode(
     num_stages=2,
     pdl=True,
     write_new_kv=True,
+    union_warps=8,
 ):
     """Target-verify sparse attention read from the pool, each request's union of tokens once.
 
@@ -331,7 +332,8 @@ def qsa_pool_union_decode(
     verify lays them out (row_requests constant within a group). q [rows, QH, 256] BF16 (or
     [rows, QH * 256]); k/v_cache [slots, H, 256] BF16 or FP8 (E4M3); an FP8 pool takes
     k/v_new already in its dtype (kernel 1 copies their bytes); write_new_kv=False when the
-    new K/V were stored before this call. Returns [rows, QH * 256] in q's dtype.
+    new K/V were stored before this call. ``union_warps`` is kernel U's warp count (its output
+    does not depend on it). Returns [rows, QH * 256] in q's dtype.
     """
     rows, ib = block_indices.shape
     kv_heads, dim = k_cache.shape[1], k_cache.shape[2]
@@ -394,7 +396,7 @@ def qsa_pool_union_decode(
         nt,
         tb,
         pdl,
-        num_warps=8,
+        num_warps=union_warps,
         **pdl_kw,
     )
     LAST_KERNEL["union"] = _qsa_pool_union_splitk[(requests, kv_heads, splits)](

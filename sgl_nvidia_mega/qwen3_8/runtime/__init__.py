@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 SHIPPED_SLOTS: tuple[str, ...] = ()
 # hc: the HC write-back kernel for up to 32 rows (runtime/hc.py); needs the S1 layers
-KNOWN_SLOTS: tuple[str, ...] = ("hc",)
+# gdn_native_pdl: the GDN target verify's ReplaySSM core as the plugin's PDL launch
+KNOWN_SLOTS: tuple[str, ...] = ("hc", "gdn_native_pdl")
 # The widest covered step: 4 rows a request x 256 requests.
 MAX_ROWS = 1024
 # S1 (test switch until it is the default): run each layer's HC read / mixer /
@@ -102,6 +103,8 @@ def build(model, hf_config, ctx):
     )
     if "hc" in slots:
         executor.hc_ready = _build_hc(model, decompose)
+    if "gdn_native_pdl" in slots and not draft:
+        executor.gdn_pdl_ready = _build_gdn_pdl(model)
     logger.info(
         "NVIDIA megakernel: Qwen3.8 %s executor: %s; slots %s; every other op stock",
         "draft" if draft else "target",
@@ -125,6 +128,18 @@ def _build_hc(model, decompose) -> bool:
     megakernel_agree(reason, what="Qwen3.8 slot hc")
     if reason:
         unavailable("hc", reason)
+    return not reason
+
+
+def _build_gdn_pdl(model) -> bool:
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    from sgl_nvidia_mega.qwen3_8.runtime import gdn
+
+    reason = gdn.verify_reasons(model)
+    megakernel_agree(reason, what="Qwen3.8 slot gdn_native_pdl")
+    if reason:
+        unavailable("gdn_native_pdl", reason)
     return not reason
 
 

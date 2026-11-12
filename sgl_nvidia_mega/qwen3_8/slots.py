@@ -33,6 +33,7 @@ OPERATION_SLOTS = {
     NumericOperation.SPARSE_SELECT: "qsa_select",
     NumericOperation.FINALIZE_PERMUTED_SHARED: "finalize_permuted_shared",
     NumericOperation.ROUTER_QUANT: "router_quant",
+    NumericOperation.QSA_PROLOGUE_FOLD: "qsa_prologue_fold",
 }
 KNOWN_SLOTS = frozenset(OPERATION_SLOTS.values())
 # Like the other architecture families, slots are fixed when this module loads.

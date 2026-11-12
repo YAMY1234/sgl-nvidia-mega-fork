@@ -15,6 +15,7 @@ from sglang.kernels.plugin_kernels.nvidia.numeric import (
     NumericCapabilityQuery,
     NumericOperation,
     NumericSignature,
+    QsaPrologueFoldSignature,
     RouterQuantSignature,
 )
 
@@ -33,6 +34,7 @@ SGLANG_READS = {
         "NumericCapabilityQuery",
         "NumericOperation",
         "NumericSignature",
+        "QsaPrologueFoldSignature",
         "RouterQuantSignature",
     ),
 }
@@ -140,6 +142,7 @@ _SCHEMAS = {
         MtpDeferredKvSignature,
         tuple(_FIXED_CONTEXTS[NumericOperation.MTP_DEFERRED_KV_PREPARE]),
     ),
+    NumericOperation.QSA_PROLOGUE_FOLD: (QsaPrologueFoldSignature, ()),
 }
 
 

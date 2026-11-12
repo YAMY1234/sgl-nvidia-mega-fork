@@ -213,6 +213,7 @@ do not enable a Qwen3.8 operation. Unsupported shapes still keep stock.
 | ROUTER_QUANT | `router_quant` |
 | MTP_CAPTURE_SEED | `mtp_capture_seed` |
 | MTP_DEFERRED_KV_PREPARE | `mtp_deferred_kv` |
+| QSA_PROLOGUE_FOLD | `qsa_prologue_fold` |
 
 An explicit list produces one startup log of enabled/disabled numeric slots.
 

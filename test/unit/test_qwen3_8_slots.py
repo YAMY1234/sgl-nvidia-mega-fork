@@ -31,6 +31,7 @@ SLOT_NAMES = (
     "gdn_native_pdl",
     "mtp_capture_seed",
     "mtp_deferred_kv",
+    "qsa_prologue_fold",
 )
 
 CHILD = r"""
@@ -40,11 +41,12 @@ from types import SimpleNamespace
 from sglang.kernels.plugin_kernels.nvidia.numeric import (
     HcSignature, ExpertSignature, GdnSignature, NumericSignature,
     FinalizePermutedSignature, RouterQuantSignature, NativeGdnPdlSignature, MtpCaptureSeedSignature, MtpDeferredKvSignature,
+    QsaPrologueFoldSignature,
     NumericRegistry, NumericOperation as O, ScalarType as D,
 )
 from sgl_nvidia_mega.qwen3_8 import providers, slots
 from sgl_nvidia_mega.qwen3_8.spec import SPEC
-from sgl_nvidia_mega.qwen3_8._providers import hc, finalize_permuted, router_quant
+from sgl_nvidia_mega.qwen3_8._providers import hc, finalize_permuted, prologue_fold, router_quant
 
 compile_calls = []
 def cpu_build(signature):
@@ -53,6 +55,7 @@ def cpu_build(signature):
 hc.build = cpu_build
 hc.build_mix = cpu_build
 finalize_permuted.build = lambda signature: (lambda io: None)
+prologue_fold.build = lambda signature: (lambda io: None)
 router_quant.build = cpu_build
 providers.numeric_registry = registry = NumericRegistry()
 signatures = (
@@ -76,6 +79,7 @@ signatures = (
     NativeGdnPdlSignature(O.GDN_NATIVE_PDL, 32, 16, 48, 128, 128, 4, D.BF16),
     MtpCaptureSeedSignature(O.MTP_CAPTURE_SEED,4,2051,2051,8,2055,2055,0,7,D.INT32,D.INT32,D.INT64,D.INT32,1),
     MtpDeferredKvSignature(O.MTP_DEFERRED_KV_PREPARE,1,1,256,D.BF16,2055,2112,4,8,32,8,4096,4096,512,512,0),
+    QsaPrologueFoldSignature(O.QSA_PROLOGUE_FOLD, 0, 4, 8, 128, 64, 3, 4, D.BF16, D.BF16, 1),
 )
 expected_names = (
     'qsa_pool_union', 'qsa_prefill_select', 'qsa_prefill_attention',
@@ -83,7 +87,7 @@ expected_names = (
     'finalize_shared', 'mkm', 'gdn_mk', 'qsa_core',
     'qsa_score', 'qsa_select', 'gdn_front', 'gdn_verify_glue',
     'finalize_permuted_shared', 'router_quant',
-    'gdn_native_pdl', 'mtp_capture_seed', 'mtp_deferred_kv',
+    'gdn_native_pdl', 'mtp_capture_seed', 'mtp_deferred_kv', 'qsa_prologue_fold',
 )
 assert tuple(slots.OPERATION_SLOTS[s.operation] for s in signatures) == expected_names
 assert slots.KNOWN_SLOTS == frozenset(expected_names)
@@ -171,8 +175,8 @@ def test_fresh_process_slot_matrix():
     cases.append("qk_front,ple_hash,ple_gather")
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(run_case, cases))
-    assert len(results) == 48
-    assert results[0]["offers"] == 20 and results[1]["offers"] == 0
-    assert [r["offers"] for r in results[6:26]] == [19] * 20
-    assert [r["offers"] for r in results[26:-2]] == [1] * 20
+    assert len(results) == 50
+    assert results[0]["offers"] == 21 and results[1]["offers"] == 0
+    assert [r["offers"] for r in results[6:27]] == [20] * 21
+    assert [r["offers"] for r in results[27:-2]] == [1] * 21
     assert results[-1]["offers"] == results[-2]["offers"] == 0

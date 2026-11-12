@@ -19,6 +19,7 @@ from sglang.kernels.plugin_kernels.nvidia.numeric import (
     NumericOffer,
     NumericOperation,
     NumericSignature,
+    QsaPrologueFoldSignature,
     RouterQuantSignature,
     ScalarType,
     numeric_registry,
@@ -39,6 +40,7 @@ SGLANG_READS = {
         "NumericOffer",
         "NumericOperation",
         "NumericSignature",
+        "QsaPrologueFoldSignature",
         "RouterQuantSignature",
         "ScalarType",
         "numeric_registry",
@@ -65,6 +67,10 @@ def supported(s):
         from ._providers.finalize_permuted import supported as finalize_supported
 
         return enabled(op) and finalize_supported(s)
+    if op == NumericOperation.QSA_PROLOGUE_FOLD:
+        from ._providers.prologue_fold import supported as fold_supported
+
+        return enabled(op) and fold_supported(s)
     if not enabled(op):
         return False
     if s.rows <= 0:
@@ -185,6 +191,10 @@ def _cached_offer(signature):
         from ._providers.mtp_deferred_kv import build
 
         run = build(signature)
+    elif isinstance(signature, QsaPrologueFoldSignature):
+        from ._providers.prologue_fold import build
+
+        run = build(signature)
     elif isinstance(signature, MtpCaptureSeedSignature):
         from ._providers.mtp_capture_seed import build
 
@@ -271,6 +281,11 @@ def make_offer(signature):
         from ._providers.mtp_capture_seed import supported as capture_supported
 
         if not capture_supported(signature):
+            return None
+    if isinstance(signature, QsaPrologueFoldSignature):
+        from ._providers.prologue_fold import supported as fold_supported
+
+        if not fold_supported(signature):
             return None
     # A bool/float can compare equal to an integer dataclass cache key.
     if isinstance(signature, NativeGdnPdlSignature):

@@ -17,6 +17,7 @@ from sglang.kernels.plugin_kernels.nvidia.numeric import (
 from sglang.kernels.plugin_kernels.nvidia.numeric import NumericOperation as O
 from sglang.kernels.plugin_kernels.nvidia.numeric import (
     NumericSignature,
+    QsaPrologueFoldSignature,
     RouterQuantSignature,
 )
 from sglang.kernels.plugin_kernels.nvidia.numeric import ScalarType as D
@@ -187,6 +188,12 @@ def representatives():
         (RouterQuantSignature(O.ROUTER_QUANT, 1, 2560, 512, D.BF16), ROUTER_CONTEXT),
         (SEED, SEED_CONTEXT),
         (KV, KV_CONTEXT),
+        (
+            QsaPrologueFoldSignature(
+                O.QSA_PROLOGUE_FOLD, 0, 4, 8, 128, 64, 3, 4, D.BF16, D.BF16, 1
+            ),
+            {},
+        ),
     )
 
 
@@ -269,11 +276,13 @@ def test_all_selected_operations_complete_query_and_exact_keys(signature, contex
         assert (
             capabilities.numeric_capability(replace(q, attributes=incomplete)) is False
         ), key
-    # Prefill ops declare rows 0 (per-call rows); any other count is refused.
-    # The permuted finalize declares rows 0 too, above its graph widths.
+    # Prefill ops and the QSA prologue fold declare rows 0 (per-call rows); any
+    # other count is refused. The permuted finalize declares rows 0 too, above its
+    # graph widths.
     rows = (
         1
-        if signature.operation in (O.PREFILL_SELECT, O.PACKED_PREFILL_ATTENTION)
+        if signature.operation
+        in (O.PREFILL_SELECT, O.PACKED_PREFILL_ATTENTION, O.QSA_PROLOGUE_FOLD)
         else 1025
         if signature.operation == O.FINALIZE_PERMUTED_SHARED
         else 0
@@ -287,7 +296,7 @@ def test_all_selected_operations_complete_query_and_exact_keys(signature, contex
 def test_query_catalogue_does_not_add_or_remove_slots():
     operations = {s.operation for s, _ in representatives()}
     assert operations == set(slots.OPERATION_SLOTS) == set(capabilities._SCHEMAS)
-    assert len(operations) == 20 and O.PACKED_ATTENTION not in operations
+    assert len(operations) == 21 and O.PACKED_ATTENTION not in operations
 
 
 @pytest.mark.parametrize("tp_size", [1, 4])

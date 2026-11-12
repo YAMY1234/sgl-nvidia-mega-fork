@@ -414,11 +414,15 @@ class Qwen38Executor:
         st.ran("hc.attn_read", STOCK)
         if use_hc:
             carried = st.scratch.pop("hc.partials", None)
-            partials = (
-                carried
-                if carried is not None and layer.ple is None
-                else hc.gate(normed, layer.attn_hyper_connection.block_inject_weight.weight)
-            )
+            if partials is not None:
+                # SGLang's mix computed the gate partials on its side stream
+                hc.join_gate_stream(layer.attn_hyper_connection, partials)
+            if carried is not None and layer.ple is None:
+                partials = carried
+            elif partials is None:
+                partials = hc.gate(
+                    normed, layer.attn_hyper_connection.block_inject_weight.weight
+                )
         if not fb.forward_mode.is_idle():
             x = self.mixers[i](layer, x, st)
         mlp_hc = layer.mlp_hyper_connection
@@ -432,6 +436,8 @@ class Qwen38Executor:
             st.ran("hc.attn_write", STOCK)
         x, (res, normed, partials) = layer._ffn_mix(streams)
         st.ran("hc.ffn_read", STOCK)
+        if use_hc and partials is not None:
+            hc.join_gate_stream(mlp_hc, partials)
         x = _moe_stock(layer, x, st)
         if use_hc:
             streams, norms.output, st.scratch["hc.partials"] = hc.write(

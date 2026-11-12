@@ -56,6 +56,16 @@ def build() -> str:
     return ""
 
 
+def join_gate_stream(module, partials: torch.Tensor) -> None:
+    """Join the side stream SGLang's one-row mix computed its gate partials on (as
+    its combine does), so a capture has no unjoined work."""
+    stream = getattr(module, "_gate_stream", None)
+    if stream is not None:
+        current = torch.cuda.current_stream()
+        current.wait_stream(stream)
+        partials.record_stream(current)
+
+
 def gate(normed: torch.Tensor, inject_weight: torch.Tensor) -> torch.Tensor:
     """The gate partials [rows, 8, 4] FP32 of a read's normalized streams."""
     from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.hc_combine_decode import (

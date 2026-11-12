@@ -159,6 +159,8 @@ class Qwen3_8Executor:
         self.gdn_ucache = None
         # the plugin's own u-cache rings (gdn_ucache_state.UcacheState), set by build
         self.ucache_state = None
+        # slot gdn_prefill: the prefill kernels' gdn_prefill.Options, set by build
+        self.gdn_prefill = None
         self._pools_checked = False
         self.mixers = {
             i: (

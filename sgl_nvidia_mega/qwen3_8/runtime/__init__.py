@@ -30,6 +30,8 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # qsa_indexer: the QSA indexer's fold, scorer and select (runtime/qsa_indexer.py)
 # qsa_pool: the TP1 QSA verify's sparse attention as split-K pool kernels (<= 64 rows)
 # moe_finalize: the TP1 MoE's finalize + gated shared expert as one ordered kernel
+# gdn_prefill: the GDN step of a covered prefill / extend on the plugin's prefill
+# kernels (runtime/gdn_prefill.py)
 KNOWN_SLOTS: tuple[str, ...] = (
     "hc",
     "hc_wide",
@@ -37,6 +39,7 @@ KNOWN_SLOTS: tuple[str, ...] = (
     "qsa_indexer",
     "qsa_pool",
     "moe_finalize",
+    "gdn_prefill",
 )
 # A node-local directory for the JIT sources some kernels write before compiling.
 SOURCE_DIR_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_SOURCE_DIR"
@@ -184,6 +187,12 @@ def build(model, hf_config, ctx):
             executor.qsa_pool = PoolKernels()
     if "moe_finalize" in slots:
         executor.moe_finalize_ready = _build_moe_finalize(model, decompose)
+    if "gdn_prefill" in slots and not draft:
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn_prefill
+
+        executor.gdn_prefill = _built_options(
+            "gdn_prefill", gdn_prefill.build(model), gdn_prefill.DEFAULT
+        )
     logger.info(
         "NVIDIA megakernel: Qwen3.8 %s executor: %s; slots %s; every other op stock",
         "draft" if draft else ("target (own GDN u-cache)" if own_ucache else "target"),
@@ -301,6 +310,17 @@ def _build_moe_finalize(model, decompose) -> bool:
     if reason:
         unavailable("moe_finalize", reason)
     return not reason
+
+
+def _built_options(slot: str, reason: str, options):
+    """``options`` when the slot built on every rank ('' everywhere), else None."""
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    megakernel_agree(reason, what=f"Qwen3.8 slot {slot}")
+    if reason:
+        unavailable(slot, reason)
+        return None
+    return options
 
 
 def unavailable(slot: str, reason: str) -> None:

@@ -28,9 +28,9 @@ SPECS = (
     # the NextN draft (ModelConfig names a GLM draft's architecture this way)
     ("GlmMoeDsaForCausalLMNextN", "sgl_nvidia_mega.glm5_3.draft:SPEC"),
     ("MuseSparkForConditionalGeneration", "sgl_nvidia_mega.muse_spark.spec:SPEC"),
-    # These specs offer numeric operators without replacing the model forward.
+    # Qwen3.8: the executor owns the target's and the MTP draft's forward.
     ("Qwen4ExpForConditionalGeneration", "sgl_nvidia_mega.qwen3_8.spec:SPEC"),
-    ("Qwen4ExpForCausalLMMTP", "sgl_nvidia_mega.qwen3_8.spec:SPEC"),
+    ("Qwen4ExpForCausalLMMTP", "sgl_nvidia_mega.qwen3_8.spec:DRAFT_SPEC"),
 )
 
 # Test only: with SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1, the composition check

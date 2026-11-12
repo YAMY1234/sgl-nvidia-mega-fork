@@ -220,7 +220,8 @@ class TestReasons(unittest.TestCase):
 
 
 class _State:  # a UcacheState double that records the calls
-    state_bytes_per_slot = 123
+    state_bytes_per_slot = 0
+    state_bytes_per_request_row = 123
     keeps_draft_ssm = tracks_decode_state = backs_up_state = False
     tokens_per_request = 4
     buffers = "rings"
@@ -263,7 +264,7 @@ class TestOwnUcache(unittest.TestCase):
 
     def test_delegates_to_state(self):
         ex = self._executor()
-        self.assertEqual(ex.state_bytes_per_slot, 123)
+        self.assertEqual((ex.state_bytes_per_slot, ex.state_bytes_per_request_row), (0, 123))
         self.assertFalse(ex.keeps_draft_ssm or ex.tracks_decode_state)
         self.assertFalse(ex.backs_up_state)
         ex.reset_state_slots("slots", "rows")

@@ -175,29 +175,25 @@ class TestBytes(unittest.TestCase):
                 head_k_dim=dims[0],
                 head_v_dim=dims[1],
             )
-            self.assertEqual(state.state_bytes_per_slot, want)
             self.assertEqual(state.ring_bytes_per_slot, want)
         # (16*32*128*2 + 48*32*128*2 + 48*32*4) * 3
-        self.assertEqual(_state(_model()).state_bytes_per_slot, 530432 * 3)
+        self.assertEqual(_state(_model()).ring_bytes_per_slot, 530432 * 3)
 
     def test_rank_layers_only(self):
         # PP-style slice: layers 2..4 hold one GDN layer
         state = _state(_model("GGGA", start=2, end=4))
         self.assertEqual(state.num_layers, 1)
 
-    def test_request_ring_charge(self):
+    def test_charge_per_slot_or_request_row(self):
         per_row = _state(_model()).ring_bytes_per_slot
-        rows_hint = dict(max_request_rows=129, max_state_slots=320)
-        rows = _state(_model(), by_request_row=True, **rows_hint)
-        self.assertEqual(rows.state_bytes_per_slot, -(-129 * per_row // 320))
-        self.assertGreaterEqual(rows.state_bytes_per_slot * 320, 129 * per_row)
-        # without the counts: the per-row bytes (an over-charge when rows < slots)
+        rows = _state(_model(), by_request_row=True)
         self.assertEqual(
-            _state(_model(), by_request_row=True).state_bytes_per_slot, per_row
+            (rows.state_bytes_per_slot, rows.state_bytes_per_request_row), (0, per_row)
         )
-        # slot rings ignore the counts
-        slots = _state(_model(), by_request_row=False, **rows_hint)
-        self.assertEqual(slots.state_bytes_per_slot, per_row)
+        slots = _state(_model(), by_request_row=False)
+        self.assertEqual(
+            (slots.state_bytes_per_slot, slots.state_bytes_per_request_row), (per_row, 0)
+        )
 
     def test_head_shapes_must_agree(self):
         model = _model("GG")

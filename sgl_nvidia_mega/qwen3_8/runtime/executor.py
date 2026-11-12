@@ -606,6 +606,10 @@ class Qwen38UcacheExecutor(Qwen38Executor):
         return self.ucache_state.state_bytes_per_slot
 
     @property
+    def state_bytes_per_request_row(self) -> int:
+        return self.ucache_state.state_bytes_per_request_row
+
+    @property
     def keeps_draft_ssm(self) -> bool:
         return self.ucache_state.keeps_draft_ssm
 

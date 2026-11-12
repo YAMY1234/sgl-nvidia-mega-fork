@@ -12,13 +12,14 @@
 and cursors the u-cache target verify (``gdn_ucache.py``) reads and appends, their
 allocation, the cursor resets and the commit after each verify. The executor holds one
 ``UcacheState`` and delegates to it the members of ``spec.SupportsStateSlotReset``
-(``state_bytes_per_slot``, ``keeps_draft_ssm``, ``reset_state_slots``,
-``tracks_decode_state``, ``backs_up_state``) and of ``spec.SupportsRecurrentCommit``
+(``state_bytes_per_slot``, ``state_bytes_per_request_row``, ``keeps_draft_ssm``,
+``reset_state_slots``, ``tracks_decode_state``, ``backs_up_state``) and of ``spec.SupportsRecurrentCommit``
 (``commit_recurrent_state`` -> ``commit``), and calls ``prepare`` from its own.
 
 When SGLang calls in:
-- ``state_bytes_per_slot``: once, after the build and before any pool exists; it is
-  charged per state slot when the state pool is sized.
+- ``state_bytes_per_slot`` / ``state_bytes_per_request_row``: once, after the build and
+  before any pool exists; charged per state slot / request-table row when the state
+  pool is sized (one of them is 0).
 - ``prepare(view)``: once the pools exist, and again on a recapture; it allocates the
   rings (the first time, or when the pool's size changed) and, with track snapshots,
   warms up the track materializer. Never during a capture.
@@ -114,10 +115,7 @@ class UcacheState:
     - ``track_snapshots``: the radix cache keeps decode-time states
       (``extra_buffer_radix``). They are written only with slot rings and a bf16 key
       ring (WIP gdn_ucache_track_snapshots), so the recipe tracks none.
-    ``max_request_rows`` / ``max_state_slots`` (optional): the request rows and state
-    slots the pools will have, when known before they exist (``--max-mamba-cache-size``);
-    request rings then charge ``ceil(rows * ring bytes / slots)`` a slot instead of the
-    full ring bytes."""
+    SGLang charges the rings per request-table row (request rings) or per state slot."""
 
     def __init__(
         self,
@@ -127,8 +125,6 @@ class UcacheState:
         key_ring_fp16: bool = True,
         by_request_row: bool = True,
         track_snapshots: bool = False,
-        max_request_rows: Optional[int] = None,
-        max_state_slots: Optional[int] = None,
     ):
         (
             self.num_layers,
@@ -145,7 +141,6 @@ class UcacheState:
         self._tracks = bool(track_snapshots) and not (
             self.by_request_row or self.key_ring_fp16
         )
-        self._charge = (max_request_rows, max_state_slots)
         self._buffers: Optional[K.GdnUcacheBuffers] = None
         self._mamba = None
         self._conv_scatter = None
@@ -167,13 +162,13 @@ class UcacheState:
 
     @property
     def state_bytes_per_slot(self) -> int:
-        """What the state pool reserves per slot for the rings. Request rings have
-        rows, not slots; without both counts this over-charges when rows < slots."""
-        per_row = self.ring_bytes_per_slot
-        rows, slots = self._charge
-        if not self.by_request_row or not rows or not slots:
-            return per_row
-        return -(-rows * per_row // slots)
+        """What the state pool reserves per state slot: the slot rings' bytes."""
+        return 0 if self.by_request_row else self.ring_bytes_per_slot
+
+    @property
+    def state_bytes_per_request_row(self) -> int:
+        """What the state pool reserves per request-table row: the request rings'."""
+        return self.ring_bytes_per_slot if self.by_request_row else 0
 
     @property
     def keeps_draft_ssm(self) -> bool:

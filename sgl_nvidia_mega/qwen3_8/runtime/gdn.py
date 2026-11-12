@@ -119,6 +119,12 @@ def pool_reasons(backend, layer_id: int, tokens_per_request: int) -> str:
 def step(executor, layer, x, st):
     """The layer's mixer output ([rows, hidden], before the stage's reduction)."""
     fb = st.fb
+    if executor.gdn_prefill is not None and st.step.mode == "prefill":
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn_prefill
+
+        out = gdn_prefill.extend(executor, layer, x, st)
+        if out is not None:
+            return out
     if executor.gdn_ucache is not None and fb.forward_mode.is_target_verify():
         from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache
 

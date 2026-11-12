@@ -243,6 +243,22 @@ class TestStepFallbacks(unittest.TestCase):
         self.assertEqual(st.ran_ops, [("gdn", "stock")])
 
 
+    def test_gdn_prefill_slot_or_stock(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn, gdn_prefill
+
+        ex = SimpleNamespace(gdn_pdl_ready=False, gdn_ucache=None, gdn_prefill="opts")
+        layer = SimpleNamespace(linear_attn=lambda x, fb: "gdn-stock")
+        for served, want in ((None, "gdn-stock"), ("gdn-prefill", "gdn-prefill")):
+            with mock.patch.object(gdn_prefill, "extend", return_value=served) as ext:
+                st = _St(_Mode.EXTEND)
+                self.assertEqual(gdn.step(ex, layer, torch.zeros(8, 4), st), want)
+                ext.assert_called_once()
+                # a verify never asks the prefill kernels
+                st = _St(_Mode.DECODE)
+                self.assertEqual(gdn.step(ex, layer, torch.zeros(8, 4), st), "gdn-stock")
+                ext.assert_called_once()
 
     def test_qsa_stock_when_off_or_prefill(self):
         from sgl_nvidia_mega.qwen3_8.runtime import attention

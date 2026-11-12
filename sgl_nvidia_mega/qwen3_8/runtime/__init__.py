@@ -32,6 +32,7 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # moe_finalize: the TP1 MoE's finalize + gated shared expert as one ordered kernel
 # gdn_prefill: the GDN step of a covered prefill / extend on the plugin's prefill
 # kernels (runtime/gdn_prefill.py)
+# qsa_prefill: the QSA attention of a covered prefill / extend (runtime/qsa_prefill.py)
 KNOWN_SLOTS: tuple[str, ...] = (
     "hc",
     "hc_wide",
@@ -40,6 +41,7 @@ KNOWN_SLOTS: tuple[str, ...] = (
     "qsa_pool",
     "moe_finalize",
     "gdn_prefill",
+    "qsa_prefill",
 )
 # A node-local directory for the JIT sources some kernels write before compiling.
 SOURCE_DIR_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_SOURCE_DIR"
@@ -192,6 +194,12 @@ def build(model, hf_config, ctx):
 
         executor.gdn_prefill = _built_options(
             "gdn_prefill", gdn_prefill.build(model), gdn_prefill.DEFAULT
+        )
+    if "qsa_prefill" in slots:
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_prefill
+
+        executor.qsa_prefill = _built_options(
+            "qsa_prefill", qsa_prefill.build(model), qsa_prefill.DEFAULT
         )
     logger.info(
         "NVIDIA megakernel: Qwen3.8 %s executor: %s; slots %s; every other op stock",

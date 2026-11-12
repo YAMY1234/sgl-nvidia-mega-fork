@@ -97,6 +97,12 @@ def step(executor, layer, x, st):
         and (mode.is_target_verify() or mode.is_decode() or mode.is_draft_extend_v2())
     ):
         return _decomposed(executor, layer, x, st)
+    if executor.qsa_prefill is not None and layer.is_qsa and st.step.mode == "prefill":
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_prefill
+
+        out = qsa_prefill.extend(executor, layer, x, st)
+        if out is not None:
+            return out
     st.ran("qsa", STOCK)
     return layer.self_attention(positions=st.positions, hidden_states=x, forward_batch=fb)
 

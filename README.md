@@ -198,12 +198,13 @@ runs every op on SGLang's module.
 | `gdn_native_pdl` | the GDN target verify on the circular ReplaySSM rings, as a PDL launch | within SGLang's own run-to-run variation |
 | `qsa_indexer` | the QSA indexer's fold, scorer and top-k in verify, decode and draft extend | the same blocks, except on ties |
 | `qsa_pool` | TP1 QSA sparse attention of up to 64 verify / decode rows on split-K pool kernels | rounding |
+| `moe_finalize` | the TP1 MoE finalize with the gated shared expert in one ordered kernel | rounding |
 
 Switches:
 
 - **`SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_DECOMPOSE=1`** runs the S1 layers: the executor calls
   each layer's HC read, mixer, HC write-back and MoE itself, instead of going through the
-  stage boundaries. It needs TP1. `hc` and `hc_wide` need it.
+  stage boundaries. It needs TP1. `hc`, `hc_wide` and `moe_finalize` need it.
 - **`SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_UCACHE=1`** turns on the GDN u-cache target verify, a
   deferred-fold ReplaySSM.
   - The executor owns the rings, keyed by request row with an fp16 key ring. It allocates

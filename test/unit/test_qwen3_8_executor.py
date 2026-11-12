@@ -172,6 +172,14 @@ class TestStepFallbacks(unittest.TestCase):
         self.assertEqual(moe.step(ex, layer, torch.zeros(8, 2560), st), ("moe", False))
         self.assertEqual(st.ran_ops, [("moe", "stock")])
 
+    def test_moe_rows_bound(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import moe
+
+        ex = SimpleNamespace(moe_finalize_ready=True)
+        layer = SimpleNamespace(mlp=self.Block())
+        st = _St(_Mode.EXTEND)
+        moe.step(ex, layer, torch.zeros(moe.MAX_ROWS + 1, 2560), st)
+        self.assertEqual(st.ran_ops, [("moe", "stock")])
 
     def test_gdn_stock_outside_verify(self):
         from sgl_nvidia_mega.qwen3_8.runtime import gdn

@@ -161,6 +161,8 @@ class Qwen3_8Executor:
         self.ucache_state = None
         # slot gdn_prefill: the prefill kernels' gdn_prefill.Options, set by build
         self.gdn_prefill = None
+        # slot qsa_prefill: qsa_prefill.Options, set by build
+        self.qsa_prefill = None
         self._pools_checked = False
         self.mixers = {
             i: (

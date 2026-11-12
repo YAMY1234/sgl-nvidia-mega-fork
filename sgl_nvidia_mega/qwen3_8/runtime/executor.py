@@ -39,7 +39,7 @@ try:
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.megakernels.spec import Step
 
-from sgl_nvidia_mega.qwen3_8.runtime import attention, gdn, hc
+from sgl_nvidia_mega.qwen3_8.runtime import attention, gdn, hc, moe
 from sgl_nvidia_mega.qwen3_8.runtime.engagement import Engagement
 from sgl_nvidia_mega.qwen3_8.runtime.state import StepState
 
@@ -146,6 +146,8 @@ class Qwen38Executor:
         # slot qsa_pool: set by build with its kernels (attention.PoolKernels)
         self.qsa_pool_ready = False
         self.qsa_pool = None
+        # slot moe_finalize: set by build
+        self.moe_finalize_ready = False
         self._pools_checked = False
         self.mixers = {
             i: (
@@ -438,7 +440,7 @@ class Qwen38Executor:
         st.ran("hc.ffn_read", STOCK)
         if use_hc and partials is not None:
             hc.join_gate_stream(mlp_hc, partials)
-        x = _moe_stock(layer, x, st)
+        x = moe.step(self, layer, x, st)
         if use_hc:
             streams, norms.output, st.scratch["hc.partials"] = hc.write(
                 x, res, ffn_partials, norms.next_norm, st.scratch.get("hc.next_inject")
@@ -448,16 +450,3 @@ class Qwen38Executor:
             streams = layer._ffn_combine(x, (res, normed, partials))
             st.ran("hc.ffn_write", STOCK)
         return streams
-
-
-def _moe_stock(layer, x, st):
-    from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
-
-    st.ran("moe", STOCK)
-    if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
-        return layer.mlp(x, st.fb, defer_finalize=False)
-    return layer.mlp(x)
-
-
-
-

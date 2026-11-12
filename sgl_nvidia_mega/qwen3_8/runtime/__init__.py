@@ -19,7 +19,8 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # hc: the HC write-back kernel for up to 32 rows (runtime/hc.py); needs the S1 layers
 # gdn_native_pdl: the GDN target verify's ReplaySSM core as the plugin's PDL launch
 # qsa_pool: the TP1 QSA verify's sparse attention as split-K pool kernels (<= 64 rows)
-KNOWN_SLOTS: tuple[str, ...] = ("hc", "gdn_native_pdl", "qsa_pool")
+# moe_finalize: the TP1 MoE's finalize + gated shared expert as one ordered kernel
+KNOWN_SLOTS: tuple[str, ...] = ("hc", "gdn_native_pdl", "qsa_pool", "moe_finalize")
 # The widest covered step: 4 rows a request x 256 requests.
 MAX_ROWS = 1024
 # S1 (test switch until it is the default): run each layer's HC read / mixer /
@@ -106,6 +107,8 @@ def build(model, hf_config, ctx):
         executor.hc_ready = _build_hc(model, decompose)
     if "gdn_native_pdl" in slots and not draft:
         executor.gdn_pdl_ready = _build_gdn_pdl(model)
+    if "moe_finalize" in slots:
+        executor.moe_finalize_ready = _build_moe_finalize(model, decompose)
     if "qsa_pool" in slots and not draft:
         executor.qsa_pool_ready = _build_qsa_pool(model)
         if executor.qsa_pool_ready:
@@ -147,6 +150,23 @@ def _build_gdn_pdl(model) -> bool:
     megakernel_agree(reason, what="Qwen3.8 slot gdn_native_pdl")
     if reason:
         unavailable("gdn_native_pdl", reason)
+    return not reason
+
+
+def _build_moe_finalize(model, decompose) -> bool:
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.qwen3_8.runtime import moe
+
+    m = model.model
+    reason = "" if decompose else f"needs the S1 layers ({DECOMPOSE_ENV}=1 at TP1)"
+    for i in range(m.start_layer, m.end_layer):
+        reason = reason or moe.layer_reasons(m.layers[i])
+    reason = reason or moe.build(get_parallel())
+    megakernel_agree(reason, what="Qwen3.8 slot moe_finalize")
+    if reason:
+        unavailable("moe_finalize", reason)
     return not reason
 
 

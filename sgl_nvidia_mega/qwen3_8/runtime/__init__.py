@@ -16,13 +16,18 @@ logger = logging.getLogger(__name__)
 # The SGLang names this package's build and checks read (test/unit/test_contract.py)
 SGLANG_READS = {
     "srt/runtime_context.py": ("get_parallel",),
+    "srt/kernel_plugins/nvidia/binding.py": ("megakernel_agree",),
 }
 
 # Comma-separated kernel slots; unset or "" runs every op on its stock step
 # function. No slot ships on by default yet.
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 SHIPPED_SLOTS: tuple[str, ...] = ()
+# hc: the HC write-back kernel for up to 32 rows (runtime/hc.py); needs the S1 layers
+# hc_wide: HC reads / write-backs of more than 32 rows (runtime/hc_wide.py)
 KNOWN_SLOTS: tuple[str, ...] = (
+    "hc",
+    "hc_wide",
 )
 # The widest covered step: 4 rows a request x 256 requests.
 MAX_ROWS = 1024
@@ -111,6 +116,10 @@ def build(model, hf_config, ctx):
         parity=checker,
         decompose=decompose,
     )
+    if "hc" in slots:
+        executor.hc_ready = _build_hc(model, decompose)
+    if "hc_wide" in slots:
+        executor.hc_wide_ready = _build_hc_wide(model, decompose, executor.hc_limits)
     logger.info(
         "NVIDIA megakernel: Qwen3.8 %s executor: %s; slots %s; every other op stock",
         "draft" if draft else "target",
@@ -118,3 +127,40 @@ def build(model, hf_config, ctx):
         sorted(slots) or "none",
     )
     return executor
+
+
+def _build_hc(model, decompose) -> bool:
+    """Whether slot hc runs, agreed on every rank."""
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    from sgl_nvidia_mega.qwen3_8.runtime import hc
+
+    m = model.model
+    reason = "" if decompose else f"needs the S1 layers ({DECOMPOSE_ENV}=1 at TP1)"
+    for i in range(m.start_layer, m.end_layer):
+        reason = reason or hc.layer_supported(m.layers[i])
+    reason = reason or hc.build()
+    megakernel_agree(reason, what="Qwen3.8 slot hc")
+    if reason:
+        unavailable("hc", reason)
+    return not reason
+
+
+def _build_hc_wide(model, decompose, limits) -> bool:
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    from sgl_nvidia_mega.qwen3_8.runtime import hc, hc_wide
+
+    m = model.model
+    reason = "" if decompose else f"needs the S1 layers ({DECOMPOSE_ENV}=1 at TP1)"
+    for i in range(m.start_layer, m.end_layer):
+        reason = reason or hc.layer_supported(m.layers[i])
+    reason = reason or hc_wide.build(limits=limits)
+    megakernel_agree(reason, what="Qwen3.8 slot hc_wide")
+    if reason:
+        unavailable("hc_wide", reason)
+    return not reason
+
+
+def unavailable(slot: str, reason: str) -> None:
+    logger.info("NVIDIA megakernel: Qwen3.8 slot %s uses stock (%s)", slot, reason)

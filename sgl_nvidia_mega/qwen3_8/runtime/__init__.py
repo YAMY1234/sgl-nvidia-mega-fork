@@ -18,7 +18,8 @@ SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 SHIPPED_SLOTS: tuple[str, ...] = ()
 # hc: the HC write-back kernel for up to 32 rows (runtime/hc.py); needs the S1 layers
 # gdn_native_pdl: the GDN target verify's ReplaySSM core as the plugin's PDL launch
-KNOWN_SLOTS: tuple[str, ...] = ("hc", "gdn_native_pdl")
+# qsa_pool: the TP1 QSA verify's sparse attention as split-K pool kernels (<= 64 rows)
+KNOWN_SLOTS: tuple[str, ...] = ("hc", "gdn_native_pdl", "qsa_pool")
 # The widest covered step: 4 rows a request x 256 requests.
 MAX_ROWS = 1024
 # S1 (test switch until it is the default): run each layer's HC read / mixer /
@@ -105,6 +106,12 @@ def build(model, hf_config, ctx):
         executor.hc_ready = _build_hc(model, decompose)
     if "gdn_native_pdl" in slots and not draft:
         executor.gdn_pdl_ready = _build_gdn_pdl(model)
+    if "qsa_pool" in slots and not draft:
+        executor.qsa_pool_ready = _build_qsa_pool(model)
+        if executor.qsa_pool_ready:
+            from sgl_nvidia_mega.qwen3_8.runtime.attention import PoolKernels
+
+            executor.qsa_pool = PoolKernels()
     logger.info(
         "NVIDIA megakernel: Qwen3.8 %s executor: %s; slots %s; every other op stock",
         "draft" if draft else "target",
@@ -140,6 +147,24 @@ def _build_gdn_pdl(model) -> bool:
     megakernel_agree(reason, what="Qwen3.8 slot gdn_native_pdl")
     if reason:
         unavailable("gdn_native_pdl", reason)
+    return not reason
+
+
+def _build_qsa_pool(model) -> bool:
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+    from sglang.srt.models.qwen4_exp import Qwen4ExpAttentionDecoderLayer
+
+    from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+    m = model.model
+    reason = ""
+    for i in range(m.start_layer, m.end_layer):
+        if isinstance(m.layers[i], Qwen4ExpAttentionDecoderLayer):
+            reason = reason or attention.layer_reasons(m.layers[i])
+    reason = reason or attention.build()
+    megakernel_agree(reason, what="Qwen3.8 slot qsa_pool")
+    if reason:
+        unavailable("qsa_pool", reason)
     return not reason
 
 

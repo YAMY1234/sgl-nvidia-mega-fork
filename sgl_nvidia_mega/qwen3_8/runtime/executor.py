@@ -39,7 +39,7 @@ try:
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.megakernels.spec import Step
 
-from sgl_nvidia_mega.qwen3_8.runtime import gdn, hc
+from sgl_nvidia_mega.qwen3_8.runtime import attention, gdn, hc
 from sgl_nvidia_mega.qwen3_8.runtime.engagement import Engagement
 from sgl_nvidia_mega.qwen3_8.runtime.state import StepState
 
@@ -143,12 +143,15 @@ class Qwen38Executor:
         m = lm.model
         # slot gdn_native_pdl: set by build; the pools are checked at the first verify
         self.gdn_pdl_ready = False
+        # slot qsa_pool: set by build with its kernels (attention.PoolKernels)
+        self.qsa_pool_ready = False
+        self.qsa_pool = None
         self._pools_checked = False
         self.mixers = {
             i: (
                 self._gdn
                 if isinstance(m.layers[i], Qwen4ExpLinearDecoderLayer)
-                else _qsa_stock
+                else self._qsa
             )
             for i in range(m.start_layer, m.end_layer)
         }
@@ -213,6 +216,9 @@ class Qwen38Executor:
 
     def _gdn(self, layer, x, st):
         return gdn.step(self, layer, x, st)
+
+    def _qsa(self, layer, x, st):
+        return attention.step(self, layer, x, st)
 
     def _check_pools(self, forward_batch):
         """The pools exist from the first covered verify on (a capture warmup runs it
@@ -447,10 +453,5 @@ def _moe_stock(layer, x, st):
     return layer.mlp(x)
 
 
-def _qsa_stock(layer, hidden, st):
-    st.ran("qsa", STOCK)
-    return layer.self_attention(
-        positions=st.positions, hidden_states=hidden, forward_batch=st.fb
-    )
 
 

@@ -126,7 +126,7 @@ class TestPlan(unittest.TestCase):
     def test_mixers(self):
         ex = _executor()
         names = [ex.mixers[i].__name__ for i in range(3)]
-        self.assertEqual(names, ["_gdn", "_gdn", "_qsa_stock"])
+        self.assertEqual(names, ["_gdn", "_gdn", "_qsa"])
 
 
 class TestReasons(unittest.TestCase):

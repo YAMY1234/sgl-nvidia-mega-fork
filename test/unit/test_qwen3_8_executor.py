@@ -129,6 +129,76 @@ class TestPlan(unittest.TestCase):
         self.assertEqual(names, ["_gdn", "_gdn", "_qsa"])
 
 
+class _St:
+    def __init__(self, mode, rows=8):
+        self.fb = SimpleNamespace(
+            forward_mode=mode, spec_info=SimpleNamespace(draft_token_num=4)
+        )
+        self.positions = torch.zeros(rows)
+        self.ran_ops = []
+
+    def ran(self, op, impl):
+        self.ran_ops.append((op, impl))
+
+
+class TestStepFallbacks(unittest.TestCase):
+    """Each step function runs SGLang's module when its slot is off or the step is
+    outside what the kernel serves, and records that it ran stock."""
+
+    def setUp(self):
+        qwen2 = types.ModuleType("sglang.srt.models.qwen2_moe")
+
+        class Block:
+            def __call__(self, x, fb=None, defer_finalize=None):
+                return ("moe", defer_finalize)
+
+        qwen2.Qwen2MoeSparseMoeBlock = Block
+        sys.modules["sglang.srt.models.qwen2_moe"] = qwen2
+        self.Block = Block
+
+    def test_moe_stock(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import moe
+
+        ex = SimpleNamespace(moe_finalize_ready=False)
+        layer = SimpleNamespace(mlp=self.Block())
+        st = _St(_Mode.TARGET_VERIFY)
+        self.assertEqual(moe.step(ex, layer, torch.zeros(8, 2560), st), ("moe", False))
+        self.assertEqual(st.ran_ops, [("moe", "stock")])
+
+    def test_moe_rows_bound(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import moe
+
+        ex = SimpleNamespace(moe_finalize_ready=True)
+        layer = SimpleNamespace(mlp=self.Block())
+        st = _St(_Mode.EXTEND)
+        moe.step(ex, layer, torch.zeros(moe.MAX_ROWS + 1, 2560), st)
+        self.assertEqual(st.ran_ops, [("moe", "stock")])
+
+    def test_gdn_stock_outside_verify(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn
+
+        ex = SimpleNamespace(gdn_pdl_ready=True)
+        layer = SimpleNamespace(linear_attn=lambda x, fb: "gdn-stock")
+        st = _St(_Mode.EXTEND)
+        self.assertEqual(gdn.step(ex, layer, torch.zeros(8, 4), st), "gdn-stock")
+        self.assertEqual(st.ran_ops, [("gdn", "stock")])
+
+    def test_qsa_stock_when_off_or_wide(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+        calls = []
+        layer = SimpleNamespace(
+            self_attention=lambda **kw: calls.append(kw) or "qsa-stock"
+        )
+        for ready, rows in ((False, 8), (True, attention.MAX_ROWS + 4)):
+            st = _St(_Mode.TARGET_VERIFY, rows)
+            ex = SimpleNamespace(qsa_pool_ready=ready)
+            out = attention.step(ex, layer, torch.zeros(rows, 4), st)
+            self.assertEqual(out, "qsa-stock")
+            self.assertEqual(st.ran_ops, [("qsa", "stock")])
+        self.assertEqual(len(calls), 2)
+
+
 class TestReasons(unittest.TestCase):
     def test_prefill_graphs_refused(self):
         cfg = SimpleNamespace(

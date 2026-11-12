@@ -18,9 +18,17 @@ requests, logical positions). Writes: the new K/V at ``out_cache_loc``."""
 
 from __future__ import annotations
 
+import logging
+import os
+
 import torch
 
+logger = logging.getLogger(__name__)
+
 STOCK = "stock"
+# Test only: on eager steps, also run SGLang's attention on the same q/k/v and selected
+# indices and log how far the pool kernel's output is from it, per row.
+OPCHECK = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_Q38_OPCHECK") == "1"
 MAX_ROWS = 64
 QUERY_HEADS, KV_HEADS, HEAD_DIM, BLOCKS, RATIO = 24, 2, 256, 512, 4
 
@@ -135,7 +143,39 @@ def _verify_pool(executor, layer, x, st):
         gate=gate,
         scale=layer.attn.scaling,
     )
-    return _finish(layer, out.view(rows, QUERY_HEADS * HEAD_DIM), None, st, "pool_splitk")
+    out = out.view(rows, QUERY_HEADS * HEAD_DIM)
+    if OPCHECK and not torch.cuda.is_current_stream_capturing():
+        _opcheck(layer, q, k, v, fb, indices, gate, out, md, query_positions)
+    return _finish(layer, out, None, st, "pool_splitk")
+
+
+def _opcheck(layer, q, k, v, fb, indices, gate, got, md, query_positions):
+    """Same selection, SGLang's attention (it rewrites the same K/V at the same slots),
+    then the gate as SGLang applies it: the remaining difference is the kernel's."""
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    want = layer.attn(q, k, v, fb, topk_indices=indices)
+    want = fused_sigmoid_mul(want.reshape(got.shape).clone(), gate, inplace=True)
+    diff = (want.float() - got.float()).abs()
+    per_row = diff.amax(dim=1)
+    worst = int(per_row.argmax())
+    rel = float((want.float() - got.float()).norm() / want.float().norm().clamp_min(1e-30))
+    valid = int((indices[worst] >= 0).sum())
+    logger.info(
+        "NVIDIA megakernel opcheck qsa_pool layer=%d rows=%d max_abs=%.4g rel_l2=%.3g "
+        "worst_row=%d worst_row_max=%.4g worst_row_valid_blocks=%d worst_row_seq_len=%d "
+        "worst_row_pos=%d rows_over_0.05=%d",
+        layer.attn.layer_id,
+        got.shape[0],
+        float(diff.max()),
+        rel,
+        worst,
+        float(per_row[worst]),
+        valid,
+        int(md.sequence_lengths[worst]),
+        int(query_positions[worst]),
+        int((per_row > 0.05).sum()),
+    )
 
 
 def _finish(layer, attn_out, gate, st, impl):

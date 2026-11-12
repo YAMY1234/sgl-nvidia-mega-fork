@@ -36,6 +36,14 @@ MAX_ROWS = 1024
 # S1 (test switch until it is the default): run each layer's HC read / mixer /
 # HC write / MoE from the executor instead of through the stage boundaries.
 DECOMPOSE_ENV = "SGLANG_NVIDIA_MEGAKERNEL_Q38_DECOMPOSE"
+# The plugin's own GDN u-cache (binding v2): the target executor allocates the rings
+# in prepare, resets them and commits each verify (runtime/gdn_ucache_state.py), with
+# the agg-top recipe's request rings and fp16 key ring. Needs --mamba-ssm-dtype float16.
+UCACHE_ENV = "SGLANG_NVIDIA_MEGAKERNEL_Q38_UCACHE"
+
+
+def ucache_requested() -> bool:
+    return os.environ.get(UCACHE_ENV) == "1"
 
 
 def decompose_supported(parallel) -> bool:
@@ -61,14 +69,24 @@ def config_reasons(cfg, hf_config) -> list[str]:
         f"{SLOTS_ENV}: unknown slot {name!r}"
         for name in sorted(requested_slots() - set(KNOWN_SLOTS))
     ]
-    if getattr(cfg, "enable_gdn_replayssm_ucache", False):
+    sglang_ucache = getattr(cfg, "enable_gdn_replayssm_ucache", False)
+    if ucache_requested():
+        from sgl_nvidia_mega.qwen3_8.runtime.gdn_ucache_state import UcacheState
+
+        if sglang_ucache:
+            reasons.append(
+                f"{UCACHE_ENV}=1 with --enable-gdn-replayssm-ucache: SGLang's u-cache "
+                "and the plugin's would own the same state"
+            )
+        reasons += [f"{UCACHE_ENV}=1: {r}" for r in UcacheState.config_reasons(cfg)]
+    if sglang_ucache or ucache_requested():
         # SGLang has no u-cache verify of its own: the executor must cover every
         # target verify, so its widest one must fit the built widths.
         tokens = int(getattr(cfg, "speculative_num_draft_tokens", 0) or 0)
         running = int(getattr(cfg, "max_running_requests", 0) or 0)
         if tokens and running and tokens * running > MAX_ROWS:
             reasons.append(
-                f"--enable-gdn-replayssm-ucache: a verify of {running} requests x "
+                f"the GDN u-cache: a verify of {running} requests x "
                 f"{tokens} rows exceeds the executor's {MAX_ROWS} rows"
             )
     graph = getattr(cfg, "cuda_graph_config", None)
@@ -98,7 +116,10 @@ def build(model, hf_config, ctx):
     """The executor of this model (target or MTP draft); ``ctx`` is SGLang's
     BuildContext."""
     from sgl_nvidia_mega.qwen3_8.runtime import parity
-    from sgl_nvidia_mega.qwen3_8.runtime.executor import Qwen38Executor
+    from sgl_nvidia_mega.qwen3_8.runtime.executor import (
+        Qwen38Executor,
+        Qwen38UcacheExecutor,
+    )
 
     draft = type(model).__name__.endswith("MTP")
     slots = requested_slots()
@@ -114,7 +135,8 @@ def build(model, hf_config, ctx):
     decompose = os.environ.get(DECOMPOSE_ENV) == "1" and decompose_supported(
         get_parallel()
     )
-    executor = Qwen38Executor(
+    own_ucache = not draft and ucache_requested()
+    executor = (Qwen38UcacheExecutor if own_ucache else Qwen38Executor)(
         model,
         widths=widths,
         draft=draft,
@@ -127,8 +149,16 @@ def build(model, hf_config, ctx):
         from sglang.srt.runtime_context import get_exec
 
         mamba = getattr(get_exec(), "mamba", None)
-        executor.verify_required = bool(
+        executor.verify_required = own_ucache or bool(
             getattr(mamba, "enable_gdn_replayssm_ucache", False)
+        )
+    if own_ucache:
+        from sgl_nvidia_mega.qwen3_8.runtime.gdn_ucache_state import UcacheState
+
+        executor.ucache_state = UcacheState(
+            model,
+            tokens_per_request=ctx.tokens_per_request,
+            track_snapshots=bool(getattr(mamba, "enable_mamba_extra_buffer", False)),
         )
     if "hc" in slots:
         executor.hc_ready = _build_hc(model, decompose)
@@ -148,11 +178,20 @@ def build(model, hf_config, ctx):
             executor.qsa_pool = PoolKernels()
     logger.info(
         "NVIDIA megakernel: Qwen3.8 %s executor: %s; slots %s; every other op stock",
-        "draft" if draft else "target",
+        "draft" if draft else ("target (own GDN u-cache)" if own_ucache else "target"),
         "layers decomposed (S1)" if decompose else "layers through the stage boundaries (S0)",
         sorted(slots) or "none",
     )
     return executor
+
+
+def prepare(built, view) -> None:
+    """spec.prepare: once the pools exist, before any capture (repeated on a
+    recapture); ``view`` is the binding's preparation view."""
+    from sgl_nvidia_mega.qwen3_8.runtime.executor import Qwen38UcacheExecutor
+
+    if isinstance(built, Qwen38UcacheExecutor):
+        built.prepare_ucache(view)
 
 
 def _build_hc(model, decompose) -> bool:

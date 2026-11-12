@@ -918,7 +918,8 @@ def pool_reasons(ucache_buffers, tokens_per_request: int, *, state=None) -> str:
 
 def verify(executor, gdn, x, st, view, buffers=None):
     """``Qwen3_5GatedDeltaNet.forward`` for a target verify on the u-cache rings
-    (``buffers``, a GdnUcacheBuffers: by default SGLang's, ``view.mamba.ucache``);
+    (``buffers``, a GdnUcacheBuffers: by default the executor's own,
+    ``executor.ucache_state``, else SGLang's, ``view.mamba.ucache``);
     ``executor.gdn_ucache`` is the executor's UcacheVerify. Returns the layer's mixer
     output [rows, hidden]."""
     import triton
@@ -936,7 +937,8 @@ def verify(executor, gdn, x, st, view, buffers=None):
     attn = gdn.attn
     meta, pools = view.gdn, view.mamba
     if buffers is None:
-        buffers = pools.ucache
+        own = executor.ucache_state
+        buffers = pools.ucache if own is None else own.buffers
     li = pools.layer_ids.index(attn.layer_id)
     tokens = int(fb.spec_info.draft_token_num)
     qkvz, ba = gdn._forward_input_proj(x)

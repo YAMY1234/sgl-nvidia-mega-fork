@@ -552,7 +552,7 @@ class TestVerify(unittest.TestCase):
         gdn = _gdn(env, batch=batch, **kw)
         st = _St(batch, tokens)
         out = U.verify(
-            SimpleNamespace(gdn_ucache=uv), gdn, torch.zeros(batch * T, 16), st, view
+            SimpleNamespace(gdn_ucache=uv, ucache_state=None), gdn, torch.zeros(batch * T, 16), st, view
         )
         return out, gdn, st, view
 
@@ -704,7 +704,7 @@ class TestVerify(unittest.TestCase):
             uv = _verifier(first_layer_id=7)
             gdn, st = _gdn(env), _St()
             x = torch.zeros(len(CACHE_INDICES) * T, 16)
-            U.verify(SimpleNamespace(gdn_ucache=uv), gdn, x, st, view, buffers)
+            U.verify(SimpleNamespace(gdn_ucache=uv, ucache_state=None), gdn, x, st, view, buffers)
             (kw,) = env.flushes()
             self.assertIs(kw["k_cache"]._base, buffers.k_ring)
             self.assertEqual(kw["flush_min"], buffers.flush_min)
@@ -714,7 +714,7 @@ class TestVerify(unittest.TestCase):
             gdn = _gdn(env)
             with self.assertRaisesRegex(RuntimeError, "UcacheVerify"):
                 U.verify(
-                    SimpleNamespace(gdn_ucache=None),
+                    SimpleNamespace(gdn_ucache=None, ucache_state=None),
                     gdn,
                     None,
                     _St(),

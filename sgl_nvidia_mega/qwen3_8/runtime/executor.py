@@ -155,9 +155,11 @@ class Qwen38Executor:
         self.moe_finalize_ready = False
         # set by build when SGLang cannot run a target verify itself (u-cache pools)
         self.verify_required = False
-        # the u-cache verify (gdn_ucache.UcacheVerify), set at the first covered verify
-        # when the step view carries u-cache rings
+        # the u-cache verify (gdn_ucache.UcacheVerify): set at the first covered verify
+        # when the step view carries SGLang's u-cache rings, or in prepare_ucache
         self.gdn_ucache = None
+        # the plugin's own u-cache rings (gdn_ucache_state.UcacheState), set by build
+        self.ucache_state = None
         self._pools_checked = False
         self.mixers = {
             i: (
@@ -245,20 +247,10 @@ class Qwen38Executor:
         mamba = getattr(st_view, "mamba", None)
         ucache = getattr(mamba, "ucache", None)
         if ucache is not None:
-            from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache
-
-            tokens = int(forward_batch.spec_info.draft_token_num)
-            reason = gdn_ucache.pool_reasons(ucache, tokens, state=mamba.temporal)
-            if reason:
-                # SGLang has no u-cache verify of its own to fall back to
-                raise RuntimeError(f"Qwen3.8 executor: u-cache verify: {reason}")
-            device = mamba.temporal.device
-            self.gdn_ucache = gdn_ucache.UcacheVerify(
-                device=device,
-                first_layer_id=min(mamba.layer_ids),
-                by_request_row=bool(ucache.by_request_row),
-                options=gdn_ucache.default_options(device),
+            self._build_ucache_verify(
+                mamba, ucache, int(forward_batch.spec_info.draft_token_num)
             )
+        if self.gdn_ucache is not None:
             self.gdn_pdl_ready = False  # the u-cache verify serves every GDN verify
         del view
         if self.gdn_pdl_ready:
@@ -276,6 +268,21 @@ class Qwen38Executor:
 
                 unavailable("gdn_native_pdl", reason)
                 self.gdn_pdl_ready = False
+
+    def _build_ucache_verify(self, mamba, buffers, tokens):
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache
+
+        reason = gdn_ucache.pool_reasons(buffers, tokens, state=mamba.temporal)
+        if reason:
+            # SGLang has no u-cache verify of its own to fall back to
+            raise RuntimeError(f"Qwen3.8 executor: u-cache verify: {reason}")
+        device = mamba.temporal.device
+        self.gdn_ucache = gdn_ucache.UcacheVerify(
+            device=device,
+            first_layer_id=min(mamba.layer_ids),
+            by_request_row=bool(buffers.by_request_row),
+            options=gdn_ucache.default_options(device),
+        )
 
     @torch.no_grad()
     def _forward(self, step, input_ids, positions, forward_batch):
@@ -547,3 +554,39 @@ class Qwen38Executor:
             limits=self.hc_limits,
         )
         return streams
+
+
+class Qwen38UcacheExecutor(Qwen38Executor):
+    """The target executor with the plugin's own GDN u-cache: binding v2's
+    SupportsStateSlotReset and SupportsRecurrentCommit, through its UcacheState."""
+
+    @property
+    def state_bytes_per_slot(self) -> int:
+        return self.ucache_state.state_bytes_per_slot
+
+    @property
+    def keeps_draft_ssm(self) -> bool:
+        return self.ucache_state.keeps_draft_ssm
+
+    @property
+    def tracks_decode_state(self) -> bool:
+        return self.ucache_state.tracks_decode_state
+
+    @property
+    def backs_up_state(self) -> bool:
+        return self.ucache_state.backs_up_state
+
+    def reset_state_slots(self, slots, request_rows) -> None:
+        self.ucache_state.reset_state_slots(slots, request_rows)
+
+    def commit_recurrent_state(self, io) -> bool:
+        return self.ucache_state.commit(io)
+
+    def prepare_ucache(self, view) -> None:
+        """spec.prepare: allocate the rings once the pools exist, then the verify."""
+        state = self.ucache_state
+        state.prepare(view)
+        if self.gdn_ucache is None:
+            self._build_ucache_verify(
+                view.mamba, state.buffers, state.tokens_per_request
+            )

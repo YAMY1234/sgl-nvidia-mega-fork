@@ -29,12 +29,14 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # gdn_native_pdl: the GDN target verify's ReplaySSM core as the plugin's PDL launch
 # qsa_indexer: the QSA indexer's fold, scorer and select (runtime/qsa_indexer.py)
 # qsa_pool: the TP1 QSA verify's sparse attention as split-K pool kernels (<= 64 rows)
+# moe_finalize: the TP1 MoE's finalize + gated shared expert as one ordered kernel
 KNOWN_SLOTS: tuple[str, ...] = (
     "hc",
     "hc_wide",
     "gdn_native_pdl",
     "qsa_indexer",
     "qsa_pool",
+    "moe_finalize",
 )
 # A node-local directory for the JIT sources some kernels write before compiling.
 SOURCE_DIR_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_SOURCE_DIR"
@@ -180,6 +182,8 @@ def build(model, hf_config, ctx):
             from sgl_nvidia_mega.qwen3_8.runtime.attention import PoolKernels
 
             executor.qsa_pool = PoolKernels()
+    if "moe_finalize" in slots:
+        executor.moe_finalize_ready = _build_moe_finalize(model, decompose)
     logger.info(
         "NVIDIA megakernel: Qwen3.8 %s executor: %s; slots %s; every other op stock",
         "draft" if draft else ("target (own GDN u-cache)" if own_ucache else "target"),
@@ -279,6 +283,23 @@ def _build_qsa_pool(model) -> bool:
     megakernel_agree(reason, what="Qwen3.8 slot qsa_pool")
     if reason:
         unavailable("qsa_pool", reason)
+    return not reason
+
+
+def _build_moe_finalize(model, decompose) -> bool:
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.qwen3_8.runtime import moe
+
+    m = model.model
+    reason = "" if decompose else f"needs the S1 layers ({DECOMPOSE_ENV}=1 at TP1)"
+    for i in range(m.start_layer, m.end_layer):
+        reason = reason or moe.layer_reasons(m.layers[i])
+    reason = reason or moe.build(get_parallel())
+    megakernel_agree(reason, what="Qwen3.8 slot moe_finalize")
+    if reason:
+        unavailable("moe_finalize", reason)
     return not reason
 
 

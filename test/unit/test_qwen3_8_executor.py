@@ -172,6 +172,66 @@ class TestStepFallbacks(unittest.TestCase):
         self.assertEqual(moe.step(ex, layer, torch.zeros(8, 2560), st), ("moe", False))
         self.assertEqual(st.ran_ops, [("moe", "stock")])
 
+    def test_moe_rows_bound(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import moe
+
+        ex = SimpleNamespace(moe_finalize_ready=True)
+        layer = SimpleNamespace(mlp=self.Block())
+        st = _St(_Mode.EXTEND)
+        moe.step(ex, layer, torch.zeros(moe.MAX_ROWS + 1, 2560), st)
+        self.assertEqual(st.ran_ops, [("moe", "stock")])
+
+    def test_moe_routed_before_shared(self):
+        """Eager (not capturing): SGLang's order, the routed experts then the shared
+        expert, then the finalize kernel."""
+        from sgl_nvidia_mega.qwen3_8.runtime import moe
+
+        calls = []
+        runner = types.ModuleType("sglang.srt.model_executor.runner")
+        runner.get_is_capture_mode = lambda: False
+        fin = types.ModuleType(
+            "sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.moe_finalize"
+        )
+
+        class Kernel:
+            def __getitem__(self, grid):
+                return lambda *a, **k: calls.append("finalize")
+
+        fin._fused_finalize_gate_sigmoid_mul_add_kernel = Kernel()
+        saved = {n: sys.modules.get(n) for n in (runner.__name__, fin.__name__)}
+        sys.modules.update({runner.__name__: runner, fin.__name__: fin})
+        self.addCleanup(
+            lambda: [
+                sys.modules.pop(n) if v is None else sys.modules.__setitem__(n, v)
+                for n, v in saved.items()
+            ]
+        )
+        rows = 8
+
+        class Block(self.Block):
+            alt_stream = None
+            shared_expert = None
+            shared_expert_gate = SimpleNamespace(weight=torch.zeros(1, 2560))
+
+            def _forward_router_experts(self, x, defer_finalize):
+                calls.append("routed")
+                return SimpleNamespace(
+                    top_k=10,
+                    gemm2_out=torch.zeros(rows * 10, 2560),
+                    expanded_idx_to_permuted_idx=torch.zeros(rows, 10, dtype=torch.int32),
+                    expert_weights=torch.zeros(rows, 10),
+                )
+
+            def _forward_shared_experts(self, x, apply_gate):
+                calls.append("shared")
+                return torch.zeros_like(x)
+
+        ex = SimpleNamespace(moe_finalize_ready=True, moe_routing=None, smallm_gemm=None)
+        layer = SimpleNamespace(mlp=Block())
+        st = _St(_Mode.TARGET_VERIFY)
+        moe.step(ex, layer, torch.zeros(rows, 2560), st)
+        self.assertEqual(calls, ["routed", "shared", "finalize"])
+        self.assertEqual(st.ran_ops, [("moe", "finalize_permuted")])
 
     def test_gdn_stock_outside_verify(self):
         from sgl_nvidia_mega.qwen3_8.runtime import gdn

@@ -195,6 +195,7 @@ runs every op on SGLang's module.
 | --- | --- | --- |
 | `hc` | HC write-backs of 1 to 32 rows | rounding |
 | `hc_wide` | HC reads and write-backs of 33 to 1024 rows; at 33 to 320 rows, a write-back and the next read in one launch | rounding |
+| `gdn_native_pdl` | the GDN target verify on the circular ReplaySSM rings, as a PDL launch | within SGLang's own run-to-run variation |
 
 Switches:
 

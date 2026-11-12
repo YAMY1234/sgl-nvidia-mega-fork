@@ -201,12 +201,13 @@ runs every op on SGLang's module.
 | `moe_finalize` | the TP1 MoE finalize with the gated shared expert in one ordered kernel | rounding |
 | `gdn_prefill` | the GDN prefill on FlashInfer's chunked kernel: split conv, retiled gating, l2norm and norm, one-launch state copies | bitwise |
 | `qsa_prefill` | QSA prefill: row-group union attention, row pack, fast top-k select, TMA prefill | union: rounding; the rest bitwise |
+| `ple` | the PLE target-verify layout, host-table gather, gate and short conv | bitwise |
 
 Switches:
 
 - **`SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_DECOMPOSE=1`** runs the S1 layers: the executor calls
   each layer's HC read, mixer, HC write-back and MoE itself, instead of going through the
-  stage boundaries. It needs TP1. `hc`, `hc_wide` and `moe_finalize` need it.
+  stage boundaries. It needs TP1. `hc`, `hc_wide`, `moe_finalize` and the PLE add need it.
 - **`SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_UCACHE=1`** turns on the GDN u-cache target verify, a
   deferred-fold ReplaySSM.
   - The executor owns the rings, keyed by request row with an fp16 key ring. It allocates

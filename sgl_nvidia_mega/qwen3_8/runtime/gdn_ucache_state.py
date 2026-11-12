@@ -44,6 +44,9 @@ from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear import gdn_ucache_stat
 logger = logging.getLogger(__name__)
 
 SGLANG_READS = {
+    "srt/speculative/ragged_verify.py": ("RaggedVerifyMode", "read_ragged_verify_mode"),
+    "srt/layers/attention/linear/utils.py": ("pp_spec_stable_rows_enabled",),
+    "srt/speculative/adaptive_spec_params.py": ("resolve_candidate_steps_from_config",),
     "srt/models/qwen4_exp.py": ("Qwen4ExpLinearDecoderLayer",),
     # Qwen4ExpLinearDecoderLayer's base sets linear_attn
     "srt/models/qwen3_5.py": ("linear_attn", "attn"),
@@ -314,10 +317,10 @@ class UcacheState:
 
     @staticmethod
     def config_reasons(cfg) -> list[str]:
-        """The server args the u-cache cannot serve (the WIP's
-        --enable-gdn-replayssm-ucache checks that read no environment)."""
+        """The server args, environment and device the u-cache cannot serve (the WIP's
+        --enable-gdn-replayssm-ucache checks)."""
         what = "the GDN u-cache"
-        reasons = []
+        reasons = _env_device_reasons(cfg, what)
         role = str(getattr(cfg, "disaggregation_mode", None) or "null")
         dtype = str(getattr(cfg, "mamba_ssm_dtype", None)).replace("torch.", "")
         if dtype != "float16":
@@ -413,6 +416,51 @@ class UcacheState:
             if getattr(cfg, field, False):
                 reasons.append(f"{what} does not support {flag}: {why}")
         return reasons
+
+
+def max_draft_tokens(cfg) -> Optional[int]:
+    """The widest verify's rows a request: the draft tokens, or under adaptive
+    speculation its largest candidate step + 1 (topk 1)."""
+    tokens = getattr(cfg, "speculative_num_draft_tokens", None)
+    if tokens is None or not getattr(cfg, "speculative_adaptive", False):
+        return tokens
+    from sglang.srt.speculative.adaptive_spec_params import (
+        resolve_candidate_steps_from_config,
+    )
+
+    steps = resolve_candidate_steps_from_config(
+        cfg_path=getattr(cfg, "speculative_adaptive_config", None)
+    )
+    return max(int(tokens), max(steps) + 1)
+
+
+def _env_device_reasons(cfg, what: str) -> list[str]:
+    """The WIP checks that read the environment, the adaptive width and the device."""
+    from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    reasons = []
+    if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+        reasons.append(f"{what} needs SGLANG_RAGGED_VERIFY_MODE=static")
+    if pp_spec_stable_rows_enabled():
+        reasons.append(f"{what} does not support SGLANG_ENABLE_PP_SPEC")
+    widest = max_draft_tokens(cfg)
+    if getattr(cfg, "speculative_adaptive", False) and (widest or 0) > MAX_DRAFT_TOKENS:
+        reasons.append(
+            f"{what} takes 1 to {MAX_DRAFT_TOKENS} draft tokens per verify; the "
+            f"--speculative-adaptive candidate steps reach {widest}"
+        )
+    # The request rings and the fp16 key ring run on the vendored SM107 flush only.
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() != (10, 7):
+        major, minor = torch.cuda.get_device_capability()
+        reasons.append(
+            f"{what} keeps request rings and an fp16 key ring, which only the SM107 "
+            f"flush takes; got SM{major}{minor}"
+        )
+    return reasons
 
 
 def _gdn_dims(model) -> tuple[int, int, int, int, int]:

@@ -497,6 +497,25 @@ class TestConfigReasons(unittest.TestCase):
         prefill = _cfg(disaggregation_mode="prefill", disable_radix_cache=True)
         self.assertEqual(len(UcacheState.config_reasons(prefill)), 1)
 
+    def test_environment_adaptive_and_device(self):
+        for env in (
+            {"SGLANG_RAGGED_VERIFY_MODE": "compact"},
+            {"SGLANG_ENABLE_PP_SPEC": "1"},
+        ):
+            with self.subTest(**env), mock.patch.dict("os.environ", env):
+                self.assertEqual(len(UcacheState.config_reasons(_cfg())), 1)
+        adaptive = _cfg(speculative_adaptive=True, speculative_adaptive_config="x")
+        target = "sglang.srt.speculative.adaptive_spec_params.resolve_candidate_steps_from_config"
+        with mock.patch(target, return_value=[1, 3, 7]):
+            self.assertEqual(S.max_draft_tokens(adaptive), 8)
+            self.assertEqual(UcacheState.config_reasons(adaptive), [])
+        with mock.patch(target, return_value=[1, 3, 8]):
+            self.assertEqual(len(UcacheState.config_reasons(adaptive)), 1)
+        with mock.patch("torch.cuda.is_available", return_value=True), mock.patch(
+            "torch.cuda.get_device_capability", return_value=(10, 0)
+        ):
+            self.assertEqual(len(UcacheState.config_reasons(_cfg())), 1)
+
     def test_missing_fields_read_defensively(self):
         reasons = UcacheState.config_reasons(SimpleNamespace())
         self.assertTrue(reasons)  # no dtype, no spec: refused, no AttributeError

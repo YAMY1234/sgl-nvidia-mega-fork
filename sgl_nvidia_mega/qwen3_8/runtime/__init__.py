@@ -80,9 +80,11 @@ def config_reasons(cfg, hf_config) -> list[str]:
             )
         reasons += [f"{UCACHE_ENV}=1: {r}" for r in UcacheState.config_reasons(cfg)]
     if sglang_ucache or ucache_requested():
+        from sgl_nvidia_mega.qwen3_8.runtime.gdn_ucache_state import max_draft_tokens
+
         # SGLang has no u-cache verify of its own: the executor must cover every
         # target verify, so its widest one must fit the built widths.
-        tokens = int(getattr(cfg, "speculative_num_draft_tokens", 0) or 0)
+        tokens = int(max_draft_tokens(cfg) or 0)
         running = int(getattr(cfg, "max_running_requests", 0) or 0)
         if tokens and running and tokens * running > MAX_ROWS:
             reasons.append(

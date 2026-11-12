@@ -16,9 +16,23 @@ logger = logging.getLogger(__name__)
 # its stock step function. S0 ships none: every op runs stock.
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 SHIPPED_SLOTS: tuple[str, ...] = ()
-KNOWN_SLOTS: tuple[str, ...] = ()
+# hc: the HC write-back kernel for up to 32 rows (runtime/hc.py); needs the S1 layers
+KNOWN_SLOTS: tuple[str, ...] = ("hc",)
 # The widest covered step: 4 rows a request x 256 requests.
 MAX_ROWS = 1024
+# S1 (test switch until it is the default): run each layer's HC read / mixer /
+# HC write / MoE from the executor instead of through the stage boundaries.
+DECOMPOSE_ENV = "SGLANG_NVIDIA_MEGAKERNEL_Q38_DECOMPOSE"
+
+
+def decompose_supported(parallel) -> bool:
+    """The stage boundaries do no collective and keep no rows elsewhere."""
+    return (
+        parallel.tp_size == 1
+        and getattr(parallel, "attn_dp_size", 1) == 1
+        and getattr(parallel, "attn_cp_size", 1) == 1
+        and getattr(parallel, "moe_ep_size", 1) == 1
+    )
 
 
 def requested_slots() -> frozenset:
@@ -71,8 +85,11 @@ def build(model, hf_config, ctx):
         widths = tuple(range(1, MAX_ROWS + 1))
     else:
         widths = tuple(ctx.widths)
-    checker = (
-        parity.Parity(model, draft=draft) if parity.ENABLED else None
+    from sglang.srt.runtime_context import get_parallel
+
+    checker = parity.Parity(model, draft=draft) if parity.ENABLED else None
+    decompose = os.environ.get(DECOMPOSE_ENV) == "1" and decompose_supported(
+        get_parallel()
     )
     executor = Qwen38Executor(
         model,
@@ -81,10 +98,35 @@ def build(model, hf_config, ctx):
         slots=slots,
         binding=ctx.binding,
         parity=checker,
+        decompose=decompose,
     )
+    if "hc" in slots:
+        executor.hc_ready = _build_hc(model, decompose)
     logger.info(
-        "NVIDIA megakernel: Qwen3.8 %s executor: slots %s; every other op stock",
+        "NVIDIA megakernel: Qwen3.8 %s executor: %s; slots %s; every other op stock",
         "draft" if draft else "target",
+        "layers decomposed (S1)" if decompose else "layers through the stage boundaries (S0)",
         sorted(slots) or "none",
     )
     return executor
+
+
+def _build_hc(model, decompose) -> bool:
+    """Whether slot hc runs, agreed on every rank."""
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    from sgl_nvidia_mega.qwen3_8.runtime import hc
+
+    m = model.model
+    reason = "" if decompose else f"needs the S1 layers ({DECOMPOSE_ENV}=1 at TP1)"
+    for i in range(m.start_layer, m.end_layer):
+        reason = reason or hc.layer_supported(m.layers[i])
+    reason = reason or hc.build()
+    megakernel_agree(reason, what="Qwen3.8 slot hc")
+    if reason:
+        unavailable("hc", reason)
+    return not reason
+
+
+def unavailable(slot: str, reason: str) -> None:
+    logger.info("NVIDIA megakernel: Qwen3.8 slot %s uses stock (%s)", slot, reason)

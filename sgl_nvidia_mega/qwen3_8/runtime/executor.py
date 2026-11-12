@@ -39,6 +39,7 @@ try:
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.megakernels.spec import Step
 
+from sgl_nvidia_mega.qwen3_8.runtime import hc
 from sgl_nvidia_mega.qwen3_8.runtime.engagement import Engagement
 from sgl_nvidia_mega.qwen3_8.runtime.state import StepState
 
@@ -120,7 +121,9 @@ class Qwen38Executor:
     graph_variants = None
     speculative_runtime_hooks = None
 
-    def __init__(self, lm, *, widths, draft, slots, binding=None, parity=None):
+    def __init__(
+        self, lm, *, widths, draft, slots, binding=None, parity=None, decompose=False
+    ):
         from sglang.srt.models.qwen4_exp import Qwen4ExpLinearDecoderLayer
 
         self.lm = lm
@@ -131,6 +134,12 @@ class Qwen38Executor:
         self.binding = binding
         self.parity = parity
         self.engagement = Engagement("draft" if draft else "target")
+        # S1: the layer split into its HC read / mixer / HC write / MoE pieces,
+        # called from here instead of through the stage boundaries. Only where the
+        # boundaries do no collective (TP1, no DP / CP / EP).
+        self.decompose = decompose
+        # slot hc (S2): set by build once the kernels compiled and every layer fits
+        self.hc_ready = False
         m = lm.model
         self.mixers = {
             i: (
@@ -307,21 +316,33 @@ class Qwen38Executor:
                     next_layer.ple.start_prefetch(batch=st.ple_batch, forward_batch=fb)
                 else:
                     next_norm = next_layer.attn_hyper_connection.hc_norm
+                st.scratch["hc.next_inject"] = (
+                    None
+                    if next_layer.ple is not None
+                    else next_layer.attn_hyper_connection.block_inject_weight.weight
+                )
             elif m.pp_group.is_last_rank:
                 next_norm = m.hyper_connection_mixer.hc_norm
+                st.scratch["hc.next_inject"] = None
             with (
                 recorder.with_current_layer(i),
                 layer.hc_norms(normalized_input, next_norm) as norms,
             ):
-                hidden = self._layer(i, layer, hidden, st)
+                if self.decompose:
+                    hidden = self._layer_streams(i, layer, hidden, st)
+                else:
+                    hidden = self._layer(i, layer, hidden, st)
             normalized_input = norms.output
             if self.parity is not None:
                 self.parity.record_layer(i, hidden)
         _commit_ple_batch(batch=st.ple_batch, forward_batch=fb)
         hc_hidden = hidden
-        hidden = residual_batch.final_norm(
-            hidden, fb, _MixStreams(m.hyper_connection_mixer, normalized_input)
-        )
+        mix = _MixStreams(m.hyper_connection_mixer, normalized_input)
+        if self.decompose:
+            residual_batch.clear(fb)
+            hidden = mix(hidden)
+        else:
+            hidden = residual_batch.final_norm(hidden, fb, mix)
         st.ran("hc.final_mix", STOCK)
         return hidden, hc_hidden
 
@@ -338,6 +359,64 @@ class Qwen38Executor:
         hidden = layer._run_ffn_stage(hidden, fb)
         st.ran("moe+hc.ffn", STOCK)
         return hidden
+
+
+    def _layer_streams(self, i, layer, streams, st):
+        """S1: the decoder layer on the HC streams, at TP1. The stage boundaries
+        there apply the attention write-back at the FFN read and the FFN
+        write-back at the stage's finish, both inside the layer's prepared-norm
+        scope, so this is the same sequence of the layer's own HC calls. With
+        slot ``hc`` (S2) a write-back of up to 32 rows runs ``hc.write``."""
+        fb = st.fb
+        norms = layer._hc_norms
+        streams = layer._widen_streams(streams)
+        use_hc = self.hc_ready and streams.shape[0] <= hc.MAX_ROWS
+        if layer.ple is not None:
+            layer._ple_forward_batch, layer._ple_batch = fb, st.ple_batch
+        try:
+            x, (res, normed, partials) = layer._attn_mix(streams)
+        finally:
+            layer._ple_forward_batch = layer._ple_batch = None
+        st.ran("hc.attn_read", STOCK)
+        if use_hc:
+            carried = st.scratch.pop("hc.partials", None)
+            partials = (
+                carried
+                if carried is not None and layer.ple is None
+                else hc.gate(normed, layer.attn_hyper_connection.block_inject_weight.weight)
+            )
+        if not fb.forward_mode.is_idle():
+            x = self.mixers[i](layer, x, st)
+        mlp_hc = layer.mlp_hyper_connection
+        if use_hc:
+            streams, norms.ffn_input, ffn_partials = hc.write(
+                x, res, partials, mlp_hc.hc_norm, mlp_hc.block_inject_weight.weight
+            )
+            st.ran("hc.attn_write", "hc_norm_gate")
+        else:
+            streams = layer._attn_combine(x, (res, normed, partials))
+            st.ran("hc.attn_write", STOCK)
+        x, (res, normed, partials) = layer._ffn_mix(streams)
+        st.ran("hc.ffn_read", STOCK)
+        x = _moe_stock(layer, x, st)
+        if use_hc:
+            streams, norms.output, st.scratch["hc.partials"] = hc.write(
+                x, res, ffn_partials, norms.next_norm, st.scratch.get("hc.next_inject")
+            )
+            st.ran("hc.ffn_write", "hc_norm_gate")
+        else:
+            streams = layer._ffn_combine(x, (res, normed, partials))
+            st.ran("hc.ffn_write", STOCK)
+        return streams
+
+
+def _moe_stock(layer, x, st):
+    from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+
+    st.ran("moe", STOCK)
+    if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+        return layer.mlp(x, st.fb, defer_finalize=False)
+    return layer.mlp(x)
 
 
 def _qsa_stock(layer, hidden, st):

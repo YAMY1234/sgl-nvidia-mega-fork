@@ -525,22 +525,36 @@ class Qwen38Executor:
         st.ran("hc.attn_read", hc_wide.mix_route(attn_hc, normed, limits=self.hc_limits))
         if not fb.forward_mode.is_idle():
             x = self.mixers[i](layer, x, st)
-        st.ran(
-            "hc.attn_write",
-            hc_wide.write_route(
-                attn_hc, x, streams, normed, partials, mlp_hc.hc_norm,
+        inject = mlp_hc.block_inject_weight.weight
+        if not hc_wide.boundary_reason(
+            attn_hc, x, streams, partials, mlp_hc, inject, limits=self.hc_limits
+        ):
+            # the attention write-back and the FFN read in one launch
+            streams, normed, partials, x = hc_wide.boundary(
+                attn_hc, x, streams, partials, mlp_hc, inject, limits=self.hc_limits
+            )
+            norms.ffn_input = normed
+            st.ran("hc.attn_write", "hc_boundary_ks")
+            st.ran("hc.ffn_read", "hc_boundary_ks")
+        else:
+            st.ran(
+                "hc.attn_write",
+                hc_wide.write_route(
+                    attn_hc, x, streams, normed, partials, mlp_hc.hc_norm,
+                    limits=self.hc_limits,
+                ),
+            )
+            streams, ffn_in, ffn_partials = hc_wide.write(
+                attn_hc, x, streams, normed, partials, mlp_hc.hc_norm, inject,
                 limits=self.hc_limits,
-            ),
-        )
-        streams, ffn_in, ffn_partials = hc_wide.write(
-            attn_hc, x, streams, normed, partials, mlp_hc.hc_norm,
-            mlp_hc.block_inject_weight.weight, limits=self.hc_limits,
-        )
-        norms.ffn_input = ffn_in
-        x, normed, partials = hc_wide.mix(
-            mlp_hc, streams, ffn_in, ffn_partials, limits=self.hc_limits
-        )
-        st.ran("hc.ffn_read", hc_wide.mix_route(mlp_hc, normed, limits=self.hc_limits))
+            )
+            norms.ffn_input = ffn_in
+            x, normed, partials = hc_wide.mix(
+                mlp_hc, streams, ffn_in, ffn_partials, limits=self.hc_limits
+            )
+            st.ran(
+                "hc.ffn_read", hc_wide.mix_route(mlp_hc, normed, limits=self.hc_limits)
+            )
         x = moe.step(self, layer, x, st)
         next_norm, next_inject = norms.next_norm, st.scratch.get("hc.next_inject")
         st.ran(

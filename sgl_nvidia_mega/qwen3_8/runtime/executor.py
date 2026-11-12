@@ -39,7 +39,7 @@ try:
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.megakernels.spec import Step
 
-from sgl_nvidia_mega.qwen3_8.runtime import attention, gdn, hc, moe
+from sgl_nvidia_mega.qwen3_8.runtime import attention, gdn, hc, hc_wide, moe
 from sgl_nvidia_mega.qwen3_8.runtime.engagement import Engagement
 from sgl_nvidia_mega.qwen3_8.runtime.state import StepState
 
@@ -140,6 +140,9 @@ class Qwen38Executor:
         self.decompose = decompose
         # slot hc (S2): set by build once the kernels compiled and every layer fits
         self.hc_ready = False
+        # slot hc_wide (S2): set by build; its row limits (hc_wide.Limits)
+        self.hc_wide_ready = False
+        self.hc_limits = hc_wide.DEFAULT
         m = lm.model
         # slot gdn_native_pdl: set by build; the pools are checked at the first verify
         self.gdn_pdl_ready = False
@@ -408,12 +411,16 @@ class Qwen38Executor:
         """S1: the decoder layer on the HC streams, at TP1. The stage boundaries
         there apply the attention write-back at the FFN read and the FFN
         write-back at the stage's finish, both inside the layer's prepared-norm
-        scope, so this is the same sequence of the layer's own HC calls. With
-        slot ``hc`` (S2) a write-back of up to 32 rows runs ``hc.write``."""
+        scope, so this is the same sequence of the layer's own HC calls. Slot
+        ``hc`` serves the write-backs of up to 32 rows (``hc.py``), slot ``hc_wide``
+        the reads and write-backs of more (``hc_wide.py``)."""
+        streams = layer._widen_streams(streams)
+        rows = streams.shape[0]
+        if self.hc_wide_ready and rows > hc.MAX_ROWS:
+            return self._layer_streams_wide(i, layer, streams, st)
         fb = st.fb
         norms = layer._hc_norms
-        streams = layer._widen_streams(streams)
-        use_hc = self.hc_ready and streams.shape[0] <= hc.MAX_ROWS
+        use_hc = self.hc_ready and rows <= hc.MAX_ROWS
         if layer.ple is not None:
             layer._ple_forward_batch, layer._ple_batch = fb, st.ple_batch
         try:
@@ -456,4 +463,58 @@ class Qwen38Executor:
         else:
             streams = layer._ffn_combine(x, (res, normed, partials))
             st.ran("hc.ffn_write", STOCK)
+        return streams
+
+    def _layer_streams_wide(self, i, layer, streams, st):
+        """The S1 layer for more than 32 rows with slot ``hc_wide``: the reads mix on
+        the wide split-K kernels and the write-backs combine, normalize for the
+        next read and compute its gate totals in one launch where a kernel serves
+        the rows (each falls back to SGLang's own read / write-back otherwise)."""
+        fb = st.fb
+        norms = layer._hc_norms
+        attn_hc, mlp_hc = layer.attn_hyper_connection, layer.mlp_hyper_connection
+        carried = st.scratch.pop("hc.partials", None)
+        normalized = norms.attn_input
+        if layer.ple is not None:
+            layer._ple_forward_batch, layer._ple_batch = fb, st.ple_batch
+            try:
+                streams = layer._add_ple_embedding(streams)
+            finally:
+                layer._ple_forward_batch = layer._ple_batch = None
+            # the PLE embedding changed the streams after the last write-back
+            normalized = carried = None
+        x, normed, partials = hc_wide.mix(
+            attn_hc, streams, normalized, carried, limits=self.hc_limits
+        )
+        st.ran("hc.attn_read", hc_wide.mix_route(attn_hc, normed, limits=self.hc_limits))
+        if not fb.forward_mode.is_idle():
+            x = self.mixers[i](layer, x, st)
+        st.ran(
+            "hc.attn_write",
+            hc_wide.write_route(
+                attn_hc, x, streams, normed, partials, mlp_hc.hc_norm,
+                limits=self.hc_limits,
+            ),
+        )
+        streams, ffn_in, ffn_partials = hc_wide.write(
+            attn_hc, x, streams, normed, partials, mlp_hc.hc_norm,
+            mlp_hc.block_inject_weight.weight, limits=self.hc_limits,
+        )
+        norms.ffn_input = ffn_in
+        x, normed, partials = hc_wide.mix(
+            mlp_hc, streams, ffn_in, ffn_partials, limits=self.hc_limits
+        )
+        st.ran("hc.ffn_read", hc_wide.mix_route(mlp_hc, normed, limits=self.hc_limits))
+        x = moe.step(self, layer, x, st)
+        next_norm, next_inject = norms.next_norm, st.scratch.get("hc.next_inject")
+        st.ran(
+            "hc.ffn_write",
+            hc_wide.write_route(
+                mlp_hc, x, streams, normed, partials, next_norm, limits=self.hc_limits
+            ),
+        )
+        streams, norms.output, st.scratch["hc.partials"] = hc_wide.write(
+            mlp_hc, x, streams, normed, partials, next_norm, next_inject,
+            limits=self.hc_limits,
+        )
         return streams

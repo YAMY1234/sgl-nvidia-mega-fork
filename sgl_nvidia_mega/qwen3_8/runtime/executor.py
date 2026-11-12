@@ -144,6 +144,9 @@ class Qwen3_8Executor:
         self.hc_wide_ready = False
         self.hc_limits = hc_wide.DEFAULT
         m = lm.model
+        # slot gdn_native_pdl: set by build; the pools are checked at the first verify
+        self.gdn_pdl_ready = False
+        self._pools_checked = False
         self.mixers = {
             i: (
                 self._gdn
@@ -217,8 +220,30 @@ class Qwen3_8Executor:
     def _qsa(self, layer, x, st):
         return attention.step(self, layer, x, st)
 
+    def _check_pools(self, forward_batch):
+        """The pools exist from the first covered verify on (a capture warmup runs it
+        eagerly before any graph is captured); refuse a slot they cannot serve."""
+        self._pools_checked = True
+        if self.gdn_pdl_ready:
+            m = self.lm.model
+            first = next(
+                i for i, f in self.mixers.items() if f == self._gdn
+            )
+            reason = gdn.pool_reasons(
+                gdn.linear_backend(),
+                m.layers[first].linear_attn.attn.layer_id,
+                int(forward_batch.spec_info.draft_token_num),
+            )
+            if reason:
+                from sgl_nvidia_mega.qwen3_8.runtime import unavailable
+
+                unavailable("gdn_native_pdl", reason)
+                self.gdn_pdl_ready = False
+
     @torch.no_grad()
     def _forward(self, step, input_ids, positions, forward_batch):
+        if not self._pools_checked and step.mode == "target_verify":
+            self._check_pools(forward_batch)
         lm = self.lm
         st = StepState(
             lm=lm,

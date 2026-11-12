@@ -70,14 +70,7 @@ SPEC = MegakernelSpec(
     **_TARGET_PREPARE,
 )
 
-DRAFT_# The plugin-owned u-cache allocates its rings in prepare (binding v2's preparation view).
-_TARGET_PREPARE = (
-    {"prepare": runtime.prepare}
-    if "prepare" in getattr(MegakernelSpec, "__struct_fields__", ())
-    else {}
-)
-
-SPEC = MegakernelSpec(
+DRAFT_SPEC = MegakernelSpec(
     name="Qwen3.8 MTP draft executor",
     requires=_REQUIRES,
     features=_FEATURES,

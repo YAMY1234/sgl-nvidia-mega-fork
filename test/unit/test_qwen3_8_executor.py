@@ -316,6 +316,17 @@ class TestOwnUcache(unittest.TestCase):
                 runtime.os.environ[env] = old
 
 
+class TestSpecs(unittest.TestCase):
+    def test_target_and_draft(self):
+        from sgl_nvidia_mega.qwen3_8 import spec
+
+        self.assertIn("forward", spec.SPEC.name)
+        self.assertIn("draft", spec.DRAFT_SPEC.name)
+        self.assertIsNone(getattr(spec.DRAFT_SPEC, "prepare", None))
+        if "prepare" in spec.MegakernelSpec.__struct_fields__:
+            self.assertIs(spec.SPEC.prepare, runtime.prepare)
+
+
 class TestEngagement(unittest.TestCase):
     def test_logs_each_new_set_once(self):
         e = Engagement("target")

@@ -191,11 +191,16 @@ for each (mode, width): `NVIDIA megakernel engagement: ...`.
 `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) lists the slots to run. Unset or empty
 runs every op on SGLang's module.
 
+| Slot | Runs | Numerics against SGLang's module |
+| --- | --- | --- |
+| `hc` | HC write-backs of 1 to 32 rows | rounding |
+| `hc_wide` | HC reads and write-backs of 33 to 1024 rows; at 33 to 320 rows, a write-back and the next read in one launch | rounding |
+
 Switches:
 
 - **`SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_DECOMPOSE=1`** runs the S1 layers: the executor calls
   each layer's HC read, mixer, HC write-back and MoE itself, instead of going through the
-  stage boundaries. It needs TP1.
+  stage boundaries. It needs TP1. `hc` and `hc_wide` need it.
 - **`SGLANG_NVIDIA_MEGAKERNEL_PARITY=layer|control`** is test only. It runs SGLang's forward
   beside the executor on every covered step, restoring the recurrent state between the two,
   and logs the steps, layers and logits that differ (`qwen3_8/tools/parity.py`).

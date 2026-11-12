@@ -403,9 +403,13 @@ class Qwen38Executor:
                     if next_layer.ple is not None
                     else next_layer.attn_hyper_connection.block_inject_weight.weight
                 )
+                # the next read a wide write-back may take over (hc_wide.boundary)
+                st.scratch["hc.next_hc"] = (
+                    None if next_layer.ple is not None else next_layer.attn_hyper_connection
+                )
             elif m.pp_group.is_last_rank:
                 next_norm = m.hyper_connection_mixer.hc_norm
-                st.scratch["hc.next_inject"] = None
+                st.scratch["hc.next_inject"] = st.scratch["hc.next_hc"] = None
             with (
                 recorder.with_current_layer(i),
                 layer.hc_norms(normalized_input, next_norm) as norms,
@@ -510,6 +514,8 @@ class Qwen38Executor:
         norms = layer._hc_norms
         attn_hc, mlp_hc = layer.attn_hyper_connection, layer.mlp_hyper_connection
         carried = st.scratch.pop("hc.partials", None)
+        # the previous layer's write-back already ran this read (hc_wide.boundary)
+        mixed = st.scratch.pop("hc.mixed", None)
         normalized = norms.attn_input
         if layer.ple is not None:
             layer._ple_forward_batch, layer._ple_batch = fb, st.ple_batch
@@ -519,10 +525,16 @@ class Qwen38Executor:
                 layer._ple_forward_batch = layer._ple_batch = None
             # the PLE embedding changed the streams after the last write-back
             normalized = carried = None
-        x, normed, partials = hc_wide.mix(
-            attn_hc, streams, normalized, carried, limits=self.hc_limits
-        )
-        st.ran("hc.attn_read", hc_wide.mix_route(attn_hc, normed, limits=self.hc_limits))
+        if mixed is not None:
+            x, normed, partials = mixed, normalized, carried
+            st.ran("hc.attn_read", "hc_boundary_ks")
+        else:
+            x, normed, partials = hc_wide.mix(
+                attn_hc, streams, normalized, carried, limits=self.hc_limits
+            )
+            st.ran(
+                "hc.attn_read", hc_wide.mix_route(attn_hc, normed, limits=self.hc_limits)
+            )
         if not fb.forward_mode.is_idle():
             x = self.mixers[i](layer, x, st)
         inject = mlp_hc.block_inject_weight.weight
@@ -557,6 +569,21 @@ class Qwen38Executor:
             )
         x = moe.step(self, layer, x, st)
         next_norm, next_inject = norms.next_norm, st.scratch.get("hc.next_inject")
+        next_hc = st.scratch.get("hc.next_hc")
+        if next_hc is not None and not hc_wide.boundary_reason(
+            mlp_hc, x, streams, partials, next_hc, next_inject, limits=self.hc_limits
+        ):
+            # the FFN write-back and the next layer's attention read in one launch
+            (
+                streams,
+                norms.output,
+                st.scratch["hc.partials"],
+                st.scratch["hc.mixed"],
+            ) = hc_wide.boundary(
+                mlp_hc, x, streams, partials, next_hc, next_inject, limits=self.hc_limits
+            )
+            st.ran("hc.ffn_write", "hc_boundary_ks")
+            return streams
         st.ran(
             "hc.ffn_write",
             hc_wide.write_route(

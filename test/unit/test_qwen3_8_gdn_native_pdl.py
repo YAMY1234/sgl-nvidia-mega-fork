@@ -5,7 +5,7 @@ import ast
 import gc
 import sys
 import weakref
-from dataclasses import fields, replace
+from dataclasses import dataclass, fields, replace
 from itertools import product
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -157,7 +157,7 @@ def original(raw, s, io):
         null_block_id=-1,
         block_v=64,
         num_warps=1,
-        num_stages=2,
+        num_stages=getattr(s, "num_stages", 2),
         nk=2,
         bs_min=4,
         pdl=True,
@@ -176,6 +176,34 @@ CASES = list(
         (0, 2),
     )
 )
+
+
+def staged(s, n):
+    """The signature at n verify stages; SGLang without the field gets a test subclass."""
+    if "num_stages" in {f.name for f in fields(NativeGdnPdlSignature)}:
+        return replace(s, num_stages=n)
+
+    @dataclass(frozen=True)
+    class Staged(NativeGdnPdlSignature):
+        num_stages: int = 2
+
+    return Staged(**{f.name: getattr(s, f.name) for f in fields(s)}, num_stages=n)
+
+
+@pytest.mark.parametrize("stages", (2, 3))
+def test_verify_stage_count_reaches_the_launch(raw, stages):
+    s = staged(signature(rows=32), stages)
+    assert native.supported(s)
+    io = view(s)
+    assert original(raw, s, io) is io.out
+    expected = list(raw[1].calls)
+    raw[1].calls.clear()
+    assert native.build(s)(io) is None
+    assert raw[1].calls == expected
+
+
+def test_unknown_verify_stage_count_has_no_offer():
+    assert not native.supported(staged(signature(), 4))
 
 
 @pytest.mark.parametrize("case", CASES)

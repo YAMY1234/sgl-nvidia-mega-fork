@@ -226,7 +226,10 @@ def test_run_uses_canonical_operation_enum_before_registration(monkeypatch, tmp_
         helper.run(str(path))
     assert len(seen) == 12
     for actual, case in zip(seen, helper.plan(seen[0].dot_precision)):
-        assert {f.name: int(getattr(actual, f.name)) for f in fields(actual)} == case
+        got = {f.name: int(getattr(actual, f.name)) for f in fields(actual)}
+        # SGLang with the verify stage count declares the default two stages.
+        assert got.pop("num_stages", 2) == 2
+        assert got == case
     assert json.loads(path.read_text())["status"] == "FAIL"
 
 

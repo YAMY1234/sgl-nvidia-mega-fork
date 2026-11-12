@@ -44,6 +44,8 @@ def supported(s):
         and s.wait_for_gate_producer in (0, 1)
         and s.state_prefetch in (0, 1)
         and s.dot_precision in (0, 2)
+        # Pipeline stages of the verify launch; SGLang without the field launches 2.
+        and getattr(s, "num_stages", 2) in (2, 3)
     )
 
 
@@ -250,7 +252,7 @@ class NativeGdnPdl:
             NULL_BLOCK_ID=-1,
             DOT_PRECISION="tf32" if s.dot_precision == 0 else "ieee",
             num_warps=1,
-            num_stages=2,
+            num_stages=getattr(s, "num_stages", 2),
             USE_GDC=True,
             launch_pdl=True,
             WAIT_FOR_GATE_PRODUCER=bool(s.wait_for_gate_producer),

@@ -26,8 +26,11 @@ KNOWN_SLOTS: tuple[str, ...] = (
     "hc_wide",
     "gdn_native_pdl",
     "qsa_pool",
+    "qsa_indexer",
     "moe_finalize",
 )
+# A node-local directory for the JIT sources some kernels write before compiling.
+SOURCE_DIR_ENV = "SGLANG_NVIDIA_MEGAKERNEL_Q38_SOURCE_DIR"
 # The widest covered step: 4 rows a request x 256 requests.
 MAX_ROWS = 1024
 # S1 (test switch until it is the default): run each layer's HC read / mixer /
@@ -135,6 +138,8 @@ def build(model, hf_config, ctx):
         executor.gdn_pdl_ready = _build_gdn_pdl(model)
     if "moe_finalize" in slots:
         executor.moe_finalize_ready = _build_moe_finalize(model, decompose)
+    if "qsa_indexer" in slots:
+        executor.qsa_indexer = _build_qsa_indexer(model)
     if "qsa_pool" in slots and not draft:
         executor.qsa_pool_ready = _build_qsa_pool(model)
         if executor.qsa_pool_ready:
@@ -210,6 +215,27 @@ def _build_moe_finalize(model, decompose) -> bool:
     if reason:
         unavailable("moe_finalize", reason)
     return not reason
+
+
+def _build_qsa_indexer(model):
+    """The indexer kernels (qsa_indexer.IndexerKernels), or None (stock indexer)."""
+    import tempfile
+
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
+
+    source_dir = os.environ.get(SOURCE_DIR_ENV) or os.path.join(
+        tempfile.gettempdir(), "q38-mk-sources"
+    )
+    os.makedirs(source_dir, exist_ok=True)
+    kernels = qsa_indexer.IndexerKernels()
+    reason = qsa_indexer.build(model, kernels, source_dir=os.path.abspath(source_dir))
+    megakernel_agree(reason, what="Qwen3.8 slot qsa_indexer")
+    if reason:
+        unavailable("qsa_indexer", reason)
+        return None
+    return kernels
 
 
 def _build_qsa_pool(model) -> bool:

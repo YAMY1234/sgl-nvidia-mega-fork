@@ -183,17 +183,17 @@ class TestStepFallbacks(unittest.TestCase):
         self.assertEqual(gdn.step(ex, layer, torch.zeros(8, 4), st), "gdn-stock")
         self.assertEqual(st.ran_ops, [("gdn", "stock")])
 
-    def test_qsa_stock_when_off_or_wide(self):
+    def test_qsa_stock_when_off_or_prefill(self):
         from sgl_nvidia_mega.qwen3_8.runtime import attention
 
         calls = []
         layer = SimpleNamespace(
-            self_attention=lambda **kw: calls.append(kw) or "qsa-stock"
+            is_qsa=True, self_attention=lambda **kw: calls.append(kw) or "qsa-stock"
         )
-        for ready, rows in ((False, 8), (True, attention.MAX_ROWS + 4)):
-            st = _St(_Mode.TARGET_VERIFY, rows)
-            ex = SimpleNamespace(qsa_pool_ready=ready)
-            out = attention.step(ex, layer, torch.zeros(rows, 4), st)
+        for ready, mode in ((False, _Mode.TARGET_VERIFY), (True, _Mode.EXTEND)):
+            st = _St(mode, 8)
+            ex = SimpleNamespace(qsa_pool_ready=ready, qsa_indexer=None)
+            out = attention.step(ex, layer, torch.zeros(8, 4), st)
             self.assertEqual(out, "qsa-stock")
             self.assertEqual(st.ran_ops, [("qsa", "stock")])
         self.assertEqual(len(calls), 2)

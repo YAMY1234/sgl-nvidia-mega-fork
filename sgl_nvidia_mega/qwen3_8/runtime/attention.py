@@ -81,37 +81,69 @@ def build() -> str:
 
 
 def step(executor, layer, x, st):
+    """The layer's attention output [rows, hidden] (before the stage's reduction).
+
+    With slot ``qsa_indexer`` or ``qsa_pool``, a decode / verify / draft-extend step
+    runs the attention split into its pieces here: SGLang's QKV + gate projection, the
+    indexer (``qsa_indexer.select``: the plugin's fold, scorers and selects where they
+    serve the step), the sparse attention (the pool kernels where they serve it) and
+    the gate and o_proj. Otherwise SGLang's ``self_attention`` runs whole."""
     fb = st.fb
+    mode = fb.forward_mode
     if (
-        executor.qsa_pool_ready
-        and fb.forward_mode.is_target_verify()
-        and x.shape[0] <= MAX_ROWS
-        and int(fb.spec_info.draft_token_num) == 4
+        (executor.qsa_indexer is not None or executor.qsa_pool_ready)
+        and layer.is_qsa
+        and (mode.is_target_verify() or mode.is_decode() or mode.is_draft_extend_v2())
     ):
-        out = _verify_pool(executor, layer, x, st)
-        if out is not None:
-            return out
+        return _decomposed(executor, layer, x, st)
     st.ran("qsa", STOCK)
     return layer.self_attention(positions=st.positions, hidden_states=x, forward_batch=fb)
 
 
-def _verify_pool(executor, layer, x, st):
-    """``self_attention`` with the plugin's pool attention, or None (no launch yet)
-    when this step's layout is not the kernel's."""
+def _pool_eligible(executor, fb, rows) -> bool:
+    return (
+        executor.qsa_pool_ready
+        and fb.forward_mode.is_target_verify()
+        and rows <= MAX_ROWS
+        and int(fb.spec_info.draft_token_num) == 4
+    )
+
+
+def _decomposed(executor, layer, x, st):
+    """``self_attention`` from its pieces. The indexer runs on the main stream here
+    (SGLang overlaps it on a side stream under capture); both orders compute the
+    same values."""
     from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
     from sglang.srt.model_executor.forward_context import get_attn_backend
 
+    from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
+
     fb, positions = st.fb, st.positions
-    backend = resolve_qsa_sparse_backend(get_attn_backend())
-    pool = backend.token_to_kv_pool
-    if pool.layer_router.layer(layer.attn.layer_id).key().dtype != torch.bfloat16:
-        return None
-    # The indexer runs on the main stream here (SGLang overlaps it on a side stream
-    # under capture); both orders compute the same values.
     q, k, v, gate = layer._prepare_qkv_gate(
         positions=positions, hidden_states=x, forward_batch=fb
     )
-    indices = layer._compute_qsa_topk_indices(x, positions, fb)
+    if executor.qsa_indexer is not None:
+        indices = qsa_indexer.select(executor, layer, x, positions, st)
+    else:
+        indices = layer._compute_qsa_topk_indices(x, positions, fb)
+        st.ran("qsa.indexer", STOCK)
+    rows = q.shape[0]
+    if _pool_eligible(executor, fb, rows):
+        backend = resolve_qsa_sparse_backend(get_attn_backend())
+        out = _verify_pool(executor, layer, backend, q, k, v, gate, indices, st)
+        if out is not None:
+            return out
+    attn_out = layer.attn(q, k, v, fb, topk_indices=indices)
+    return _finish(layer, attn_out, gate, st, STOCK)
+
+
+def _verify_pool(executor, layer, backend, q, k, v, gate, indices, st):
+    """The pool kernels on a TP1 verify of up to 64 rows, or None (nothing launched)
+    when this step's layout is not theirs."""
+    fb = st.fb
+    pool = backend.token_to_kv_pool
+    if pool.layer_router.layer(layer.attn.layer_id).key().dtype != torch.bfloat16:
+        return None
     md = backend._resolve_metadata(fb)
     rows = q.shape[0]
     indexer = md.indexer_metadata
@@ -124,9 +156,7 @@ def _verify_pool(executor, layer, x, st):
         or row_requests is None
         or rows != fb.req_pool_indices.numel() * 4
     ):
-        # The layout is not the kernel's: SGLang's attention on the same q/k/v.
-        attn_out = layer.attn(q, k, v, fb, topk_indices=indices)
-        return _finish(layer, attn_out, gate, st, STOCK)
+        return None
     kv = pool.layer_router.read(layer.attn.layer_id)
     out = executor.qsa_pool.run(
         q=q.reshape(rows, QUERY_HEADS * HEAD_DIM),

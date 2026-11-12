@@ -39,6 +39,15 @@ _FEATURES = frozenset(
 )
 # S0 runs SGLang's own ops; kernel slots declare their tolerances as they land.
 _NUMERICS = Numerics(kind=NumericsKind.BITWISE)
+# The target's step view: the typed EAGLE hybrid view (QSA step/pool views, GDN pools
+# incl. the u-cache rings, layer readiness) where SGLang offers binding kinds. The
+# MTP draft keeps the default view: the EAGLE prefill view needs a linear-attention
+# backend, which the draft has not.
+_TARGET_BINDING = (
+    {"binding": "eagle_hybrid"}
+    if "binding" in getattr(MegakernelSpec, "__struct_fields__", ())
+    else {}
+)
 
 SPEC = MegakernelSpec(
     name="Qwen3.8 forward executor",
@@ -50,6 +59,7 @@ SPEC = MegakernelSpec(
     api_version=2,
     model_disable_reasons=runtime.model_reasons,
     config_disable_reasons=runtime.config_reasons,
+    **_TARGET_BINDING,
 )
 
 DRAFT_SPEC = MegakernelSpec(

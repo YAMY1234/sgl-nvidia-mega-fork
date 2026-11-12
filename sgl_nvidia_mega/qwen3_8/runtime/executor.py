@@ -148,6 +148,8 @@ class Qwen38Executor:
         self.qsa_pool = None
         # slot moe_finalize: set by build
         self.moe_finalize_ready = False
+        # set by build when SGLang cannot run a target verify itself (u-cache pools)
+        self.verify_required = False
         self._pools_checked = False
         self.mixers = {
             i: (
@@ -200,6 +202,11 @@ class Qwen38Executor:
         else:
             name = None
         if name is None or rows not in self._covered:
+            if name == "target_verify" and self.verify_required:
+                raise RuntimeError(
+                    f"Qwen3.8 executor: a {rows}-row target verify is not covered, and "
+                    "SGLang has no verify of its own for this pool (u-cache)"
+                )
             return None
         return Step(mode=name, rows=rows)
 

@@ -51,6 +51,16 @@ def config_reasons(cfg, hf_config) -> list[str]:
         f"{SLOTS_ENV}: unknown slot {name!r}"
         for name in sorted(requested_slots() - set(KNOWN_SLOTS))
     ]
+    if getattr(cfg, "enable_gdn_replayssm_ucache", False):
+        # SGLang has no u-cache verify of its own: the executor must cover every
+        # target verify, so its widest one must fit the built widths.
+        tokens = int(getattr(cfg, "speculative_num_draft_tokens", 0) or 0)
+        running = int(getattr(cfg, "max_running_requests", 0) or 0)
+        if tokens and running and tokens * running > MAX_ROWS:
+            reasons.append(
+                f"--enable-gdn-replayssm-ucache: a verify of {running} requests x "
+                f"{tokens} rows exceeds the executor's {MAX_ROWS} rows"
+            )
     graph = getattr(cfg, "cuda_graph_config", None)
     prefill = getattr(getattr(graph, "prefill", None), "backend", None)
     if prefill is not None and str(prefill) not in ("disabled", "Backend.DISABLED"):
@@ -103,6 +113,13 @@ def build(model, hf_config, ctx):
         parity=checker,
         decompose=decompose,
     )
+    if not draft:
+        from sglang.srt.runtime_context import get_exec
+
+        mamba = getattr(get_exec(), "mamba", None)
+        executor.verify_required = bool(
+            getattr(mamba, "enable_gdn_replayssm_ucache", False)
+        )
     if "hc" in slots:
         executor.hc_ready = _build_hc(model, decompose)
     if "gdn_native_pdl" in slots and not draft:

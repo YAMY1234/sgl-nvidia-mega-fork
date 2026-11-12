@@ -146,6 +146,12 @@ class Qwen3_8Executor:
         m = lm.model
         # slot gdn_native_pdl: set by build; the pools are checked at the first verify
         self.gdn_pdl_ready = False
+        # set by build when SGLang cannot run a target verify itself (u-cache pools)
+        self.verify_required = False
+        # the u-cache verify (gdn_ucache.UcacheVerify), set by prepare_ucache
+        self.gdn_ucache = None
+        # the plugin's own u-cache rings (gdn_ucache_state.UcacheState), set by build
+        self.ucache_state = None
         self._pools_checked = False
         self.mixers = {
             i: (
@@ -198,6 +204,11 @@ class Qwen3_8Executor:
         else:
             name = None
         if name is None or rows not in self._covered:
+            if name == "target_verify" and self.verify_required:
+                raise RuntimeError(
+                    f"Qwen3.8 executor: a {rows}-row target verify is not covered, and "
+                    "SGLang has no verify of its own for this pool (u-cache)"
+                )
             return None
         return Step(mode=name, rows=rows)
 
@@ -224,6 +235,8 @@ class Qwen3_8Executor:
         """The pools exist from the first covered verify on (a capture warmup runs it
         eagerly before any graph is captured); refuse a slot they cannot serve."""
         self._pools_checked = True
+        if self.gdn_ucache is not None:
+            self.gdn_pdl_ready = False  # the u-cache verify serves every GDN verify
         if self.gdn_pdl_ready:
             m = self.lm.model
             first = next(
@@ -239,6 +252,21 @@ class Qwen3_8Executor:
 
                 unavailable("gdn_native_pdl", reason)
                 self.gdn_pdl_ready = False
+
+    def _build_ucache_verify(self, mamba, buffers, tokens):
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache
+
+        reason = gdn_ucache.pool_reasons(buffers, tokens, state=mamba.temporal)
+        if reason:
+            # SGLang has no u-cache verify of its own to fall back to
+            raise RuntimeError(f"Qwen3.8 executor: u-cache verify: {reason}")
+        device = mamba.temporal.device
+        self.gdn_ucache = gdn_ucache.UcacheVerify(
+            device=device,
+            first_layer_id=min(mamba.layer_ids),
+            by_request_row=bool(buffers.by_request_row),
+            options=gdn_ucache.default_options(device),
+        )
 
     @torch.no_grad()
     def _forward(self, step, input_ids, positions, forward_batch):
@@ -546,3 +574,43 @@ class Qwen3_8Executor:
             limits=self.hc_limits,
         )
         return streams
+
+
+class Qwen3_8UcacheExecutor(Qwen3_8Executor):
+    """The target executor with the plugin's own GDN u-cache: binding v2's
+    SupportsStateSlotReset and SupportsRecurrentCommit, through its UcacheState."""
+
+    @property
+    def state_bytes_per_slot(self) -> int:
+        return self.ucache_state.state_bytes_per_slot
+
+    @property
+    def state_bytes_per_request_row(self) -> int:
+        return self.ucache_state.state_bytes_per_request_row
+
+    @property
+    def keeps_draft_ssm(self) -> bool:
+        return self.ucache_state.keeps_draft_ssm
+
+    @property
+    def tracks_decode_state(self) -> bool:
+        return self.ucache_state.tracks_decode_state
+
+    @property
+    def backs_up_state(self) -> bool:
+        return self.ucache_state.backs_up_state
+
+    def reset_state_slots(self, slots, request_rows) -> None:
+        self.ucache_state.reset_state_slots(slots, request_rows)
+
+    def commit_recurrent_state(self, io) -> bool:
+        return self.ucache_state.commit(io)
+
+    def prepare_ucache(self, view) -> None:
+        """spec.prepare: allocate the rings once the pools exist, then the verify."""
+        state = self.ucache_state
+        state.prepare(view)
+        if self.gdn_ucache is None:
+            self._build_ucache_verify(
+                view.mamba, state.buffers, state.tokens_per_request
+            )

@@ -119,6 +119,10 @@ def pool_reasons(backend, layer_id: int, tokens_per_request: int) -> str:
 def step(executor, layer, x, st):
     """The layer's mixer output ([rows, hidden], before the stage's reduction)."""
     fb = st.fb
+    if executor.gdn_ucache is not None and fb.forward_mode.is_target_verify():
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache
+
+        return gdn_ucache.verify(executor, layer.linear_attn, x, st, st.view)
     if not (executor.gdn_pdl_ready and fb.forward_mode.is_target_verify()):
         st.ran("gdn", STOCK)
         return layer.linear_attn(x, fb)

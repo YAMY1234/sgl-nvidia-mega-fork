@@ -66,7 +66,10 @@ _install_fakes()
 
 from sgl_nvidia_mega.qwen3_8 import runtime  # noqa: E402
 from sgl_nvidia_mega.qwen3_8.runtime.engagement import Engagement  # noqa: E402
-from sgl_nvidia_mega.qwen3_8.runtime.executor import Qwen3_8Executor  # noqa: E402
+from sgl_nvidia_mega.qwen3_8.runtime.executor import (  # noqa: E402
+    Qwen3_8Executor,
+    Qwen3_8UcacheExecutor,
+)
 
 
 def _model(layers=(_Linear, _Linear, _Attention)):
@@ -214,6 +217,99 @@ class TestReasons(unittest.TestCase):
         self.assertEqual(runtime.model_reasons(SimpleNamespace(), None), [])
 
 
+class _State:  # a UcacheState double that records the calls
+    state_bytes_per_slot = 0
+    state_bytes_per_request_row = 123
+    keeps_draft_ssm = tracks_decode_state = backs_up_state = False
+    tokens_per_request = 4
+    buffers = "rings"
+
+    def __init__(self):
+        self.calls = []
+
+    def reset_state_slots(self, slots, request_rows):
+        self.calls.append(("reset", slots, request_rows))
+
+    def commit(self, io):
+        self.calls.append(("commit", io))
+        return True
+
+    def prepare(self, view):
+        self.calls.append(("prepare", view))
+
+
+class TestOwnUcache(unittest.TestCase):
+    def _executor(self):
+        ex = Qwen3_8UcacheExecutor(
+            _model(), widths=tuple(range(4, 1025, 4)), draft=False, slots=frozenset()
+        )
+        ex.ucache_state = _State()
+        return ex
+
+    def test_binding_protocols(self):
+        try:
+            from sglang.kernels.plugin_kernels.nvidia.spec import (
+                SupportsRecurrentCommit,
+                SupportsStateSlotReset,
+            )
+        except ImportError:
+            self.skipTest("binding v2 (SupportsStateSlotReset) not in this SGLang")
+        ex = self._executor()
+        self.assertIsInstance(ex, SupportsStateSlotReset)
+        self.assertIsInstance(ex, SupportsRecurrentCommit)
+        self.assertNotIsInstance(_executor(), SupportsStateSlotReset)
+        self.assertNotIsInstance(_executor(), SupportsRecurrentCommit)
+
+    def test_delegates_to_state(self):
+        ex = self._executor()
+        self.assertEqual((ex.state_bytes_per_slot, ex.state_bytes_per_request_row), (0, 123))
+        self.assertFalse(ex.keeps_draft_ssm or ex.tracks_decode_state)
+        self.assertFalse(ex.backs_up_state)
+        ex.reset_state_slots("slots", "rows")
+        self.assertTrue(ex.commit_recurrent_state("io"))
+        self.assertEqual(
+            ex.ucache_state.calls, [("reset", "slots", "rows"), ("commit", "io")]
+        )
+
+    def test_prepare_builds_the_verify_once(self):
+        ex = self._executor()
+        built = []
+        ex._build_ucache_verify = lambda mamba, buffers, tokens: (
+            built.append((mamba, buffers, tokens)),
+            setattr(ex, "gdn_ucache", "verify"),
+        )
+        view = SimpleNamespace(mamba="pools")
+        runtime.prepare(ex, view)
+        runtime.prepare(ex, view)  # a recapture repeats prepare
+        self.assertEqual(built, [("pools", "rings", 4)])
+        self.assertEqual(
+            ex.ucache_state.calls, [("prepare", view), ("prepare", view)]
+        )
+        runtime.prepare(_executor(), view)  # no own u-cache: nothing to prepare
+
+    def test_config_reasons(self):
+        cfg = SimpleNamespace(
+            mamba_ssm_dtype="float16",
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy="extra_buffer_lazy",
+            speculative_algorithm="NEXTN",
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+            max_running_requests=8,
+        )
+        env = runtime.UCACHE_ENV
+        old = runtime.os.environ.get(env)
+        runtime.os.environ[env] = "1"
+        try:
+            self.assertEqual(runtime.config_reasons(cfg, None), [])
+            cfg.mamba_ssm_dtype = "bfloat16"
+            cfg.max_running_requests = 512  # 512 x 4 rows > MAX_ROWS
+            self.assertEqual(len(runtime.config_reasons(cfg, None)), 2)
+        finally:
+            if old is None:
+                del runtime.os.environ[env]
+            else:
+                runtime.os.environ[env] = old
 
 
 class TestSpecs(unittest.TestCase):
@@ -223,6 +319,8 @@ class TestSpecs(unittest.TestCase):
         self.assertIn("forward", spec.SPEC.name)
         self.assertIn("draft", spec.DRAFT_SPEC.name)
         self.assertIsNone(getattr(spec.DRAFT_SPEC, "prepare", None))
+        if "prepare" in spec.MegakernelSpec.__struct_fields__:
+            self.assertIs(spec.SPEC.prepare, runtime.prepare)
 
 
 class TestEngagement(unittest.TestCase):

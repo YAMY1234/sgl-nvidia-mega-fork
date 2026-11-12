@@ -49,6 +49,12 @@ _TARGET_BINDING = (
     else {}
 )
 
+# The executor's u-cache allocates its rings in prepare (the binding's preparation view).
+_TARGET_PREPARE = (
+    {"prepare": runtime.prepare}
+    if "prepare" in getattr(MegakernelSpec, "__struct_fields__", ())
+    else {}
+)
 
 SPEC = MegakernelSpec(
     name="Qwen3.8 forward executor",
@@ -61,6 +67,7 @@ SPEC = MegakernelSpec(
     model_disable_reasons=runtime.model_reasons,
     config_disable_reasons=runtime.config_reasons,
     **_TARGET_BINDING,
+    **_TARGET_PREPARE,
 )
 
 DRAFT_SPEC = MegakernelSpec(

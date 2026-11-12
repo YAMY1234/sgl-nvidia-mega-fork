@@ -155,6 +155,9 @@ class Qwen38Executor:
         self.moe_finalize_ready = False
         # set by build when SGLang cannot run a target verify itself (u-cache pools)
         self.verify_required = False
+        # the u-cache verify (gdn_ucache.UcacheVerify), set at the first covered verify
+        # when the step view carries u-cache rings
+        self.gdn_ucache = None
         self._pools_checked = False
         self.mixers = {
             i: (
@@ -238,6 +241,26 @@ class Qwen38Executor:
         """The pools exist from the first covered verify on (a capture warmup runs it
         eagerly before any graph is captured); refuse a slot they cannot serve."""
         self._pools_checked = True
+        view = st_view = getattr(self, "_first_view", None)
+        mamba = getattr(st_view, "mamba", None)
+        ucache = getattr(mamba, "ucache", None)
+        if ucache is not None:
+            from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache
+
+            tokens = int(forward_batch.spec_info.draft_token_num)
+            reason = gdn_ucache.pool_reasons(ucache, tokens, state=mamba.temporal)
+            if reason:
+                # SGLang has no u-cache verify of its own to fall back to
+                raise RuntimeError(f"Qwen3.8 executor: u-cache verify: {reason}")
+            device = mamba.temporal.device
+            self.gdn_ucache = gdn_ucache.UcacheVerify(
+                device=device,
+                first_layer_id=min(mamba.layer_ids),
+                by_request_row=bool(ucache.by_request_row),
+                options=gdn_ucache.default_options(device),
+            )
+            self.gdn_pdl_ready = False  # the u-cache verify serves every GDN verify
+        del view
         if self.gdn_pdl_ready:
             m = self.lm.model
             first = next(
@@ -257,7 +280,11 @@ class Qwen38Executor:
     @torch.no_grad()
     def _forward(self, step, input_ids, positions, forward_batch):
         if not self._pools_checked and step.mode == "target_verify":
-            self._check_pools(forward_batch)
+            self._first_view = step.view
+            try:
+                self._check_pools(forward_batch)
+            finally:
+                self._first_view = None
         lm = self.lm
         st = StepState(
             lm=lm,

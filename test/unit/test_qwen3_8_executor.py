@@ -177,7 +177,7 @@ class TestStepFallbacks(unittest.TestCase):
     def test_gdn_stock_outside_verify(self):
         from sgl_nvidia_mega.qwen3_8.runtime import gdn
 
-        ex = SimpleNamespace(gdn_pdl_ready=True)
+        ex = SimpleNamespace(gdn_pdl_ready=True, gdn_ucache=None)
         layer = SimpleNamespace(linear_attn=lambda x, fb: "gdn-stock")
         st = _St(_Mode.EXTEND)
         self.assertEqual(gdn.step(ex, layer, torch.zeros(8, 4), st), "gdn-stock")

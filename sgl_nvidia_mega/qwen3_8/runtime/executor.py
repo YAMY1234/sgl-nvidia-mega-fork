@@ -146,6 +146,11 @@ class Qwen3_8Executor:
         m = lm.model
         # slot gdn_native_pdl: set by build; the pools are checked at the first verify
         self.gdn_pdl_ready = False
+        # slot qsa_pool: set by build with its kernels (attention.PoolKernels)
+        self.qsa_pool_ready = False
+        self.qsa_pool = None
+        # slot qsa_indexer: qsa_indexer.IndexerKernels, set by build
+        self.qsa_indexer = None
         # set by build when SGLang cannot run a target verify itself (u-cache pools)
         self.verify_required = False
         # the u-cache verify (gdn_ucache.UcacheVerify), set by prepare_ucache

@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 SGLANG_READS = {
     "srt/runtime_context.py": ("get_exec", "get_parallel"),
     "srt/kernel_plugins/nvidia/binding.py": ("megakernel_agree",),
+    "srt/models/qwen4_exp.py": ("Qwen4ExpAttentionDecoderLayer",),
 }
 
 # Comma-separated kernel slots; unset or "" runs every op on its stock step
@@ -26,11 +27,17 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # hc: the HC write-back kernel for up to 32 rows (runtime/hc.py); needs the S1 layers
 # hc_wide: HC reads / write-backs of more than 32 rows (runtime/hc_wide.py)
 # gdn_native_pdl: the GDN target verify's ReplaySSM core as the plugin's PDL launch
+# qsa_indexer: the QSA indexer's fold, scorer and select (runtime/qsa_indexer.py)
+# qsa_pool: the TP1 QSA verify's sparse attention as split-K pool kernels (<= 64 rows)
 KNOWN_SLOTS: tuple[str, ...] = (
     "hc",
     "hc_wide",
     "gdn_native_pdl",
+    "qsa_indexer",
+    "qsa_pool",
 )
+# A node-local directory for the JIT sources some kernels write before compiling.
+SOURCE_DIR_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_SOURCE_DIR"
 # The widest covered step: 4 rows a request x 256 requests.
 MAX_ROWS = 1024
 # Test only: compare every covered step with SGLang's forward (tools/parity.py)
@@ -165,6 +172,14 @@ def build(model, hf_config, ctx):
         executor.hc_wide_ready = _build_hc_wide(model, decompose, executor.hc_limits)
     if "gdn_native_pdl" in slots and not draft:
         executor.gdn_pdl_ready = _build_gdn_pdl(model)
+    if "qsa_indexer" in slots:
+        executor.qsa_indexer = _build_qsa_indexer(model)
+    if "qsa_pool" in slots and not draft:
+        executor.qsa_pool_ready = _build_qsa_pool(model)
+        if executor.qsa_pool_ready:
+            from sgl_nvidia_mega.qwen3_8.runtime.attention import PoolKernels
+
+            executor.qsa_pool = PoolKernels()
     logger.info(
         "NVIDIA megakernel: Qwen3.8 %s executor: %s; slots %s; every other op stock",
         "draft" if draft else ("target (own GDN u-cache)" if own_ucache else "target"),
@@ -225,6 +240,45 @@ def _build_gdn_pdl(model) -> bool:
     megakernel_agree(reason, what="Qwen3.8 slot gdn_native_pdl")
     if reason:
         unavailable("gdn_native_pdl", reason)
+    return not reason
+
+
+def _build_qsa_indexer(model):
+    """The indexer kernels (qsa_indexer.IndexerKernels), or None (stock indexer)."""
+    import tempfile
+
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
+
+    source_dir = os.environ.get(SOURCE_DIR_ENV) or os.path.join(
+        tempfile.gettempdir(), "qwen3_8-megakernel-sources"
+    )
+    os.makedirs(source_dir, exist_ok=True)
+    kernels = qsa_indexer.IndexerKernels()
+    reason = qsa_indexer.build(model, kernels, source_dir=os.path.abspath(source_dir))
+    megakernel_agree(reason, what="Qwen3.8 slot qsa_indexer")
+    if reason:
+        unavailable("qsa_indexer", reason)
+        return None
+    return kernels
+
+
+def _build_qsa_pool(model) -> bool:
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+    from sglang.srt.models.qwen4_exp import Qwen4ExpAttentionDecoderLayer
+
+    from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+    m = model.model
+    reason = ""
+    for i in range(m.start_layer, m.end_layer):
+        if isinstance(m.layers[i], Qwen4ExpAttentionDecoderLayer):
+            reason = reason or attention.layer_reasons(m.layers[i])
+    reason = reason or attention.build()
+    megakernel_agree(reason, what="Qwen3.8 slot qsa_pool")
+    if reason:
+        unavailable("qsa_pool", reason)
     return not reason
 
 

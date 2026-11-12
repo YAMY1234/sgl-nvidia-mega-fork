@@ -33,6 +33,8 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # gdn_prefill: the GDN step of a covered prefill / extend on the plugin's prefill
 # kernels (runtime/gdn_prefill.py)
 # qsa_prefill: the QSA attention of a covered prefill / extend (runtime/qsa_prefill.py)
+# ple: the PLE batch layout, table gather, gate and short conv (runtime/ple.py); its
+# embedding add needs the S1 layers
 KNOWN_SLOTS: tuple[str, ...] = (
     "hc",
     "hc_wide",
@@ -42,6 +44,7 @@ KNOWN_SLOTS: tuple[str, ...] = (
     "moe_finalize",
     "gdn_prefill",
     "qsa_prefill",
+    "ple",
 )
 # A node-local directory for the JIT sources some kernels write before compiling.
 SOURCE_DIR_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_SOURCE_DIR"
@@ -201,6 +204,10 @@ def build(model, hf_config, ctx):
         executor.qsa_prefill = _built_options(
             "qsa_prefill", qsa_prefill.build(model), qsa_prefill.DEFAULT
         )
+    if "ple" in slots and not draft:
+        from sgl_nvidia_mega.qwen3_8.runtime import ple
+
+        executor.ple_options = _built_options("ple", ple.build(model), ple.DEFAULT)
     logger.info(
         "NVIDIA megakernel: Qwen3.8 %s executor: %s; slots %s; every other op stock",
         "draft" if draft else ("target (own GDN u-cache)" if own_ucache else "target"),

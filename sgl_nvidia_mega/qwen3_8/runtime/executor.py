@@ -39,7 +39,7 @@ try:
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.megakernels.spec import Step
 
-from sgl_nvidia_mega.qwen3_8.runtime import attention, gdn, hc, hc_wide, moe
+from sgl_nvidia_mega.qwen3_8.runtime import attention, gdn, hc, hc_wide, moe, ple
 from sgl_nvidia_mega.qwen3_8.runtime.engagement import Engagement
 from sgl_nvidia_mega.qwen3_8.runtime.state import StepState
 
@@ -60,9 +60,6 @@ SGLANG_READS = {
     "srt/models/qwen4_exp.py": (
         "Qwen4ExpAttentionDecoderLayer",
         "Qwen4ExpLinearDecoderLayer",
-        "_prepare_ple_batch",
-        "_commit_ple_batch",
-        "start_prefetch",
         "_shards_rows_over_cp",
         "_MixStreams",
         "_prepare_attn_stage",
@@ -163,6 +160,8 @@ class Qwen3_8Executor:
         self.gdn_prefill = None
         # slot qsa_prefill: qsa_prefill.Options, set by build
         self.qsa_prefill = None
+        # slot ple: ple.Options, set by build
+        self.ple_options = None
         self._pools_checked = False
         self.mixers = {
             i: (
@@ -361,23 +360,13 @@ class Qwen3_8Executor:
             get_global_expert_distribution_recorder,
         )
         from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-        from sglang.srt.models.qwen4_exp import (
-            _commit_ple_batch,
-            _MixStreams,
-            _prepare_ple_batch,
-        )
+        from sglang.srt.models.qwen4_exp import _MixStreams
 
         m, fb = st.model, st.fb
         hidden = inputs_embeds if inputs_embeds is not None else m.embed_tokens(input_ids)
         residual_batch.start(fb)
         if m.has_ple:
-            st.ple_batch = _prepare_ple_batch(
-                input_ids=input_ids,
-                forward_batch=fb,
-                ngram_size=m.ple_ngram_size,
-                ngram_eos_token_id=m.ple_ngram_eos_token_id,
-            )
-            st.ran("ple", STOCK)
+            st.ple_batch = ple.prepare(st, input_ids, options=self.ple_options)
         recorder = get_global_expert_distribution_recorder()
         normalized_input = None
         for i in range(m.start_layer, m.end_layer):
@@ -386,7 +375,7 @@ class Qwen3_8Executor:
             if i + 1 < m.end_layer:
                 next_layer = m.layers[i + 1]
                 if next_layer.ple is not None:
-                    next_layer.ple.start_prefetch(batch=st.ple_batch, forward_batch=fb)
+                    ple.prefetch(next_layer, st.ple_batch, st, options=self.ple_options)
                 else:
                     next_norm = next_layer.attn_hyper_connection.hc_norm
                 st.scratch["hc.next_inject"] = (
@@ -412,7 +401,7 @@ class Qwen3_8Executor:
             normalized_input = norms.output
             if self.parity is not None:
                 self.parity.record_layer(i, hidden)
-        _commit_ple_batch(batch=st.ple_batch, forward_batch=fb)
+        ple.commit(st.ple_batch, st)
         hc_hidden = hidden
         mix = _MixStreams(m.hyper_connection_mixer, normalized_input)
         if self.decompose:
@@ -452,11 +441,13 @@ class Qwen3_8Executor:
         norms = layer._hc_norms
         use_hc = self.hc_ready and rows <= hc.MAX_ROWS
         if layer.ple is not None:
-            layer._ple_forward_batch, layer._ple_batch = fb, st.ple_batch
-        try:
+            # _attn_mix's PLE add, then its read of the changed streams
+            streams = ple.add(layer, streams, st.ple_batch, st, options=self.ple_options)
+            x, (res, normed, partials) = layer.attn_hyper_connection.mix(
+                streams, normalized_input=None
+            )
+        else:
             x, (res, normed, partials) = layer._attn_mix(streams)
-        finally:
-            layer._ple_forward_batch = layer._ple_batch = None
         st.ran("hc.attn_read", STOCK)
         if use_hc:
             carried = st.scratch.pop("hc.partials", None)
@@ -508,11 +499,7 @@ class Qwen3_8Executor:
         mixed = st.scratch.pop("hc.mixed", None)
         normalized = norms.attn_input
         if layer.ple is not None:
-            layer._ple_forward_batch, layer._ple_batch = fb, st.ple_batch
-            try:
-                streams = layer._add_ple_embedding(streams)
-            finally:
-                layer._ple_forward_batch = layer._ple_batch = None
+            streams = ple.add(layer, streams, st.ple_batch, st, options=self.ple_options)
             # the PLE embedding changed the streams after the last write-back
             normalized = carried = None
         if mixed is not None:

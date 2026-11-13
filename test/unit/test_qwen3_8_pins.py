@@ -1188,17 +1188,13 @@ class TestStockStepMirrors(_Gemm):
 # -- SM107 small-M BF16 routes ---------------------------------------------------------
 
 ROUTER = (512, 2560)
-VENDORED = os.path.join(
-    os.path.dirname(os.path.dirname(sr.__file__)),
-    "kernels/ops/gemm/dense_bf16_gemm_sm100_splitk.py",
-)
-SPLITK_MODULE = "sgl_nvidia_mega.qwen3_8.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk"
+SPLITK_MODULE = "sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue"
 SMEM_SM100 = 232448  # cutlass.utils.get_smem_capacity_in_bytes("sm_100")
 
 
 class _Routes(_Gemm):
     """The routes' process-wide state fresh, their kernels CPU stand-ins, the split-K
-    module a fake at the vendored file's path and SGLang's unquant state set."""
+    module (SGLang's) a fake and SGLang's unquant state set."""
 
     def setUp(self):
         super().setUp()
@@ -1234,9 +1230,7 @@ class _Routes(_Gemm):
         driver = self.fake_module("cuda.bindings.driver", CUstream=object)
         bindings = self.fake_module("cuda.bindings", driver=driver)
         self.fake_module("cuda", bindings=bindings)
-        self.splitk = self.fake_module(
-            SPLITK_MODULE, __file__=VENDORED, _SMEM_CAPACITY_BYTES=SMEM_SM100
-        )
+        self.splitk = self.fake_module(SPLITK_MODULE, _SMEM_CAPACITY_BYTES=SMEM_SM100)
         unquant = sys.modules["sglang.srt.layers.quantization.unquant"]
         unquant._enable_bf16_splitk_gemm = True
         unquant._cutedsl_bf16_gemm = object()
@@ -1292,21 +1286,12 @@ class TestSmallmRoutes(_Routes):
         for args in ((100, True, True), (107, False, True), (107, True, False)):
             with self.assertLogs(sr.logger, "WARNING"):
                 self.assertFalse(sr.install(*args))
-        # the vendored file's SHA-256 matches
         with self.assertLogs(sr.logger, "INFO") as logs:
             self.assertTrue(self.install_routes())
         self.assertIn("87 keys (cluster split-K 70, TGV 17)", logs.output[0])
         self.assertIs(sr._routes, sr.ROUTES)
         # installed, not checked: nothing served yet
         self.assertIsNone(sr.route_for(_x(12, k=2560), torch.zeros(ROUTER, dtype=BF16)))
-        edited = f"{self.dir.name}/dense_bf16_gemm_sm100_splitk.py"
-        with open(VENDORED, "rb") as src, open(edited, "wb") as dst:
-            dst.write(src.read() + b"\n")
-        self.splitk.__file__ = edited
-        with self.assertLogs(sr.logger, "WARNING"):
-            self.assertFalse(self.install_routes())
-        self.assertIsNone(sr._routes)
-        self.splitk.__file__ = VENDORED
         self.splitk._SMEM_CAPACITY_BYTES = 64 << 10  # a "cl" tactic no longer fits
         with self.assertLogs(sr.logger, "WARNING"):
             self.assertFalse(self.install_routes())

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adapted from SGLang (Apache-2.0, SGLang Team):
-# python/sglang/srt/layers/quantization/sm107_bf16_smallm.py (ROUTES, _FI_SPLITK_SHA256,
+# python/sglang/srt/layers/quantization/sm107_bf16_smallm.py (ROUTES,
 # _cluster_smem, _cluster_ok, _tgvc_ok, _install_routes, _cluster_out, _tgvc_out,
 # _tgv_out, route_for, gemm, precompile) and its call sites in
 # python/sglang/srt/layers/quantization/unquant.py (initialize_bf16_gemm_config,
@@ -10,8 +10,10 @@
 # SGLANG_ENABLE_SM107_BF16_SMALLM_ROUTES). The routes serve the executor's TP1
 # projection calls (``bf16_gemm_pins.linear`` and ``in_proj``, after a pin, as the
 # source's dispatch consults them after its pins), not SGLang's BF16 dispatch; ``build``
-# installs and checks them once a process, at the executor's build. The split-K kernel
-# is this package's byte-for-byte copy of the source's vendored one. The non-bitwise
+# installs and checks them once a process, at the executor's build. The cluster routes run
+# SGLang's dense_bf16_gemm_sm100_splitk_epilogue (no epilogue), which writes the bits of
+# the source's vendored FlashInfer 0.7.2 split-K module at every "cl" key (checked on
+# VR200); the source gates on that file's SHA-256 instead. The non-bitwise
 # routes and the fused act are slot smallm_gemm's (runtime/smallm_gemm.py).
 """Bitwise small-M BF16 GEMM routes for SM107 (default off; SGLANG_OPT_SM107_BF16_SMALLM_ROUTES=1).
 
@@ -28,11 +30,9 @@ output bits equal the stock route's:
   FP32 partials summed in rank order); tactic ``(mma_m, mma_n, split_k, stages, cta_k)``.
 
 The source checked every key bit-equal to the stock dispatch on SM107 with cuBLAS 13.8
-and FlashInfer 0.7.2, eagerly and under CUDA graph replay. The cluster routes install
-only against that split-K source (``kernels/ops/gemm/dense_bf16_gemm_sm100_splitk.py``,
-FlashInfer 0.7.2 with #7443), and ``build`` checks every key once more against SGLang's
-live dispatch: a mismatch on either side turns the routes off, and until that check has
-passed the routes are not served. Keys where no bit-equal single kernel beat stock keep
+and FlashInfer 0.7.2, eagerly and under CUDA graph replay. ``build`` checks every key
+once more against SGLang's live dispatch: a mismatch turns the routes off, and until
+that check has passed the routes are not served. Keys where no bit-equal single kernel beat stock keep
 the stock route: gdn_in_proj and attn_qkv at M 1-4, the shared expert's gate_up at M
 17-32 and out_proj below M 64. Any other shape, a bias or a non-contiguous operand
 takes SGLang's dispatch, and a BF16 pin at a key runs before its route
@@ -41,7 +41,6 @@ takes SGLang's dispatch, and a BF16 pin at a key runs before its route
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 from typing import Callable, Optional
@@ -57,6 +56,15 @@ SGLANG_READS = {
         "_cutedsl_bf16_gemm",
     ),
     "srt/runtime_context.py": ("get_parallel",),
+    "kernels/ops/gemm/dense_bf16_gemm_sm100_splitk_epilogue.py": (
+        "SplitKDenseGemmKernel",
+        "SplitKTactic",
+        "_SMEM_CAPACITY_BYTES",
+        "_to_cute_swap",
+        "_make_compile_repr_tensors",
+        "_bmm_no_bias",
+        "cute_ext",
+    ),
     "kernels/ops/gemm/cutedsl_bf16_gemm.py": (
         "cutedsl_bf16_gemm",
         "_to_cute_swap",
@@ -98,10 +106,6 @@ ROUTES = {
     # Stock runs TGV tactic 18 here; tactic 21 is the same unsplit K order.
     (64, *_OUT_PROJ): ("tgv", 21),
 }
-# FlashInfer 0.7.2's dense_bf16_gemm_sm100_splitk.py with FlashInfer #7443's hand-off fix, vendored as
-# kernels/ops/gemm/dense_bf16_gemm_sm100_splitk.py (0.7.2's tiles, K slices and reduction order, so 0.7.2's bits): the
-# "cl" routes call into its compile path, so they are installed only against that exact source.
-_FI_SPLITK_SHA256 = "f00c89b75ade23d868f9fd11fef2bb5b7c8deee72e61fa27e78bd0c390fb75d3"
 
 _routes: Optional[dict] = None
 _fi = None  # (the split-K module, CUstream constructor)
@@ -171,26 +175,12 @@ def install(device_sm: int, splitk_enabled: bool, cutedsl_available: bool) -> bo
         return False
     try:
         import cuda.bindings.driver as cuda_driver
-
-        from sgl_nvidia_mega.qwen3_8.kernels.ops.gemm import (
-            dense_bf16_gemm_sm100_splitk as fi_splitk,
-        )
-
-        with open(fi_splitk.__file__, "rb") as f:
-            digest = hashlib.sha256(f.read()).hexdigest()
-    except (ImportError, OSError) as err:
+        import sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue as fi_splitk
+    except ImportError as err:
         logger.warning(
             "%s: the split-K module is unavailable (%s); the stock dispatch stays",
             ENV,
             err,
-        )
-        return False
-    if digest != _FI_SPLITK_SHA256:
-        logger.warning(
-            "%s: the split-K source (sha256 %s) is not the one the routes were checked against; "
-            "the stock dispatch stays",
-            ENV,
-            digest[:16],
         )
         return False
     for (m, n, k), (kind, tactic) in ROUTES.items():
@@ -226,32 +216,21 @@ def _cluster_out(
     key = (x_2d.get_device(), x_2d.dtype, tactic, tensors[4])
     compiled = _compiled.get(key)
     if compiled is None:
-        fi_tactic = fi_splitk.SplitKTactic(mma_m, mma_n, split_k, stages)
-        if cta_k == fi_splitk._CTA_K:
-            compiled = fi_splitk._get_compiled_splitk_kernel(
-                device_index=x_2d.get_device(),
-                dtype=x_2d.dtype,
-                tactic=fi_tactic,
-                use_pdl=True,
-                has_bias=False,
-                leading_dims=tensors[4],
+        # The kernel body reads only self.cta_k; the module's _CTA_K is host-side validation.
+        kernel = fi_splitk.SplitKDenseGemmKernel(
+            tactic=fi_splitk.SplitKTactic(mma_m, mma_n, split_k, stages),
+            use_pdl=True,
+            has_bias=False,
+        )
+        kernel.cta_k = cta_k
+        with torch.cuda.device(x_2d.device):
+            rep = fi_splitk._make_compile_repr_tensors(x_2d.dtype, False, *tensors[4])
+            compiled = fi_splitk.cute_ext.compile(
+                fi_splitk._bmm_no_bias,
+                kernel,
+                *rep[:3],
+                stream_ctor(torch.cuda.current_stream().cuda_stream),
             )
-        else:
-            # The kernel body reads only self.cta_k; FlashInfer's _CTA_K is host-side validation.
-            kernel = fi_splitk.SplitKDenseGemmKernel(
-                tactic=fi_tactic, use_pdl=True, has_bias=False
-            )
-            kernel.cta_k = cta_k
-            with torch.cuda.device(x_2d.device):
-                rep = fi_splitk._make_compile_repr_tensors(
-                    x_2d.dtype, False, *tensors[4]
-                )
-                compiled = fi_splitk.cute_ext.compile(
-                    fi_splitk._bmm_no_bias,
-                    kernel,
-                    *rep[:3],
-                    stream_ctor(torch.cuda.current_stream().cuda_stream),
-                )
         _compiled[key] = compiled
     compiled(
         *tensors[:3], stream_ctor(torch.cuda.current_stream(x_2d.device).cuda_stream)

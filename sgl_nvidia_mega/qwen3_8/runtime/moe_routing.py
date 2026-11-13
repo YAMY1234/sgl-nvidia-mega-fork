@@ -50,6 +50,8 @@ from dataclasses import dataclass
 
 import torch
 
+from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins
+
 logger = logging.getLogger(__name__)
 
 OP = "moe.routing"
@@ -301,7 +303,7 @@ def routed(executor, mlp, x, st):
         mlp.alt_stream.wait_stream(current)
         with torch.cuda.stream(mlp.alt_stream):
             x_fp4, x_sf = quantize_hidden_states_fp4(x, experts.w13_input_scale_quant)
-    logits, _ = mlp.gate(x)
+    logits = bf16_gemm_pins.linear(mlp.gate, x)
     topk_output = mlp.topk(x, logits)
     if prequant:
         current.wait_stream(mlp.alt_stream)

@@ -45,7 +45,15 @@ try:
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.megakernels.spec import Step
 
-from sgl_nvidia_mega.qwen3_8.runtime import attention, gdn, hc, hc_wide, moe, ple
+from sgl_nvidia_mega.qwen3_8.runtime import (
+    attention,
+    flashinfer_tactic_pins,
+    gdn,
+    hc,
+    hc_wide,
+    moe,
+    ple,
+)
 from sgl_nvidia_mega.qwen3_8.runtime.engagement import Engagement
 from sgl_nvidia_mega.qwen3_8.runtime.state import StepState
 
@@ -179,6 +187,8 @@ class Qwen3_8Executor:
         self.ple_options = None
         # slot smallm_gemm: smallm_gemm.Options, set by build
         self.smallm_gemm = None
+        # SGLANG_FLASHINFER_TACTIC_PIN_FILE's MoE table applies, set by build
+        self.moe_pins = False
         # set by build: the target's prefill body runs in breakable prefill graphs
         self.prefill_graph = False
         # gdn_prefill's in-graph core outputs, newest first (gdn_prefill._graph_output)
@@ -417,6 +427,8 @@ class Qwen3_8Executor:
         self.engagement.begin()
         out = self._draft(st) if self.draft else self._target(st)
         self.engagement.end(step.mode, step.rows)
+        if self.moe_pins:
+            flashinfer_tactic_pins.after_forward()
         return out
 
     def _target(self, st):

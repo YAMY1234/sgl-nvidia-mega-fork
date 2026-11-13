@@ -55,6 +55,8 @@ from typing import Optional
 
 import torch
 
+from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins
+
 logger = logging.getLogger(__name__)
 
 STOCK = "stock"
@@ -560,7 +562,7 @@ class IndexerKernels:
         k_compress in one launch; returns the index Q [rows, padded heads, dim]."""
         pool = md.token_to_kv_pool
         rope = indexer.rotary_emb
-        qk, _ = indexer.index_qk_proj(hidden)
+        qk = bf16_gemm_pins.linear(indexer.index_qk_proj, hidden)
         out_dtype = pool.qsa_compressed_dtype
         module = self._fold_module(self._fold_key(indexer, qk.dtype, out_dtype))
         positions = positions.long()

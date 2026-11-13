@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import torch
 
+from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins
+
 STOCK = "stock"
 # slot gdn_verify_glue: 2-8 requests of 4 rows; one program per (request, value head)
 GLUE_MAX_ROWS = 32
@@ -363,7 +365,7 @@ def _verify_front(executor, gdn, x, st):
     core = normalized.view(rows, -1)
     out = smallm_gemm.out_proj(executor, gdn.out_proj, core, st, "gdn.out_proj")
     if out is None:
-        out, _ = gdn.out_proj(core)
+        out = bf16_gemm_pins.linear(gdn.out_proj, core)
     return out
 
 
@@ -394,7 +396,7 @@ def _verify_glue(executor, gdn, x, st):
     ):
         return None  # tree verify: the conv walks parent links
     layer = gdn.attn
-    qkvz, ba = gdn._forward_input_proj(x)
+    qkvz, ba = bf16_gemm_pins.in_proj(gdn, x)
     cache = backend.state_layer_cache(layer.layer_id)
     pool = backend.state_pool
     cache_indices = md.mamba_cache_indices
@@ -438,7 +440,7 @@ def _verify_glue(executor, gdn, x, st):
     st.ran("gdn", "verify_glue")
     out = smallm_gemm.out_proj(executor, gdn.out_proj, core, st, "gdn.out_proj")
     if out is None:
-        out, _ = gdn.out_proj(core)
+        out = bf16_gemm_pins.linear(gdn.out_proj, core)
     return out
 
 
@@ -452,7 +454,7 @@ def _verify(executor, gdn, x, st):
     from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
 
     fb = st.fb
-    qkvz, ba = gdn._forward_input_proj(x)
+    qkvz, ba = bf16_gemm_pins.in_proj(gdn, x)
     nk = triton.cdiv(gdn.num_k_heads, gdn.attn_tp_size)
     nv = triton.cdiv(gdn.num_v_heads, gdn.attn_tp_size)
     mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
@@ -472,7 +474,7 @@ def _verify(executor, gdn, x, st):
     core = core.reshape(*core.shape[:-2], core.shape[-2] * core.shape[-1])
     out = smallm_gemm.out_proj(executor, gdn.out_proj, core, st, "gdn.out_proj")
     if out is None:
-        out, _ = gdn.out_proj(core)
+        out = bf16_gemm_pins.linear(gdn.out_proj, core)
     return out
 
 

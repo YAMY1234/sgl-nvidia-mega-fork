@@ -17,7 +17,8 @@ warp-specialized attention over it (launched with PDL) and the split merge; SGLa
 output gate follows. It replaces SGLang's K/V pack and TRT-LLM decode.
 
 The QKV / gate projection with its norms and RoPE, the indexer (selection) and o_proj
-stay SGLang's. Every other step runs SGLang's ``self_attention``. Numerics: both
+stay SGLang's (with BF16 GEMM pins on, the projection's CUDA branch runs here so
+``qkv_proj`` and ``o_proj`` can take a pin: ``bf16_gemm_pins``). Every other step runs SGLang's ``self_attention``. Numerics: both
 reorder the FP32 softmax reduction against TRT-LLM's sparse decode (the union kernel
 also rescales lazily), tolerance slots; the E4M3 pool bytes are torch's cast.
 
@@ -30,6 +31,8 @@ import logging
 import os
 
 import torch
+
+from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +59,23 @@ SGLANG_READS = {
         "self_attention",
         "is_qsa",
     ),
-    "srt/models/qwen3_5.py": ("_prepare_qkv_gate", "o_proj"),
+    "srt/models/qwen3_5.py": (
+        "_prepare_qkv_gate",
+        "o_proj",
+        "attn_output_gate",
+        "qkv_proj",
+        "q_size",
+        "kv_size",
+        "q_norm",
+        "k_norm",
+        "rotary_emb",
+        "num_heads",
+        "num_kv_heads",
+        "head_dim",
+    ),
+    "kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py": (
+        "fused_qk_gemma_rmsnorm_rope_gate",
+    ),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "kernels/ops/elementwise/elementwise.py": ("fused_sigmoid_mul",),
     "srt/layers/attention/qsa/glue.py": ("resolve_qsa_sparse_backend",),
@@ -72,6 +91,12 @@ SGLANG_READS = {
         "token_to_kv_pool",
     ),
     "srt/mem_cache/kv/router.py": ("layer", "read", "key", "value"),
+}
+
+# _qkv_gate mirrors this branch of _prepare_qkv_gate when BF16 pins are on
+SGLANG_MIRRORS = {
+    "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer._prepare_qkv_gate": "1af0524597d94935",
+    "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer.forward_prepare_cuda_fused": "d10e23f5651990d0",
 }
 
 
@@ -183,6 +208,39 @@ def step(executor, layer, x, st):
     return layer.self_attention(positions=st.positions, hidden_states=x, forward_batch=fb)
 
 
+def _qkv_gate(layer, x, positions, fb):
+    """``layer._prepare_qkv_gate``; with BF16 pins on, its CUDA gated branch
+    (``forward_prepare_cuda_fused``) here, so ``qkv_proj`` can take a pin."""
+    if not (bf16_gemm_pins.routed() and x.is_cuda and layer.attn_output_gate):
+        return layer._prepare_qkv_gate(
+            positions=positions, hidden_states=x, forward_batch=fb
+        )
+    from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+        fused_qk_gemma_rmsnorm_rope_gate,
+    )
+
+    qkv = bf16_gemm_pins.linear(layer.qkv_proj, x)
+    q_gate, k, v = qkv.split([layer.q_size * 2, layer.kv_size, layer.kv_size], dim=-1)
+    rope = layer.rotary_emb
+    q_out, k_out, gate_out = fused_qk_gemma_rmsnorm_rope_gate(
+        q_gate,
+        k,
+        layer.q_norm.weight.data,
+        layer.k_norm.weight.data,
+        rope.cos_sin_cache,
+        positions,
+        layer.q_norm.variance_epsilon,
+        layer.num_heads,
+        layer.num_kv_heads,
+        layer.head_dim,
+        rope.rotary_dim,
+        has_gate=True,
+        mrope_axis_map=(rope.axis_map if positions.dim() == 2 else None),
+    )
+    rows = x.shape[0]
+    return q_out.view(rows, -1), k_out.view(rows, -1), v, gate_out.view(rows, -1)
+
+
 def _pool_eligible(executor, fb, rows) -> bool:
     return (
         executor.qsa_pool_ready
@@ -209,9 +267,7 @@ def _decomposed(executor, layer, x, st):
     from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
 
     fb, positions = st.fb, st.positions
-    q, k, v, gate = layer._prepare_qkv_gate(
-        positions=positions, hidden_states=x, forward_batch=fb
-    )
+    q, k, v, gate = _qkv_gate(layer, x, positions, fb)
     if executor.qsa_indexer is not None:
         indices = qsa_indexer.select(executor, layer, x, positions, st)
     else:
@@ -357,7 +413,7 @@ def _finish(executor, layer, attn_out, gate, st, impl):
     st.ran("qsa", impl)
     output = smallm_gemm.out_proj(executor, layer.o_proj, attn_out, st, "qsa.o_proj")
     if output is None:
-        output, _ = layer.o_proj(attn_out)
+        output = bf16_gemm_pins.linear(layer.o_proj, attn_out)
     return output
 
 

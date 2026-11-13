@@ -19,6 +19,8 @@ from typing import NamedTuple
 from unittest import mock
 
 import torch
+import torch.nn.functional as F
+import triton  # noqa: F401 - imported after the custom-op test, it aborts the CPU process
 
 from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins as bp
 from sgl_nvidia_mega.qwen3_8.runtime import flashinfer_tactic_pins as tp
@@ -335,12 +337,12 @@ class _Gemm(_Files):
         self.runs = []
 
         def runner(kind):
-            def run(x, w):
+            def run(x, w, out=None):
                 self.runs.append((kind, x.shape[0]))
-                out = _gemm(x, w)
+                got = _gemm(x, w)
                 if kind in self.flip:
-                    out.view(-1).view(torch.int16)[0] ^= 1
-                return out
+                    got.view(-1).view(torch.int16)[0] ^= 1
+                return got if out is None else out.copy_(got)
 
             return run
 
@@ -348,6 +350,14 @@ class _Gemm(_Files):
             patcher = mock.patch.object(bp, name, lambda *a, kind=kind: runner(kind))
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def fake_module(self, name, **attrs):
+        module = types.ModuleType(name)
+        module.__dict__.update(attrs)
+        patcher = mock.patch.dict(sys.modules, {name: module})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return module
 
     def install(self, entries, digest_env=None):
         path, digest = self.write("gemm.json.py", _bf16_document(entries))
@@ -583,6 +593,372 @@ class TestQkvGate(_Gemm):
                 [tuple(t.shape) for t in (q, k, gate)], [(6, 8), (6, 4), (6, 8)]
             )
         self.layer._prepare_qkv_gate.assert_not_called()
+
+
+class _LogitsProcessor:
+    """The fake LogitsProcessor: forward computes the lm_head GEMM, then the softcap."""
+
+    def __init__(self):
+        self.use_fp32_lm_head = False
+        self.use_fp32_lm_head_output = False
+        self.rl_on_policy_target = None
+        self.softcap = 2.0
+        self.stock_calls = 0
+
+    def __call__(self, hidden, lm_head, out=None):
+        logits = self._compute_lm_head(hidden, lm_head, None, out=out)
+        return logits * self.softcap
+
+    def _compute_lm_head(self, hidden, lm_head, embedding_bias=None, *, out=None):
+        self.stock_calls += 1
+        logits = _gemm(hidden, lm_head.weight)  # CPU stand-in for the BF16 matmul
+        if out is not None and out.dtype == lm_head.weight.dtype:
+            return out.copy_(logits)
+        return logits
+
+
+class TestLmHead(_Gemm):
+    V = 512
+
+    def setUp(self):
+        super().setUp()
+        self.fake_module(
+            "sglang.srt.layers.logits_processor",
+            LogitsProcessor=_LogitsProcessor,
+            should_apply_lm_head_quant_method=lambda lm_head, qm: False,
+            use_intel_amx_backend=lambda lm_head: False,
+            _aiter_lm_head_ok=lambda h, w: False,
+        )
+        self.install([{"m": 6, "n": self.V, "k": 16, "kind": "tgv", "tactic": 1}])
+        patcher = mock.patch.object(bp, "_lm_head_matmul", _gemm)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        g = torch.Generator().manual_seed(9)
+        self.lm_head = SimpleNamespace(
+            weight=torch.randn(self.V, 16, generator=g).to(BF16)
+        )
+        self.processor = _LogitsProcessor()
+
+    def test_unrouted_keeps_the_processor(self):
+        self.assertIs(bp.logits_processor(self.processor), self.processor)
+
+    def test_the_view_pins_the_gemm_and_keeps_the_rest(self):
+        bp.enable_routes()
+        view = bp.logits_processor(self.processor)
+        self.assertIsNot(view, self.processor)
+        self.assertIs(bp.logits_processor(self.processor), view)
+        self.processor.softcap = 3.0  # state is shared
+        x = _x(6, k=16)
+        logits = _gemm(x, self.lm_head.weight)
+        buffer = torch.empty(6, self.V, dtype=BF16)
+        for out in (None, buffer):
+            self.assertTrue(torch.equal(view(x, self.lm_head, out=out), logits * 3.0))
+        self.assertTrue(torch.equal(buffer, logits))  # the pin wrote the buffer
+        self.assertEqual(self.runs, [("tgv", 6)] * 3)  # check, then two serves
+        self.assertEqual(self.processor.stock_calls, 0)
+        view(_x(8, k=16), self.lm_head)  # no pin at 8 rows
+        self.processor.use_fp32_lm_head_output = True
+        view(x, self.lm_head)  # another branch of _compute_lm_head
+        self.assertEqual(self.processor.stock_calls, 2)
+
+
+class _GatedResidual:
+    def __init__(self, hc=2, hidden=8, lowrank=4, jit=True):
+        g = torch.Generator().manual_seed(4)
+        self.hc_count, self.hidden_size, self.params_dtype = hc, hidden, BF16
+        self.config = SimpleNamespace(hc_lowrank=lowrank, hc_per_branch_norm=True)
+        self.input_mix_weight_down = SimpleNamespace(
+            weight=torch.randn(lowrank, hc * hidden, generator=g).to(BF16)
+        )
+        self.input_mix_weight_up = SimpleNamespace(
+            weight=torch.randn(hc * hidden, lowrank, generator=g).to(BF16)
+        )
+        self.hc_norm = lambda t: t * 2
+        self._jit_mix_ok = jit
+        self._mix_up_weight_padded = None
+        self._gate_stream = None
+        self._flydsl_mix_ok = lambda: False
+        self.mix = mock.Mock(return_value="sglang")
+
+
+class TestGatedMix(_Gemm):
+    def setUp(self):
+        super().setUp()
+        self.routes = []
+        self.fused = {"rows": 16}
+        self.fake_module(
+            "sglang.srt.layers.hyperconnection",
+            flydsl_hc_mix_supported=lambda t, ok: False,
+            fused_hc_mix_supported=lambda t, d, u: t.shape[0] <= self.fused["rows"],
+            fused_hc_mix=lambda t, d, u, hc, hs: self.route("fused", t, hs),
+        )
+        self.fake_module(
+            "sglang.kernels.ops.gemm.hc_mix_splitk",
+            hc_mix=lambda t, d, u, hc, hs: self.route("splitk", t, hs),
+            permute_pad_up_weight=lambda w, hc: "padded",
+        )
+        self.gr = _GatedResidual()
+        self.install([
+            {"m": 28, "n": 4, "k": 16, "kind": "tgv", "tactic": 1},
+            {"m": 28, "n": 16, "k": 4, "kind": "tgv", "tactic": 2},
+        ])  # fmt: skip
+
+    def route(self, name, t, hs):
+        self.routes.append((name, t.shape[0]))
+        return torch.zeros(t.shape[0], hs)
+
+    def test_unrouted_or_unpinned_is_sglangs_mix(self):
+        self.assertEqual(bp.gated_mix(self.gr, _x(28, k=16)), "sglang")
+        bp.enable_routes()
+        other = _GatedResidual(lowrank=8)
+        self.assertEqual(bp.gated_mix(other, _x(28, k=16)), "sglang")
+
+    def test_routes_in_sglangs_order(self):
+        bp.enable_routes()
+        compute = mock.Mock(
+            side_effect=lambda t, d, u, hc, hs: self.route("pinned", t, hs)
+        )
+        with mock.patch.object(bp, "_pinned_mix_compute", lambda: compute):
+            for rows in (8, 20, 28):
+                x = _x(rows, k=16)
+                mixed, (res, normed, partials) = bp.gated_mix(self.gr, x)
+                self.assertIs(res, x)
+                self.assertTrue(torch.equal(normed, x * 2))
+                self.assertIsNone(partials)
+            self.gr._jit_mix_ok = False
+            bp.gated_mix(self.gr, _x(8, k=16), normalized_input=_x(8, k=16))
+        self.assertEqual(
+            self.routes, [("splitk", 8), ("splitk", 20), ("pinned", 28), ("fused", 8)]
+        )
+        self.gr.mix.assert_not_called()
+
+    def test_the_pinned_compute_is_mix_compute_on_the_pins(self):
+        bp.enable_routes()
+        with mock.patch.object(torch, "compile", lambda f: f):
+            compute = bp._pinned_mix_compute()
+        x = _x(28, k=16)
+        down, up = (
+            self.gr.input_mix_weight_down.weight,
+            self.gr.input_mix_weight_up.weight,
+        )
+        got = compute(x, down, up, 2, 8)
+        mix = torch.sigmoid(_gemm((F.silu(_gemm(x, down) / 2)), up)).unflatten(
+            -1, (2, 8)
+        )
+        want = (mix * x.unflatten(-1, (2, 8))).mean(dim=-2)
+        self.assertTrue(torch.equal(got, want))
+        self.assertEqual(self.runs, [("tgv", 28)] * 4)  # each GEMM: check, then serve
+
+    def test_layer_reads_and_the_final_mix(self):
+        layer = SimpleNamespace(
+            ple=None,
+            _hc_norms=SimpleNamespace(attn_input="a", ffn_input="f"),
+            attn_hyper_connection="attn_hc",
+            mlp_hyper_connection="mlp_hc",
+            _attn_mix=mock.Mock(return_value="stock attn"),
+            _ffn_mix=mock.Mock(return_value="stock ffn"),
+        )
+        self.assertEqual(bp.attn_mix(layer, "s"), "stock attn")
+        self.assertEqual(bp.ffn_mix(layer, "s"), "stock ffn")
+        bp.enable_routes()
+        calls = []
+        with mock.patch.object(
+            bp,
+            "gated_mix",
+            lambda gr, x, n: calls.append((gr, x, n)) or ("mixed", None),
+        ):
+            bp.attn_mix(layer, "s")
+            bp.ffn_mix(layer, "s")
+            self.assertEqual(bp.MixStreams("final", "n")("s"), "mixed")
+        self.assertEqual(
+            calls, [("attn_hc", "s", "a"), ("mlp_hc", "s", "f"), ("final", "s", "n")]
+        )
+
+
+class TestMoeMirrors(_Gemm):
+    def setUp(self):
+        super().setUp()
+        self.fake_module(
+            "sglang.srt.models.qwen2_moe",
+            TopKOutputChecker=SimpleNamespace(format_is_bypassed=lambda t: t == "topk"),
+            can_run_silu_fp4_quant_fusion=lambda module, gate_up: False,
+            silu_and_mul_fp4_quant=None,
+        )
+        self.install([
+            {"m": 6, "n": 512, "k": 16, "kind": "tgv", "tactic": 1},
+            {"m": 6, "n": 8, "k": 16, "kind": "tgv", "tactic": 2},
+        ])  # fmt: skip
+        shared = SimpleNamespace(
+            gate_up_proj=_Linear(n=8, k=16),
+            down_proj=_Linear(n=16, k=4),
+            act_fn=lambda t: t[:, :4] * t[:, 4:],
+        )
+        self.mlp = SimpleNamespace(
+            gate=_Linear(n=512, k=16),
+            topk=mock.Mock(return_value="topk"),
+            supports_deferred_finalize=True,
+            experts=SimpleNamespace(
+                forward_deferred_finalize=mock.Mock(return_value="d")
+            ),
+            shared_expert=shared,
+            _forward_router_experts=mock.Mock(return_value="stock router"),
+            _forward_shared_experts=mock.Mock(return_value="stock shared"),
+        )
+
+    def test_unrouted_calls_sglang(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import moe
+
+        x = _x(6, k=16)
+        self.assertEqual(moe._router_experts(self.mlp, x), "stock router")
+        self.assertEqual(moe._shared_experts(self.mlp, x), "stock shared")
+        self.mlp._forward_router_experts.assert_called_once_with(x, defer_finalize=True)
+        self.mlp._forward_shared_experts.assert_called_once_with(x, apply_gate=False)
+
+    def test_routed_runs_the_mirrors_on_the_pins(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import moe
+
+        bp.enable_routes()
+        x = _x(6, k=16)
+        self.assertEqual(moe._router_experts(self.mlp, x), "d")
+        logits = self.mlp.topk.call_args.args[1]
+        self.assertTrue(torch.equal(logits, _gemm(x, self.mlp.gate.weight)))
+        shared = self.mlp.shared_expert
+        gate_up = _gemm(x, shared.gate_up_proj.weight)
+        want = _gemm(gate_up[:, :4] * gate_up[:, 4:], shared.down_proj.weight)
+        self.assertTrue(torch.equal(moe._shared_experts(self.mlp, x), want))
+        self.assertEqual(self.runs, [("tgv", 6)] * 4)  # gate and gate_up pinned
+        self.assertEqual((self.mlp.gate.calls, shared.gate_up_proj.calls), (0, 0))
+        self.assertEqual(shared.down_proj.calls, 1)  # no pin at (16, 4)
+        self.mlp.topk.return_value = "standard"
+        with self.assertRaises(RuntimeError):
+            moe._router_experts(self.mlp, x)
+
+
+class TestProjectQk(_Gemm):
+    HEADS, KV, DIM = 2, 1, 4
+
+    def setUp(self):
+        super().setUp()
+        n = (self.HEADS + self.KV) * self.DIM
+        self.install([{"m": 6, "n": n, "k": 16, "kind": "tgv", "tactic": 1}])
+        self.indexer = SimpleNamespace(
+            index_qk_proj=_Linear(n=n, k=16),
+            index_n_heads=self.HEADS,
+            index_kv_heads=self.KV,
+            index_head_dim=self.DIM,
+            _use_fused_prep=lambda qk: False,
+            q_layernorm=lambda t: t * 2,
+            apply_rope=lambda positions, q: q + 1,
+            project_qk=mock.Mock(return_value="stock"),
+        )
+
+    def test_mirror(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
+
+        x, positions = _x(6, k=16), torch.arange(6)
+        self.assertEqual(qsa_indexer._project_qk(self.indexer, x, positions), "stock")
+        bp.enable_routes()
+        pool = SimpleNamespace(qsa_compressed_dtype=torch.float32)
+        q, token_k, stored = qsa_indexer._project_qk(
+            self.indexer, x, positions, pool=pool
+        )
+        qk = _gemm(x, self.indexer.index_qk_proj.weight)
+        want_q = (qk[:, :8].reshape(-1, 4) * 2).reshape(-1, 2, 4) + 1
+        self.assertTrue(torch.equal(q, want_q.float()))
+        self.assertTrue(torch.equal(token_k, qk[:, 8:].reshape(-1, 1, 4)))
+        self.assertFalse(stored)
+        self.assertEqual(self.indexer.index_qk_proj.calls, 0)
+
+
+class TestStockStepMirrors(_Gemm):
+    """gdn.forward and attention._self_attention: SGLang's stock GDN and QSA steps with
+    their projections on the pins."""
+
+    def test_gdn_forward(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn as gdn_step
+
+        def split(qkvz, ba, nk, nv, dk, dv):
+            rows = qkvz.shape[0]
+            return qkvz[:, :6], qkvz[:, 6:10].reshape(rows, 2, 2), ba[:, :2], ba[:, 2:]
+
+        self.fake_module(
+            "sglang.srt.models.qwen3_5",
+            _GDN_FUSED_QKVZBA_RATIOS=(2,),
+            _fp8_tuple_input=lambda linear, rows: False,
+            _gdn_decode_fused_proj_conv=False,
+            _is_cpu=False,
+            _is_cuda=True,
+            _is_xpu=False,
+            _layer_norm_fwd=None,
+            fused_qkvzba_split_reshape_cat_contiguous=split,
+            get_exec=None,
+            qwen3_5_gdn_prefill_projection_views=None,
+        )
+        self.install([
+            {"m": 6, "n": 14, "k": 16, "kind": "tgv", "tactic": 1},
+            {"m": 6, "n": 16, "k": 4, "kind": "tgv", "tactic": 2},
+        ])  # fmt: skip
+        bp.enable_routes()
+        g = torch.Generator().manual_seed(11)
+        layer = SimpleNamespace(
+            num_k_heads=1,
+            num_v_heads=2,
+            attn_tp_size=1,
+            head_k_dim=2,
+            head_v_dim=2,
+            _fused_in_proj_weight=torch.randn(14, 16, generator=g).to(BF16),
+            _fused_in_proj_qkvz_width=10,
+            _forward_input_proj=mock.Mock(),
+            attn=lambda fb, mixed_qkv, a, b: mixed_qkv[:, :4].reshape(-1, 2, 2),
+            norm=lambda core, z: core * z,
+            out_proj=_Linear(n=16, k=4),
+        )
+        mode = SimpleNamespace(is_target_verify=lambda: False, is_decode=lambda: True)
+        fb = SimpleNamespace(
+            forward_mode=mode,
+            logical_forward_mode=SimpleNamespace(
+                is_extend_without_speculative=lambda: False
+            ),
+        )
+        x = _x(6, k=16)
+        out = gdn_step.forward(layer, x, fb)
+        packed = _gemm(x, layer._fused_in_proj_weight)
+        core = packed[:, :4] * packed[:, 6:10]
+        self.assertTrue(torch.equal(out, _gemm(core, layer.out_proj.weight)))
+        layer._forward_input_proj.assert_not_called()
+        self.assertEqual(layer.out_proj.calls, 0)
+        self.assertEqual(self.runs, [("tgv", 6)] * 4)
+
+    def test_self_attention(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+        self.fake_module(
+            "sglang.srt.models.qwen4_exp",
+            _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD=1024,
+            _shards_rows_over_cp=lambda fb: False,
+            fused_sigmoid_mul=None,
+            get_attn_backend=None,
+            get_is_capture_mode=lambda: False,
+            is_in_breakable_cuda_graph=lambda: False,
+        )
+        self.install([{"m": 6, "n": N, "k": K, "kind": "tgv", "tactic": 1}])
+        bp.enable_routes()
+        attn_out = _x(6)
+        layer = SimpleNamespace(
+            is_qsa=True,
+            alt_stream=None,
+            attn_output_gate=False,
+            _prepare_qkv_gate=mock.Mock(return_value=("q", "k", "v", None)),
+            _compute_qsa_topk_indices=mock.Mock(return_value="idx"),
+            attn=mock.Mock(return_value=attn_out),
+            o_proj=_Linear(),
+        )
+        x = _x(6, k=16)
+        out = attention._self_attention(layer, x, "pos", "fb")
+        self.assertTrue(torch.equal(out, _gemm(attn_out, layer.o_proj.weight)))
+        layer.attn.assert_called_once_with("q", "k", "v", "fb", topk_indices="idx")
+        layer._compute_qsa_topk_indices.assert_called_once_with(x, "pos", "fb")
+        self.assertEqual(layer.o_proj.calls, 0)
 
 
 if __name__ == "__main__":

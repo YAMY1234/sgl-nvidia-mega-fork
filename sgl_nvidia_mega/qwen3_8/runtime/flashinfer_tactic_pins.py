@@ -45,6 +45,13 @@ only when every ``_metadata`` field equals this process's (FlashInfer's
 ``_collect_metadata()`` fields plus the device's SM) and a table only where the
 shape matches; everywhere else the tuner's behavior is kept, with a warning. Pins
 never keep a split-K tactic: those reduce in a different order.
+
+Run pinned servers with ``SGLANG_FLASHINFER_AUTOTUNE_CACHE=0``. The decode table
+rewrites only the winners the tuner tuned in this process (as the source's does), and
+SGLang's autotune cache path does not include the pin file (the source's does): a
+reused cache would serve its saved tactics past the table, and a pinned boot's saved
+cache would carry the pins into unpinned boots. The prefill table is not applied: no
+SGLang prefill MoE tuning pass creates the entries it settles.
 """
 
 from __future__ import annotations

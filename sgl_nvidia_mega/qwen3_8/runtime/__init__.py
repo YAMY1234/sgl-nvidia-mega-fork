@@ -22,8 +22,19 @@ SGLANG_READS = {
         "Qwen4ExpLinearDecoderLayer",
         "is_qsa",
         "indexer",
+        "attn_hyper_connection",
+        "mlp_hyper_connection",
+        "hyper_connection_mixer",
     ),
-    "srt/models/qwen2_moe.py": ("Qwen2MoeSparseMoeBlock", "gate"),
+    "srt/models/qwen3_vl.py": ("lm_head",),
+    "srt/models/qwen2_moe.py": (
+        "Qwen2MoeSparseMoeBlock",
+        "gate",
+        "shared_expert",
+        "gate_up_proj",
+        "down_proj",
+    ),
+    "srt/layers/hyperconnection.py": ("input_mix_weight_down", "input_mix_weight_up"),
     "srt/models/qwen3_5.py": (
         "linear_attn",
         "_fused_in_proj_weight",
@@ -547,6 +558,10 @@ def _gemm_call_sites(model) -> dict:
         if weight is not None:
             sites.setdefault(tuple(weight.shape), set()).add(name)
 
+    def add_mix(hc):
+        add(hc.input_mix_weight_down.weight, "hc.mix_down")
+        add(hc.input_mix_weight_up.weight, "hc.mix_up")
+
     m = model.model
     for i in range(m.start_layer, m.end_layer):
         layer = m.layers[i]
@@ -560,6 +575,13 @@ def _gemm_call_sites(model) -> dict:
                 add(layer.indexer.index_qk_proj.weight, "qsa.index_qk_proj")
         if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
             add(layer.mlp.gate.weight, "moe.gate")
+            if layer.mlp.shared_expert is not None:
+                add(layer.mlp.shared_expert.gate_up_proj.weight, "moe.shared_gate_up")
+                add(layer.mlp.shared_expert.down_proj.weight, "moe.shared_down")
+        add_mix(layer.attn_hyper_connection)
+        add_mix(layer.mlp_hyper_connection)
+    add_mix(m.hyper_connection_mixer)
+    add(model.lm_head.weight, "lm_head")
     return {shape: "/".join(sorted(names)) for shape, names in sites.items()}
 
 

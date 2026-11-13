@@ -33,7 +33,10 @@ or decoder-layer ``forward``:
    handed back as the hidden states.
 
 Each op's implementation is chosen per width at build (``slots``); an op no kernel
-serves calls SGLang's own module, and ``engagement`` records which one ran.
+serves calls SGLang's own module, and ``engagement`` records which one ran. With BF16
+GEMM pins on (``bf16_gemm_pins``), the step functions launch the dense BF16 GEMMs that
+SGLang's modules would (projections, router, shared expert, HC mixes, lm_head) on the
+pinned kernels.
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 
 from sgl_nvidia_mega.qwen3_8.runtime import (
     attention,
+    bf16_gemm_pins,
     flashinfer_tactic_pins,
     gdn,
     hc,
@@ -473,7 +477,8 @@ class Qwen3_8Executor:
         else:
             hidden, hc_hidden = self._language_model(st, ids, embeds)
             lm.model.last_hc_hidden_states = hc_hidden
-        out = lm.logits_processor(st.input_ids, hidden, lm.lm_head, fb, None)
+        logits = bf16_gemm_pins.logits_processor(lm.logits_processor)
+        out = logits(st.input_ids, hidden, lm.lm_head, fb, None)
         st.ran("logits", STOCK)
         if hc_hidden is not None and isinstance(out, LogitsProcessorOutput):
             out.hidden_states = hc_hidden
@@ -492,7 +497,8 @@ class Qwen3_8Executor:
         st.ran("mtp_fusion", STOCK)
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden, hc_hidden = self._language_model(st, st.input_ids, streams)
-        out = lm.logits_processor(st.input_ids, hidden, lm.lm_head, fb)
+        logits = bf16_gemm_pins.logits_processor(lm.logits_processor)
+        out = logits(st.input_ids, hidden, lm.lm_head, fb)
         st.ran("logits", STOCK)
         lm._set_hc_logits_hidden_states(out, hc_hidden, fb)
         return out
@@ -559,7 +565,8 @@ class Qwen3_8Executor:
         else:
             ple.commit(st.ple_batch, st)
         hc_hidden = hidden
-        mix = _MixStreams(m.hyper_connection_mixer, normalized_input)
+        mixer = bf16_gemm_pins.MixStreams if bf16_gemm_pins.routed() else _MixStreams
+        mix = mixer(m.hyper_connection_mixer, normalized_input)
         if self.decompose:
             residual_batch.clear(fb)
             hidden = mix(hidden)
@@ -607,11 +614,11 @@ class Qwen3_8Executor:
         if layer.ple is not None:
             # _attn_mix's PLE add, then its read of the changed streams
             streams = self._ple_add(layer, streams, st)
-            x, (res, normed, partials) = layer.attn_hyper_connection.mix(
-                streams, normalized_input=None
+            x, (res, normed, partials) = bf16_gemm_pins.gated_mix(
+                layer.attn_hyper_connection, streams, None
             )
         else:
-            x, (res, normed, partials) = layer._attn_mix(streams)
+            x, (res, normed, partials) = bf16_gemm_pins.attn_mix(layer, streams)
         st.ran("hc.attn_read", STOCK)
         if use_hc:
             carried = st.scratch.pop("hc.partials", None)
@@ -635,7 +642,7 @@ class Qwen3_8Executor:
         else:
             streams = layer._attn_combine(x, (res, normed, partials))
             st.ran("hc.attn_write", STOCK)
-        x, (res, normed, partials) = layer._ffn_mix(streams)
+        x, (res, normed, partials) = bf16_gemm_pins.ffn_mix(layer, streams)
         st.ran("hc.ffn_read", STOCK)
         if use_hc and partials is not None:
             hc.join_gate_stream(mlp_hc, partials)

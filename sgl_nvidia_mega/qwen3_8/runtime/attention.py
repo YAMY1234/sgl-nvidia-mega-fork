@@ -58,6 +58,12 @@ SGLANG_READS = {
         "_compute_qsa_topk_indices",
         "self_attention",
         "is_qsa",
+        "_QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD",
+        "_shards_rows_over_cp",
+        "fused_sigmoid_mul",
+        "get_attn_backend",
+        "get_is_capture_mode",
+        "is_in_breakable_cuda_graph",
     ),
     "srt/models/qwen3_5.py": (
         "_prepare_qkv_gate",
@@ -72,6 +78,8 @@ SGLANG_READS = {
         "num_heads",
         "num_kv_heads",
         "head_dim",
+        "alt_stream",
+        "attn",
     ),
     "kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py": (
         "fused_qk_gemma_rmsnorm_rope_gate",
@@ -89,12 +97,15 @@ SGLANG_READS = {
         "decode_logical_positions",
         "req_to_token_pool",
         "token_to_kv_pool",
+        "prefetch_cp_kv",
     ),
     "srt/mem_cache/kv/router.py": ("layer", "read", "key", "value"),
 }
 
-# _qkv_gate mirrors this branch of _prepare_qkv_gate when BF16 pins are on
+# With BF16 pins on, _self_attention mirrors self_attention and _qkv_gate this branch
+# of _prepare_qkv_gate
 SGLANG_MIRRORS = {
+    "srt/models/qwen4_exp.py:Qwen4ExpAttentionDecoderLayer.self_attention": "e88bd51bae6665bc",
     "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer._prepare_qkv_gate": "1af0524597d94935",
     "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer.forward_prepare_cuda_fused": "d10e23f5651990d0",
 }
@@ -205,7 +216,64 @@ def step(executor, layer, x, st):
         if out is not None:
             return out
     st.ran("qsa", STOCK)
+    if bf16_gemm_pins.routed():
+        return _self_attention(layer, x, st.positions, fb)
     return layer.self_attention(positions=st.positions, hidden_states=x, forward_batch=fb)
+
+
+def _self_attention(layer, hidden_states, positions, forward_batch):
+    """``layer.self_attention`` with ``qkv_proj`` and ``o_proj`` through
+    ``bf16_gemm_pins`` (the stock QSA step with BF16 pins on)."""
+    from sglang.srt.models.qwen4_exp import (
+        _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD,
+        _shards_rows_over_cp,
+        fused_sigmoid_mul,
+        get_attn_backend,
+        get_is_capture_mode,
+        is_in_breakable_cuda_graph,
+    )
+
+    overlap_indexer = (
+        layer.is_qsa
+        and layer.alt_stream is not None
+        and get_is_capture_mode()
+        and not is_in_breakable_cuda_graph()
+        and hidden_states.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
+    )
+    attention_kwargs = {}
+    if overlap_indexer:
+        current_stream = torch.cuda.current_stream()
+        layer.alt_stream.wait_stream(current_stream)
+
+    q, k, v, gate = _qkv_gate(layer, hidden_states, positions, forward_batch)
+
+    if overlap_indexer:
+        with torch.cuda.stream(layer.alt_stream):
+            topk_indices = layer._compute_qsa_topk_indices(
+                hidden_states, positions, forward_batch
+            )
+        current_stream.wait_stream(layer.alt_stream)
+        topk_indices.record_stream(current_stream)
+        attention_kwargs["topk_indices"] = topk_indices
+    elif layer.is_qsa:
+        if _shards_rows_over_cp(forward_batch) and not get_is_capture_mode():
+            from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
+
+            resolve_qsa_sparse_backend(get_attn_backend()).prefetch_cp_kv(
+                layer.attn, k, v, forward_batch
+            )
+        attention_kwargs["topk_indices"] = layer._compute_qsa_topk_indices(
+            hidden_states, positions, forward_batch
+        )
+
+    attn_output = layer.attn(q, k, v, forward_batch, **attention_kwargs)
+    if gate is not None:
+        if attn_output.is_cuda:
+            attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+        else:
+            gate = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+            attn_output = attn_output * torch.sigmoid(gate)
+    return bf16_gemm_pins.linear(layer.o_proj, attn_output)
 
 
 def _qkv_gate(layer, x, positions, fb):

@@ -26,7 +26,8 @@ and TRT-LLM decode there.
 
 The QKV / gate projection with its norms and RoPE, the indexer (selection) and o_proj
 stay SGLang's (with BF16 GEMM pins on, the projection's CUDA branch runs here so
-``qkv_proj`` and ``o_proj`` can take a pin: ``bf16_gemm_pins``). As in the source's
+``qkv_proj`` and ``o_proj`` can take a pin: ``bf16_gemm_pins``; with the source's
+SGLANG_Q38C_QSA_PDL_FIX=1 a 4-row step's QK norm is its PDL launch). As in the source's
 ``self_attention``, under CUDA graph capture (not a breakable graph) below 1024 rows the
 indexer runs on the layer's side stream beside the QKV / gate projection, joined before
 the attention. Every other step runs SGLang's ``self_attention``. Numerics: both
@@ -72,6 +73,9 @@ ATTN_CORE_V1 = os.environ.get("Q38_ATTN_CORE_V1", "0") == "1"
 # source hands the output gate to the attention, whose tcgen05 core merge applies it
 ATTN_GATE_V2 = _env_bool("Q38_ATTN_GATE_V2")
 POOL_MERGE_GATE = _env_bool("SGLANG_ENABLE_QSA_POOL_MERGE_GATE")
+# SGLANG_Q38C_QSA_PDL_FIX (exactly "1"): a 4-row QK norm of 24 / 2 heads launches with PDL
+# and waits for the QKV in-kernel; the core's gate epilogue waits for its partials
+QSA_PDL_FIX = os.environ.get("SGLANG_Q38C_QSA_PDL_FIX", "0") == "1"
 # Test only: on eager steps, also run SGLang's attention on the same q/k/v and selected
 # indices and log how far the pool kernel's output is from it, per row.
 OPCHECK = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_OPCHECK") == "1"
@@ -345,15 +349,31 @@ def _self_attention(layer, hidden_states, positions, forward_batch):
 
 
 def _qkv_gate(layer, x, positions, fb):
-    """``layer._prepare_qkv_gate``; with BF16 pins on, its CUDA gated branch
-    (``forward_prepare_cuda_fused``) here, so ``qkv_proj`` can take a pin."""
-    if not (bf16_gemm_pins.routed() and x.is_cuda and layer.attn_output_gate):
+    """``layer._prepare_qkv_gate``; with BF16 pins on, or where SGLANG_Q38C_QSA_PDL_FIX
+    changes the QK norm's launch, its CUDA gated branch (``forward_prepare_cuda_fused``)
+    here, so ``qkv_proj`` can take a pin and the QK norm is the source's launch."""
+    pdl_fix = (
+        QSA_PDL_FIX
+        and x.shape[0] == 4
+        and (layer.num_heads, layer.num_kv_heads) == (QUERY_HEADS, KV_HEADS)
+    )
+    if not (
+        (bf16_gemm_pins.routed() or pdl_fix) and x.is_cuda and layer.attn_output_gate
+    ):
         return layer._prepare_qkv_gate(
             positions=positions, hidden_states=x, forward_batch=fb
         )
-    from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
-        fused_qk_gemma_rmsnorm_rope_gate,
-    )
+    kwargs = {}
+    if pdl_fix:  # SGLang's launcher has no PDL wait
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+            fused_qk_gemma_rmsnorm_rope_gate,
+        )
+
+        kwargs["qsa_pdl_fix"] = True
+    else:
+        from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+            fused_qk_gemma_rmsnorm_rope_gate,
+        )
 
     qkv = bf16_gemm_pins.linear(layer.qkv_proj, x)
     q_gate, k, v = qkv.split([layer.q_size * 2, layer.kv_size, layer.kv_size], dim=-1)
@@ -372,6 +392,7 @@ def _qkv_gate(layer, x, positions, fb):
         rope.rotary_dim,
         has_gate=True,
         mrope_axis_map=(rope.axis_map if positions.dim() == 2 else None),
+        **kwargs,
     )
     rows = x.shape[0]
     return q_out.view(rows, -1), k_out.view(rows, -1), v, gate_out.view(rows, -1)
@@ -939,7 +960,7 @@ class CoreKernels:
         if gate is None:
             return qsa_tcgen05_v1.run(*args, width=4, store_new_kv=True)
         return qsa_gate_epilogue_v2.run_gated(
-            *args, gate, width=4, store_new_kv=True, wait_primary=False
+            *args, gate, width=4, store_new_kv=True, wait_primary=QSA_PDL_FIX
         )
 
 

@@ -1346,10 +1346,14 @@ class TestQsaCore(unittest.TestCase):
         self.assertEqual(kw, dict(width=4, store_new_kv=True))
         from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import qsa_gate_epilogue_v2
 
-        with mock.patch.object(qsa_gate_epilogue_v2, "run_gated", lambda *a, **kw: (a, kw)):
-            args, kw = attention.CoreKernels().run(**{n: n for n in names}, gate="gate")
-        self.assertEqual(args, names + ("gate",))
-        self.assertEqual(kw, dict(width=4, store_new_kv=True, wait_primary=False))
+        for fix in (False, True):  # SGLANG_Q38C_QSA_PDL_FIX: the merge waits for the partials
+            with (
+                mock.patch.object(qsa_gate_epilogue_v2, "run_gated", lambda *a, **kw: (a, kw)),
+                mock.patch.object(attention, "QSA_PDL_FIX", fix),
+            ):
+                args, kw = attention.CoreKernels().run(**{n: n for n in names}, gate="gate")
+            self.assertEqual(args, names + ("gate",))
+            self.assertEqual(kw, dict(width=4, store_new_kv=True, wait_primary=fix))
 
     def test_build(self):
         from sgl_nvidia_mega.qwen3_8.runtime import attention
@@ -2861,6 +2865,55 @@ class TestQsaIndexerStreams(unittest.TestCase):
         log, ran = self.run_step(_Mode.DECODE, glue=glue)
         self.assertEqual(log, ["qkv", SEL, "attn"])
         self.assertNotIn("qsa.index_stream", dict(ran))
+
+
+_SWITCHES = r"""
+import importlib
+import json
+import os
+
+from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+names = {
+    "QSA_EARLY_INDEXER": "Q38_QSA_EARLY_INDEXER",
+    "QSA_PDL_INDEX": "Q38_QSA_PDL_INDEX",
+    "ATTN_CORE_V1": "Q38_ATTN_CORE_V1",
+    "ATTN_GATE_V2": "Q38_ATTN_GATE_V2",
+    "POOL_MERGE_GATE": "SGLANG_ENABLE_QSA_POOL_MERGE_GATE",
+    "QSA_PDL_FIX": "SGLANG_Q38C_QSA_PDL_FIX",
+}
+out = {}
+for value in (None, "1", "true", "True", "0", "yes"):
+    for name in names.values():
+        os.environ.pop(name, None)
+        if value is not None:
+            os.environ[name] = value
+    importlib.reload(attention)
+    out[str(value)] = {attr: getattr(attention, attr) for attr in names}
+print(json.dumps(out))
+"""
+
+
+class TestSourceSwitches(unittest.TestCase):
+    def test_read_as_the_source_reads_them(self):
+        """get_bool_env_var's parsing (default off) for the self_attention switches and
+        the gate's, an exact "1" for Q38_ATTN_CORE_V1 and SGLANG_Q38C_QSA_PDL_FIX."""
+        import json
+        import os
+        import subprocess
+
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        done = subprocess.run(
+            [sys.executable, "-c", _SWITCHES], env=env, capture_output=True, text=True,
+            timeout=300,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        got = json.loads(done.stdout.strip().splitlines()[-1])
+        boolean = ("QSA_EARLY_INDEXER", "QSA_PDL_INDEX", "ATTN_GATE_V2", "POOL_MERGE_GATE")
+        for value, on in (("None", ()), ("1", "all"), ("true", boolean),
+                          ("True", boolean), ("0", ()), ("yes", ())):
+            want = {a: on == "all" or a in on for a in got[value]}
+            self.assertEqual(got[value], want, value)
 
 
 _INTERPRETED_DRAFT = r"""

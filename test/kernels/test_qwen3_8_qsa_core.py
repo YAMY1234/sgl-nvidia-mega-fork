@@ -113,3 +113,20 @@ def test_gate_epilogue_gates_the_bf16_core_output(seed):
     torch.cuda.synchronize()
     want = plain.float() * torch.sigmoid(gate.view(4, 24, 256).float())
     torch.testing.assert_close(gated, want.bfloat16())  # BF16 tolerances
+
+
+def test_gate_epilogue_wait_keeps_the_values():
+    """SGLANG_Q38C_QSA_PDL_FIX: the gate merge waits for the partials in-kernel; the
+    output is the same bits."""
+    q, k, v, nk, nv, table, req, positions, loc, idx = _case(3)
+    gate = torch.randn(4, 24 * 256, device="cuda").bfloat16()
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import qsa_gate_epilogue_v2
+
+    outs = []
+    for wait in (False, True):
+        args = _args(q, k.clone(), v.clone(), nk, nv, table, req, positions, loc, idx)
+        outs.append(
+            qsa_gate_epilogue_v2.run_gated(*args.values(), gate, wait_primary=wait)
+        )
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0], outs[1])

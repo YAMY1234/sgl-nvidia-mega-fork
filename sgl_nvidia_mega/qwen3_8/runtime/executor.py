@@ -143,6 +143,8 @@ class Qwen3_8Executor:
         m = lm.model
         # slot gdn_native_pdl: set by build; the pools are checked at the first verify
         self.gdn_pdl_ready = False
+        # slot gdn_verify_glue: set by build; the pools are checked at the first verify
+        self.gdn_glue_ready = False
         # slot qsa_pool: set by build with its kernels (attention.PoolKernels)
         self.qsa_pool_ready = False
         self.qsa_pool = None
@@ -250,22 +252,30 @@ class Qwen3_8Executor:
         eagerly before any graph is captured); refuse a slot they cannot serve."""
         self._pools_checked = True
         if self.gdn_ucache is not None:
-            self.gdn_pdl_ready = False  # the u-cache verify serves every GDN verify
-        if self.gdn_pdl_ready:
+            # the u-cache verify serves every GDN verify
+            self.gdn_pdl_ready = self.gdn_glue_ready = False
+        if self.gdn_pdl_ready or self.gdn_glue_ready:
+            from sgl_nvidia_mega.qwen3_8.runtime import unavailable
+
             m = self.lm.model
             first = next(
                 i for i, f in self.mixers.items() if f == self._gdn
             )
-            reason = gdn.pool_reasons(
+            args = (
                 gdn.linear_backend(),
                 m.layers[first].linear_attn.attn.layer_id,
                 int(forward_batch.spec_info.draft_token_num),
             )
-            if reason:
-                from sgl_nvidia_mega.qwen3_8.runtime import unavailable
-
-                unavailable("gdn_native_pdl", reason)
-                self.gdn_pdl_ready = False
+            if self.gdn_pdl_ready:
+                reason = gdn.pool_reasons(*args)
+                if reason:
+                    unavailable("gdn_native_pdl", reason)
+                    self.gdn_pdl_ready = False
+            if self.gdn_glue_ready:
+                reason = gdn.glue_pool_reasons(*args)
+                if reason:
+                    unavailable("gdn_verify_glue", reason)
+                    self.gdn_glue_ready = False
 
     def _build_ucache_verify(self, mamba, buffers, tokens):
         from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache

@@ -27,6 +27,8 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # hc: the HC write-back kernel for up to 32 rows (runtime/hc.py); needs the S1 layers
 # hc_wide: HC reads / write-backs of more than 32 rows (runtime/hc_wide.py)
 # gdn_native_pdl: the GDN target verify's ReplaySSM core as the plugin's PDL launch
+# gdn_verify_glue: a GDN target verify of 2-8 requests as one launch per layer between
+# the input and the output projection (runtime/gdn.py)
 # qsa_indexer: the QSA indexer's fold, scorer and select (runtime/qsa_indexer.py)
 # qsa_pool: the TP1 QSA verify's sparse attention as split-K pool kernels (<= 64 rows)
 # moe_finalize: the TP1 MoE's finalize + gated shared expert as one ordered kernel
@@ -44,6 +46,7 @@ KNOWN_SLOTS: tuple[str, ...] = (
     "hc",
     "hc_wide",
     "gdn_native_pdl",
+    "gdn_verify_glue",
     "qsa_indexer",
     "qsa_pool",
     "moe_finalize",
@@ -189,6 +192,8 @@ def build(model, hf_config, ctx):
         executor.hc_wide_ready = _build_hc_wide(model, decompose, executor.hc_limits)
     if "gdn_native_pdl" in slots and not draft:
         executor.gdn_pdl_ready = _build_gdn_pdl(model)
+    if "gdn_verify_glue" in slots and not draft:
+        executor.gdn_glue_ready = _build_gdn_glue(model)
     if "qsa_indexer" in slots:
         executor.qsa_indexer = _build_qsa_indexer(model)
     if "qsa_pool" in slots and not draft:
@@ -288,6 +293,25 @@ def _build_gdn_pdl(model) -> bool:
     megakernel_agree(reason, what="Qwen3.8 slot gdn_native_pdl")
     if reason:
         unavailable("gdn_native_pdl", reason)
+    return not reason
+
+
+def _build_gdn_glue(model) -> bool:
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    from sgl_nvidia_mega.qwen3_8.runtime import gdn
+
+    reason = gdn.glue_reasons(model)
+    if not reason:
+        try:
+            from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear import (  # noqa: F401
+                gdn_fused_verify_glue,
+            )
+        except Exception as e:
+            reason = f"the glue kernel does not import: {type(e).__name__}: {e}"
+    megakernel_agree(reason, what="Qwen3.8 slot gdn_verify_glue")
+    if reason:
+        unavailable("gdn_verify_glue", reason)
     return not reason
 
 

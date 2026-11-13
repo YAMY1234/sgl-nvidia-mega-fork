@@ -242,6 +242,85 @@ class TestStepFallbacks(unittest.TestCase):
         self.assertEqual(gdn.step(ex, layer, torch.zeros(8, 4), st), "gdn-stock")
         self.assertEqual(st.ran_ops, [("gdn", "stock")])
 
+    def test_gdn_glue_declines_one_request(self):
+        """The glue serves 2-8 requests; a 1-request verify falls through."""
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn
+
+        ex = SimpleNamespace(
+            gdn_glue_ready=True, gdn_pdl_ready=False, gdn_ucache=None, gdn_prefill=None
+        )
+        layer = SimpleNamespace(linear_attn=lambda x, fb: "gdn-stock")
+        st = _St(_Mode.TARGET_VERIFY, rows=4)
+        self.assertEqual(gdn.step(ex, layer, torch.zeros(4, 8), st), "gdn-stock")
+        self.assertEqual(st.ran_ops, [("gdn", "stock")])
+
+    def test_gdn_glue_runs_the_projections_around_one_launch(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn
+
+        rows, seen = 8, {}
+        kmod = types.ModuleType(
+            "sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear.gdn_fused_verify_glue"
+        )
+
+        def glue(**kw):
+            seen.update(kw)
+            return torch.ones(rows, 6)
+
+        kmod.gdn_fused_verify_glue = glue
+        umod = types.ModuleType("sglang.srt.layers.attention.linear.utils")
+        selected = []
+        umod.select_verify_intermediate_state_indices = (
+            lambda idx, req, valid, size: selected.append(valid) or idx
+        )
+        umod.pp_spec_stable_rows_enabled = lambda: False
+        cache = SimpleNamespace(
+            conv=[torch.zeros(1)], intermediate_conv_window=[torch.zeros(1)],
+            temporal="ckpt", replayssm_d="d", replayssm_k="k", replayssm_g="g",
+            replayssm_rawv=None, replayssm_rawk=None, replayssm_beta=None,
+        )
+        backend = SimpleNamespace(
+            forward_metadata=SimpleNamespace(
+                retrieve_next_token=None, retrieve_next_sibling=None,
+                retrieve_parent_token=None, mamba_cache_indices=torch.arange(2),
+            ),
+            state_layer_cache=lambda layer_id: cache,
+            state_pool=SimpleNamespace(
+                replayssm_spec_write_pos="wp", replayssm_cache_base="cb",
+                replayssm_is_flush="fl",
+            ),
+            verify_intermediate_state_indices=torch.arange(2),
+            req_to_token_pool=SimpleNamespace(size=16),
+        )
+        attn = SimpleNamespace(
+            layer_id=0, conv_weights="w", activation="silu", A_log="al", dt_bias="dt",
+            num_k_heads=4, head_k_dim=128,
+        )
+        linear = SimpleNamespace(
+            attn=attn,
+            norm=SimpleNamespace(weight="nw", eps=1e-6, activation="swish"),
+            _forward_input_proj=lambda x: ("qkvz", "ba"),
+            out_proj=lambda core: (core * 2, None),
+        )
+        ex = SimpleNamespace(
+            gdn_glue_ready=True, gdn_pdl_ready=False, gdn_ucache=None,
+            gdn_prefill=None, smallm_gemm=None,
+        )
+        st = _St(_Mode.TARGET_VERIFY, rows=rows)
+        st.fb.req_pool_indices = torch.arange(2)
+        with mock.patch.dict(sys.modules, {kmod.__name__: kmod, umod.__name__: umod}), \
+                mock.patch.object(gdn, "linear_backend", lambda: backend):
+            out = gdn.step(ex, SimpleNamespace(linear_attn=linear), torch.zeros(rows, 8), st)
+        self.assertTrue(torch.equal(out, torch.full((rows, 6), 2.0)))
+        self.assertEqual(st.ran_ops, [("gdn", "verify_glue")])
+        self.assertEqual((seen["mixed_qkvz"], seen["mixed_ba"]), ("qkvz", "ba"))
+        self.assertEqual((seen["draft_token_num"], seen["norm_activation"]), (4, "swish"))
+        self.assertIsNone(seen["conv_bias"])
+        # without PP stable rows, the source's call: no mask, the backend's own indices
+        self.assertEqual(selected, [])
+        self.assertIs(seen["intermediate_state_indices"], backend.verify_intermediate_state_indices)
+
     def test_qsa_prefill_slot_or_stock(self):
         from unittest import mock
 

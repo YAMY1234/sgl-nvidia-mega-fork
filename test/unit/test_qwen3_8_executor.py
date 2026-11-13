@@ -143,6 +143,7 @@ class _St:
             rows=rows,
         )
         self.ran_ops = []
+        self.scratch = {}
 
     def ran(self, op, impl):
         self.ran_ops.append((op, impl))
@@ -247,7 +248,8 @@ class TestStepFallbacks(unittest.TestCase):
         from sgl_nvidia_mega.qwen3_8.runtime import gdn
 
         ex = SimpleNamespace(
-            gdn_glue_ready=True, gdn_pdl_ready=False, gdn_ucache=None, gdn_prefill=None
+            gdn_glue_ready=True, gdn_pdl_ready=False, gdn_ucache=None, gdn_prefill=None,
+            gdn_front_ready=False,
         )
         layer = SimpleNamespace(linear_attn=lambda x, fb: "gdn-stock")
         st = _St(_Mode.TARGET_VERIFY, rows=4)
@@ -303,9 +305,10 @@ class TestStepFallbacks(unittest.TestCase):
             _forward_input_proj=lambda x: ("qkvz", "ba"),
             out_proj=lambda core: (core * 2, None),
         )
+        # slot gdn_front declines 8 rows before it imports its kernels
         ex = SimpleNamespace(
             gdn_glue_ready=True, gdn_pdl_ready=False, gdn_ucache=None,
-            gdn_prefill=None, smallm_gemm=None,
+            gdn_prefill=None, smallm_gemm=None, gdn_front_ready=True,
         )
         st = _St(_Mode.TARGET_VERIFY, rows=rows)
         st.fb.req_pool_indices = torch.arange(2)
@@ -320,6 +323,92 @@ class TestStepFallbacks(unittest.TestCase):
         # without PP stable rows, the source's call: no mask, the backend's own indices
         self.assertEqual(selected, [])
         self.assertIs(seen["intermediate_state_indices"], backend.verify_intermediate_state_indices)
+
+    def test_gdn_front_runs_one_request(self):
+        """4 rows: the front's projection + conv, then the core with the fused norm on
+        the packed [q|k|v|z|b|a] columns, then the out_proj; the window rows are
+        selected once a step."""
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn
+
+        rows, hv, vd, qk = 4, 3, 2, 4  # packed: q 4 | k 4 | v 6 | z 6 | b 3 | a 3
+        width = 2 * qk + 2 * hv * vd + 2 * hv
+        seen, selects = {}, []
+        pkg = "sgl_nvidia_mega.qwen3_8.kernels.ops.attention.gdn_front."
+        front, core = types.ModuleType(pkg + "mk_front"), types.ModuleType(pkg + "mk_core")
+
+        def run(x, weight, conv_w, conv_b, conv_state, state_idx, window, w_rows, pad_slot):
+            seen["run"] = (weight, conv_b, state_idx, w_rows, pad_slot)
+            return torch.arange(width, dtype=torch.float32).repeat(rows, 1), "qkv"
+
+        def core_fn(qkv, a, b, *pools, z, norm_weight, normalized, eps):
+            seen["core"] = (qkv, a[0].tolist(), b[0].tolist(), z[0].tolist(), pools)
+            return normalized.fill_(1.0)
+
+        front.run, core.core = run, core_fn
+        conv = types.ModuleType("sglang.kernels.ops.mamba.causal_conv1d_triton")
+        conv.PAD_SLOT_ID = -1
+        umod = types.ModuleType("sglang.srt.layers.attention.linear.utils")
+        umod.select_verify_intermediate_state_indices = (
+            lambda idx, req, valid, size: selects.append(size) or idx
+        )
+        cache = SimpleNamespace(
+            conv=["conv"], intermediate_conv_window=["window"], temporal="ckpt",
+            replayssm_d="d", replayssm_k="k", replayssm_g="g", replayssm_rawv="dlo",
+            replayssm_rawk="klo",
+        )
+        backend = SimpleNamespace(
+            forward_metadata=SimpleNamespace(
+                retrieve_next_token=None, retrieve_next_sibling=None,
+                retrieve_parent_token=None, mamba_cache_indices=torch.tensor([5, -1]),
+            ),
+            state_layer_cache=lambda layer_id: cache,
+            state_pool=SimpleNamespace(
+                replayssm_spec_write_pos="wp", replayssm_cache_base="cb",
+                replayssm_is_flush="fl",
+            ),
+            verify_intermediate_state_indices=torch.tensor([7, 8]),
+            req_to_token_pool=SimpleNamespace(size=16),
+        )
+        attn = SimpleNamespace(
+            layer_id=0, conv_weights="w", A_log="al", dt_bias="dt", q_dim=qk, k_dim=qk,
+            v_dim=hv * vd, num_v_heads=hv, head_v_dim=vd,
+        )
+        linear = SimpleNamespace(
+            attn=attn,
+            norm=SimpleNamespace(weight="nw", eps=1e-6),
+            _fused_in_proj_weight="packed_w",
+            out_proj=lambda core: (core * 2, None),
+        )
+        ex = SimpleNamespace(
+            gdn_front_ready=True, gdn_glue_ready=True, gdn_pdl_ready=False,
+            gdn_ucache=None, gdn_prefill=None, smallm_gemm=None,
+        )
+        st = _St(_Mode.TARGET_VERIFY, rows=rows)
+        st.fb.req_pool_indices = torch.tensor([3])
+        mods = {m.__name__: m for m in (front, core, conv, umod)}
+        with mock.patch.dict(sys.modules, mods), \
+                mock.patch.object(gdn, "linear_backend", lambda: backend):
+            for _ in range(2):  # two GDN layers of one step
+                out = gdn.step(
+                    ex, SimpleNamespace(linear_attn=linear), torch.zeros(rows, 8), st
+                )
+        self.assertTrue(torch.equal(out, torch.full((rows, hv * vd), 2.0)))
+        self.assertEqual(st.ran_ops, [("gdn", "front")] * 2)
+        self.assertEqual(selects, [16])
+        weight, conv_b, state_idx, w_rows, pad_slot = seen["run"]
+        self.assertEqual((weight, conv_b, pad_slot), ("packed_w", None, -1))
+        self.assertEqual((state_idx.tolist(), w_rows.tolist()), ([5], [7]))
+        qkv, a, b, z, pools = seen["core"]
+        self.assertEqual(qkv, "qkv")
+        # mk_core.core's order: A_log ... rings, state / replay indices, cursors, out
+        self.assertEqual(pools[:8], ("al", "dt", "ckpt", "d", "k", "g", "dlo", "klo"))
+        self.assertEqual(pools[8].tolist() + pools[9].tolist(), [5, -1, 3])
+        self.assertEqual(pools[10:13], ("wp", "cb", "fl"))
+        self.assertEqual(z, [float(c) for c in range(14, 20)])
+        self.assertEqual((b, a), ([20.0, 21.0, 22.0], [23.0, 24.0, 25.0]))
+        self.assertEqual(tuple(pools[13].shape), (rows, hv, vd))
 
     def test_qsa_prefill_slot_or_stock(self):
         from unittest import mock
@@ -386,6 +475,142 @@ class TestReasons(unittest.TestCase):
         model = SimpleNamespace(capture_aux_hidden_states=True)
         self.assertTrue(runtime.model_reasons(model, None))
         self.assertEqual(runtime.model_reasons(SimpleNamespace(), None), [])
+
+
+def _gdn_front_model():
+    """One GDN layer of the TP1 shape slot gdn_front takes."""
+    attn = SimpleNamespace(
+        q_dim=2048, k_dim=2048, v_dim=6144, num_v_heads=48, num_q_heads=16,
+        head_q_dim=128, num_k_heads=16, head_k_dim=128, bias=None, activation="silu",
+        A_log=torch.zeros(48), dt_bias=torch.zeros(48, dtype=torch.bfloat16),
+    )
+    norm = SimpleNamespace(
+        group_size=None, norm_before_gate=True, bias=None, activation="sigmoid",
+        weight=torch.zeros(128, dtype=torch.bfloat16),
+    )
+    layer = _Linear()
+    layer.linear_attn = SimpleNamespace(
+        attn=attn, norm=norm, attn_tp_size=1, num_k_heads=16, num_v_heads=48,
+        head_k_dim=128, head_v_dim=128,
+        _fused_in_proj_weight=SimpleNamespace(shape=(16480, 2560), dtype=torch.bfloat16),
+    )
+    m = SimpleNamespace(layers=[layer, _Attention()], start_layer=0, end_layer=2)
+    return SimpleNamespace(model=m), layer.linear_attn
+
+
+def _gdn_front_backend():
+    bf16 = torch.bfloat16
+    cache = SimpleNamespace(
+        replayssm_d=torch.zeros(2, 1, 16, 1, dtype=bf16), replayssm_rawv="dlo",
+        replayssm_rawk="klo", replayssm_beta=None, temporal=torch.zeros(1, dtype=bf16),
+        conv=[torch.zeros(2, 4, 3, dtype=bf16)],
+        intermediate_conv_window=[torch.zeros(2, 4, 4, 3, dtype=bf16)],
+    )
+    pool = SimpleNamespace(
+        replayssm_cache_base="cb", replayssm_spec_fold=False, replayssm_is_kda=False
+    )
+    return SimpleNamespace(state_pool=pool, state_layer_cache=lambda i: cache), cache
+
+
+class TestGdnFront(unittest.TestCase):
+    def test_model_reasons(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn
+
+        model, linear = _gdn_front_model()
+        self.assertEqual(gdn.front_reasons(model), "")
+        for change in (
+            lambda: setattr(linear, "_fused_in_proj_weight", None),
+            lambda: setattr(linear._fused_in_proj_weight, "shape", (16480, 4096)),
+            lambda: setattr(linear.norm, "activation", "swish"),  # the core's is sigmoid
+            lambda: setattr(linear, "attn_tp_size", 4),
+            lambda: setattr(linear.attn, "bias", torch.zeros(1)),
+            lambda: setattr(linear.attn, "A_log", torch.zeros(48, dtype=torch.bfloat16)),
+        ):
+            model, linear = _gdn_front_model()
+            change()
+            self.assertTrue(gdn.front_reasons(model))
+
+    def test_pool_reasons(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn
+
+        backend, _ = _gdn_front_backend()
+        self.assertEqual(gdn.front_pool_reasons(backend, 0, 4), "")
+        self.assertTrue(gdn.front_pool_reasons(backend, 0, 8))
+        for name, value in (
+            ("replayssm_beta", "beta"),  # the exact-raw rings
+            ("replayssm_rawv", None),
+            ("replayssm_d", torch.zeros(2, 1, 16, 1)),
+            ("temporal", torch.zeros(1)),
+        ):
+            backend, cache = _gdn_front_backend()
+            setattr(cache, name, value)
+            self.assertTrue(gdn.front_pool_reasons(backend, 0, 4), name)
+
+    def test_pool_check_turns_the_slot_off(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn
+
+        ex = _executor()
+        attn = SimpleNamespace(layer_id=3)
+        ex.lm.model.layers[0].linear_attn = SimpleNamespace(attn=attn)
+        ex.gdn_front_ready = True
+        fb = SimpleNamespace(spec_info=SimpleNamespace(draft_token_num=4))
+        with mock.patch.object(gdn, "linear_backend", lambda: "backend"), \
+                mock.patch.object(gdn, "front_pool_reasons", return_value="no rings") as r:
+            ex._check_pools(fb)
+        r.assert_called_once_with("backend", 3, 4)
+        self.assertFalse(ex.gdn_front_ready)
+
+    def test_front_compiles_eagerly_never_while_capturing(self):
+        """A layout compiles at its first eager call and a capture reuses it; a cold
+        layout while capturing raises before any compile or launch."""
+        import importlib
+        from unittest import mock
+
+        import sgl_nvidia_mega.qwen3_8.kernels.ops.attention.gdn_front as package
+
+        calls, capturing = [], [False]
+        cuda, bindings, driver = (
+            types.ModuleType(n) for n in ("cuda", "cuda.bindings", "cuda.bindings.driver")
+        )
+        cuda.bindings, bindings.driver, driver.CUstream = bindings, driver, lambda s: s
+        cutlass, cute, runtime = (
+            types.ModuleType(n) for n in ("cutlass", "cutlass.cute", "cutlass.cute.runtime")
+        )
+        cutlass.cute, cute.runtime, cutlass.BFloat16 = cute, runtime, "bf16"
+        cute.experimental = SimpleNamespace(
+            compile=lambda op, *args: calls.append("compile")
+            or (lambda *a: calls.append("launch"))
+        )
+        runtime.from_dlpack = lambda t, assumed_align: t
+        kernel = types.ModuleType(package.__name__ + ".mk_front_kernel")
+        kernel.MkGdnFront = lambda **kw: SimpleNamespace(**kw)
+        mods = (cuda, bindings, driver, cutlass, cute, runtime, kernel)
+        mods = {m.__name__: m for m in mods}
+        bf = lambda *shape: torch.empty(shape, dtype=torch.bfloat16, device="meta")
+        idx = lambda: torch.empty(1, dtype=torch.int32, device="meta")
+        args = lambda: (
+            bf(4, 2560), bf(16480, 2560), bf(10240, 4), None, bf(3, 10240, 3), idx(),
+            bf(2, 4, 10240, 3), idx(),
+        )
+        cuda_fns = dict(
+            is_current_stream_capturing=lambda: capturing[0],
+            current_stream=lambda d: SimpleNamespace(cuda_stream=7),
+            get_device_capability=lambda d: (10, 7),
+        )
+        self.addCleanup(lambda: vars(package).pop("mk_front", None))
+        with mock.patch.dict(sys.modules, mods), mock.patch.multiple(torch.cuda, **cuda_fns):
+            sys.modules.pop(package.__name__ + ".mk_front", None)
+            front = importlib.import_module(package.__name__ + ".mk_front")
+            packed, conv = front.run(*args(), pad_slot=-1)
+            self.assertEqual(tuple(packed.shape) + tuple(conv.shape), (4, 16480, 4, 10240))
+            capturing[0] = True
+            front.run(*args(), pad_slot=-1)
+            self.assertEqual(calls, ["compile", "launch", "launch"])
+            with self.assertRaises(RuntimeError):
+                front.run(*args(), pad_slot=0)  # a layout no eager step compiled
+            self.assertEqual(calls, ["compile", "launch", "launch"])
 
 
 class _State:  # a UcacheState double that records the calls

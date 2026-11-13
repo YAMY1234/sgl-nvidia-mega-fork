@@ -12,8 +12,11 @@ causal conv update into the verify's intermediate windows, the q/k/v split, the 
 verify core (the plugin's native kernel: SGLang's circular verify kernel launched with
 PDL), the gated RMSNorm and the output projection. With slot ``gdn_verify_glue``, a
 verify of 2-8 requests runs everything between the input and the output projection as
-one launch per layer (``kernels/ops/attention/linear/gdn_fused_verify_glue.py``). Every
-other mode, and verify without the slots, runs SGLang's ``GatedDeltaNet.forward``.
+one launch per layer (``kernels/ops/attention/linear/gdn_fused_verify_glue.py``). With
+slot ``gdn_front``, a verify of one request (4 rows) runs two launches before the output
+projection: the input projection with the causal conv update in its epilogue, then the
+MMA ReplaySSM core with the gated RMSNorm (``kernels/ops/attention/gdn_front/mk_*.py``).
+Every other mode, and verify without the slots, runs SGLang's ``GatedDeltaNet.forward``.
 
 What the verify reads and writes (the pools are SGLang's): the conv states by state
 slot (the conv update also writes them; SGLang's commit restores them), the
@@ -29,10 +32,14 @@ STOCK = "stock"
 # slot gdn_verify_glue: 2-8 requests of 4 rows; one program per (request, value head)
 GLUE_MAX_ROWS = 32
 GLUE_NORM_ACTIVATIONS = ("swish", "silu", "sigmoid")
+# slot gdn_front: one request of 4 rows at hidden 2560; the core's gate is sigmoid(z)
+FRONT_ROWS = 4
+FRONT_HIDDEN = 2560
 
 SGLANG_READS = {
     "srt/models/qwen3_5.py": (
         "_forward_input_proj",
+        "_fused_in_proj_weight",
         "num_k_heads",
         "num_v_heads",
         "head_k_dim",
@@ -79,12 +86,30 @@ SGLANG_READS = {
         "v_dim",
         "num_q_heads",
         "head_q_dim",
+        "num_v_heads",
+        "head_v_dim",
     ),
     "kernels/ops/attention/triton_gdn_fused_proj.py": (
         "fused_qkvzba_split_reshape_cat_contiguous",
         "fused_qkv_split_gdn_prefill",
     ),
-    "kernels/ops/mamba/causal_conv1d_triton.py": ("causal_conv1d_update",),
+    "kernels/ops/mamba/causal_conv1d_triton.py": ("causal_conv1d_update", "PAD_SLOT_ID"),
+    "srt/mem_cache/memory_pool.py": (
+        "conv",
+        "temporal",
+        "intermediate_conv_window",
+        "replayssm_d",
+        "replayssm_k",
+        "replayssm_g",
+        "replayssm_rawv",
+        "replayssm_rawk",
+        "replayssm_beta",
+        "replayssm_spec_write_pos",
+        "replayssm_cache_base",
+        "replayssm_is_flush",
+        "replayssm_spec_fold",
+        "replayssm_is_kda",
+    ),
     "srt/layers/attention/linear/utils.py": (
         "select_verify_intermediate_state_indices",
         "pp_spec_stable_rows_enabled",
@@ -149,6 +174,10 @@ def step(executor, layer, x, st):
         from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache
 
         return gdn_ucache.verify(executor, layer.linear_attn, x, st, st.view)
+    if fb.forward_mode.is_target_verify() and executor.gdn_front_ready:
+        out = _verify_front(executor, layer.linear_attn, x, st)
+        if out is not None:
+            return out
     if fb.forward_mode.is_target_verify() and executor.gdn_glue_ready:
         out = _verify_glue(executor, layer.linear_attn, x, st)
         if out is not None:
@@ -174,7 +203,7 @@ def glue_reasons(model) -> str:
         gdn, attn = layer.linear_attn, layer.linear_attn.attn
         norm = gdn.norm
         if gdn.attn_tp_size != 1:
-            return "the glue takes TP1"
+            return "the kernel takes TP1"
         if norm.group_size is not None or not norm.norm_before_gate or norm.bias is not None:
             return "the gated RMSNorm is grouped, gate-first or has a bias"
         if norm.activation not in GLUE_NORM_ACTIVATIONS:
@@ -194,12 +223,151 @@ def glue_pool_reasons(backend, layer_id: int, tokens_per_request: int) -> str:
     cache = backend.state_layer_cache(layer_id)
     window = cache.intermediate_conv_window[0]
     if cache.temporal.dtype != torch.bfloat16:
-        return f"GDN checkpoint dtype {cache.temporal.dtype}, the glue takes BF16"
+        return f"GDN checkpoint dtype {cache.temporal.dtype}, the kernel takes BF16"
     if cache.conv[0].dtype != torch.bfloat16 or window.dtype != torch.bfloat16:
         return "the conv states are not BF16"
     if cache.conv[0].dim() != 3 or cache.conv[0].shape[-1] != 3 or window.dim() != 4:
         return "the conv state is not width 4"
     return ""
+
+
+def front_reasons(model) -> str:
+    """'' when every GDN layer fits the verify front and its fused-norm core, else why
+    not (glue_reasons plus SGLang's packed BF16 in_proj weight and a sigmoid gate)."""
+    from sglang.srt.models.qwen4_exp import Qwen4ExpLinearDecoderLayer
+
+    reason = glue_reasons(model)
+    if reason:
+        return reason
+    m = model.model
+    for i in range(m.start_layer, m.end_layer):
+        layer = m.layers[i]
+        if not isinstance(layer, Qwen4ExpLinearDecoderLayer):
+            continue
+        gdn, attn = layer.linear_attn, layer.linear_attn.attn
+        weight = gdn._fused_in_proj_weight
+        rows = attn.q_dim + attn.k_dim + 2 * attn.v_dim + 2 * attn.num_v_heads
+        shape = (rows, FRONT_HIDDEN)  # [q|k|v|z|b|a] rows
+        if weight is None or weight.dtype != torch.bfloat16:
+            return "no packed BF16 in_proj weight (SGLang's _fused_in_proj_weight)"
+        if tuple(weight.shape) != shape:
+            return f"packed in_proj weight {tuple(weight.shape)}, the front takes {shape}"
+        if gdn.norm.activation != "sigmoid":
+            return f"gated RMSNorm activation {gdn.norm.activation!r}, not sigmoid"
+        if gdn.norm.weight.dtype not in (torch.bfloat16, torch.float32):
+            return f"gated RMSNorm weight dtype {gdn.norm.weight.dtype}"
+        if attn.A_log.dtype != torch.float32:
+            return f"A_log dtype {attn.A_log.dtype}, the core takes FP32"
+        if attn.dt_bias.dtype not in (torch.bfloat16, torch.float32):
+            return f"dt_bias dtype {attn.dt_bias.dtype}"
+    return ""
+
+
+def front_pool_reasons(backend, layer_id: int, tokens_per_request: int) -> str:
+    """'' when the pool's states fit the front and its core (glue_pool_reasons plus
+    BF16 rings that keep low parts)."""
+    reason = glue_pool_reasons(backend, layer_id, tokens_per_request)
+    if reason:
+        return reason
+    cache = backend.state_layer_cache(layer_id)
+    if (
+        cache.replayssm_d.dtype != torch.bfloat16
+        or cache.replayssm_rawv is None
+        or cache.replayssm_rawk is None
+        or cache.replayssm_beta is not None
+    ):
+        return "the ReplaySSM rings are not BF16 with low parts"
+    return ""
+
+
+def _verify_front(executor, gdn, x, st):
+    """``Qwen3_5GatedDeltaNet.forward``'s fused-front verify of one request: the input
+    projection with the causal conv update, the ReplaySSM core with the gated RMSNorm
+    (``GDNAttnBackend.forward_inproj_conv``) and the output projection; None outside
+    one request of 4 rows or for a tree verify."""
+    fb = st.fb
+    rows = x.shape[0]
+    if rows != FRONT_ROWS or fb.spec_info.draft_token_num != FRONT_ROWS:
+        return None
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+    from sglang.srt.layers.attention.linear.utils import (
+        select_verify_intermediate_state_indices,
+    )
+
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.gdn_front import (
+        mk_core,
+        mk_front,
+    )
+    from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
+
+    backend = linear_backend()
+    md = backend.forward_metadata
+    if (
+        md.retrieve_next_token is not None
+        or md.retrieve_next_sibling is not None
+        or md.retrieve_parent_token is not None
+    ):
+        return None  # tree verify: the conv walks parent links
+    layer = gdn.attn
+    cache = backend.state_layer_cache(layer.layer_id)
+    pool = backend.state_pool
+    cache_indices = md.mamba_cache_indices
+    window_rows = st.scratch.get("gdn.front_window_rows")
+    if window_rows is None:
+        # the same for every layer of the step: one launch, not one a layer
+        window_rows = st.scratch["gdn.front_window_rows"] = (
+            select_verify_intermediate_state_indices(
+                backend.verify_intermediate_state_indices,
+                fb.req_pool_indices,
+                cache_indices[:1] >= 0,
+                backend.req_to_token_pool.size,
+            )[:1]
+        )
+    packed, qkv = mk_front.run(
+        x,
+        gdn._fused_in_proj_weight,
+        layer.conv_weights,
+        None,
+        cache.conv[0],
+        cache_indices[:1],
+        cache.intermediate_conv_window[0],
+        window_rows,
+        pad_slot=PAD_SLOT_ID,
+    )
+    z_start = layer.q_dim + layer.k_dim + layer.v_dim
+    b_start = z_start + layer.v_dim
+    hv = layer.num_v_heads
+    raw = x.new_empty(rows, hv, layer.head_v_dim)
+    normalized = torch.empty_like(raw)
+    mk_core.core(
+        qkv,
+        packed[:, b_start + hv :],
+        packed[:, b_start : b_start + hv],
+        layer.A_log,
+        layer.dt_bias,
+        cache.temporal,
+        cache.replayssm_d,
+        cache.replayssm_k,
+        cache.replayssm_g,
+        cache.replayssm_rawv,
+        cache.replayssm_rawk,
+        cache_indices,
+        fb.req_pool_indices,
+        pool.replayssm_spec_write_pos,
+        pool.replayssm_cache_base,
+        pool.replayssm_is_flush,
+        raw,
+        z=packed[:, z_start:b_start],
+        norm_weight=gdn.norm.weight,
+        normalized=normalized,
+        eps=gdn.norm.eps,
+    )
+    st.ran("gdn", "front")
+    core = normalized.view(rows, -1)
+    out = smallm_gemm.out_proj(executor, gdn.out_proj, core, st, "gdn.out_proj")
+    if out is None:
+        out, _ = gdn.out_proj(core)
+    return out
 
 
 def _verify_glue(executor, gdn, x, st):

@@ -605,7 +605,17 @@ def gated_mix(gr, hyper_input: torch.Tensor, normalized_input=None):
     """``gr.mix(hyper_input, normalized_input=...)`` (an HC read, ``GatedResidual``);
     with the pins routed and gr's mix shapes in the table, the source's pinned
     _mix_compute where SGLang's mix runs _mix_compute."""
-    if not (_routed and _mix_gemms_pinned(gr)):
+    from sgl_nvidia_mega.qwen3_8.runtime import hc_mix_tuned
+
+    # the source's row-aware HC mix tactics serve its split-K mix rows (<= 32; SGLang's <= 24)
+    tuned = (
+        hyper_input.is_cuda
+        and hyper_input.dtype in (torch.bfloat16, torch.float16)
+        and 0 < hyper_input.shape[0] <= hc_mix_tuned.MAX_ROWS
+        and gr._jit_mix_ok
+        and hc_mix_tuned.enabled()
+    )
+    if not (tuned or (_routed and _mix_gemms_pinned(gr))):
         return gr.mix(hyper_input, normalized_input=normalized_input)
     from sglang.srt.layers.hyperconnection import (
         flydsl_hc_mix_supported,
@@ -631,13 +641,15 @@ def gated_mix(gr, hyper_input: torch.Tensor, normalized_input=None):
         gr._jit_mix_ok
         and hyper_input_normed.is_cuda
         and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
-        and hyper_input_normed.shape[0] <= 24
+        and hyper_input_normed.shape[0] <= (hc_mix_tuned.MAX_ROWS if tuned else 24)
     ):
         from sglang.kernels.ops.gemm.hc_mix_splitk import (
             hc_mix,
             permute_pad_up_weight,
         )
 
+        if tuned:
+            hc_mix = hc_mix_tuned.hc_mix
         if gr._mix_up_weight_padded is None:
             gr._mix_up_weight_padded = permute_pad_up_weight(up, gr.hc_count)
         mixed_input = hc_mix(

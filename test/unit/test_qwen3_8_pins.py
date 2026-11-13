@@ -702,6 +702,16 @@ class TestGatedMix(_Gemm):
             {"m": 28, "n": 4, "k": 16, "kind": "tgv", "tactic": 1},
             {"m": 28, "n": 16, "k": 4, "kind": "tgv", "tactic": 2},
         ])  # fmt: skip
+        from sgl_nvidia_mega.qwen3_8.runtime import hc_mix_tuned
+
+        self.tuned = {"on": False}
+        for name, value in (
+            ("enabled", lambda: self.tuned["on"]),
+            ("hc_mix", lambda t, d, u, hc, hs: self.route("tuned", t, hs)),
+        ):
+            patcher = mock.patch.object(hc_mix_tuned, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def route(self, name, t, hs):
         self.routes.append((name, t.shape[0]))
@@ -731,6 +741,22 @@ class TestGatedMix(_Gemm):
             self.routes, [("splitk", 8), ("splitk", 20), ("pinned", 28), ("fused", 8)]
         )
         self.gr.mix.assert_not_called()
+
+    def test_the_sources_tuned_tactics_serve_the_jit_rows(self):
+        # SGLANG_HC_MACRO (on by default) at TP1: the source's split-K mix rows (<= 32,
+        # SGLang's <= 24) run its tactics, pinned or not; wider rows keep SGLang's mix
+        # when unpinned and the pinned order when pinned
+        self.tuned["on"] = True
+        mixed, (res, normed, partials) = bp.gated_mix(self.gr, _x(12, k=16))
+        self.assertTrue(torch.equal(normed, _x(12, k=16) * 2))
+        bp.gated_mix(self.gr, _x(28, k=16))
+        bp.gated_mix(self.gr, _x(32, k=16))
+        self.assertEqual(bp.gated_mix(self.gr, _x(36, k=16)), "sglang")
+        self.assertEqual(self.routes, [("tuned", 12), ("tuned", 28), ("tuned", 32)])
+        bp.enable_routes()
+        self.fused["rows"] = 40
+        bp.gated_mix(self.gr, _x(36, k=16))
+        self.assertEqual(self.routes[-1], ("fused", 36))
 
     def test_the_pinned_compute_is_mix_compute_on_the_pins(self):
         bp.enable_routes()

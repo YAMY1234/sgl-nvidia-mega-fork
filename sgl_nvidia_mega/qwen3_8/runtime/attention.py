@@ -141,7 +141,7 @@ def _decomposed(executor, layer, x, st):
         if out is not None:
             return out
     attn_out = layer.attn(q, k, v, fb, topk_indices=indices)
-    return _finish(layer, attn_out, gate, st, STOCK)
+    return _finish(executor, layer, attn_out, gate, st, STOCK)
 
 
 def _verify_pool(executor, layer, backend, q, k, v, gate, indices, st):
@@ -183,7 +183,7 @@ def _verify_pool(executor, layer, backend, q, k, v, gate, indices, st):
     out = out.view(rows, QUERY_HEADS * HEAD_DIM)
     if OPCHECK and not torch.cuda.is_current_stream_capturing():
         _opcheck(layer, q, k, v, fb, indices, gate, out, md, query_positions)
-    return _finish(layer, out, None, st, "pool_splitk")
+    return _finish(executor, layer, out, None, st, "pool_splitk")
 
 
 def _opcheck(layer, q, k, v, fb, indices, gate, got, md, query_positions):
@@ -215,14 +215,19 @@ def _opcheck(layer, q, k, v, fb, indices, gate, got, md, query_positions):
     )
 
 
-def _finish(layer, attn_out, gate, st, impl):
-    """The output gate (unless the merge applied it) and o_proj."""
+def _finish(executor, layer, attn_out, gate, st, impl):
+    """The output gate (unless the merge applied it) and o_proj (on slot smallm_gemm's
+    split-K where it serves)."""
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
 
     if gate is not None:
         attn_out = fused_sigmoid_mul(attn_out, gate, inplace=True)
     st.ran("qsa", impl)
-    output, _ = layer.o_proj(attn_out)
+    output = smallm_gemm.out_proj(executor, layer.o_proj, attn_out, st, "qsa.o_proj")
+    if output is None:
+        output, _ = layer.o_proj(attn_out)
     return output
 
 

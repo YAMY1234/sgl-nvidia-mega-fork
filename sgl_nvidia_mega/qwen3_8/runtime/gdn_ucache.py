@@ -913,6 +913,8 @@ def verify(executor, gdn, x, st, view, buffers=None):
         qwen3_5_gdn_prefill_projection_views,
     )
 
+    from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
+
     uv = executor.gdn_ucache
     if uv is None:
         raise RuntimeError(
@@ -1002,7 +1004,9 @@ def verify(executor, gdn, x, st, view, buffers=None):
     )
     if fused_norm is not None:
         # [rows, HV, V], gated and normalized
-        return gdn.out_proj(core.reshape(x.shape[0], -1))[0]
+        core = core.reshape(x.shape[0], -1)
+        out = smallm_gemm.out_proj(executor, gdn.out_proj, core, st, "gdn.out_proj")
+        return gdn.out_proj(core)[0] if out is None else out
     z_shape = z.shape
     core = core.reshape(-1, core.shape[-1])
     z_flat_shape = (z.numel() // z.shape[-1], z.shape[-1])
@@ -1013,7 +1017,9 @@ def verify(executor, gdn, x, st, view, buffers=None):
     core = gdn.norm(core, z)
     core = core.reshape(z_shape)
     core = core.reshape(*core.shape[:-2], core.shape[-2] * core.shape[-1])
-    out, _ = gdn.out_proj(core)
+    out = smallm_gemm.out_proj(executor, gdn.out_proj, core, st, "gdn.out_proj")
+    if out is None:
+        out, _ = gdn.out_proj(core)
     return out
 
 

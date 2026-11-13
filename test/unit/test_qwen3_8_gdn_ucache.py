@@ -551,7 +551,9 @@ class TestVerify(unittest.TestCase):
         gdn = _gdn(env, batch=batch, **kw)
         st = _St(batch, tokens)
         executor = SimpleNamespace(
-            gdn_ucache=uv, ucache_state=SimpleNamespace(buffers=buffers)
+            gdn_ucache=uv,
+            ucache_state=SimpleNamespace(buffers=buffers),
+            smallm_gemm=None,
         )
         out = U.verify(executor, gdn, torch.zeros(batch * T, 16), st, view)
         view.rings = buffers  # for the assertions on the rings
@@ -704,7 +706,8 @@ class TestVerify(unittest.TestCase):
             uv = _verifier(first_layer_id=7)
             gdn, st = _gdn(env), _St()
             x = torch.zeros(len(CACHE_INDICES) * T, 16)
-            U.verify(SimpleNamespace(gdn_ucache=uv, ucache_state=None), gdn, x, st, view, buffers)
+            executor = SimpleNamespace(gdn_ucache=uv, ucache_state=None, smallm_gemm=None)
+            U.verify(executor, gdn, x, st, view, buffers)
             (kw,) = env.flushes()
             self.assertIs(kw["k_cache"]._base, buffers.k_ring)
             self.assertEqual(kw["flush_min"], buffers.flush_min)

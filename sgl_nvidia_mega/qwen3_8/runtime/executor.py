@@ -162,6 +162,8 @@ class Qwen3_8Executor:
         self.qsa_prefill = None
         # slot ple: ple.Options, set by build
         self.ple_options = None
+        # slot smallm_gemm: smallm_gemm.Options, set by build
+        self.smallm_gemm = None
         self._pools_checked = False
         self.mixers = {
             i: (

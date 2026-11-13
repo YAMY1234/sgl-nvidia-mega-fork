@@ -142,6 +142,8 @@ def _verify(executor, gdn, x, st):
         fused_qkvzba_split_reshape_cat_contiguous,
     )
 
+    from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
+
     fb = st.fb
     qkvz, ba = gdn._forward_input_proj(x)
     nk = triton.cdiv(gdn.num_k_heads, gdn.attn_tp_size)
@@ -161,7 +163,9 @@ def _verify(executor, gdn, x, st):
     core = gdn.norm(core, z)
     core = core.reshape(z_shape)
     core = core.reshape(*core.shape[:-2], core.shape[-2] * core.shape[-1])
-    out, _ = gdn.out_proj(core)
+    out = smallm_gemm.out_proj(executor, gdn.out_proj, core, st, "gdn.out_proj")
+    if out is None:
+        out, _ = gdn.out_proj(core)
     return out
 
 

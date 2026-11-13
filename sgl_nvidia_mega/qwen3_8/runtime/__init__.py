@@ -35,6 +35,8 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # qsa_prefill: the QSA attention of a covered prefill / extend (runtime/qsa_prefill.py)
 # ple: the PLE batch layout, table gather, gate and short conv (runtime/ple.py); its
 # embedding add needs the S1 layers
+# smallm_gemm: SM107 small-M BF16 GEMMs (runtime/smallm_gemm.py): out_proj / o_proj
+# split-K at 4-16 and 20-32 rows, the shared expert's fused act and TGV down_proj
 KNOWN_SLOTS: tuple[str, ...] = (
     "hc",
     "hc_wide",
@@ -45,6 +47,7 @@ KNOWN_SLOTS: tuple[str, ...] = (
     "gdn_prefill",
     "qsa_prefill",
     "ple",
+    "smallm_gemm",
 )
 # A node-local directory for the JIT sources some kernels write before compiling.
 SOURCE_DIR_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_SOURCE_DIR"
@@ -208,6 +211,12 @@ def build(model, hf_config, ctx):
         from sgl_nvidia_mega.qwen3_8.runtime import ple
 
         executor.ple_options = _built_options("ple", ple.build(model), ple.DEFAULT)
+    if "smallm_gemm" in slots:
+        from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
+
+        executor.smallm_gemm = _built_options(
+            "smallm_gemm", smallm_gemm.build(model), smallm_gemm.DEFAULT
+        )
     logger.info(
         "NVIDIA megakernel: Qwen3.8 %s executor: %s; slots %s; every other op stock",
         "draft" if draft else ("target (own GDN u-cache)" if own_ucache else "target"),

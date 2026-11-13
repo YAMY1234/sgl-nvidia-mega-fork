@@ -25,6 +25,7 @@ SGLANG_READS = {
     "srt/models/qwen2_moe.py": (
         "Qwen2MoeSparseMoeBlock",
         "_forward_shared_experts",
+        "shared_expert",
         "_forward_router_experts",
         "supports_deferred_finalize",
         "shared_expert_gate",
@@ -86,6 +87,7 @@ def step(executor, layer, x, st):
     from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.moe_finalize import (
         _fused_finalize_gate_sigmoid_mul_add_kernel as kernel,
     )
+    from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
 
     # SGLang's order (Qwen2MoeSparseMoeBlock.forward_normal_dual_stream): the routed
     # experts on the current stream; while capturing, the shared expert on the block's
@@ -96,7 +98,10 @@ def step(executor, layer, x, st):
         side.wait_stream(current)
     deferred = mlp._forward_router_experts(x, defer_finalize=True)
     with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
-        shared = mlp._forward_shared_experts(x, apply_gate=False).contiguous()
+        shared = smallm_gemm.shared_expert(executor, mlp.shared_expert, x, st)
+        if shared is None:
+            shared = mlp._forward_shared_experts(x, apply_gate=False)
+        shared = shared.contiguous()
     if side is not None:
         shared.record_stream(current)
         current.wait_stream(side)

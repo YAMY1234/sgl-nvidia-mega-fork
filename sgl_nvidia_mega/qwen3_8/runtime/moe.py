@@ -25,6 +25,7 @@ SGLANG_READS = {
     "srt/models/qwen2_moe.py": (
         "Qwen2MoeSparseMoeBlock",
         "_forward_shared_experts",
+        "shared_expert",
         "_forward_router_experts",
         "supports_deferred_finalize",
         "shared_expert_gate",
@@ -77,8 +78,12 @@ def step(executor, layer, x, st):
     from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.moe_finalize import (
         _fused_finalize_gate_sigmoid_mul_add_kernel as kernel,
     )
+    from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
 
-    shared = mlp._forward_shared_experts(x, apply_gate=False).contiguous()
+    shared = smallm_gemm.shared_expert(executor, mlp.shared_expert, x, st)
+    if shared is None:
+        shared = mlp._forward_shared_experts(x, apply_gate=False)
+    shared = shared.contiguous()
     # slot moe_routing: None when it does not take these rows
     deferred = moe_routing.routed(executor, mlp, x, st)
     if deferred is None:

@@ -401,7 +401,9 @@ def test_bitwise_routes_match_main_dispatch(env, record_property):
     from sgl_nvidia_mega.qwen3_8.runtime import sm107_bf16_smallm as sr
 
     assert sr.install(device_sm=107, splitk_enabled=True, cutedsl_available=True)
-    assert sr.precompile(stock_gemm=env.stock_gemm)  # every key, bit for bit
+    # every key, bit for bit: ROUTES against main's dispatch, SOURCE_SPLITK_ROUTES against
+    # main's split-K kernel at the source's tactic
+    assert sr.precompile(stock_gemm=env.stock_gemm, source_gemm=sr._source_splitk)
     g = torch.Generator(device="cuda").manual_seed(11)
     names = {}
     with torch.inference_mode():

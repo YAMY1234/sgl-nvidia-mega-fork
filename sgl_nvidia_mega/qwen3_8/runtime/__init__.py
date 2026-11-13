@@ -214,8 +214,9 @@ def config_reasons(cfg, hf_config) -> list[str]:
 
 
 def prefill_graphs_on() -> bool:
-    """Whether this server captures the target's prefill body in breakable prefill
-    graphs (config_reasons refused every other prefill graph)."""
+    """Whether this server captures the prefill body of the target and of the MTP
+    draft in breakable prefill graphs (config_reasons refused every other prefill
+    graph)."""
     from sglang.srt.runtime_context import get_exec
 
     return (
@@ -286,7 +287,7 @@ def build(model, hf_config, ctx):
 
         mamba = getattr(get_exec(), "mamba", None)
         executor.verify_required = own_ucache
-        executor.prefill_graph = prefill_graphs_on()
+    executor.prefill_graph = prefill_graphs_on()
     if own_ucache:
         from sgl_nvidia_mega.qwen3_8.runtime.gdn_ucache_state import UcacheState
 
@@ -330,8 +331,14 @@ def build(model, hf_config, ctx):
         executor.gdn_prefill = _built_options(
             "gdn_prefill", gdn_prefill.build(model), gdn_prefill.DEFAULT
         )
-    if executor.prefill_graph and executor.gdn_prefill is None and gdn_graph_tables():
-        # SGLang's captured GDN extend refuses FlashInfer's tables
+    if (
+        executor.prefill_graph
+        and not draft
+        and executor.gdn_prefill is None
+        and gdn_graph_tables()
+    ):
+        # SGLang's captured GDN extend refuses FlashInfer's tables (the MTP draft has
+        # no GDN layer)
         raise RuntimeError(
             "Qwen3.8 executor: breakable prefill graphs with FlashInfer's GDN tables "
             "need slot gdn_prefill, which did not build (see its log line)"

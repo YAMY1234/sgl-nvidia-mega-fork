@@ -462,6 +462,27 @@ class TestStepFallbacks(unittest.TestCase):
                 self.assertEqual(out, "qsa-stock")
                 ext.assert_called_once()
 
+    def test_draft_prefill_qsa_takes_the_prefill_path(self):
+        """The draft's slots for its decode and draft extend leave its prefill (the
+        body a breakable prefill graph captures) to qsa_prefill, as the target's."""
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import attention, qsa_prefill
+
+        layer = SimpleNamespace(is_qsa=True, self_attention=lambda **kw: "qsa-stock")
+        ex = SimpleNamespace(
+            qsa_pool_ready=False, qsa_union="union", qsa_indexer="indexer",
+            qsa_prefill="o", qsa_draft="glue",
+        )
+        with (
+            mock.patch.object(qsa_prefill, "extend", return_value="qsa-prefill") as ext,
+            mock.patch.object(attention, "_decomposed", side_effect=AssertionError),
+            mock.patch.object(attention, "_draft_extend", side_effect=AssertionError),
+        ):
+            out = attention.step(ex, layer, torch.zeros(8, 4), _St(_Mode.EXTEND))
+        self.assertEqual(out, "qsa-prefill")
+        ext.assert_called_once()
+
     def test_gdn_prefill_slot_or_stock(self):
         from unittest import mock
 
@@ -1289,6 +1310,10 @@ class TestSpecs(unittest.TestCase):
         self.assertIsNone(getattr(spec.DRAFT_SPEC, "prepare", None))
         if "prepare" in spec.MegakernelSpec.__struct_fields__:
             self.assertIs(spec.SPEC.prepare, runtime.prepare)
+        if "prefill_graph" in spec.MegakernelSpec.__struct_fields__:
+            # breakable prefill graphs may capture both prefill bodies
+            self.assertTrue(spec.SPEC.prefill_graph)
+            self.assertTrue(spec.DRAFT_SPEC.prefill_graph)
 
 
 class _LogitsOutput:  # the fake LogitsProcessorOutput
@@ -1313,6 +1338,30 @@ def _target_lm():
     return lm
 
 
+class Qwen4ExpForCausalLMMTP(SimpleNamespace):  # build tells the draft by its name
+    pass
+
+
+def _draft_lm():
+    """An MTP draft model whose layer module's forward (Qwen4ExpModel's) is a spy."""
+    lm = Qwen4ExpForCausalLMMTP(model=_model(layers=(_Attention,)).model)
+    lm.lm_head = "head"
+    lm.logits_processor = lambda ids, hidden, head, fb: _LogitsOutput()
+    lm._prepare_input_embeds = lambda ids, fb, embeds: "embeds"
+    lm._mtp_input_fusion = lambda embeds, hidden: ("streams", embeds, hidden)
+    lm._set_hc_logits_hidden_states = lambda out, hc, fb: setattr(
+        out, "hidden_states", hc
+    )
+    lm.calls = []
+
+    def forward(input_ids, positions, forward_batch, inputs_embeds=None):
+        lm.calls.append((input_ids, positions, forward_batch, inputs_embeds))
+        return "hidden", "hc"
+
+    lm.model.forward = forward
+    return lm
+
+
 class TestPrefillBody(unittest.TestCase):
     """SupportsPrefillBody: the layer loop of a prefill as the layer module's forward,
     which breakable prefill graphs capture."""
@@ -1326,10 +1375,12 @@ class TestPrefillBody(unittest.TestCase):
         return None if step is None else (step.mode, step.rows)
 
     def test_off_without_prefill_graphs(self):
-        ex = _executor()
-        self.assertIsNone(self.body(ex, _Mode.EXTEND, 64))
-        _STATE["breakable"] = True
-        self.assertIsNone(ex.plan(torch.zeros(64), _batch(_Mode.EXTEND, 64)))
+        for ex in (_executor(), _executor(draft=True)):
+            _STATE["breakable"] = False
+            self.assertIsNone(self.body(ex, _Mode.EXTEND, 64))
+            self.assertIsNone(self.body(ex, _Mode.EXTEND, 64, inputs_embeds="streams"))
+            _STATE["breakable"] = True
+            self.assertIsNone(ex.plan(torch.zeros(64), _batch(_Mode.EXTEND, 64)))
 
     def test_covers_what_plan_covers_as_prefill(self):
         ex = _executor()
@@ -1356,6 +1407,178 @@ class TestPrefillBody(unittest.TestCase):
         self.assertIsNone(self.body(ex, _Mode.EXTEND, 8, "embeds", 1))  # positional pp
         _STATE["cp"] = True
         self.assertIsNone(self.body(ex, _Mode.EXTEND, 8))
+
+    def test_draft_body_takes_the_mtp_streams(self):
+        ex = _executor(draft=True)
+        ex.prefill_graph = True
+        for breakable in (False, True):
+            _STATE["breakable"] = breakable
+            # the graph runner's capture names Qwen4ExpModel.forward's parameter
+            self.assertEqual(
+                self.body(ex, _Mode.EXTEND, 8192, inputs_embeds="slot"),
+                ("prefill", 8192),
+            )
+            # the draft's outer step passes the streams positionally
+            self.assertEqual(self.body(ex, _Mode.EXTEND, 64, "streams"), ("prefill", 64))
+            self.assertEqual(self.body(ex, _Mode.MIXED, 37), ("prefill", 37))
+            # the outer step around a replay
+            step = ex.plan(torch.zeros(64), _batch(_Mode.EXTEND, 64))
+            self.assertEqual((step.mode, step.rows), ("prefill", 64))
+        # draft extend and decode stay in the draft's own graphs (plan)
+        for mode in (
+            _Mode.DRAFT_EXTEND_V2, _Mode.DECODE, _Mode.TARGET_VERIFY, _Mode.IDLE,
+            _Mode.PREBUILT,
+        ):
+            self.assertIsNone(self.body(ex, mode, 8, inputs_embeds="slot"), mode)
+        self.assertIsNone(self.body(ex, _Mode.EXTEND, 8, "streams", 1))  # positional pp
+        self.assertIsNone(self.body(ex, _Mode.EXTEND, 8, inputs_embeds="s", unknown=1))
+        _STATE["cp"] = True
+        self.assertIsNone(self.body(ex, _Mode.EXTEND, 8, inputs_embeds="slot"))
+        # the target's layer module takes no inputs_embeds: its own forward runs
+        _STATE["cp"] = False
+        target = _executor()
+        target.prefill_graph = True
+        self.assertIsNone(self.body(target, _Mode.EXTEND, 8, inputs_embeds="slot"))
+
+    def test_draft_forward_body_returns_the_streams(self):
+        from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+        ex = _executor(draft=True)
+        ex.prefill_graph = True
+        seen, logged = [], []
+        ex._language_model = lambda st, ids, embeds: (
+            seen.append((st.graph, st.positions, ids, embeds)) or ("h", "hc")
+        )
+        ex.engagement.begin = lambda: logged.append("begin")
+        ex.engagement.end = lambda mode, rows: logged.append(("end", mode, rows))
+        fb = _batch(_Mode.EXTEND, 16)
+        step = Step(mode="prefill", rows=16, view="pview")
+        for breakable in (False, True):
+            _STATE["breakable"] = breakable
+            out = ex.forward_body(step, None, None, "pos", fb, inputs_embeds="slot")
+            self.assertEqual(out, ("h", "hc"))  # Qwen4ExpModel.forward's pair
+            out = ex.forward_body(step, None, fb.input_ids, "pos", fb, "streams")
+            self.assertEqual(out, ("h", "hc"))
+        self.assertEqual(
+            seen,
+            [
+                (graph, "pos", fb.input_ids, embeds)
+                for graph in (False, True)
+                for embeds in ("slot", "streams")
+            ],
+        )
+        # the draft's layer module has no HC side channel
+        self.assertFalse(hasattr(ex.lm.model, "last_hc_hidden_states"))
+        # eager, the outer prefill step records the body; a capture records itself
+        self.assertEqual(logged, ["begin", ("end", "prefill", 16)] * 2)
+
+    def test_draft_capture_logs_its_engagement(self):
+        from unittest import mock
+
+        from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+        ex = _executor(draft=True)
+        ex.prefill_graph = True
+
+        def layers(st, ids, embeds):
+            st.ran("qsa", "break")
+            st.ran("moe", "extend_finalize")
+            return "h", "hc"
+
+        ex._language_model = layers
+        _STATE["breakable"] = True
+        fb = _batch(_Mode.EXTEND, 16384)
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "is_current_stream_capturing", return_value=True),
+            self.assertLogs(
+                "sgl_nvidia_mega.qwen3_8.runtime.engagement", logging.INFO
+            ) as logs,
+        ):
+            step = Step(mode="prefill", rows=16384)
+            ex.forward_body(step, None, None, "pos", fb, inputs_embeds="slot")
+        (line,) = logs.output
+        self.assertIn(
+            "engagement: draft prefill rows=16384 graph: moe=extend_finalize; qsa=break",
+            line,
+        )
+
+    def run_draft(self, ex, mode=_Mode.EXTEND, breakable=False):
+        from unittest import mock
+
+        from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+        logits = types.ModuleType("sglang.srt.layers.logits_processor")
+        logits.LogitsProcessorOutput = _LogitsOutput
+        eplb = types.ModuleType("sglang.srt.eplb.expert_distribution")
+        eplb.get_global_expert_distribution_recorder = lambda: SimpleNamespace(
+            disable_this_region=contextlib.nullcontext
+        )
+        _STATE["breakable"] = breakable
+        fb = SimpleNamespace(
+            forward_mode=mode,
+            input_ids=torch.zeros(8),
+            spec_info=SimpleNamespace(hidden_states="target"),
+        )
+        name = "prefill" if mode is _Mode.EXTEND else "draft_extend"
+        with mock.patch.dict(sys.modules, {m.__name__: m for m in (logits, eplb)}):
+            out = ex._forward(Step(mode=name, rows=8), fb.input_ids, "pos", fb)
+        return out, fb
+
+    def test_draft_outer_prefill_calls_the_layer_module(self):
+        lm = _draft_lm()
+        ex = Qwen3_8Executor(lm, widths=(4,), draft=True, slots=frozenset())
+        ex.prefill_graph = True
+        ex._language_model = lambda *a: self.fail("the body runs the layers")
+        out, fb = self.run_draft(ex)
+        # Qwen4ExpForCausalLMMTP.forward's call: the MTP streams as inputs_embeds
+        self.assertEqual(
+            lm.calls, [(fb.input_ids, "pos", fb, ("streams", "embeds", "target"))]
+        )
+        self.assertEqual(out.hidden_states, "hc")
+        # around a replay of the captured body
+        out, _ = self.run_draft(ex, breakable=True)
+        self.assertEqual((len(lm.calls), out.hidden_states), (2, "hc"))
+        recorded = [item for ops in ex.engagement._seen.values() for item in ops]
+        self.assertIn(("layers", "prefill_graph"), recorded)
+
+    def test_draft_runs_the_layers_outside_the_prefill_body(self):
+        lm = _draft_lm()
+        ex = Qwen3_8Executor(lm, widths=(8,), draft=True, slots=frozenset())
+        ex._language_model = lambda st, ids, streams: ("hidden2", "hc2")
+        # no prefill graphs: the prefill's layers run here
+        out, _ = self.run_draft(ex)
+        self.assertEqual((lm.calls, out.hidden_states), ([], "hc2"))
+        # a draft extend is never a prefill body
+        ex.prefill_graph = True
+        out, _ = self.run_draft(ex, mode=_Mode.DRAFT_EXTEND_V2)
+        self.assertEqual((lm.calls, out.hidden_states), ([], "hc2"))
+
+    def test_build_sets_the_body_on_target_and_draft(self):
+        from unittest import mock
+
+        context = types.ModuleType("sglang.srt.runtime_context")
+        context.get_parallel = lambda: SimpleNamespace(tp_size=1)
+        context.get_exec = lambda: SimpleNamespace(mamba=None)
+        ctx = SimpleNamespace(widths=(4, 8), binding=None, tokens_per_request=4)
+        env = {k: v for k, v in runtime.os.environ.items() if not k.startswith("SGLANG_")}
+        with (
+            mock.patch.dict(sys.modules, {context.__name__: context}),
+            mock.patch.dict(runtime.os.environ, env, clear=True),
+            mock.patch.object(runtime, "gdn_graph_tables", return_value=True),
+        ):
+            for on in (False, True):
+                with mock.patch.object(runtime, "prefill_graphs_on", return_value=on):
+                    built = runtime.build(_draft_lm(), None, ctx)
+                    self.assertEqual((built.draft, built.prefill_graph), (True, on))
+                    if not on:
+                        built = runtime.build(_model(), None, ctx)
+                        self.assertEqual((built.draft, built.prefill_graph), (False, on))
+            # FlashInfer's GDN tables need slot gdn_prefill on the target only: the MTP
+            # draft has no GDN layer
+            with mock.patch.object(runtime, "prefill_graphs_on", return_value=True):
+                with self.assertRaisesRegex(RuntimeError, "gdn_prefill"):
+                    runtime.build(_model(), None, ctx)
 
     def run_prefill(self, ex, breakable=False):
         from unittest import mock

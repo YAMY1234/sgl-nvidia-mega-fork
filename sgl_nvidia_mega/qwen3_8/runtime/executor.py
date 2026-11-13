@@ -14,10 +14,11 @@ declines idle batches, embedding calls and pipeline-parallel proxies, which run 
 model's own forward.
 
 With breakable prefill CUDA graphs (``prefill_graph``: SGLang's ``SupportsPrefillBody``)
-the target's prefill step calls the layer module's forward, which SGLang routes to
-``plan_body`` / ``forward_body`` (the layer loop below) and a breakable prefill graph
-captures per token bucket and replays; the ops that read the batch's host state run
-there as graph breaks (``prefill_graph.py``).
+the prefill step of the target and of the MTP draft calls the layer module's forward
+(``Qwen4ExpVLModel.forward``, the draft's ``Qwen4ExpModel.forward``), which SGLang
+routes to ``plan_body`` / ``forward_body`` (the layer loop below) and a breakable
+prefill graph captures per token bucket and replays; the ops that read the batch's host
+state run there as graph breaks (``prefill_graph.py``).
 
 ``Qwen3_8Executor.forward`` takes and returns what the replaced forward does. It runs
 the layer loop itself from the executor's step functions, never through a model-level
@@ -92,6 +93,7 @@ SGLANG_READS = {
         "ple_ngram_eos_token_id",
         "last_hc_hidden_states",
         "residual_batch",
+        "forward(inputs_embeds)",
     ),
     "srt/models/qwen3_5.py": ("linear_attn",),
     "srt/models/qwen4_exp_mtp.py": (
@@ -199,7 +201,7 @@ class Qwen3_8Executor:
         self.smallm_gemm = None
         # SGLANG_FLASHINFER_TACTIC_PIN_FILE's MoE table applies, set by build
         self.moe_pins = False
-        # set by build: the target's prefill body runs in breakable prefill graphs
+        # set by build: the prefill body runs in breakable prefill graphs
         self.prefill_graph = False
         # gdn_prefill's in-graph core outputs, newest first (gdn_prefill._graph_output)
         self.gdn_graph_outputs = []
@@ -271,18 +273,21 @@ class Qwen3_8Executor:
         input_embeds=None,
         pp_proxy_tensors=None,
         input_deepstack_embeds=None,
+        inputs_embeds=None,
         **kwargs,
     ):
         """SupportsPrefillBody: a "prefill" step for the layer module's forward of an
         extend / mixed batch, as ``plan`` covers it but captured or replayed in a
         breakable prefill graph too; None (the module's own forward) otherwise. Host
-        state only: a captured bucket replays the decision made at its capture."""
+        state only: a captured bucket replays the decision made at its capture. The
+        draft's layer module names its embeddings ``inputs_embeds``."""
         from sglang.srt.models.qwen4_exp import _shards_rows_over_cp
 
         mode = forward_batch.forward_mode
         if (
             not self.prefill_graph
             or kwargs
+            or (inputs_embeds is not None and not self.draft)
             or pp_proxy_tensors is not None
             or input_deepstack_embeds is not None
             or mode.is_idle()
@@ -307,17 +312,23 @@ class Qwen3_8Executor:
         input_embeds=None,
         pp_proxy_tensors=None,
         input_deepstack_embeds=None,
+        inputs_embeds=None,
         **kwargs,
     ):
         """SupportsPrefillBody: ``Qwen4ExpVLModel.forward`` for a planned prefill body,
         the layer loop on ``input_embeds`` (a capture's static slot); sets
-        ``last_hc_hidden_states`` and returns the mixed hidden rows."""
+        ``last_hc_hidden_states`` and returns the mixed hidden rows. The draft's:
+        ``Qwen4ExpModel.forward`` on the MTP streams (``inputs_embeds``), returning
+        the mixed hidden rows and the HC streams."""
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
             is_in_breakable_cuda_graph,
         )
 
         m = self.lm.model
-        m.last_hc_hidden_states = None
+        if inputs_embeds is not None:
+            input_embeds = inputs_embeds
+        if not self.draft:
+            m.last_hc_hidden_states = None
         if input_ids is None:
             input_ids = forward_batch.input_ids
         st = StepState(
@@ -335,9 +346,11 @@ class Qwen3_8Executor:
         if st.graph:
             self.engagement.begin()
         hidden, hc_hidden = self._language_model(st, input_ids, input_embeds)
-        m.last_hc_hidden_states = hc_hidden
         if st.graph:
             self.engagement.end(step.mode, step.rows)
+        if self.draft:
+            return hidden, hc_hidden
+        m.last_hc_hidden_states = hc_hidden
         return hidden
 
     def forward(
@@ -498,6 +511,9 @@ class Qwen3_8Executor:
             get_global_expert_distribution_recorder,
         )
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            is_in_breakable_cuda_graph,
+        )
 
         from sgl_nvidia_mega.qwen3_8.runtime import draft_fold
 
@@ -517,7 +533,16 @@ class Qwen3_8Executor:
         streams = lm._mtp_input_fusion(embeds, fb.spec_info.hidden_states)
         st.ran("mtp_fusion", STOCK)
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden, hc_hidden = self._language_model(st, st.input_ids, streams)
+            if self.prefill_graph and st.step.mode == "prefill":
+                # Through the attribute, as _target: SGLang's body dispatch, or a
+                # breakable prefill graph's replay of the captured body.
+                hidden, hc_hidden = lm.model.forward(
+                    st.input_ids, st.positions, fb, streams
+                )
+                if is_in_breakable_cuda_graph():
+                    st.ran("layers", "prefill_graph")
+            else:
+                hidden, hc_hidden = self._language_model(st, st.input_ids, streams)
         if fold is not None and fold.bf16:
             # the fold's top-1 reads the LM head's BF16 logits: no FP32 copy
             logits = draft_fold.bf16_logits(lm, hidden)

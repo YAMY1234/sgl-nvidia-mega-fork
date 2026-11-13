@@ -49,10 +49,11 @@ def test_side_stream_depends_on_the_projection_only():
         with torch.cuda.stream(alt):
             side = qk * 2
             (side_node,) = capture_fork.projection_frontier(alt)
+            # while the captured graph exists (torch drops it once instantiated)
+            deps = _dependencies(side_node)
         qk.record_stream(alt)
         current.wait_stream(alt)
     assert nodes and later_nodes and set(nodes).isdisjoint(later_nodes)
-    deps = _dependencies(side_node)
     assert deps == set(nodes)
     graph.replay()
     torch.cuda.synchronize()

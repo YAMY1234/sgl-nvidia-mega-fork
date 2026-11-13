@@ -196,9 +196,9 @@ class TestStepFallbacks(unittest.TestCase):
             moe.step(ex, layer, x, st)
             self.assertEqual(st.ran_ops, [("moe", "stock")])
 
-    def test_moe_routed_before_shared(self):
-        """Eager (not capturing): SGLang's order, the routed experts then the shared
-        expert, then the finalize kernel."""
+    def test_moe_shared_before_routed(self):
+        """Eager (not capturing): the source's order, the shared expert then the routed
+        experts, then the finalize kernel."""
         from sgl_nvidia_mega.qwen3_8.runtime import moe
 
         calls = []
@@ -256,7 +256,7 @@ class TestStepFallbacks(unittest.TestCase):
         st = _St(_Mode.TARGET_VERIFY)
         self.enterContext(mock.patch.object(moe, "FINALIZE_COLUMN_CHUNK", 1024))
         moe.step(ex, layer, torch.zeros(rows, 2560), st)
-        self.assertEqual(calls, ["routed", "shared", "finalize"])
+        self.assertEqual(calls, ["shared", "routed", "finalize"])
         self.assertEqual(st.ran_ops, [("moe", "finalize_permuted")])
         # the source's decode-size launch: 16 warps, PDL where supported, and up to 64
         # rows the (row, 1024-column) grid

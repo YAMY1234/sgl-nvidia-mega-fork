@@ -126,27 +126,41 @@ def step(executor, layer, x, st):
         return mlp(x)
     if rows >= EXTEND_MIN_ROWS:
         return _extend(executor, mlp, x, st)
-    from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
-
-    # SGLang's order (Qwen2MoeSparseMoeBlock.forward_normal_dual_stream): the routed
-    # experts on the current stream; while capturing, the shared expert on the block's
-    # side stream, so it runs beside the routed GEMMs.
     side = _side_stream(mlp)
-    if side is not None:
+    options = executor.moe_routing
+    if side is None:
+        # The source's eager order: the shared expert, then the routed experts.
+        shared = _shared(executor, mlp, x, st)
+        deferred = moe_routing.routed(executor, mlp, x, st)
+        if deferred is None:
+            deferred = _router_experts(mlp, x)
+    else:
+        # The source's forward_normal_dual_stream: on the current stream the routed input's
+        # quant (when the fused routing does not quantize it) and the shared expert; on the
+        # block's side stream the router and the routed experts; then the finalize.
         current = torch.cuda.current_stream()
         side.wait_stream(current)
-    # slot moe_routing: None when it does not take these rows
-    deferred = moe_routing.routed(executor, mlp, x, st)
-    if deferred is None:
-        deferred = _router_experts(mlp, x)
-    with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
-        shared = smallm_gemm.shared_expert(executor, mlp.shared_expert, x, st)
-        if shared is None:
-            shared = _shared_experts(mlp, x)
-        shared = shared.contiguous()
-    if side is not None:
-        shared.record_stream(current)
+        fused = options is not None and moe_routing._takes_fused(options, mlp, x)
+        quant = None
+        if options is not None and not fused and options.prequant_overlap:
+            quant = moe_routing.quantize(mlp, x)
+        shared = _shared(executor, mlp, x, st)
+        with torch.cuda.stream(side):
+            if fused:
+                deferred = moe_routing.routed(executor, mlp, x, st)
+            elif quant is not None:
+                logits = bf16_gemm_pins.linear(mlp.gate, x)
+                deferred = moe_routing.deferred(mlp, x, logits, quant)
+                st.ran(moe_routing.OP, "prequant")
+            else:
+                deferred = _router_experts(mlp, x)
         current.wait_stream(side)
+        for t in (
+            deferred.gemm2_out,
+            deferred.expert_weights,
+            deferred.expanded_idx_to_permuted_idx,
+        ):
+            t.record_stream(current)
     from sglang.kernels.jit.utils import is_arch_support_pdl
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
@@ -211,6 +225,16 @@ def _extend(executor, mlp, x, st):
     )
     st.ran("moe", "extend_finalize")
     return out
+
+
+def _shared(executor, mlp, x, st):
+    """The ungated shared expert: slot smallm_gemm's where it serves, else SGLang's."""
+    from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
+
+    shared = smallm_gemm.shared_expert(executor, mlp.shared_expert, x, st)
+    if shared is None:
+        shared = _shared_experts(mlp, x)
+    return shared.contiguous()
 
 
 def _finalize(mlp, x, shared, deferred, chunk=0, **launch):

@@ -175,6 +175,10 @@ class Qwen3_8Executor:
         self.qsa_indexer = None
         # slot qsa_draft: qsa_draft.DraftGlue, set by build (the draft only)
         self.qsa_draft = None
+        # slot draft_fold: the entry draft_step_fold (draft_fold.make), set by build;
+        # the embedding its last finalize gathered for the next draft step
+        self.draft_step_fold = None
+        self.step_embedding = None
         # slot moe_finalize: set by build
         self.moe_finalize_ready = False
         # slot moe_routing: moe_routing.Options, set by build
@@ -493,8 +497,14 @@ class Qwen3_8Executor:
         )
 
         lm, fb = st.lm, st.fb
-        embeds = lm._prepare_input_embeds(st.input_ids, fb, None)
-        st.ran("embed", STOCK)
+        embeds = self.step_embedding if st.step.mode == "decode" else None
+        if embeds is not None:
+            # slot draft_fold: the previous step's finalize gathered this embedding
+            self.step_embedding = None
+            st.ran("embed", "draft_fold")
+        else:
+            embeds = lm._prepare_input_embeds(st.input_ids, fb, None)
+            st.ran("embed", STOCK)
         streams = lm._mtp_input_fusion(embeds, fb.spec_info.hidden_states)
         st.ran("mtp_fusion", STOCK)
         with get_global_expert_distribution_recorder().disable_this_region():

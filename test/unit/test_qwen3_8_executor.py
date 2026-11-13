@@ -798,6 +798,7 @@ class TestQsaPoolFp8(unittest.TestCase):
         calls = []
         layer = SimpleNamespace(
             is_qsa=True,
+            alt_stream=None,
             attn=_QsaAttn(calls),
             _prepare_qkv_gate=lambda positions, hidden_states, forward_batch: (
                 torch.zeros(rows, 24 * 256, dtype=q_dtype),
@@ -2383,6 +2384,128 @@ class _Stream:
 
     def wait_stream(self, other):
         self.log.append(f"{self.name} waits {other.name}")
+
+
+class TestQsaIndexerStreams(unittest.TestCase):
+    """The source's streams for a decomposed QSA step's indexer
+    (``attention._qkv_and_indices``): under capture, not in a breakable graph and below
+    1024 rows, the indexer runs on the layer's side stream beside the QKV / gate
+    projection and the main stream joins it before the attention; otherwise everything
+    runs on the main stream."""
+
+    SIDE = [
+        "alt waits main", "qkv", "enter alt", ("select",), "exit alt",
+        "main waits alt", "record main", "attn",
+    ]
+
+    def run_step(
+        self, mode=_Mode.TARGET_VERIFY, rows=8, *, capture=True, breakable=False,
+        alt=True, indexer=True, glue=None, patches=(), layer_kw=None,
+    ):
+        """One decomposed QSA step; returns (the stream log, the engagement record).
+        ``patches``: (target, name, value) applied for the step."""
+        from sgl_nvidia_mega.qwen3_8.runtime import attention, qsa_draft, qsa_indexer
+
+        log = self.log = []
+        main = _Stream("main", log)
+        entered = contextlib.contextmanager(
+            lambda s: (log.append(f"enter {s.name}"), (yield), log.append(f"exit {s.name}"))
+        )
+        layer = SimpleNamespace(
+            is_qsa=True,
+            layer_id=7,
+            alt_stream=_Stream("alt", log) if alt else None,
+            attn_output_gate=True,
+            attn=lambda q, k, v, fb, topk_indices=None: log.append("attn")
+            or torch.zeros(rows, 6144),
+            _prepare_qkv_gate=lambda positions, hidden_states, forward_batch: log.append(
+                "qkv"
+            )
+            or (torch.zeros(rows, 6144), "k", "v", None),
+            _compute_qsa_topk_indices=lambda x, positions, fb: log.append("sglang")
+            or _Indices(log),
+            o_proj=lambda x: (x, None),
+        )
+        layer.__dict__.update(layer_kw or {})
+        ex = SimpleNamespace(
+            # the union never takes these widths: SGLang's attention runs
+            qsa_pool_ready=False, qsa_pool=None, qsa_union="union", qsa_core=None,
+            qsa_indexer=indexer or None, qsa_draft=glue, qsa_prefill=None,
+            smallm_gemm=None,
+        )
+        runner = types.ModuleType("sglang.srt.model_executor.runner")
+        runner.get_is_capture_mode = lambda: capture
+        elementwise = types.ModuleType("sglang.kernels.ops.elementwise.elementwise")
+        elementwise.fused_sigmoid_mul = lambda x, gate, inplace: x
+        st = _St(mode, rows)
+        st.fb.req_pool_indices = torch.zeros(rows // 4)
+        select = lambda *a: log.append(("select",) + a[5:]) or _Indices(log)
+        draft = lambda *a: log.append("draft_indices") or _Indices(log)
+        _STATE["breakable"] = breakable
+        with contextlib.ExitStack() as stack:
+            stack.callback(_STATE.update, breakable=False)
+            modules = {m.__name__: m for m in (runner, elementwise)}
+            stack.enter_context(mock.patch.dict(sys.modules, modules))
+            stack.enter_context(
+                mock.patch.object(
+                    sys.modules["sglang.srt.models.qwen4_exp"],
+                    "_QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD",
+                    1024,
+                    create=True,
+                )
+            )
+            for target, name, value in (
+                (attention, "sparse_backend", lambda: "backend"),
+                (qsa_indexer, "select", select),
+                (qsa_draft, "indices", draft),
+                (torch.cuda, "current_stream", lambda: main),
+                (torch.cuda, "stream", entered),
+                *patches,
+            ):
+                stack.enter_context(mock.patch.object(target, name, value))
+            attention.step(ex, layer, torch.zeros(rows, 8), st)
+        return log, st.ran_ops
+
+    def test_verify_indexer_beside_the_qkv(self):
+        log, ran = self.run_step()
+        self.assertEqual(log, self.SIDE)
+        self.assertIn(("qsa.index_stream", "side"), ran)
+        # SGLang's indexer (slot qsa_indexer off) takes the same streams
+        log, ran = self.run_step(indexer=False)
+        self.assertEqual(log, [s if s != ("select",) else "sglang" for s in self.SIDE])
+        self.assertIn(("qsa.indexer", "stock"), ran)
+
+    def test_draft_extend_and_decode_take_the_side_stream(self):
+        for mode in (_Mode.DRAFT_EXTEND_V2, _Mode.DECODE):
+            log, ran = self.run_step(mode)
+            self.assertEqual(log, self.SIDE, mode)
+            self.assertIn(("qsa.index_stream", "side"), ran)
+        # a draft extend without slot qsa_indexer: SGLang's indexer and the seed capture
+        log, _ = self.run_step(_Mode.DRAFT_EXTEND_V2, indexer=False, glue="glue")
+        want = [s if s != ("select",) else "draft_indices" for s in self.SIDE]
+        self.assertEqual(log, want)
+
+    def test_main_stream_outside_the_overlap(self):
+        for kw in (
+            dict(capture=False),  # eager
+            dict(breakable=True),  # graph breaks stay off the overlap stream
+            dict(rows=1024),  # the source's bound
+            dict(alt=False),
+        ):
+            log, ran = self.run_step(**kw)
+            self.assertEqual(log, ["qkv", ("select",), "attn"], kw)
+            self.assertNotIn("qsa.index_stream", dict(ran), kw)
+
+    def test_draft_decode_glue_keeps_the_main_stream(self):
+        out = torch.zeros(8, 6144)
+        packs = []
+        glue = SimpleNamespace(decode=lambda *a: packs.append("pack") or out)
+        log, ran = self.run_step(_Mode.DECODE, glue=glue)
+        self.assertEqual((log, packs), (["qkv"], ["pack"]))  # no indexer, no fork
+        glue.decode = lambda *a: packs.append("pack")  # declines: SGLang's lookup
+        log, ran = self.run_step(_Mode.DECODE, glue=glue)
+        self.assertEqual(log, ["qkv", ("select",), "attn"])
+        self.assertNotIn("qsa.index_stream", dict(ran))
 
 
 _INTERPRETED_DRAFT = r"""

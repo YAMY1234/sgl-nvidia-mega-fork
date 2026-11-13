@@ -17,6 +17,8 @@ import contextlib
 
 import torch
 
+from sgl_nvidia_mega.qwen3_8.runtime import moe_routing
+
 STOCK = "stock"
 MAX_ROWS = 1024
 HIDDEN, TOP_K = 2560, 10
@@ -96,7 +98,10 @@ def step(executor, layer, x, st):
     if side is not None:
         current = torch.cuda.current_stream()
         side.wait_stream(current)
-    deferred = mlp._forward_router_experts(x, defer_finalize=True)
+    # slot moe_routing: None when it does not take these rows
+    deferred = moe_routing.routed(executor, mlp, x, st)
+    if deferred is None:
+        deferred = mlp._forward_router_experts(x, defer_finalize=True)
     with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
         shared = smallm_gemm.shared_expert(executor, mlp.shared_expert, x, st)
         if shared is None:

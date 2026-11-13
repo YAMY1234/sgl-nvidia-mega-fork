@@ -30,6 +30,9 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # qsa_indexer: the QSA indexer's fold, scorer and select (runtime/qsa_indexer.py)
 # qsa_pool: the TP1 QSA verify's sparse attention as split-K pool kernels (<= 64 rows)
 # moe_finalize: the TP1 MoE's finalize + gated shared expert as one ordered kernel
+# moe_routing: in moe_finalize's step, the routed experts' routing, NVFP4 quant and
+# trtllm-gen metadata as one kernel, else the quant beside the router GEMV
+# (runtime/moe_routing.py)
 # gdn_prefill: the GDN step of a covered prefill / extend on the plugin's prefill
 # kernels (runtime/gdn_prefill.py)
 # qsa_prefill: the QSA attention of a covered prefill / extend (runtime/qsa_prefill.py)
@@ -44,6 +47,7 @@ KNOWN_SLOTS: tuple[str, ...] = (
     "qsa_indexer",
     "qsa_pool",
     "moe_finalize",
+    "moe_routing",
     "gdn_prefill",
     "qsa_prefill",
     "ple",
@@ -195,6 +199,13 @@ def build(model, hf_config, ctx):
             executor.qsa_pool = PoolKernels()
     if "moe_finalize" in slots:
         executor.moe_finalize_ready = _build_moe_finalize(model, decompose)
+    if "moe_routing" in slots:
+        from sgl_nvidia_mega.qwen3_8.runtime import moe_routing
+
+        reason = "" if executor.moe_finalize_ready else "needs slot moe_finalize"
+        executor.moe_routing = _built_options(
+            "moe_routing", reason or moe_routing.build(model), moe_routing.DEFAULT
+        )
     if "gdn_prefill" in slots and not draft:
         from sgl_nvidia_mega.qwen3_8.runtime import gdn_prefill
 

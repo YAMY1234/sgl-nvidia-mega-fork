@@ -150,6 +150,8 @@ class Qwen3_8Executor:
         self.qsa_indexer = None
         # slot moe_finalize: set by build
         self.moe_finalize_ready = False
+        # slot moe_routing: moe_routing.Options, set by build
+        self.moe_routing = None
         # set by build when SGLang cannot run a target verify itself (u-cache pools)
         self.verify_required = False
         # the u-cache verify (gdn_ucache.UcacheVerify), set by prepare_ucache

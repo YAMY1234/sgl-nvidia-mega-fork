@@ -22,7 +22,10 @@ and TRT-LLM decode there.
 
 The QKV / gate projection with its norms and RoPE, the indexer (selection) and o_proj
 stay SGLang's (with BF16 GEMM pins on, the projection's CUDA branch runs here so
-``qkv_proj`` and ``o_proj`` can take a pin: ``bf16_gemm_pins``). Every other step runs SGLang's ``self_attention``. Numerics: both
+``qkv_proj`` and ``o_proj`` can take a pin: ``bf16_gemm_pins``). As in the source's
+``self_attention``, under CUDA graph capture (not a breakable graph) below 1024 rows the
+indexer runs on the layer's side stream beside the QKV / gate projection, joined before
+the attention. Every other step runs SGLang's ``self_attention``. Numerics: both
 reorder the FP32 softmax reduction against TRT-LLM's sparse decode (the union kernel
 also rescales lazily), tolerance slots; the E4M3 pool bytes are torch's cast.
 
@@ -41,6 +44,26 @@ from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins
 logger = logging.getLogger(__name__)
 
 STOCK = "stock"
+# The engagement op naming the stream the indexer ran on, recorded off the main stream
+INDEX_STREAM = "qsa.index_stream"
+
+
+def _env_bool(name: str) -> bool:
+    """SGLang's ``get_bool_env_var(name)`` at its default, as the source reads it."""
+    return os.environ.get(name, "false").lower() in ("true", "1")
+
+
+# The source branch's switches of its QSA attention, under this plugin's names, parsed
+# with the source's rules and defaults.
+# SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_EARLY_INDEXER (self_attention): the side-stream
+# indexer is enqueued before the QKV
+QSA_EARLY_INDEXER = _env_bool("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_EARLY_INDEXER")
+# SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_INDEX (self_attention): a 1-16 row verify /
+# draft extend projects the index Q/K on the main stream before the QKV; only the rest
+# of the indexer forks to the side stream
+QSA_PDL_INDEX = _env_bool("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_INDEX")
+# The index projection's (N, K) the source's PDL_INDEX branch takes
+INDEX_QK_SHAPE = (640, 2560)
 # Test only: on eager steps, also run SGLang's attention on the same q/k/v and selected
 # indices and log how far the pool kernel's output is from it, per row.
 OPCHECK = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_OPCHECK") == "1"
@@ -62,6 +85,7 @@ SGLANG_READS = {
         "_compute_qsa_topk_indices",
         "self_attention",
         "is_qsa",
+        "indexer",
         "_QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD",
         "_shards_rows_over_cp",
         "fused_sigmoid_mul",
@@ -109,6 +133,14 @@ SGLANG_READS = {
         "prefetch_cp_kv",
     ),
     "srt/layers/attention/qsa/config.py": ("budget", "block_topk"),
+    "srt/layers/attention/qsa/qsa_indexer.py": ("_use_fused_prep", "index_qk_proj"),
+    "srt/layers/quantization/unquant.py": (
+        "UnquantizedLinearMethod",
+        "get_bf16_gemm_backend",
+        "is_cutedsl",
+        "use_bf16_splitk_gemm",
+    ),
+    "srt/layers/linear.py": ("quant_method", "weight"),
     "srt/layers/attention/qsa/metadata.py": ("is_cuda_graph",),
     "srt/mem_cache/kv/router.py": ("layer", "read", "key", "value"),
 }
@@ -351,26 +383,156 @@ def _draft_union_eligible(executor, fb, rows) -> bool:
     )
 
 
-def _decomposed(executor, layer, x, st):
-    """``self_attention`` from its pieces. The indexer runs on the main stream here
-    (SGLang overlaps it on a side stream under capture); both orders compute the
-    same values. The BF16 pool's split-K kernels take a verify first; an FP8 pool's
-    verify or draft extend goes to the union kernels; a draft decode that reuses the
-    draft extend's selection goes to slot qsa_draft's lookup pack."""
-    from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
+def _overlap_indexer(layer, x) -> bool:
+    """``self_attention``'s ``overlap_indexer``: under CUDA graph capture (not a
+    breakable graph), below 1024 rows, the indexer runs on the layer's side stream."""
+    if not layer.is_qsa or layer.alt_stream is None:
+        return False
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
+    from sglang.srt.models.qwen4_exp import _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
 
+    return (
+        get_is_capture_mode()
+        and not is_in_breakable_cuda_graph()
+        and x.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
+    )
+
+
+def _pdl_index_projection(executor, layer, x, positions, fb):
+    """The PDL-index branch of the source's ``self_attention``
+    (SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_INDEX): (slot qsa_indexer's step, the step's
+    rows of ``index_qk_proj`` launched here on the current stream) where the
+    projection is the native BF16 split-K of 1-16 rows, else (None, None). The step
+    hands the projection to the plugin's indexer (SGLang's takes none)."""
+    mode = fb.forward_mode
+    kernels = executor.qsa_indexer
+    if not (
+        QSA_PDL_INDEX
+        and kernels is not None
+        and layer.attn_output_gate
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and (mode.is_target_verify() or mode.is_draft_extend_v2())
+    ):
+        return None, None
+    step = kernels.prepare(layer, x, positions, fb)
+    if step is None:
+        return None, None
+    from sglang.srt.layers.quantization.unquant import (
+        UnquantizedLinearMethod,
+        get_bf16_gemm_backend,
+        use_bf16_splitk_gemm,
+    )
+
+    rows = step.rows
+    projection = layer.indexer.index_qk_proj
+    if not (
+        0 < rows <= 16
+        and rows <= x.shape[0]
+        and layer.indexer._use_fused_prep(x)
+        and isinstance(projection.quant_method, UnquantizedLinearMethod)
+        and projection.weight.dtype == torch.bfloat16
+        and tuple(projection.weight.shape) == INDEX_QK_SHAPE
+        # SGLang enables its BF16 split-K with the CuTe DSL backend
+        and get_bf16_gemm_backend().is_cutedsl()
+        and use_bf16_splitk_gemm(rows, *INDEX_QK_SHAPE)
+    ):
+        return None, None
+    return step, bf16_gemm_pins.linear(projection, x[:rows])
+
+
+def _qkv_and_indices(executor, layer, x, st, indices):
+    """``self_attention`` up to its attention call, in its order and streams: (q, k, v,
+    gate, top-k indices), ``indices(step, projected_qk)`` running the indexer. Where the
+    source overlaps it, the indexer runs on the layer's side stream beside the QKV /
+    gate projection and the current stream joins it before the attention; with
+    SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_INDEX the index projection stays on the
+    current stream before the QKV and the side stream depends on its completion only."""
     fb, positions = st.fb, st.positions
+    overlap = _overlap_indexer(layer, x)
+    early = (
+        overlap
+        and QSA_EARLY_INDEXER
+        and layer.attn_output_gate
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and layer.indexer._use_fused_prep(x)
+    )
+    step = projected_qk = nodes = None
+    if overlap:
+        # the indexer reads only hidden_states / positions and writes QSA-private buffers
+        current = torch.cuda.current_stream()
+        step, projected_qk = _pdl_index_projection(executor, layer, x, positions, fb)
+        if projected_qk is not None:
+            from sgl_nvidia_mega.qwen3_8.runtime import capture_fork
+
+            nodes = capture_fork.projection_frontier(current)
+        else:
+            layer.alt_stream.wait_stream(current)
+        if early and projected_qk is None:
+            with torch.cuda.stream(layer.alt_stream):
+                topk = indices()
     q, k, v, gate = _qkv_gate(layer, x, positions, fb)
+    if not overlap:
+        return q, k, v, gate, indices()
+    if projected_qk is not None:
+        # No event between the projection and the QKV keeps their PDL chain. Outside a
+        # capture (no frontier) the side stream waits for the whole QKV instead.
+        layer.alt_stream.wait_stream(current)
+        if nodes is not None:
+            capture_fork.fork_after_projection(layer.alt_stream, nodes)
+        with torch.cuda.stream(layer.alt_stream):
+            topk = indices(step, projected_qk)
+        projected_qk.record_stream(layer.alt_stream)
+        impl = "pdl_index"
+    else:
+        if not early:
+            with torch.cuda.stream(layer.alt_stream):
+                topk = indices()
+        impl = "side_early" if early else "side"
+    current.wait_stream(layer.alt_stream)
+    # allocated on the side stream, read by the attention on this one
+    topk.record_stream(current)
+    st.ran(INDEX_STREAM, impl)
+    return q, k, v, gate, topk
+
+
+def _indices(executor, layer, x, positions, st, step=None, projected_qk=None):
+    """``layer._compute_qsa_topk_indices``: slot qsa_indexer's ``select`` where it is
+    on (with the PDL-index branch's step and projection), else SGLang's."""
+    if executor.qsa_indexer is not None:
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
+
+        return qsa_indexer.select(executor, layer, x, positions, st, step, projected_qk)
+    st.ran("qsa.indexer", STOCK)
+    return layer._compute_qsa_topk_indices(x, positions, st.fb)
+
+
+def _decomposed(executor, layer, x, st):
+    """``self_attention`` from its pieces, the indexer in its streams
+    (``_qkv_and_indices``). The BF16 pool's split-K kernels take a verify first; an
+    FP8 pool's verify or draft extend goes to the union kernels; a draft decode that
+    reuses the draft extend's selection goes to slot qsa_draft's lookup pack."""
+    fb, positions = st.fb, st.positions
     if executor.qsa_draft is not None and fb.forward_mode.is_decode():
+        # the pack looks the selection up itself; where it declines, SGLang's lookup
+        q, k, v, gate = _qkv_gate(layer, x, positions, fb)
         out = executor.qsa_draft.decode(layer, sparse_backend(), q, k, v, fb)
         if out is not None:
             st.ran("qsa.indexer", "mtp_lookup_in_pack")
             return _finish(executor, layer, out, gate, st, "fused_kv_lookup")
-    if executor.qsa_indexer is not None:
-        indices = qsa_indexer.select(executor, layer, x, positions, st)
+        indices = _indices(executor, layer, x, positions, st)
     else:
-        indices = layer._compute_qsa_topk_indices(x, positions, fb)
-        st.ran("qsa.indexer", STOCK)
+        q, k, v, gate, indices = _qkv_and_indices(
+            executor,
+            layer,
+            x,
+            st,
+            lambda step=None, qk=None: _indices(executor, layer, x, positions, st, step, qk),
+        )
     rows = q.shape[0]
     out = None
     if _pool_eligible(executor, fb, rows):
@@ -386,38 +548,15 @@ def _decomposed(executor, layer, x, st):
 
 
 def _draft_extend(executor, layer, x, st):
-    """``self_attention`` of a draft extend with no plugin indexer: SGLang's order and
-    streams (under capture the indexer, with the seed capture of ``qsa_draft.indices``,
-    runs on the layer's side stream beside the QKV), then the union kernels where they
-    serve it."""
-    from sglang.srt.model_executor.runner import get_is_capture_mode
-    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-        is_in_breakable_cuda_graph,
-    )
-    from sglang.srt.models.qwen4_exp import _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
-
+    """``self_attention`` of a draft extend with no plugin indexer: SGLang's indexer with
+    the seed capture of ``qsa_draft.indices``, in the source's order and streams
+    (``_qkv_and_indices``), then the union kernels where they serve it."""
     from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
 
     fb, positions = st.fb, st.positions
-    overlap = (
-        layer.alt_stream is not None
-        and get_is_capture_mode()
-        and not is_in_breakable_cuda_graph()
-        and x.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
+    q, k, v, gate, indices = _qkv_and_indices(
+        executor, layer, x, st, lambda: qsa_draft.indices(executor, layer, x, positions, st)
     )
-    if overlap:
-        current = torch.cuda.current_stream()
-        layer.alt_stream.wait_stream(current)
-    q, k, v, gate = layer._prepare_qkv_gate(
-        positions=positions, hidden_states=x, forward_batch=fb
-    )
-    if overlap:
-        with torch.cuda.stream(layer.alt_stream):
-            indices = qsa_draft.indices(executor, layer, x, positions, st)
-        current.wait_stream(layer.alt_stream)
-        indices.record_stream(current)
-    else:
-        indices = qsa_draft.indices(executor, layer, x, positions, st)
     st.ran("qsa.indexer", STOCK)
     if _draft_union_eligible(executor, fb, q.shape[0]):
         out = _draft_union(executor, layer, sparse_backend(), q, k, v, gate, indices, st)

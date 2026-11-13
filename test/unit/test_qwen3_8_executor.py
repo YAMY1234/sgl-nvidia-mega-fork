@@ -798,6 +798,7 @@ class TestQsaPoolFp8(unittest.TestCase):
         calls = []
         layer = SimpleNamespace(
             is_qsa=True,
+            alt_stream=None,
             attn=_QsaAttn(calls),
             _prepare_qkv_gate=lambda positions, hidden_states, forward_batch: (
                 torch.zeros(rows, 24 * 256, dtype=q_dtype),
@@ -2383,6 +2384,285 @@ class _Stream:
 
     def wait_stream(self, other):
         self.log.append(f"{self.name} waits {other.name}")
+
+
+SEL = ("select", None, None)  # slot qsa_indexer's select, with no step or projection
+
+
+class TestQsaIndexerStreams(unittest.TestCase):
+    """The source's streams for a decomposed QSA step's indexer
+    (``attention._qkv_and_indices``): under capture, not in a breakable graph and below
+    1024 rows, the indexer runs on the layer's side stream beside the QKV / gate
+    projection and the main stream joins it before the attention; otherwise everything
+    runs on the main stream."""
+
+    SIDE = [
+        "alt waits main", "qkv", "enter alt", SEL, "exit alt",
+        "main waits alt", "record main", "attn",
+    ]
+
+    def run_step(
+        self, mode=_Mode.TARGET_VERIFY, rows=8, *, capture=True, breakable=False,
+        alt=True, indexer=True, glue=None, patches=(), layer_kw=None,
+        dtype=torch.float32,
+    ):
+        """One decomposed QSA step; returns (the stream log, the engagement record).
+        ``patches``: (target, name, value) applied for the step."""
+        from sgl_nvidia_mega.qwen3_8.runtime import attention, qsa_draft, qsa_indexer
+
+        log = self.log = []
+        main = _Stream("main", log)
+        entered = contextlib.contextmanager(
+            lambda s: (log.append(f"enter {s.name}"), (yield), log.append(f"exit {s.name}"))
+        )
+        layer = SimpleNamespace(
+            is_qsa=True,
+            layer_id=7,
+            alt_stream=_Stream("alt", log) if alt else None,
+            attn_output_gate=True,
+            attn=lambda q, k, v, fb, topk_indices=None: log.append("attn")
+            or torch.zeros(rows, 6144),
+            _prepare_qkv_gate=lambda positions, hidden_states, forward_batch: log.append(
+                "qkv"
+            )
+            or (torch.zeros(rows, 6144), "k", "v", None),
+            _compute_qsa_topk_indices=lambda x, positions, fb: log.append("sglang")
+            or _Indices(log),
+            o_proj=lambda x: (x, None),
+        )
+        layer.__dict__.update(layer_kw or {})
+        ex = SimpleNamespace(
+            # the union never takes these widths: SGLang's attention runs
+            qsa_pool_ready=False, qsa_pool=None, qsa_union="union", qsa_core=None,
+            qsa_indexer=indexer or None, qsa_draft=glue, qsa_prefill=None,
+            smallm_gemm=None,
+        )
+        runner = types.ModuleType("sglang.srt.model_executor.runner")
+        runner.get_is_capture_mode = lambda: capture
+        elementwise = types.ModuleType("sglang.kernels.ops.elementwise.elementwise")
+        elementwise.fused_sigmoid_mul = lambda x, gate, inplace: x
+        st = _St(mode, rows)
+        st.fb.req_pool_indices = torch.zeros(rows // 4)
+        select = lambda *a: log.append(("select",) + a[5:]) or _Indices(log)
+        draft = lambda *a: log.append("draft_indices") or _Indices(log)
+        _STATE["breakable"] = breakable
+        with contextlib.ExitStack() as stack:
+            stack.callback(_STATE.update, breakable=False)
+            modules = {m.__name__: m for m in (runner, elementwise)}
+            stack.enter_context(mock.patch.dict(sys.modules, modules))
+            stack.enter_context(
+                mock.patch.object(
+                    sys.modules["sglang.srt.models.qwen4_exp"],
+                    "_QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD",
+                    1024,
+                    create=True,
+                )
+            )
+            for target, name, value in (
+                (attention, "sparse_backend", lambda: "backend"),
+                (qsa_indexer, "select", select),
+                (qsa_draft, "indices", draft),
+                (torch.cuda, "current_stream", lambda: main),
+                (torch.cuda, "stream", entered),
+                *patches,
+            ):
+                stack.enter_context(mock.patch.object(target, name, value))
+            attention.step(ex, layer, torch.zeros(rows, 8, dtype=dtype), st)
+        return log, st.ran_ops
+
+    def test_verify_indexer_beside_the_qkv(self):
+        log, ran = self.run_step()
+        self.assertEqual(log, self.SIDE)
+        self.assertIn(("qsa.index_stream", "side"), ran)
+        # SGLang's indexer (slot qsa_indexer off) takes the same streams
+        log, ran = self.run_step(indexer=False)
+        self.assertEqual(log, [s if s != SEL else "sglang" for s in self.SIDE])
+        self.assertIn(("qsa.indexer", "stock"), ran)
+
+    def test_draft_extend_and_decode_take_the_side_stream(self):
+        for mode in (_Mode.DRAFT_EXTEND_V2, _Mode.DECODE):
+            log, ran = self.run_step(mode)
+            self.assertEqual(log, self.SIDE, mode)
+            self.assertIn(("qsa.index_stream", "side"), ran)
+        # a draft extend without slot qsa_indexer: SGLang's indexer and the seed capture
+        log, _ = self.run_step(_Mode.DRAFT_EXTEND_V2, indexer=False, glue="glue")
+        want = [s if s != SEL else "draft_indices" for s in self.SIDE]
+        self.assertEqual(log, want)
+
+    def test_main_stream_outside_the_overlap(self):
+        for kw in (
+            dict(capture=False),  # eager
+            dict(breakable=True),  # graph breaks stay off the overlap stream
+            dict(rows=1024),  # the source's bound
+            dict(alt=False),
+        ):
+            log, ran = self.run_step(**kw)
+            self.assertEqual(log, ["qkv", SEL, "attn"], kw)
+            self.assertNotIn("qsa.index_stream", dict(ran), kw)
+
+    def test_early_indexer(self):
+        """The early indexer: the side stream's indexer is enqueued before the QKV."""
+        from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+        fused = []
+        indexer = SimpleNamespace(_use_fused_prep=lambda x: fused.append(x) or True)
+        early = (attention, "QSA_EARLY_INDEXER", True)
+        cuda = (torch.Tensor, "is_cuda", property(lambda t: True))
+        kw = dict(layer_kw=dict(indexer=indexer), dtype=torch.bfloat16)
+        log, ran = self.run_step(patches=(early, cuda), **kw)
+        self.assertEqual(
+            log,
+            [
+                "alt waits main", "enter alt", SEL, "exit alt", "qkv",
+                "main waits alt", "record main", "attn",
+            ],
+        )
+        self.assertIn(("qsa.index_stream", "side_early"), ran)
+        self.assertEqual(len(fused), 1)
+        for name, patches, step_kw in (
+            ("off", (cuda,), kw),
+            ("float32", (early, cuda), dict(kw, dtype=torch.float32)),
+            ("unfused prep", (early, cuda), dict(kw, layer_kw=dict(indexer=SimpleNamespace(
+                _use_fused_prep=lambda x: False)))),
+            ("no output gate", (early, cuda), dict(kw, layer_kw=dict(
+                indexer=indexer, attn_output_gate=False))),
+        ):
+            log, ran = self.run_step(patches=patches, **step_kw)
+            self.assertEqual(log, self.SIDE, name)
+            self.assertIn(("qsa.index_stream", "side"), ran)
+        # eager: no side stream, so no early indexer
+        log, _ = self.run_step(patches=(early, cuda), capture=False, **kw)
+        self.assertEqual(log, ["qkv", SEL, "attn"])
+
+    def pdl_step(self, mode=_Mode.TARGET_VERIFY, rows=8, *, frontier=("node",),
+                 prepared=True, backend="cutedsl", quant=None, env=True,
+                 dtype=torch.bfloat16, **kw):
+        """A step with the PDL-index branch's conditions met unless changed."""
+        from sgl_nvidia_mega.qwen3_8.runtime import attention, bf16_gemm_pins, capture_fork
+
+        class Unquant:
+            pass
+
+        projection = SimpleNamespace(
+            quant_method=(quant or Unquant)(),
+            weight=torch.empty(640, 2560, dtype=torch.bfloat16),
+        )
+        fused = kw.pop("fused", True)
+        layer_kw = kw.pop("layer_kw", {})
+        layer_kw.setdefault(
+            "indexer",
+            SimpleNamespace(index_qk_proj=projection, _use_fused_prep=lambda x: fused),
+        )
+        unquant = types.ModuleType("sglang.srt.layers.quantization.unquant")
+        unquant.UnquantizedLinearMethod = Unquant
+        unquant.get_bf16_gemm_backend = lambda: SimpleNamespace(
+            is_cutedsl=lambda: backend == "cutedsl"
+        )
+        # the source's split-K table at (N, K) = (640, 2560): M 1-4 and 8
+        unquant.use_bf16_splitk_gemm = lambda m, n, k: (
+            (n, k) == (640, 2560) and m in (1, 2, 3, 4, 8)
+        )
+        self.step = SimpleNamespace(rows=rows)
+        kernels = SimpleNamespace(
+            prepare=lambda layer, x, positions, fb: self.log.append("prepare")
+            or (self.step if prepared else None)
+        )
+        self.projected = []
+
+        def linear(module, x):
+            if module is not projection:
+                return module(x)[0]
+            self.log.append(("index_qk", x.shape[0]))
+            self.projected.append(_Indices(self.log))
+            return self.projected[-1]
+
+        patches = (
+            (attention, "QSA_PDL_INDEX", env),
+            (torch.Tensor, "is_cuda", property(lambda t: True)),
+            (bf16_gemm_pins, "linear", linear),
+            (
+                capture_fork,
+                "projection_frontier",
+                lambda s: self.log.append(f"frontier {s.name}") or frontier,
+            ),
+            (
+                capture_fork,
+                "fork_after_projection",
+                lambda s, nodes: self.log.append((f"{s.name} after", nodes)),
+            ),
+        )
+        with mock.patch.dict(sys.modules, {unquant.__name__: unquant}):
+            return self.run_step(
+                mode, rows, patches=patches, layer_kw=layer_kw, dtype=dtype,
+                indexer=kw.pop("indexer", kernels), **kw
+            )
+
+    def test_pdl_index_projects_on_the_main_stream(self):
+        """The PDL-index branch: index_qk_proj before the QKV on the main stream, no event
+        between them; the side stream depends on the projection's completion only and
+        runs the rest of the indexer on it."""
+        for mode, rows in (
+            (_Mode.TARGET_VERIFY, 4),
+            (_Mode.TARGET_VERIFY, 8),
+            (_Mode.DRAFT_EXTEND_V2, 8),
+        ):
+            log, ran = self.pdl_step(mode, rows)
+            (qk,) = self.projected
+            self.assertEqual(
+                log,
+                [
+                    "prepare", ("index_qk", rows), "frontier main", "qkv",
+                    "alt waits main", ("alt after", ("node",)), "enter alt",
+                    ("select", self.step, qk), "exit alt", "record alt",
+                    "main waits alt", "record main", "attn",
+                ],
+                (mode, rows),
+            )
+            self.assertIn(("qsa.index_stream", "pdl_index"), ran)
+        # not capturing (a warmup): the side stream waits for the whole QKV
+        log, _ = self.pdl_step(frontier=None)
+        self.assertNotIn(("alt after", None), log)
+        self.assertEqual(
+            log[:6],
+            ["prepare", ("index_qk", 8), "frontier main", "qkv", "alt waits main",
+             "enter alt"],
+        )
+
+    def test_pdl_index_declines_to_the_side_stream(self):
+        prepared = ["prepare"] + self.SIDE
+        for name, kw, want in (
+            ("off", dict(env=False), self.SIDE),
+            ("decode", dict(mode=_Mode.DECODE), self.SIDE),
+            ("float32", dict(dtype=torch.float32), self.SIDE),
+            ("no gate", dict(layer_kw=dict(attn_output_gate=False)), self.SIDE),
+            ("plugin indexer declines", dict(prepared=False), prepared),
+            ("12 rows: no split-K", dict(rows=12), prepared),
+            ("20 rows", dict(rows=20), prepared),
+            ("not CuTe DSL", dict(backend="cublas"), prepared),
+            ("quantized", dict(quant=object), prepared),
+            ("unfused prep", dict(fused=False), prepared),
+        ):
+            log, ran = self.pdl_step(**kw)
+            self.assertEqual(log, want, name)
+            self.assertIn(("qsa.index_stream", "side"), ran)
+            self.assertEqual(self.projected, [], name)
+        # SGLang's indexer takes no projection
+        log, _ = self.pdl_step(indexer=False)
+        self.assertEqual(log, [s if s != SEL else "sglang" for s in self.SIDE])
+        # eager: no overlap, no projection
+        log, _ = self.pdl_step(capture=False)
+        self.assertEqual(log, ["qkv", SEL, "attn"])
+
+    def test_draft_decode_glue_keeps_the_main_stream(self):
+        out = torch.zeros(8, 6144)
+        packs = []
+        glue = SimpleNamespace(decode=lambda *a: packs.append("pack") or out)
+        log, ran = self.run_step(_Mode.DECODE, glue=glue)
+        self.assertEqual((log, packs), (["qkv"], ["pack"]))  # no indexer, no fork
+        glue.decode = lambda *a: packs.append("pack")  # declines: SGLang's lookup
+        log, ran = self.run_step(_Mode.DECODE, glue=glue)
+        self.assertEqual(log, ["qkv", SEL, "attn"])
+        self.assertNotIn("qsa.index_stream", dict(ran))
 
 
 _INTERPRETED_DRAFT = r"""

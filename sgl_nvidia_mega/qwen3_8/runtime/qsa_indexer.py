@@ -258,13 +258,17 @@ def build(
     return ""
 
 
-def select(executor, layer, hidden_states, positions, st) -> torch.Tensor:
+def select(
+    executor, layer, hidden_states, positions, st, step=None, projected_qk=None
+) -> torch.Tensor:
     """What ``layer._compute_qsa_topk_indices(hidden_states, positions, st.fb)``
-    returns. ``executor.qsa_indexer``: the built ``IndexerKernels``, or None."""
+    returns. ``executor.qsa_indexer``: the built ``IndexerKernels``, or None.
+    ``step``, ``projected_qk``: a step ``prepare`` made and ``index_qk_proj`` of its rows,
+    launched ahead by the caller (the source's ``projected_qk``,
+    SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_INDEX)."""
     kernels = executor.qsa_indexer
     fb = st.fb
-    step = None
-    if kernels is not None:
+    if step is None and kernels is not None:
         step = kernels.prepare(layer, hidden_states, positions, fb)
     if step is None:
         st.ran(OP, STOCK)
@@ -273,7 +277,7 @@ def select(executor, layer, hidden_states, positions, st) -> torch.Tensor:
 
             return qsa_draft.indices(executor, layer, hidden_states, positions, st)
         return layer._compute_qsa_topk_indices(hidden_states, positions, fb)
-    topk = kernels.run(step, layer.indexer, hidden_states, positions)
+    topk = kernels.run(step, layer.indexer, hidden_states, positions, projected_qk)
     # _compute_qsa_topk_indices_eager: a draft extend seeds the MTP decode steps
     should_capture = getattr(step.backend, "should_capture_mtp_sparse_indices", None)
     if should_capture is not None and should_capture(fb):
@@ -532,15 +536,18 @@ class IndexerKernels:
             )
         return False
 
-    def run(self, step, indexer, hidden_states, positions) -> torch.Tensor:
-        """``QSAIndexer._forward_impl`` for a decode-like step on graph metadata."""
+    def run(
+        self, step, indexer, hidden_states, positions, projected_qk=None
+    ) -> torch.Tensor:
+        """``QSAIndexer._forward_impl`` for a decode-like step on graph metadata;
+        ``projected_qk``: ``index_qk_proj`` of the step's rows, already launched."""
         md, n = step.metadata, step.rows
         logical = md.decode_logical_positions[:n]
         hidden = hidden_states[:n]
         positions = positions[:, :n] if positions.ndim == 2 else positions[:n]
         slots = md.pending_ring_slots
         if step.fold:
-            q = self._fold(indexer, md, hidden, positions, slots[:n])
+            q = self._fold(indexer, md, hidden, positions, slots[:n], projected_qk)
         else:
             q, token_k, stored = _project_qk(
                 indexer,
@@ -549,6 +556,7 @@ class IndexerKernels:
                 pool=md.token_to_kv_pool,
                 cache_loc=slots,
                 q_heads_padded=_padded(indexer.index_n_heads),
+                projected_qk=projected_qk,
             )
             indexer.update_key_state_and_compress(
                 token_k, logical, positions, md, state_slots=slots, state_stored=stored
@@ -575,12 +583,14 @@ class IndexerKernels:
         neox = bool(indexer.rotary_emb.is_neox_style)
         return ("fold", dtype, out_dtype, indexer.index_head_dim, neox)
 
-    def _fold(self, indexer, md, hidden, positions, slots) -> torch.Tensor:
+    def _fold(self, indexer, md, hidden, positions, slots, qk=None) -> torch.Tensor:
         """``project_qk``'s fused q_prep and ``_compress_decode_cuda_graph``'s fused
-        k_compress in one launch; returns the index Q [rows, padded heads, dim]."""
+        k_compress in one launch, on ``qk`` (``index_qk_proj`` of the rows) if given;
+        returns the index Q [rows, padded heads, dim]."""
         pool = md.token_to_kv_pool
         rope = indexer.rotary_emb
-        qk = bf16_gemm_pins.linear(indexer.index_qk_proj, hidden)
+        if qk is None:
+            qk = bf16_gemm_pins.linear(indexer.index_qk_proj, hidden)
         out_dtype = pool.qsa_compressed_dtype
         module = self._fold_module(self._fold_key(indexer, qk.dtype, out_dtype))
         positions = positions.long()
@@ -786,11 +796,18 @@ class IndexerKernels:
 
 
 def _project_qk(
-    indexer, hidden_states, positions, pool=None, cache_loc=None, q_heads_padded=None
+    indexer,
+    hidden_states,
+    positions,
+    pool=None,
+    cache_loc=None,
+    q_heads_padded=None,
+    projected_qk=None,
 ):
-    """``indexer.project_qk(...)``; with BF16 pins on, here with ``index_qk_proj``
+    """``indexer.project_qk(...)``; with BF16 pins on, or on an already launched
+    ``projected_qk`` (the source's ``project_qk`` argument), here, with ``index_qk_proj``
     through ``bf16_gemm_pins``."""
-    if not bf16_gemm_pins.routed():
+    if projected_qk is None and not bf16_gemm_pins.routed():
         return indexer.project_qk(
             hidden_states,
             positions,
@@ -798,7 +815,10 @@ def _project_qk(
             cache_loc=cache_loc,
             q_heads_padded=q_heads_padded,
         )
-    qk = bf16_gemm_pins.linear(indexer.index_qk_proj, hidden_states)
+    if projected_qk is None:
+        qk = bf16_gemm_pins.linear(indexer.index_qk_proj, hidden_states)
+    else:
+        qk = projected_qk
     token_k = qk[:, indexer.index_n_heads * indexer.index_head_dim :].reshape(
         -1, indexer.index_kv_heads, indexer.index_head_dim
     )

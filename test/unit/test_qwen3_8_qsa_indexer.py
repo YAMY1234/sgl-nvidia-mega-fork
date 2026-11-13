@@ -211,8 +211,9 @@ def _kernels(**options):
     k = qi.IndexerKernels(**options)
     k.launches = []
 
-    def fold(indexer, md, hidden, positions, slots):
+    def fold(indexer, md, hidden, positions, slots, qk=None):
         k.launches.append(("fold", hidden.shape[0], positions.shape, slots))
+        k.projected = qk
         return torch.zeros(hidden.shape[0], 8, 128, dtype=torch.bfloat16)
 
     def score_kernel(variant, rows, heads, device, request_dtype):
@@ -246,6 +247,7 @@ class _Case(unittest.TestCase):
         capture=False,
         hidden_rows=None,
         glue=None,
+        ahead=None,
     ):
         md = md or _metadata(rows)
         backend = _STATE["backend"] = _Backend(md, reuse=reuse, capture=capture)
@@ -262,8 +264,14 @@ class _Case(unittest.TestCase):
         hidden = torch.zeros(hidden_rows or rows, 640, dtype=torch.bfloat16)
         positions = torch.zeros(3, hidden_rows or rows, dtype=torch.int64)
         ex = SimpleNamespace(qsa_indexer=k, qsa_draft=glue)
-        out = qi.select(ex, layer, hidden, positions, st)
-        return SimpleNamespace(out=out, st=st, layer=layer, backend=backend, k=k, md=md)
+        step = qk = None
+        if ahead is not None:  # PDL index: prepared and projected by the caller
+            step = k.prepare(layer, hidden, positions, fb)
+            qk = ahead(step)
+        out = qi.select(ex, layer, hidden, positions, st, step, qk)
+        return SimpleNamespace(
+            out=out, st=st, layer=layer, backend=backend, k=k, md=md, qk=qk
+        )
 
     def assert_stock(self, r):
         self.assertIs(r.out, STOCK_OUT)
@@ -452,6 +460,34 @@ class TestSelect(_Case):
             r.backend.calls, ["should_reuse", ("metadata", 7), "should_capture"]
         )
         self.assertEqual(r.k._warm, {("v4", 16, WIDTH), ("v1", 16, WIDTH)})
+
+    def test_projected_qk_from_the_caller(self):
+        """The PDL-index branch: the caller's step is not prepared again and its projection
+        feeds the fold (or SGLang's q_prep without it); nothing projects here."""
+        ahead = lambda step: torch.ones(step.rows, 640, dtype=torch.bfloat16)
+        r = self.run_select(_Mode.TARGET_VERIFY, 8, ahead=ahead)
+        self.assertEqual(r.st.record, [(qi.OP, "fold+score_v4+select_v1")])
+        self.assertIs(r.k.projected, r.qk)
+        # one prepare (the caller's): one metadata read
+        self.assertEqual(
+            r.backend.calls, ["should_reuse", ("metadata", 7), "should_capture"]
+        )
+        projected = []
+        ix = _indexer()
+        with mock.patch.object(
+            qi, "_project_qk", lambda *a, **kw: projected.append(kw["projected_qk"])
+            or (torch.zeros(8, 8, 128), torch.zeros(8, 1, 128), True),
+        ):
+            r = self.run_select(
+                _Mode.TARGET_VERIFY, 8, kernels=_kernels(prologue_fold=False), ix=ix,
+                ahead=ahead,
+            )
+        self.assertEqual(r.st.record, [(qi.OP, "stock+score_v4+select_v1")])
+        self.assertEqual(len(projected), 1)
+        self.assertIs(projected[0], r.qk)
+        # without a caller's projection the fold projects itself
+        r = self.run_select(_Mode.TARGET_VERIFY, 8)
+        self.assertIsNone(r.k.projected)
 
     def test_draft_extend_seed_capture_on_slot_qsa_draft(self):
         from unittest import mock

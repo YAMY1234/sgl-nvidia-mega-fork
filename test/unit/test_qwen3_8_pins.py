@@ -1052,6 +1052,27 @@ class TestProjectQk(_Gemm):
         self.assertFalse(stored)
         self.assertEqual(self.indexer.index_qk_proj.calls, 0)
 
+    def test_projected_qk(self):
+        """The PDL-index branch's projection, launched ahead: the mirror runs on it, with
+        or without pins, and nothing projects again."""
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
+
+        x, positions = _x(6, k=16), torch.arange(6)
+        qk = _x(6, k=12, seed=9)
+        pool = SimpleNamespace(qsa_compressed_dtype=torch.float32)
+        for routed in (False, True):
+            if routed:
+                bp.enable_routes()
+            q, token_k, stored = qsa_indexer._project_qk(
+                self.indexer, x, positions, pool=pool, projected_qk=qk
+            )
+            want_q = (qk[:, :8].reshape(-1, 4) * 2).reshape(-1, 2, 4) + 1
+            self.assertTrue(torch.equal(q, want_q.float()), routed)
+            self.assertTrue(torch.equal(token_k, qk[:, 8:].reshape(-1, 1, 4)), routed)
+            self.assertFalse(stored)
+        self.indexer.project_qk.assert_not_called()
+        self.assertEqual((self.indexer.index_qk_proj.calls, self.runs), (0, []))
+
 
 class TestStockStepMirrors(_Gemm):
     """gdn.forward and attention._self_attention: SGLang's stock GDN and QSA steps with

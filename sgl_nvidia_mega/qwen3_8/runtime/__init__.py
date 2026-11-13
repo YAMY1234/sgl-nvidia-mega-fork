@@ -29,6 +29,9 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # gdn_native_pdl: the GDN target verify's ReplaySSM core as the plugin's PDL launch
 # gdn_verify_glue: a GDN target verify of 2-8 requests as one launch per layer between
 # the input and the output projection (runtime/gdn.py)
+# gdn_front: a TP1 GDN target verify of one request (4 rows) as the input projection
+# with the causal conv in its epilogue, then the ReplaySSM core with the gated RMSNorm
+# (runtime/gdn.py)
 # qsa_indexer: the QSA indexer's fold, scorer and select (runtime/qsa_indexer.py)
 # qsa_pool: the TP1 QSA verify's sparse attention as split-K pool kernels (<= 64 rows)
 # moe_finalize: the TP1 MoE's finalize + gated shared expert as one ordered kernel
@@ -47,6 +50,7 @@ KNOWN_SLOTS: tuple[str, ...] = (
     "hc_wide",
     "gdn_native_pdl",
     "gdn_verify_glue",
+    "gdn_front",
     "qsa_indexer",
     "qsa_pool",
     "moe_finalize",
@@ -194,6 +198,8 @@ def build(model, hf_config, ctx):
         executor.gdn_pdl_ready = _build_gdn_pdl(model)
     if "gdn_verify_glue" in slots and not draft:
         executor.gdn_glue_ready = _build_gdn_glue(model)
+    if "gdn_front" in slots and not draft:
+        executor.gdn_front_ready = _build_gdn_front(model)
     if "qsa_indexer" in slots:
         executor.qsa_indexer = _build_qsa_indexer(model)
     if "qsa_pool" in slots and not draft:
@@ -312,6 +318,33 @@ def _build_gdn_glue(model) -> bool:
     megakernel_agree(reason, what="Qwen3.8 slot gdn_verify_glue")
     if reason:
         unavailable("gdn_verify_glue", reason)
+    return not reason
+
+
+def _build_gdn_front(model) -> bool:
+    """Whether slot gdn_front runs, agreed on every rank. Its kernels compile at the
+    first eager verify of each layout (a capture warmup), never while capturing."""
+    import torch
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    from sgl_nvidia_mega.qwen3_8.runtime import gdn
+
+    reason = gdn.front_reasons(model)
+    if not reason and (
+        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10
+    ):
+        reason = "the front's tcgen05 GEMM needs an SM10x GPU"
+    if not reason:
+        try:
+            from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.gdn_front import (  # noqa: F401
+                mk_core,
+                mk_front,
+            )
+        except Exception as e:
+            reason = f"the front kernels do not import: {type(e).__name__}: {e}"
+    megakernel_agree(reason, what="Qwen3.8 slot gdn_front")
+    if reason:
+        unavailable("gdn_front", reason)
     return not reason
 
 

@@ -145,6 +145,8 @@ class Qwen3_8Executor:
         self.gdn_pdl_ready = False
         # slot gdn_verify_glue: set by build; the pools are checked at the first verify
         self.gdn_glue_ready = False
+        # slot gdn_front: set by build; the pools are checked at the first verify
+        self.gdn_front_ready = False
         # slot qsa_pool: set by build with its kernels (attention.PoolKernels)
         self.qsa_pool_ready = False
         self.qsa_pool = None
@@ -253,8 +255,8 @@ class Qwen3_8Executor:
         self._pools_checked = True
         if self.gdn_ucache is not None:
             # the u-cache verify serves every GDN verify
-            self.gdn_pdl_ready = self.gdn_glue_ready = False
-        if self.gdn_pdl_ready or self.gdn_glue_ready:
+            self.gdn_pdl_ready = self.gdn_glue_ready = self.gdn_front_ready = False
+        if self.gdn_pdl_ready or self.gdn_glue_ready or self.gdn_front_ready:
             from sgl_nvidia_mega.qwen3_8.runtime import unavailable
 
             m = self.lm.model
@@ -276,6 +278,11 @@ class Qwen3_8Executor:
                 if reason:
                     unavailable("gdn_verify_glue", reason)
                     self.gdn_glue_ready = False
+            if self.gdn_front_ready:
+                reason = gdn.front_pool_reasons(*args)
+                if reason:
+                    unavailable("gdn_front", reason)
+                    self.gdn_front_ready = False
 
     def _build_ucache_verify(self, mamba, buffers, tokens):
         from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache

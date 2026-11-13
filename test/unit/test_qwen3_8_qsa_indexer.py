@@ -245,6 +245,7 @@ class _Case(unittest.TestCase):
         reuse=False,
         capture=False,
         hidden_rows=None,
+        glue=None,
     ):
         md = md or _metadata(rows)
         backend = _STATE["backend"] = _Backend(md, reuse=reuse, capture=capture)
@@ -260,7 +261,8 @@ class _Case(unittest.TestCase):
         st = _St(fb)
         hidden = torch.zeros(hidden_rows or rows, 640, dtype=torch.bfloat16)
         positions = torch.zeros(3, hidden_rows or rows, dtype=torch.int64)
-        out = qi.select(SimpleNamespace(qsa_indexer=k), layer, hidden, positions, st)
+        ex = SimpleNamespace(qsa_indexer=k, qsa_draft=glue)
+        out = qi.select(ex, layer, hidden, positions, st)
         return SimpleNamespace(out=out, st=st, layer=layer, backend=backend, k=k, md=md)
 
     def assert_stock(self, r):
@@ -451,12 +453,43 @@ class TestSelect(_Case):
         )
         self.assertEqual(r.k._warm, {("v4", 16, WIDTH), ("v1", 16, WIDTH)})
 
+    def test_draft_extend_seed_capture_on_slot_qsa_draft(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+        k = _kernels()
+        k.sm107 = True
+        md = _metadata(128, defer=False)
+        seen = []
+        glue = SimpleNamespace(capture=lambda *a: seen.append(a[1:]) or True)
+        r = self.run_select(
+            _Mode.DRAFT_EXTEND_V2, 128, kernels=k, md=md, capture=True, glue=glue
+        )
+        self.assertEqual(
+            r.st.record,
+            [("qsa.mtp_capture", "batched"), (qi.OP, "fold+score_v7+select_v2")],
+        )
+        ((topk, fb, metadata, layer_id),) = seen
+        self.assertIs(topk, r.out)
+        self.assertIs(metadata, md)
+        self.assertNotIn("capture", [c[0] for c in r.backend.calls if isinstance(c, tuple)])
+        # where the plugin's indexer declines, SGLang's indexer then the glue's capture
+        with mock.patch.object(qsa_draft, "indices", return_value="glue") as indices:
+            r = self.run_select(_Mode.DRAFT_EXTEND_V2, 128, kernels=None, glue=glue)
+        self.assertEqual(r.out, "glue")
+        indices.assert_called_once()
+        self.assertEqual(r.st.record, [(qi.OP, qi.STOCK)])
+
     def test_draft_extend_expands_then_captures(self):
         k = _kernels()
         k.sm107 = True
         md = _metadata(128, defer=False)
         r = self.run_select(_Mode.DRAFT_EXTEND_V2, 128, kernels=k, md=md, capture=True)
-        self.assertEqual(r.st.record, [(qi.OP, "fold+score_v7+select_v2")])
+        self.assertEqual(
+            r.st.record,
+            [("qsa.mtp_capture", "stock"), (qi.OP, "fold+score_v7+select_v2")],
+        )
         self.assertEqual(
             [x[:2] for x in k.launches[1:]], [("score", "v7"), ("select", "v2")]
         )
@@ -520,7 +553,8 @@ class TestSelect(_Case):
         layer = _layer(_indexer(), is_qsa=False)
         st = _St(fb)
         x = torch.zeros(16, 640)
-        out = qi.select(SimpleNamespace(qsa_indexer=_kernels()), layer, x, x[:1], st)
+        ex = SimpleNamespace(qsa_indexer=_kernels(), qsa_draft=None)
+        out = qi.select(ex, layer, x, x[:1], st)
         self.assertIs(out, STOCK_OUT)
 
     def test_wide_decode_folds_and_scores_stock(self):

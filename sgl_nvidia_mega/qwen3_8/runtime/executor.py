@@ -173,6 +173,8 @@ class Qwen3_8Executor:
         self.qsa_union = None
         # slot qsa_indexer: qsa_indexer.IndexerKernels, set by build
         self.qsa_indexer = None
+        # slot qsa_draft: qsa_draft.DraftGlue, set by build (the draft only)
+        self.qsa_draft = None
         # slot moe_finalize: set by build
         self.moe_finalize_ready = False
         # slot moe_routing: moe_routing.Options, set by build

@@ -84,6 +84,10 @@ SGLANG_READS = {
     "kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py": (
         "fused_qk_gemma_rmsnorm_rope_gate",
     ),
+    "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
+    "srt/model_executor/runner_backend_utils/breakable_cuda_graph/__init__.py": (
+        "is_in_breakable_cuda_graph",
+    ),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "kernels/ops/elementwise/elementwise.py": ("fused_sigmoid_mul",),
     "srt/layers/attention/qsa/glue.py": ("resolve_qsa_sparse_backend",),
@@ -191,12 +195,13 @@ def sparse_backend():
 def step(executor, layer, x, st):
     """The layer's attention output [rows, hidden] (before the stage's reduction).
 
-    With slot ``qsa_indexer``, ``qsa_pool`` or ``qsa_pool_fp8``, a decode / verify /
-    draft-extend step runs the attention split into its pieces here: SGLang's QKV +
-    gate projection, the indexer (``qsa_indexer.select``: the plugin's fold, scorers
-    and selects where they serve the step), the sparse attention (the pool or union
-    kernels where they serve it) and the gate and o_proj. Otherwise SGLang's
-    ``self_attention`` runs whole."""
+    With slot ``qsa_indexer``, ``qsa_pool``, ``qsa_pool_fp8`` or ``qsa_draft``, a
+    decode / verify / draft-extend step runs the attention split into its pieces here:
+    SGLang's QKV + gate projection, the indexer (``qsa_indexer.select``: the plugin's
+    fold, scorers and selects where they serve the step; a draft decode's lookup inside
+    ``qsa_draft``'s pack), the sparse attention (the pool, union or lookup kernels where
+    they serve it) and the gate and o_proj. Otherwise SGLang's ``self_attention`` runs
+    whole."""
     fb = st.fb
     mode = fb.forward_mode
     if (
@@ -204,10 +209,17 @@ def step(executor, layer, x, st):
             executor.qsa_indexer is not None
             or executor.qsa_pool_ready
             or executor.qsa_union is not None
+            or executor.qsa_draft is not None
         )
         and layer.is_qsa
         and (mode.is_target_verify() or mode.is_decode() or mode.is_draft_extend_v2())
     ):
+        if (
+            mode.is_draft_extend_v2()
+            and executor.qsa_indexer is None
+            and executor.qsa_draft is not None
+        ):
+            return _draft_extend(executor, layer, x, st)
         return _decomposed(executor, layer, x, st)
     if executor.qsa_prefill is not None and layer.is_qsa and st.step.mode == "prefill":
         from sgl_nvidia_mega.qwen3_8.runtime import qsa_prefill
@@ -331,11 +343,17 @@ def _decomposed(executor, layer, x, st):
     """``self_attention`` from its pieces. The indexer runs on the main stream here
     (SGLang overlaps it on a side stream under capture); both orders compute the
     same values. The BF16 pool's split-K kernels take a verify first; an FP8 pool's
-    verify goes to the union kernels."""
+    verify goes to the union kernels; a draft decode that reuses the draft extend's
+    selection goes to slot qsa_draft's lookup pack."""
     from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
 
     fb, positions = st.fb, st.positions
     q, k, v, gate = _qkv_gate(layer, x, positions, fb)
+    if executor.qsa_draft is not None and fb.forward_mode.is_decode():
+        out = executor.qsa_draft.decode(layer, sparse_backend(), q, k, v, fb)
+        if out is not None:
+            st.ran("qsa.indexer", "mtp_lookup_in_pack")
+            return _finish(executor, layer, out, gate, st, "fused_kv_lookup")
     if executor.qsa_indexer is not None:
         indices = qsa_indexer.select(executor, layer, x, positions, st)
     else:
@@ -349,6 +367,43 @@ def _decomposed(executor, layer, x, st):
         out = _verify_union(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
     if out is not None:
         return out
+    attn_out = layer.attn(q, k, v, fb, topk_indices=indices)
+    return _finish(executor, layer, attn_out, gate, st, STOCK)
+
+
+def _draft_extend(executor, layer, x, st):
+    """``self_attention`` of a draft extend with slot qsa_draft and no plugin indexer:
+    SGLang's order and streams (under capture the indexer, now with the seed capture
+    of ``qsa_draft.indices``, runs on the layer's side stream beside the QKV)."""
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
+    from sglang.srt.models.qwen4_exp import _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
+
+    from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+    fb, positions = st.fb, st.positions
+    overlap = (
+        layer.alt_stream is not None
+        and get_is_capture_mode()
+        and not is_in_breakable_cuda_graph()
+        and x.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
+    )
+    if overlap:
+        current = torch.cuda.current_stream()
+        layer.alt_stream.wait_stream(current)
+    q, k, v, gate = layer._prepare_qkv_gate(
+        positions=positions, hidden_states=x, forward_batch=fb
+    )
+    if overlap:
+        with torch.cuda.stream(layer.alt_stream):
+            indices = qsa_draft.indices(executor, layer, x, positions, st)
+        current.wait_stream(layer.alt_stream)
+        indices.record_stream(current)
+    else:
+        indices = qsa_draft.indices(executor, layer, x, positions, st)
+    st.ran("qsa.indexer", STOCK)
     attn_out = layer.attn(q, k, v, fb, topk_indices=indices)
     return _finish(executor, layer, attn_out, gate, st, STOCK)
 

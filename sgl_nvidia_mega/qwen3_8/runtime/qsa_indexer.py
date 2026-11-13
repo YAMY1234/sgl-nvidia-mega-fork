@@ -26,7 +26,8 @@ An op no kernel serves runs SGLang's own (``project_qk`` +
 breakable graphs, CP, batch-invariant mode, eager metadata and any other geometry call
 ``layer._compute_qsa_topk_indices``. An MTP draft decode step that reuses the draft
 extend's captured indices runs SGLang's lookup; a draft extend captures its indices
-through SGLang's hooks, in the stock order.
+through SGLang's hooks, in the stock order (slot ``qsa_draft``: the lookup inside its
+K/V pack and the capture as one launch, ``runtime/qsa_draft.py``).
 
 Reads: the index projection and norms, the step's graph metadata, the layer's ring,
 RoPE positions and compressed-K cache. Writes: the ring rows and RoPE positions at the
@@ -267,13 +268,19 @@ def select(executor, layer, hidden_states, positions, st) -> torch.Tensor:
         step = kernels.prepare(layer, hidden_states, positions, fb)
     if step is None:
         st.ran(OP, STOCK)
+        if executor.qsa_draft is not None and fb.forward_mode.is_draft_extend_v2():
+            from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+            return qsa_draft.indices(executor, layer, hidden_states, positions, st)
         return layer._compute_qsa_topk_indices(hidden_states, positions, fb)
     topk = kernels.run(step, layer.indexer, hidden_states, positions)
     # _compute_qsa_topk_indices_eager: a draft extend seeds the MTP decode steps
     should_capture = getattr(step.backend, "should_capture_mtp_sparse_indices", None)
     if should_capture is not None and should_capture(fb):
-        step.backend.capture_mtp_sparse_indices(
-            topk, fb, layer.layer_id, metadata=step.metadata
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+        qsa_draft.capture(
+            executor, step.backend, topk, fb, step.metadata, layer.layer_id, st
         )
     st.ran(OP, step.impl)
     return topk

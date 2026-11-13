@@ -82,6 +82,9 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # The tuning-pin tables are on when their files are set, as in the source, not by slot:
 # SGLANG_FLASHINFER_TACTIC_PIN_FILE (runtime/flashinfer_tactic_pins.py) and
 # SGLANG_BF16_GEMM_PIN_FILE (runtime/bf16_gemm_pins.py).
+# qsa_draft: the MTP draft's QSA glue (runtime/qsa_draft.py): a draft decode step's
+# lookup of the draft extend's selection inside the K/V pack, and the draft extend's
+# seed capture as one launch
 KNOWN_SLOTS: tuple[str, ...] = (
     "hc",
     "hc_wide",
@@ -97,6 +100,7 @@ KNOWN_SLOTS: tuple[str, ...] = (
     "qsa_prefill",
     "ple",
     "smallm_gemm",
+    "qsa_draft",
 )
 # A node-local directory for the JIT sources some kernels write before compiling.
 SOURCE_DIR_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_SOURCE_DIR"
@@ -335,6 +339,8 @@ def build(model, hf_config, ctx):
         from sgl_nvidia_mega.qwen3_8.runtime import ple
 
         executor.ple_options = _built_options("ple", ple.build(model), ple.DEFAULT)
+    if "qsa_draft" in slots and draft:
+        executor.qsa_draft = _build_qsa_draft(model)
     if "smallm_gemm" in slots:
         from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
 
@@ -471,6 +477,23 @@ def _build_qsa_indexer(model):
         unavailable("qsa_indexer", reason)
         return None
     return kernels
+
+
+def _build_qsa_draft(model):
+    """The draft glue (qsa_draft.DraftGlue), or None (SGLang's lookup and capture)."""
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+    reason = qsa_draft.build(model)
+    megakernel_agree(reason, what="Qwen3.8 slot qsa_draft")
+    if reason:
+        unavailable("qsa_draft", reason)
+        return None
+    lookup = qsa_draft.lookup_reason(model)
+    if lookup:
+        logger.info("NVIDIA megakernel: Qwen3.8 slot qsa_draft: stock lookup (%s)", lookup)
+    return qsa_draft.DraftGlue(lookup=not lookup)
 
 
 def _qsa_layers_reason(model) -> str:

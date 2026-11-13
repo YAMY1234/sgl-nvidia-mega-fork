@@ -17,10 +17,13 @@
 ``extend(executor, layer, x, st)`` returns what ``layer.self_attention`` returns for an
 EXTEND or MIXED step, or None when it does not serve the step (nothing launched; the
 caller runs ``self_attention``). It declines: no options (``executor.qsa_prefill`` is
-None), a non-QSA layer, any other mode, a breakable graph or stream capture, CP, batch-
-invariant mode, MLP-sync padded rows, missing host lengths, a non-CUDA input, and an
-attention backend that is not SGLang's ``QwenSparseAttnBackend``. Otherwise it runs, in
-self_attention's order (the indexer is never overlapped at prefill):
+None), a non-QSA layer, any other mode, a stream capture outside a breakable prefill
+graph, CP, batch-invariant mode, MLP-sync padded rows, missing host lengths, a non-CUDA
+input, and an attention backend that is not SGLang's ``QwenSparseAttnBackend``. Inside a
+breakable prefill graph (the executor's prefill body) the indexer and the attention (2
+and 3) run as one graph break on the batch's real rows (``prefill_graph.qsa``), the rest
+in the captured segments. Otherwise it runs, in self_attention's order (the indexer is
+never overlapped at prefill):
 
 1. QKV + gate (``qsa.qkv``): ``qkv_proj``, then ``qk_rows`` (the row-tiled Gluon QK
    norm + RoPE + gate deinterleave, ``fused_qk_rmsnorm_rope_gate_rows``) for gated BF16
@@ -220,7 +223,7 @@ class Options:
     union: bool = True
     # SGLANG_OPT_QSA_UNION_PREFILL_OUT_ALIAS (all 1): the union kernel writes
     # forward_batch._attn_output in place when that buffer is set (only inside a
-    # breakable graph's attention break, which the executor never runs)
+    # breakable graph's attention break, prefill_graph.qsa)
     union_out_alias: bool = True
     # SGLANG_OPT_QSA_PREFILL_PACK_ROWS (high: 1, mid: 0)
     pack_rows: bool = True
@@ -353,8 +356,10 @@ def _capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
 
-def decline_reason(layer, x, fb, backend) -> str:
-    """'' when ``extend`` serves this layer's step, else why not. Host state only."""
+def decline_reason(layer, x, fb, backend, *, graph=False) -> str:
+    """'' when ``extend`` serves this layer's step, else why not. Host state only.
+    ``graph``: a breakable prefill graph's capture, whose break reads the batch's host
+    lengths and real rows (``prefill_graph.qsa``)."""
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
     from sglang.srt.layers.attention.graph_utils import padded_extend_real_tokens
     from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
@@ -370,7 +375,7 @@ def decline_reason(layer, x, fb, backend) -> str:
         return "not a QSA layer"
     if not fb.forward_mode.is_extend_or_draft_extend_or_mixed():
         return "not an extend step"
-    if is_in_breakable_cuda_graph() or _capturing():
+    if not graph and (is_in_breakable_cuda_graph() or _capturing()):
         return "graph capture"
     if _shards_rows_over_cp(fb) or (
         fb.attn_cp_metadata is not None and is_cp_active(fb)
@@ -380,9 +385,9 @@ def decline_reason(layer, x, fb, backend) -> str:
         return "batch-invariant mode"
     if not x.is_cuda:
         return "not a CUDA input"
-    if fb.extend_seq_lens_cpu is None or fb.seq_lens_cpu is None:
+    if not graph and (fb.extend_seq_lens_cpu is None or fb.seq_lens_cpu is None):
         return "no host lengths"
-    if padded_extend_real_tokens(x.shape[0], fb) is not None:
+    if not graph and padded_extend_real_tokens(x.shape[0], fb) is not None:
         return "MLP-sync padded rows"
     if not isinstance(backend, QwenSparseAttnBackend):
         return f"attention backend {type(backend).__name__}"
@@ -399,15 +404,30 @@ def extend(executor, layer, x, st):
         return None
     from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
     from sglang.srt.model_executor.forward_context import get_attn_backend
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
 
     backend = resolve_qsa_sparse_backend(get_attn_backend())
-    if decline_reason(layer, x, st.fb, backend):
+    graph = is_in_breakable_cuda_graph()
+    if decline_reason(layer, x, st.fb, backend, graph=graph):
         return None
-    positions = st.positions
-    q, k, v, gate = qkv_gate(options, layer, x, positions, st)
-    indices = indexer(options, layer, x, positions, backend, st)
-    out = attention(options, layer.attn, backend, q, k, v, indices, st)
+    q, k, v, gate = qkv_gate(options, layer, x, st.positions, st)
+    if graph:
+        from sgl_nvidia_mega.qwen3_8.runtime import prefill_graph
+
+        # the indexer and attention read the batch's host lengths: a graph break
+        out = prefill_graph.qsa(executor, layer, x, q, k, v, st)
+    else:
+        out = attend(options, layer, x, q, k, v, backend, st)
     return finish(layer, out, gate)
+
+
+def attend(options, layer, x, q, k, v, backend, st):
+    """``self_attention``'s indexer, then the K/V store and the attention:
+    [rows, heads * 256]."""
+    indices = indexer(options, layer, x, st.positions, backend, st)
+    return attention(options, layer.attn, backend, q, k, v, indices, st)
 
 
 # -- QKV + gate ---------------------------------------------------------------------
@@ -1084,8 +1104,8 @@ def pack(options, pack_args, st):
 def union_output(q, fb, num_output_rows):
     """The source's ``_union_prefill_out``: ``fb._attn_output`` as the union
     kernel's [rows, heads, 256] output when it is exactly q's rows in q's dtype and
-    contiguous; else None. SGLang sets that buffer only inside a breakable prefill
-    graph's attention break."""
+    contiguous; else None. Set only inside a breakable prefill graph's attention
+    break (``prefill_graph.qsa``)."""
     out = fb._attn_output
     if (
         out is None

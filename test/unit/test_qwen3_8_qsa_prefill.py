@@ -5,6 +5,7 @@ stock fallbacks, the MTP seed rows from host lengths, and the recipe options. SG
 modules are replaced by fakes and the kernel launches by spies, so no GPU, no kernel
 build and no model weights are needed."""
 
+import contextlib
 import enum
 import sys
 import types
@@ -23,6 +24,7 @@ from sgl_nvidia_mega.qwen3_8.qsa import (  # noqa: F401
     tma_prefill,
     union_prefill,
 )
+from sgl_nvidia_mega.qwen3_8.runtime import prefill_graph as pg
 from sgl_nvidia_mega.qwen3_8.runtime import qsa_prefill as qp
 
 
@@ -340,10 +342,81 @@ class TestDecline(unittest.TestCase):
         _STATE["padded"] = None
         self.assertIn("backend", self.reason(backend=object()))
 
+    def test_graph_capture_leaves_the_batch_checks_to_its_break(self):
+        _STATE.update(breakable=True, padded=7)
+        fb = _fb()
+        fb.seq_lens_cpu = None
+        reason = lambda f: qp.decline_reason(
+            self.layer, self.x, f, _STATE["backend"], graph=True
+        )
+        self.assertEqual(reason(fb), "")
+        _STATE["cp"] = True
+        self.assertIn("context", reason(fb))
+        _STATE["cp"] = False
+        self.assertIn("extend", reason(_fb(_Mode.DECODE)))
+
 
 class TestExtend(unittest.TestCase):
     def setUp(self):
         _install(self)
+
+    def test_breakable_graph_runs_indexer_and_attention_as_a_break(self):
+        _STATE.update(breakable=True, padded=7)  # bucket rows past the batch's
+        layer = SimpleNamespace(is_qsa=True, attn=_attn())
+        st = _St(_fb(), positions="pos")
+        ex = SimpleNamespace(qsa_prefill=qp.DEFAULT)
+        x = SimpleNamespace(is_cuda=True, shape=(8, 16))
+        seen = []
+        with (
+            mock.patch.object(qp, "qkv_gate", lambda *a: ("q", "k", "v", "gate")),
+            mock.patch.object(qp, "attend", lambda *a: self.fail("eager attend")),
+            mock.patch.object(pg, "qsa", lambda *a: seen.append(a) or "attn_rows"),
+            mock.patch.object(qp, "finish", lambda layer_, out, gate: (out, gate)),
+        ):
+            self.assertEqual(qp.extend(ex, layer, x, st), ("attn_rows", "gate"))
+        self.assertEqual(seen, [(ex, layer, x, "q", "k", "v", st)])
+
+    def test_break_runs_on_the_live_batch_rows(self):
+        fb = _fb(extend=(3, 2))  # 5 tokens of an 8-row bucket
+        fb.global_num_token_non_padded_cpu = 5
+        fb.out_cache_loc = torch.arange(8) + 100
+        live, scopes = _St(fb), []
+
+        @contextlib.contextmanager
+        def scope(fb_, output, query_tokens, kv_tokens, kwargs):
+            fb_._attn_output = output[:query_tokens]
+            fb_.out_cache_loc = fb_.out_cache_loc[:query_tokens]
+            scopes.append((query_tokens, kv_tokens))
+            yield kwargs
+            fb_._attn_output, fb_.out_cache_loc = None, torch.arange(8) + 100
+
+        def attend(options, layer, x, q, k, v, backend, st):
+            self.assertEqual((options, backend), (qp.DEFAULT, _STATE["backend"]))
+            self.assertEqual(tuple(st.positions.shape), (5,))
+            self.assertEqual(tuple(fb.out_cache_loc.shape), (5,))
+            self.assertEqual([t.shape[0] for t in (x, q, k, v)], [5] * 4)
+            return torch.ones(5, 8)
+
+        graph_utils = sys.modules["sglang.srt.layers.attention.graph_utils"]
+        graph_utils.attention_input_scope = scope
+        output = torch.full((8, 8), 7.0)
+        rows = [torch.zeros(8, 4) for _ in range(4)]
+        ex = SimpleNamespace(qsa_prefill=qp.DEFAULT)
+        with mock.patch.object(pg, "_live", lambda executor: live), mock.patch.object(
+            qp, "attend", attend
+        ):
+            pg._qsa(ex, SimpleNamespace(), rows[0], torch.arange(8), *rows[1:], output)
+        self.assertEqual(scopes, [(5, 5)])
+        self.assertTrue(torch.equal(output[:5], torch.ones(5, 8)))
+        self.assertTrue(torch.equal(output[5:], torch.zeros(3, 8)))
+        # the union kernel writing the output rows in place: no copy
+        output.fill_(7.0)
+        with mock.patch.object(pg, "_live", lambda executor: live), mock.patch.object(
+            qp, "attend", lambda *a: fb._attn_output.fill_(2.0)
+        ):
+            pg._qsa(ex, SimpleNamespace(), rows[0], torch.arange(8), *rows[1:], output)
+        self.assertTrue(torch.equal(output[:5], torch.full((5, 8), 2.0)))
+        self.assertTrue(torch.equal(output[5:], torch.zeros(3, 8)))
 
     def test_off_or_declined_launches_nothing(self):
         layer = SimpleNamespace(is_qsa=True)
@@ -382,7 +455,7 @@ class TestExtend(unittest.TestCase):
             return "out"
 
         with (
-            mock.patch.object(qp, "decline_reason", lambda *a: ""),
+            mock.patch.object(qp, "decline_reason", lambda *a, **k: ""),
             mock.patch.object(qp, "qkv_gate", qkv),
             mock.patch.object(qp, "indexer", index),
             mock.patch.object(qp, "attention", attend),

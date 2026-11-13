@@ -3,9 +3,10 @@
 # Adapted from SGLang (Apache-2.0, SGLang Team): python/sglang/srt/models/qwen2_moe.py
 # (Qwen2MoeSparseMoeBlock._forward_router_experts, its deferred-finalize branch and the
 # dual-stream NVFP4 prequant) and python/sglang/srt/layers/moe/moe_runner/ (the Qwen3.8
-# fused routing's prepared-routing run, and flashinfer_trtllm.py's logits-bypassed
-# deferred call). Changed: the step calls FlashInfer's prepared-routing body itself and
-# hands the prequantized input to the runner as already quantized; see the docstring.
+# fused routing's prepared-routing run, flashinfer_trtllm.py's logits-bypassed deferred
+# call and the source's quantize_nvfp4_routed_input). Changed: the step calls
+# FlashInfer's prepared-routing body itself and hands the prequantized input to the
+# runner as already quantized; see the docstring.
 """The routed half of the executor's deferred-finalize MoE step (slot ``moe_routing``):
 what ``mlp._forward_router_experts(x, defer_finalize=True)`` returns for TP1 ModelOpt
 NVFP4 experts on FlashInfer's TRT-LLM runner, inside slot ``moe_finalize``'s step
@@ -27,6 +28,10 @@ NVFP4 experts on FlashInfer's TRT-LLM runner, inside slot ``moe_finalize``'s ste
    (the runner's ``hidden_states_scale`` input).
 3. otherwise the stock deferred call (``experts.forward_deferred_finalize``) on the same
    routing; ``routed`` returns None before the router GEMV when neither path can run.
+
+Slot ``moe_finalize``'s extend-size step and its prefill tuning pass take the source's
+extend order instead: ``quantize`` on the current stream, the router GEMV and
+``deferred`` on the block's side stream, its experts after the quant's event.
 
 SGLang main's NVFP4 runner has no prepared-routing entry (its DA body serves MXFP4 only)
 and ignores a typed prequantized input, so (1) calls FlashInfer with the stock call's
@@ -292,11 +297,7 @@ def routed(executor, mlp, x, st):
         return None
     if prequant:
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-            flashinfer_trtllm_deferred_finalize_context,
             quantize_hidden_states_fp4,
-        )
-        from sglang.srt.layers.moe.token_dispatcher.standard import (
-            StandardDispatchOutput,
         )
 
         current = torch.cuda.current_stream()
@@ -309,20 +310,53 @@ def routed(executor, mlp, x, st):
         current.wait_stream(mlp.alt_stream)
         x_fp4.record_stream(current)
         x_sf.record_stream(current)
-        # FusedMoE.forward_deferred_finalize; at TP1 / EP1 the dispatch passes through
-        dispatch = StandardDispatchOutput(
-            hidden_states=x_fp4, hidden_states_scale=x_sf, topk_output=topk_output
-        )
-        with flashinfer_trtllm_deferred_finalize_context():
-            combine_input = experts.run_moe_core(dispatch_output=dispatch)
         st.ran(OP, "prequant")
-        return experts.dispatcher.combine(combine_input=combine_input)
+        return _prequantized(experts, x_fp4, x_sf, topk_output)
     out = _fused(experts, x, topk_output)
     if out is None:
         st.ran(OP, STOCK)
         return experts.forward_deferred_finalize(x, topk_output)
     st.ran(OP, "fused_routing")
     return out
+
+
+def quantize(mlp, x):
+    """The source's ``quantize_nvfp4_routed_input``: SGLang's quant of the routed input on
+    the current stream, and the event the routed experts wait for (``deferred``)."""
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        quantize_hidden_states_fp4,
+    )
+
+    x_fp4, x_sf = quantize_hidden_states_fp4(x, mlp.experts.w13_input_scale_quant)
+    return x_fp4, x_sf, torch.cuda.current_stream().record_event()
+
+
+def deferred(mlp, x, logits, quant):
+    """``mlp.experts.forward_deferred_finalize(x, mlp.topk(x, logits))``; with ``quant``
+    (``quantize``'s output) the experts take it as already quantized once its event has
+    passed, as the source's runner does with a prequantized input."""
+    topk_output = mlp.topk(x, logits)
+    if quant is None:
+        return mlp.experts.forward_deferred_finalize(x, topk_output)
+    x_fp4, x_sf, ready = quant
+    torch.cuda.current_stream().wait_event(ready)
+    return _prequantized(mlp.experts, x_fp4, x_sf, topk_output)
+
+
+def _prequantized(experts, x_fp4, x_sf, topk_output):
+    """``FusedMoE.forward_deferred_finalize`` on an NVFP4 input; at TP1 / EP1 the
+    dispatch passes through."""
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        flashinfer_trtllm_deferred_finalize_context,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+
+    dispatch = StandardDispatchOutput(
+        hidden_states=x_fp4, hidden_states_scale=x_sf, topk_output=topk_output
+    )
+    with flashinfer_trtllm_deferred_finalize_context():
+        combine_input = experts.run_moe_core(dispatch_output=dispatch)
+    return experts.dispatcher.combine(combine_input=combine_input)
 
 
 def _takes_fused(options, mlp, x) -> bool:

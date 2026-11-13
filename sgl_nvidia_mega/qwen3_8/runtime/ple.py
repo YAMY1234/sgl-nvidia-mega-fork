@@ -34,6 +34,9 @@ take the built ``Options`` as ``options`` (None: main's function). Engagement op
 * ``ple.add`` stock: the whole add ran ``_add_ple_embedding`` (no piece served, an idle
   or breakable-graph step, or CP); ``ple.commit`` is always SGLang's.
 
+Inside a breakable prefill graph (the executor's prefill body) each of the four runs as
+a graph break on the live batch (``prefill_graph.py``), these functions in its body.
+
 Reads and writes what SGLang's functions do: the N-gram history and the short-conv
 state by state slot (and the verify intermediate windows, the track slots), the PLE
 table, the request pool's window cache.
@@ -570,9 +573,10 @@ def _embed(ple, batch, fb, options):
 # -- the PLE embedding add ----------------------------------------------------------
 
 
-def served(options, layer, batch, fb) -> str:
+def served(options, layer, batch, fb, *, in_break=False) -> str:
     """The pieces of this layer's PLE add a kernel here serves ('' for none: the add
-    runs ``_add_ple_embedding``). Host state only."""
+    runs ``_add_ple_embedding``). Host state only. ``in_break``: the add runs eagerly
+    in a breakable prefill graph's break (``prefill_graph.ple_add``)."""
     from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
         is_in_breakable_cuda_graph,
     )
@@ -581,7 +585,11 @@ def served(options, layer, batch, fb) -> str:
     if (
         options is None
         or batch is None
-        or (is_in_breakable_cuda_graph() and fb.forward_mode.is_extend())
+        or (
+            not in_break
+            and is_in_breakable_cuda_graph()
+            and fb.forward_mode.is_extend()
+        )
         or _shards_rows_over_cp(fb)
     ):
         return ""

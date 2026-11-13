@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adapted from SGLang (Apache-2.0, SGLang Team): the source's
 # python/sglang/srt/layers/moe/flashinfer_tactic_pins.py (the file format, its parsers, the
-# metadata gate, the cache-key readers, settle_decode_tactics and pin_decode_moe_tactics)
-# and the call of pin_decode_moe_tactics in
+# metadata gate, the cache-key readers, settle_prefill_tactics, settle_decode_tactics and
+# pin_decode_moe_tactics) and the call of pin_decode_moe_tactics in
 # python/sglang/srt/model_executor/runner/flashinfer_autotune.py
 # (run_flashinfer_autotune_forward).
 # Changed: the file comes from the environment directly, with an optional SHA-256 check.
@@ -11,8 +11,8 @@
 # layout's shape (16 runner extras; a valid-tactics query of 14 or 15 fields), anything
 # else matches no pin. The executor calls ``after_forward`` at the end of each covered
 # forward, which runs pin_decode_moe_tactics inside an autotune pass as the source's
-# runner does after its dummy forward. The prefill table is read and validated; no
-# SGLang prefill MoE tuning pass exists for it to settle.
+# runner does after its dummy forward. The prefill table settles the entries the
+# executor's prefill tuning pass adds (runtime/moe_prefill_autotune.py).
 """Pinned FlashInfer TRT-LLM-gen FP4 MoE tactics, read from a tuning file.
 
 ``SGLANG_FLASHINFER_TACTIC_PIN_FILE`` names a JSON file such as::
@@ -50,8 +50,9 @@ Run pinned servers with ``SGLANG_FLASHINFER_AUTOTUNE_CACHE=0``. The decode table
 rewrites only the winners the tuner tuned in this process (as the source's does), and
 SGLang's autotune cache path does not include the pin file (the source's does): a
 reused cache would serve its saved tactics past the table, and a pinned boot's saved
-cache would carry the pins into unpinned boots. The prefill table is not applied: no
-SGLang prefill MoE tuning pass creates the entries it settles.
+cache would carry the pins into unpinned boots. The prefill table applies to the
+entries the prefill tuning pass of slot ``moe_finalize`` adds
+(``runtime/moe_prefill_autotune.py``).
 """
 
 from __future__ import annotations
@@ -334,6 +335,47 @@ def valid_tactics_by_bucket(valid_tactics_dict, shape: MoeShape) -> dict[int, se
     return valid
 
 
+def settle_prefill_tactics(
+    winners: dict,
+    new_keys,
+    *,
+    pins: Optional[MoeTacticPins],
+    valid: dict[int, set],
+) -> list[tuple[int, Tactic, Tactic, str]]:
+    """Apply the prefill table to the tuner entries a prefill tuning pass added.
+
+    With a table, each such bucket takes its pinned tactic; a bucket the table does
+    not list, or whose pin FlashInfer did not offer there, falls back to the default
+    tactic, which is what an untuned prefill bucket runs. Without a table the
+    tuner's pick stands unless it is a split-K tactic. Edits ``winners`` in place
+    and returns (bucket, final, tuned, source) per entry.
+    """
+    rows = []
+    for key in sorted(new_keys, key=cache_key_bucket):
+        tactic, profile = winners[key]
+        bucket = cache_key_bucket(key)
+        tuned = normalize_tactic(tactic)
+        final, source = tuned, "tuner"
+        pinned_shape = pins is not None and cache_key_shape(key) == pins.shape
+        if pinned_shape and pins.prefill is not None:
+            final, source = pins.prefill.get(bucket), "pin"
+            if final is None:
+                final, source = DEFAULT_TACTIC, "pin_absent"
+            elif final == DEFAULT_TACTIC:
+                source = "pin_default"
+            elif final not in valid.get(bucket, ()):
+                final, source = DEFAULT_TACTIC, "pin_invalid"
+        if pinned_shape and final in pins.split_k:
+            final, source = DEFAULT_TACTIC, source + "_split_k"
+        if final != tuned:
+            winners[key] = (
+                DEFAULT_TACTIC if final == DEFAULT_TACTIC else list(final),
+                profile,
+            )
+        rows.append((bucket, final, tuned, source))
+    return rows
+
+
 def settle_decode_tactics(
     winners: dict,
     *,
@@ -460,7 +502,8 @@ def build(model) -> str:
         return f"{path} pins the MoE shape {pins.shape}, this model's is {shape}"
     logger.info(
         "MoE tactic pins: %s (SHA-256 %s): decode buckets %s, prefill buckets %s "
-        "(no SGLang prefill MoE tuning pass applies them), %d split-K tactics refused",
+        "(applied by slot moe_finalize's prefill tuning pass), %d split-K tactics "
+        "refused",
         path,
         file_digest(path)[:16],
         sorted(pins.decode or ()),

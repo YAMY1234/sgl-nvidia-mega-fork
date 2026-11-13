@@ -1,15 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adapted from SGLang (Apache-2.0, SGLang Team):
-# python/sglang/srt/models/qwen2_moe.py (Qwen2MoeSparseMoeBlock.forward).
+# python/sglang/srt/models/qwen2_moe.py (Qwen2MoeSparseMoeBlock.forward), and from the
+# source's python/sglang/srt/models/qwen2_moe.py (forward_normal_dual_stream and the eager
+# branch of forward at extend sizes) and python/sglang/kernels/ops/elementwise/
+# elementwise.py (fused_moe_finalize_gate_sigmoid_mul_add's launch). Changed: the
+# finalize launches the plugin's copy of the kernel; the extend switches are constants.
 """The MoE step of a covered forward.
 
-Slot ``moe_finalize`` (TP1, no EP, up to 1024 rows): the router and the routed experts
-run SGLang's FlashInfer TRT-LLM MoE with its finalize deferred, the shared expert runs
-ungated, and one plugin kernel (``_fused_finalize_gate_sigmoid_mul_add_kernel``) writes
+Slot ``moe_finalize`` (TP1, no EP): the router and the routed experts run SGLang's
+FlashInfer TRT-LLM MoE with its finalize deferred, the shared expert runs ungated, and
+one plugin kernel (``_fused_finalize_gate_sigmoid_mul_add_kernel``) writes
 ``sigmoid(x . g) * shared + sum_k w_k * expert_k`` from the un-finalized expert rows
-(``gemm2_out`` and its permutation). Stock: FlashInfer's finalize, then
-``fused_gate_sigmoid_mul_add``. Every other case runs SGLang's ``Qwen2MoeSparseMoeBlock``."""
+(``gemm2_out`` and its permutation). Below ``EXTEND_MIN_ROWS`` rows the step keeps
+SGLang's deferred dual stream; from it on it is the source's extend-size MoE
+(``_extend``), in breakable prefill graphs too. Stock: FlashInfer's finalize, then
+``fused_gate_sigmoid_mul_add``. Every other case runs SGLang's
+``Qwen2MoeSparseMoeBlock``."""
 
 from __future__ import annotations
 
@@ -20,8 +27,11 @@ import torch
 from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins, moe_routing
 
 STOCK = "stock"
-MAX_ROWS = 1024
 HIDDEN, TOP_K = 2560, 10
+# The source's extend-size finalize at its recipes' defaults: from this many rows the
+# extend order, and a launch capped at 64 registers (3 -> 4 CTAs per SM, same math).
+EXTEND_MIN_ROWS = 1024
+EXTEND_MAX_REGISTERS = 64
 
 SGLANG_READS = {
     "srt/models/qwen2_moe.py": (
@@ -46,6 +56,7 @@ SGLANG_READS = {
         "expert_weights",
         "top_k",
     ),
+    "kernels/jit/utils/__init__.py": ("is_arch_support_pdl",),
 }
 
 
@@ -94,14 +105,13 @@ def step(executor, layer, x, st):
 
     mlp = layer.mlp
     rows = x.shape[0]
-    if not (executor.moe_finalize_ready and 0 < rows <= MAX_ROWS and x.shape[1] == HIDDEN):
+    if not (executor.moe_finalize_ready and rows > 0 and x.shape[1] == HIDDEN):
         st.ran("moe", STOCK)
         if isinstance(mlp, Qwen2MoeSparseMoeBlock):
             return mlp(x, st.fb, defer_finalize=False)
         return mlp(x)
-    from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.moe_finalize import (
-        _fused_finalize_gate_sigmoid_mul_add_kernel as kernel,
-    )
+    if rows >= EXTEND_MIN_ROWS:
+        return _extend(executor, mlp, x, st)
     from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
 
     # SGLang's order (Qwen2MoeSparseMoeBlock.forward_normal_dual_stream): the routed
@@ -123,6 +133,65 @@ def step(executor, layer, x, st):
     if side is not None:
         shared.record_stream(current)
         current.wait_stream(side)
+    out = _finalize(mlp, x, shared, deferred, USE_PDL=False, num_warps=8)
+    st.ran("moe", "finalize_permuted")
+    return out
+
+
+def _extend(executor, mlp, x, st):
+    """The source's extend-size MoE. Capturing (its forward_normal_dual_stream): the
+    shared expert on the current stream, the router and the routed experts on the
+    block's side stream, with slot moe_routing the routed input quantized on the current
+    stream first. Eager (its forward): the shared, then the routed experts. Then the
+    finalize at the source's extend launch: 8 warps, the register cap, PDL."""
+    from sglang.kernels.jit.utils import is_arch_support_pdl
+
+    side = _side_stream(mlp)
+    options = executor.moe_routing
+    quant = None
+    if side is not None:
+        current = torch.cuda.current_stream()
+        side.wait_stream(current)
+        if options is not None and options.prequant_overlap:
+            quant = moe_routing.quantize(mlp, x)
+    shared = _shared_experts(mlp, x)
+    with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
+        if quant is None:
+            deferred = _router_experts(mlp, x)
+        else:
+            logits = bf16_gemm_pins.linear(mlp.gate, x)
+            deferred = moe_routing.deferred(mlp, x, logits, quant)
+            st.ran(moe_routing.OP, "prequant")
+    if side is not None:
+        current.wait_stream(side)
+        for t in (
+            deferred.gemm2_out,
+            deferred.expert_weights,
+            deferred.expanded_idx_to_permuted_idx,
+        ):
+            t.record_stream(current)
+    pdl = is_arch_support_pdl()
+    out = _finalize(
+        mlp,
+        x,
+        shared,
+        deferred,
+        USE_PDL=pdl,
+        num_warps=8,
+        maxnreg=EXTEND_MAX_REGISTERS,
+        **({"launch_pdl": True} if pdl else {}),
+    )
+    st.ran("moe", "extend_finalize")
+    return out
+
+
+def _finalize(mlp, x, shared, deferred, **launch):
+    """The finalize kernel on the deferred output, one row a program."""
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.moe_finalize import (
+        _fused_finalize_gate_sigmoid_mul_add_kernel as kernel,
+    )
+
+    rows = x.shape[0]
     top_k = int(deferred.top_k)
     gemm2 = deferred.gemm2_out.view(-1, deferred.gemm2_out.shape[-1])
     perm = deferred.expanded_idx_to_permuted_idx.view(-1, top_k)[:rows].contiguous()
@@ -133,7 +202,7 @@ def step(executor, layer, x, st):
     kernel[(rows,)](
         x.contiguous(),
         mlp.shared_expert_gate.weight.view(-1),
-        shared,
+        shared.contiguous(),
         out,
         gemm2,
         perm,
@@ -142,10 +211,8 @@ def step(executor, layer, x, st):
         hidden_dim=HIDDEN,
         TOP_K=TOP_K,
         BLOCK_SIZE=4096,
-        USE_PDL=False,
-        num_warps=8,
+        **launch,
     )
-    st.ran("moe", "finalize_permuted")
     return out
 
 

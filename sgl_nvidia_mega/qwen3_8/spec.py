@@ -56,6 +56,10 @@ _TARGET_PREPARE = (
     else {}
 )
 
+# The prefill body of the target and of the MTP draft (Qwen3_8Executor.plan_body /
+# forward_body) may be captured by breakable prefill graphs.
+_PREFILL_GRAPH = {"prefill_graph": True} if runtime.prefill_graph_supported() else {}
+
 SPEC = MegakernelSpec(
     name="Qwen3.8 forward executor",
     requires=_REQUIRES,
@@ -68,6 +72,7 @@ SPEC = MegakernelSpec(
     config_disable_reasons=runtime.config_reasons,
     **_TARGET_BINDING,
     **_TARGET_PREPARE,
+    **_PREFILL_GRAPH,
 )
 
 DRAFT_SPEC = MegakernelSpec(
@@ -79,4 +84,5 @@ DRAFT_SPEC = MegakernelSpec(
     build=runtime.build,
     api_version=2,
     model_disable_reasons=runtime.model_reasons,
+    **_PREFILL_GRAPH,
 )

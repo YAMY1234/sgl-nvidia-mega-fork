@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """The Qwen3.8 executor's tuning-pin tables on CPU (runtime/flashinfer_tactic_pins.py,
-runtime/bf16_gemm_pins.py): the file formats, the SHA-256 and metadata gates, which
-autotuner entries the MoE decode table rewrites and which it refuses, when a BF16 pin
-serves an executor projection call and when SGLang's dispatch keeps it. FlashInfer's
-and SGLang's modules are fakes and the pinned kernels CPU stand-ins, so no GPU is
-needed."""
+runtime/bf16_gemm_pins.py, runtime/moe_prefill_autotune.py): the file formats, the
+SHA-256 and metadata gates, which autotuner entries the MoE decode and prefill tables
+rewrite and which they refuse, the prefill tuning pass that adds the prefill entries,
+when a BF16 pin serves an executor projection call and when SGLang's dispatch keeps it.
+FlashInfer's and SGLang's modules are fakes and the pinned kernels CPU stand-ins, so no
+GPU is needed."""
 
 import hashlib
 import json
@@ -249,6 +250,162 @@ class TestMoeAfterForward(_Files):
         self.here = dict(META, sm="10.0")
         with mock.patch.object(tp, "model_shape", lambda m: SHAPE):
             self.assertIn("does not apply here", tp.build(model))
+
+
+class TestMoeSettlePrefill(unittest.TestCase):
+    """settle_prefill_tactics: the prefill table over the entries a tuning pass added."""
+
+    def setUp(self):
+        prefill = {"768": [32, 125], "1024": -1, "2048": [64, 9], "4096": SPLIT}
+        self.pins = tp.parse_moe_tactic_pins(_moe_document(prefill=prefill))
+
+    def settle(self, winners, pins, valid):
+        before = dict(winners)
+        rows = tp.settle_prefill_tactics(winners, list(winners), pins=pins, valid=valid)
+        changed = {tp.cache_key_bucket(k) for k in winners if winners[k] != before[k]}
+        return {row[0]: row[1:] for row in rows}, changed
+
+    def test_a_table_falls_back_to_the_default_tactic_not_the_tuner(self):
+        winners = {_key(b): ([8, 1], f"p{b}") for b in (768, 1024, 2048, 4096, 8192)}
+        valid = {768: {(32, 125)}, 2048: {(8, 1)}, 4096: {tuple(SPLIT)}}
+        rows, _ = self.settle(winners, self.pins, valid)
+        self.assertEqual(rows[768], ((32, 125), (8, 1), "pin"))
+        self.assertEqual(rows[1024][0::2], (tp.DEFAULT_TACTIC, "pin_default"))
+        self.assertEqual(rows[2048][0::2], (tp.DEFAULT_TACTIC, "pin_invalid"))
+        self.assertEqual(rows[4096][0::2], (tp.DEFAULT_TACTIC, "pin_split_k"))
+        self.assertEqual(rows[8192][0::2], (tp.DEFAULT_TACTIC, "pin_absent"))
+        stored = {tp.cache_key_bucket(k): v for k, v in winners.items()}
+        self.assertEqual(
+            stored,
+            {768: ([32, 125], "p768"), 1024: (-1, "p1024"), 2048: (-1, "p2048"),
+             4096: (-1, "p4096"), 8192: (-1, "p8192")},
+        )  # fmt: skip
+
+    def test_without_a_table_the_tuner_picks_stand_but_split_k(self):
+        winners = {_key(768): (list(SPLIT), "a"), _key(1024): ([8, 1], "b")}
+        rows, changed = self.settle(dict(winners), None, {})
+        self.assertEqual(changed, set())
+        self.assertEqual(rows[768], (tuple(SPLIT), tuple(SPLIT), "tuner"))
+        no_table = tp.parse_moe_tactic_pins(_moe_document(prefill=None))
+        rows, changed = self.settle(winners, no_table, {})
+        self.assertEqual(rows[768][0::2], (tp.DEFAULT_TACTIC, "tuner_split_k"))
+        self.assertEqual(rows[1024][0::2], ((8, 1), "tuner"))
+        self.assertEqual(changed, {768})
+
+    def test_another_shape_keeps_the_tuner_pick(self):
+        winners = {_key(768, shape=(4096, 640, 512, 10)): (list(SPLIT), "p")}
+        rows, changed = self.settle(winners, self.pins, {})
+        self.assertEqual(changed, set())
+        self.assertEqual(rows[768][0::2], (tuple(SPLIT), "tuner"))
+
+
+class TestMoePrefillAutotune(_Files):
+    """The prefill tuning pass SGLang's extend autotune calls through the model hook:
+    one extend-size routed call, then the prefill table over the entries it added."""
+
+    def setUp(self):
+        super().setUp()
+        from sgl_nvidia_mega.qwen3_8.runtime import moe_prefill_autotune as pa
+        from sgl_nvidia_mega.qwen3_8.runtime import moe_routing as mr
+
+        self.pa, self.mr = pa, mr
+        path, _ = self.write("moe.json.py", _moe_document())  # prefill: 768 only
+        self.set_env(tp.FILE_ENV, path)
+        self.decode_key = _key(512)
+        self.tuner = _FakeTuner({self.decode_key: ([8, 1], "d")})
+        self.extend_pass, self.oom, self.calls = False, False, []
+        runner = SimpleNamespace(valid_tactics_dict={(1, _query(768)): [[32, 125]]})
+        envs = SimpleNamespace(
+            SGLANG_FLASHINFER_AUTOTUNE_EXTEND=SimpleNamespace(
+                get=lambda: self.extend_pass
+            )
+        )
+        fakes = {
+            "flashinfer.autotuner": dict(
+                AutoTuner=SimpleNamespace(get=lambda: self.tuner)
+            ),
+            "flashinfer.fused_moe.backends.trtllm.sm100_runner": dict(MoERunner=runner),
+            "sglang.srt.environ": dict(envs=envs),
+        }
+        for name, attrs in fakes.items():
+            module = types.ModuleType(name)
+            module.__dict__.update(attrs)
+            patcher = mock.patch.dict(sys.modules, {name: module})
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        def deferred(mlp, x, logits, quant):
+            # FlashInfer's tuner adds an entry per prefill bucket of the call
+            self.calls.append((mlp, tuple(x.shape), tuple(logits.shape), quant))
+            if self.oom:
+                raise torch.OutOfMemoryError("dummy rows")
+            self.tuner.winners.update({_key(b): ([8, 1], f"t{b}") for b in (768, 1024)})
+
+        stream = SimpleNamespace(synchronize=lambda: None)
+        for target, name, value in (
+            (mr, "deferred", deferred),
+            (mr, "quantize", lambda mlp, x: "prequantized"),
+            (torch.cuda, "current_stream", lambda: stream),
+            (torch.cuda, "empty_cache", lambda: None),
+        ):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.mlp = SimpleNamespace(gate=SimpleNamespace(weight=torch.zeros(512, 16)))
+        layers = [SimpleNamespace(mlp=self.mlp), SimpleNamespace(mlp=None)]
+        self.model = SimpleNamespace(
+            model=SimpleNamespace(layers=layers, start_layer=0)
+        )
+        self.executor = SimpleNamespace(
+            lm=self.model, moe_routing=mr.DEFAULT, moe_pins=True, draft=False
+        )
+
+    def tune(self, num_tokens=2048):
+        return self.pa.autotune(self.executor, num_tokens, dtype=torch.float32)
+
+    def test_one_extend_call_then_the_table(self):
+        self.assertEqual(self.tune(), 2)
+        self.assertEqual(
+            self.calls, [(self.mlp, (2048, 16), (2048, 512), "prequantized")]
+        )
+        winners = self.tuner.winners
+        self.assertEqual(winners[_key(768)], ([32, 125], "t768"))
+        self.assertEqual(winners[_key(1024)], (tp.DEFAULT_TACTIC, "t1024"))  # unlisted
+        self.assertEqual(winners[self.decode_key], ([8, 1], "d"))  # not this pass's
+
+    def test_prequant_follows_slot_moe_routing(self):
+        for options in (None, self.mr.Options(prequant_overlap=False)):
+            self.calls.clear()
+            self.executor.moe_routing = options
+            self.tune()
+            self.assertIsNone(self.calls[0][3])
+
+    def test_without_the_pin_table_the_tuner_picks_stand(self):
+        self.executor.moe_pins = False
+        self.tune()
+        self.assertEqual(self.tuner.winners[_key(1024)], ([8, 1], "t1024"))
+
+    def test_too_few_tokens_or_out_of_memory_tune_nothing(self):
+        self.assertEqual(self.tune(16), 0)
+        self.assertEqual(self.calls, [])
+        self.oom = True
+        with self.assertLogs(self.pa.logger, "INFO") as logs:
+            self.assertEqual(self.tune(), 0)
+        self.assertIn("skipped after OOM", logs.output[-1])
+
+    def test_an_explicit_extend_pass_still_runs(self):
+        self.extend_pass = True
+        self.assertEqual(self.tune(), 0)
+        self.assertEqual(self.tuner.winners[_key(768)][0], [32, 125])
+
+    def test_install_hands_sglang_the_hook(self):
+        reasons = mock.Mock(return_value="")
+        with mock.patch.object(self.mr, "layer_reasons", reasons):
+            self.assertEqual(self.pa.reasons(self.model), "")
+        reasons.assert_called_once_with(self.mlp)
+        self.pa.install(self.model, self.executor)
+        self.assertEqual(self.model.autotune_prefill_kernels(2048, dtype=torch.float32), 2)
+        self.assertEqual(len(self.calls), 1)
 
 
 # -- BF16 GEMM pins ------------------------------------------------------------------

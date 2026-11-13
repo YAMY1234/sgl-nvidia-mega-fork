@@ -45,10 +45,18 @@ gating keeps the per-element expressions; the l2norm and norm tiles keep each ro
 
 ``extend`` returns None (the caller runs SGLang's forward) for anything the kernels do
 not serve: not an EXTEND / MIXED step (a target verify, a draft extend, DP-relabeled
-decode rows), linear-attention TP > 1, activations other than BF16, a prefill CUDA graph
-(breakable or full) or a captured prefill bucket, CP row sharding, DP padding rows,
+decode rows), linear-attention TP > 1, activations other than BF16, a full prefill CUDA
+graph or an eager step on a captured bucket's tables, CP row sharding, DP padding rows,
 MIS, a page-major (strided) state pool, and an SGLang prefill kernel other than
 FlashInfer's (its checkpoint plan and track rows are FlashInfer's only then).
+
+Inside a breakable prefill CUDA graph (the executor's prefill body, prefill_graph.py)
+the projections and the norm stay in the captured segment, and the core (conv, gates,
+FlashInfer, track copies) either runs there too, on the bucket's static tables
+(``LinearPrefillView.prefill_graph_metadata`` with FlashInfer's: ``_core_in_graph``),
+or, without them, as a graph break running the eager core on the live batch's rows
+(``prefill_graph.gdn_core``). Tables without FlashInfer's (SGLang's Triton chain) keep
+SGLang's forward.
 """
 
 from __future__ import annotations
@@ -118,6 +126,27 @@ SGLANG_READS = {
         "mis_metadata",
         "prefill_graph_metadata",
         "_split_prefill_qkv",
+        "forward_extend",
+    ),
+    "srt/kernel_plugins/nvidia/eagle_binding.py": ("prefill_graph_metadata",),
+    "srt/layers/attention/linear/gdn_prefill_graph.py": (
+        "GDN_CHUNK_SIZE",
+        "flashinfer",
+        "track",
+        "cu_seqlens",
+        "cache_indices",
+        "has_initial_state",
+        "conv_block_table",
+        "track_mode",
+        "pre_track_mode",
+        "track_h_row",
+        "track_conv_start",
+        "track_dst",
+        "num_logical_tokens",
+    ),
+    "kernels/ops/mamba/gdn_prefill_track.py": (
+        "gdn_track_conv_window",
+        "gdn_track_ssm_state",
     ),
     "srt/layers/attention/hybrid_linear_attn_backend.py": (
         "forward_metadata",
@@ -318,9 +347,10 @@ class _Step:
     ssm_states: torch.Tensor
 
 
-def prepare(gdn, x, fb) -> tuple:
+def prepare(gdn, x, fb, *, graph=False) -> tuple:
     """(reason, None) when the step stays stock, else ('', the _Step). Host state
-    only; nothing is written."""
+    only; nothing is written. ``graph``: a breakable prefill graph's capture, whose
+    rows are the bucket's (the tables or a break take the batch's)."""
     from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
         FlashInferGDNKernel,
     )
@@ -343,12 +373,12 @@ def prepare(gdn, x, fb) -> tuple:
         return f"linear-attention TP{gdn.attn_tp_size}", None
     if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16:
         return "activations are not a BF16 tensor", None
-    if is_in_breakable_cuda_graph() or is_in_full_prefill_graph():
+    if is_in_full_prefill_graph() or (not graph and is_in_breakable_cuda_graph()):
         return "a prefill CUDA graph", None
     if _shards_rows_over_cp(fb):
         return "CP row sharding", None
     real = fb.global_num_token_non_padded_cpu
-    if real is not None and real < x.shape[0]:
+    if not graph and real is not None and real < x.shape[0]:
         return "DP padding rows", None
     backend = linear_backend()
     kernel = backend.kernel_dispatcher.extend_kernel
@@ -356,7 +386,7 @@ def prepare(gdn, x, fb) -> tuple:
         return f"SGLang's GDN prefill kernel is {type(kernel).__name__}", None
     if backend.mis_metadata is not None:
         return "MIS", None
-    if backend.prefill_graph_metadata is not None:
+    if not graph and backend.prefill_graph_metadata is not None:
         return "a captured prefill bucket", None
     cache = backend.state_layer_cache(gdn.attn.layer_id)
     conv_states, ssm_states = cache.conv[0], cache.temporal
@@ -372,17 +402,38 @@ def extend(executor, layer, x, st):
     options = executor.gdn_prefill
     if options is None:
         return None
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
+
     gdn = layer.linear_attn
-    reason, step = prepare(gdn, x, st.fb)
+    graph = is_in_breakable_cuda_graph()
+    reason, step = prepare(gdn, x, st.fb, graph=graph)
     if reason:
         return None
-    out, impl = _forward(options, step, gdn, x, st.fb)
+    core = None
+    if graph:
+        meta = st.view.prefill_graph_metadata
+        if meta is None:
+            from sgl_nvidia_mega.qwen3_8.runtime import prefill_graph
+
+            core = lambda qkv, a, b: prefill_graph.gdn_core(
+                executor, gdn, step, qkv, a, b
+            )
+        elif meta.flashinfer is None:
+            return None  # SGLang's own chain on the bucket's tables
+        else:
+            core = lambda qkv, a, b: _core_in_graph(
+                executor, options, step, gdn.attn, meta, qkv, a, b
+            )
+    out, impl = _forward(options, step, gdn, x, st.fb, core)
     st.ran(OP, impl)
     return out
 
 
-def _forward(options, step, gdn, x, fb):
-    """``Qwen3_5GatedDeltaNet.forward``'s prefill branch; returns (output, impl)."""
+def _forward(options, step, gdn, x, fb, core=None):
+    """``Qwen3_5GatedDeltaNet.forward``'s prefill branch; returns (output, impl).
+    ``core(mixed_qkv, a, b)`` -> ([1, T, HV, V], impl) replaces ``_extend_core``."""
     import triton
     from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
         qwen3_5_gdn_prefill_projection_views,
@@ -401,9 +452,12 @@ def _forward(options, step, gdn, x, fb):
         gdn.head_k_dim,
         gdn.head_v_dim,
     )
-    core, impl = _extend_core(options, step, gdn.attn, fb, mixed_qkv, a, b)
-    # the prefill views' z stays [T, HV, V] (strided); DP padding was declined, so the
-    # core has z's rows
+    if core is None:
+        core, impl = _extend_core(options, step, gdn.attn, fb, mixed_qkv, a, b)
+    else:
+        core, impl = core(mixed_qkv, a, b)
+    # the prefill views' z stays [T, HV, V] (strided); DP padding was declined (a
+    # graph's core has the bucket's rows), so the core has z's rows
     z_shape = z.shape
     core = core.reshape(-1, core.shape[-1])
     norm = gdn.norm
@@ -425,9 +479,10 @@ def _forward(options, step, gdn, x, fb):
     return bf16_gemm_pins.linear(gdn.out_proj, core), impl
 
 
-def _extend_core(options, step, layer, fb, mixed_qkv, a, b):
+def _extend_core(options, step, layer, fb, mixed_qkv, a, b, output=None):
     """``GDNAttnBackend.forward_extend``'s eager non-verify branch on a contiguous pool
-    with FlashInfer's prefill kernel; returns ([1, T, HV, V], impl)."""
+    with FlashInfer's prefill kernel; returns ([1, T, HV, V], impl), in ``output``
+    when given."""
     from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear.gdn_prefill_flashinfer import (
         extend as flashinfer_extend,
     )
@@ -512,6 +567,7 @@ def _extend_core(options, step, layer, fb, mixed_qkv, a, b):
         fused_rows=fused_rows,
         l2norm_retile=options.l2norm_retile,
         qk_one_launch=options.qk_l2norm_one_launch,
+        output=output,
     )
     if track and not (options.fused_track and _fused_track_states(md, h, ssm_states)):
         track_fused = False
@@ -522,6 +578,135 @@ def _extend_core(options, step, layer, fb, mixed_qkv, a, b):
     if track:
         impl.append("track_fused" if track_fused else "track")
     return core_attn_out, "+".join(impl)
+
+
+def core_rows(options, step, gdn, fb, mixed_qkv, a, b, output) -> str:
+    """The eager core of a breakable prefill graph's break (``prefill_graph.gdn_core``)
+    on the live batch's rows, into ``output`` [1, rows, HV, V]; returns the impl."""
+    if step.backend.mis_metadata is not None:
+        # SGLang's MIS extend, as the eager step declines to the stock forward
+        output.copy_(step.backend.forward_extend(gdn.attn, fb, mixed_qkv, a, b))
+        return "mis_stock"
+    return _extend_core(options, step, gdn.attn, fb, mixed_qkv, a, b, output=output)[1]
+
+
+def _core_in_graph(executor, options, step, layer, meta, mixed_qkv, a, b):
+    """``_extend_core`` inside a breakable prefill graph on the bucket's static tables
+    (SGLang's ``GDNPrefillGraphMetadata`` with FlashInfer's): every launch grid from the
+    bucket, the state updated in place by slot, the prefix-cache snapshots from the
+    64-token state checkpoints. Returns ([1, T, HV, V], impl)."""
+    from sglang.kernels.ops.mamba.gdn_prefill_track import (
+        gdn_track_conv_window,
+        gdn_track_ssm_state,
+    )
+    from sglang.srt.layers.attention.linear.gdn_prefill_graph import GDN_CHUNK_SIZE
+
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear.gdn_prefill_flashinfer import (
+        extend_in_graph,
+    )
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear.gdn_prefill_gating import (
+        fused_gdn_gating,
+    )
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba.gdn_prefill_conv import (
+        causal_conv1d_fn,
+        causal_conv1d_fn_split_qkv,
+    )
+
+    conv_states, ssm_states = step.conv_states, step.ssm_states
+    tables, rows = meta.flashinfer, mixed_qkv.shape[0]
+    if meta.track:
+        # the conv windows before the conv updates the cache
+        gdn_track_conv_window(
+            conv_pool=conv_states,
+            x=mixed_qkv,
+            track_mode=meta.track_mode,
+            track_conv_start=meta.track_conv_start,
+            track_dst=meta.track_dst,
+            num_tokens=meta.num_logical_tokens,
+        )
+    conv_kwargs = dict(
+        conv_states=conv_states,
+        query_start_loc=meta.cu_seqlens,
+        seq_lens_cpu=None,
+        activation=layer.activation,
+        has_initial_state=meta.has_initial_state,
+        cache_indices=meta.cache_indices,
+        block_table=meta.conv_block_table,
+    )
+    if options.split_conv and _split_conv_ok(layer, mixed_qkv):
+        conv = "conv_split"
+        q, k, v = causal_conv1d_fn_split_qkv(
+            mixed_qkv.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
+            q_dim=layer.q_dim,
+            k_dim=layer.k_dim,
+            **conv_kwargs,
+        )
+        query, key, value = _split_conv_views(layer, q, k, v)
+    else:
+        conv = "conv"
+        mixed_qkv = causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1), layer.conv_weights, layer.bias, **conv_kwargs
+        ).transpose(0, 1)[:rows]
+        query, key, value = step.backend._split_prefill_qkv(layer, mixed_qkv)
+    g, beta = fused_gdn_gating(
+        layer.A_log, a, b, layer.dt_bias, gating_2d=options.gating_2d
+    )
+    if meta.track:
+        # a chunk-0 snapshot is the initial state, which the kernel overwrites
+        gdn_track_ssm_state(
+            ssm_pool=ssm_states,
+            h=ssm_states.unsqueeze(0),
+            track_mode=tables.pre_track_mode,
+            track_h_row=tables.track_h_row,
+            track_dst=meta.track_dst,
+            cache_indices=meta.cache_indices,
+        )
+    output = _graph_output(executor, value)
+    checkpoints = extend_in_graph(
+        step.kernel,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        ssm_states=ssm_states,
+        tables=tables,
+        output=output,
+        checkpoint_rows=rows // GDN_CHUNK_SIZE if meta.track else 0,
+        checkpoint_every_n_tokens=GDN_CHUNK_SIZE,
+        l2norm_retile=options.l2norm_retile,
+        qk_one_launch=options.qk_l2norm_one_launch,
+    )
+    if meta.track:
+        # buckets under 64 tokens have no checkpoints, only final-state rows
+        gdn_track_ssm_state(
+            ssm_pool=ssm_states,
+            h=checkpoints if checkpoints is not None else ssm_states.unsqueeze(0),
+            track_mode=tables.track_mode,
+            track_h_row=tables.track_h_row,
+            track_dst=meta.track_dst,
+            cache_indices=meta.cache_indices,
+        )
+    impl = ["graph", conv, "fi_tmem" if _tmem_fixed else "fi"]
+    if meta.track:
+        impl.append("track")
+    return output.view(1, rows, *output.shape[1:]), "+".join(impl)
+
+
+def _graph_output(executor, value: torch.Tensor) -> torch.Tensor:
+    """The [rows, HV, V] core output every captured bucket and GDN layer share,
+    allocated (zero) outside the graph pool by a capture's warmup; the FlashInfer
+    calls write only the batch's rows, so the rest keep finite values."""
+    rows, outputs = value.shape[1], executor.gdn_graph_outputs
+    if not outputs or outputs[0].shape[0] < rows:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("GDN prefill graph output not allocated before capture")
+        # graphs captured on a smaller one keep it
+        shape = (rows, *value.shape[2:])
+        outputs.insert(0, value.new_zeros(shape))
+    return outputs[0][:rows]
 
 
 def _split_conv_ok(layer, mixed_qkv: torch.Tensor) -> bool:

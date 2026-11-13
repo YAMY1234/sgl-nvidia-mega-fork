@@ -37,6 +37,9 @@ class StepState:
         self.binding = binding
         self.engagement = engagement  # per-op implementation record of this step
         self.ple_batch = None
+        # a prefill body inside a breakable prefill graph's capture (or its warmup):
+        # what reads the batch's host state runs as a graph break (prefill_graph.py)
+        self.graph = False
         self.scratch: dict[str, Any] = {}
 
     def ran(self, op: str, impl: str) -> None:

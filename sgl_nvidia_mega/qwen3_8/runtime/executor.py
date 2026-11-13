@@ -13,6 +13,13 @@ draft-extend steps (in the draft's graphs) and prefill / extend steps (eager). I
 declines idle batches, embedding calls and pipeline-parallel proxies, which run the
 model's own forward.
 
+With breakable prefill CUDA graphs (``prefill_graph``: SGLang's ``SupportsPrefillBody``)
+the prefill step of the target and of the MTP draft calls the layer module's forward
+(``Qwen4ExpVLModel.forward``, the draft's ``Qwen4ExpModel.forward``), which SGLang
+routes to ``plan_body`` / ``forward_body`` (the layer loop below) and a breakable
+prefill graph captures per token bucket and replays; the ops that read the batch's host
+state run there as graph breaks (``prefill_graph.py``).
+
 ``Qwen3_8Executor.forward`` takes and returns what the replaced forward does. It runs
 the layer loop itself from the executor's step functions, never through a model-level
 or decoder-layer ``forward``:
@@ -86,6 +93,7 @@ SGLANG_READS = {
         "ple_ngram_eos_token_id",
         "last_hc_hidden_states",
         "residual_batch",
+        "forward(inputs_embeds)",
     ),
     "srt/models/qwen3_5.py": ("linear_attn",),
     "srt/models/qwen4_exp_mtp.py": (
@@ -187,6 +195,10 @@ class Qwen3_8Executor:
         self.smallm_gemm = None
         # SGLANG_FLASHINFER_TACTIC_PIN_FILE's MoE table applies, set by build
         self.moe_pins = False
+        # set by build: the prefill body runs in breakable prefill graphs
+        self.prefill_graph = False
+        # gdn_prefill's in-graph core outputs, newest first (gdn_prefill._graph_output)
+        self.gdn_graph_outputs = []
         self._pools_checked = False
         self.mixers = {
             i: (
@@ -233,7 +245,8 @@ class Qwen3_8Executor:
         elif mode.is_draft_extend_v2():
             name = "draft_extend" if self.draft else None
         elif mode.is_extend_or_draft_extend_or_mixed():
-            if is_in_breakable_cuda_graph():
+            # a breakable prefill graph's replay runs the outer step eagerly around it
+            if is_in_breakable_cuda_graph() and not self.prefill_graph:
                 return None
             return Step(mode="prefill", rows=rows)
         else:
@@ -246,6 +259,93 @@ class Qwen3_8Executor:
                 )
             return None
         return Step(mode=name, rows=rows)
+
+    def plan_body(
+        self,
+        input_ids,
+        forward_batch,
+        input_embeds=None,
+        pp_proxy_tensors=None,
+        input_deepstack_embeds=None,
+        inputs_embeds=None,
+        **kwargs,
+    ):
+        """SupportsPrefillBody: a "prefill" step for the layer module's forward of an
+        extend / mixed batch, as ``plan`` covers it but captured or replayed in a
+        breakable prefill graph too; None (the module's own forward) otherwise. Host
+        state only: a captured bucket replays the decision made at its capture. The
+        draft's layer module names its embeddings ``inputs_embeds``."""
+        from sglang.srt.models.qwen4_exp import _shards_rows_over_cp
+
+        mode = forward_batch.forward_mode
+        if (
+            not self.prefill_graph
+            or kwargs
+            or (inputs_embeds is not None and not self.draft)
+            or pp_proxy_tensors is not None
+            or input_deepstack_embeds is not None
+            or mode.is_idle()
+            or mode.is_target_verify()
+            or mode.is_decode()
+            or mode.is_draft_extend_v2()
+            or not mode.is_extend_or_draft_extend_or_mixed()
+            or _shards_rows_over_cp(forward_batch)
+        ):
+            return None
+        ids = input_ids if input_ids is not None else forward_batch.input_ids
+        return Step(mode="prefill", rows=int(ids.shape[0]))
+
+    @torch.no_grad()
+    def forward_body(
+        self,
+        step,
+        original,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        pp_proxy_tensors=None,
+        input_deepstack_embeds=None,
+        inputs_embeds=None,
+        **kwargs,
+    ):
+        """SupportsPrefillBody: ``Qwen4ExpVLModel.forward`` for a planned prefill body,
+        the layer loop on ``input_embeds`` (a capture's static slot); sets
+        ``last_hc_hidden_states`` and returns the mixed hidden rows. The draft's:
+        ``Qwen4ExpModel.forward`` on the MTP streams (``inputs_embeds``), returning
+        the mixed hidden rows and the HC streams."""
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            is_in_breakable_cuda_graph,
+        )
+
+        m = self.lm.model
+        if inputs_embeds is not None:
+            input_embeds = inputs_embeds
+        if not self.draft:
+            m.last_hc_hidden_states = None
+        if input_ids is None:
+            input_ids = forward_batch.input_ids
+        st = StepState(
+            lm=self.lm,
+            step=step,
+            forward_batch=forward_batch,
+            positions=positions,
+            input_ids=input_ids,
+            slots=self.slots,
+            binding=self.binding,
+            engagement=self.engagement,
+        )
+        # Eager, the outer prefill step records it; a capture (or its warmup) alone.
+        st.graph = is_in_breakable_cuda_graph()
+        if st.graph:
+            self.engagement.begin()
+        hidden, hc_hidden = self._language_model(st, input_ids, input_embeds)
+        if st.graph:
+            self.engagement.end(step.mode, step.rows)
+        if self.draft:
+            return hidden, hc_hidden
+        m.last_hc_hidden_states = hc_hidden
+        return hidden
 
     def forward(
         self, step, original, input_ids, positions, forward_batch, *args, **kwargs
@@ -376,8 +476,20 @@ class Qwen3_8Executor:
         if ids is None:
             ids = fb.input_ids
         st.ran("embed", STOCK)
-        hidden, hc_hidden = self._language_model(st, ids, embeds)
-        lm.model.last_hc_hidden_states = hc_hidden
+        if self.prefill_graph and st.step.mode == "prefill":
+            from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+                is_in_breakable_cuda_graph,
+            )
+
+            # Through the attribute: SGLang's body dispatch (plan_body), or a breakable
+            # prefill graph's replay of the captured body, which restores the streams.
+            hidden = lm.model.forward(ids, st.positions, fb, input_embeds=embeds)
+            hc_hidden = lm.model.last_hc_hidden_states
+            if is_in_breakable_cuda_graph():
+                st.ran("layers", "prefill_graph")
+        else:
+            hidden, hc_hidden = self._language_model(st, ids, embeds)
+            lm.model.last_hc_hidden_states = hc_hidden
         logits = bf16_gemm_pins.logits_processor(lm.logits_processor)
         out = logits(st.input_ids, hidden, lm.lm_head, fb, None)
         st.ran("logits", STOCK)
@@ -390,6 +502,9 @@ class Qwen3_8Executor:
         from sglang.srt.eplb.expert_distribution import (
             get_global_expert_distribution_recorder,
         )
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            is_in_breakable_cuda_graph,
+        )
 
         lm, fb = st.lm, st.fb
         embeds = lm._prepare_input_embeds(st.input_ids, fb, None)
@@ -397,7 +512,16 @@ class Qwen3_8Executor:
         streams = lm._mtp_input_fusion(embeds, fb.spec_info.hidden_states)
         st.ran("mtp_fusion", STOCK)
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden, hc_hidden = self._language_model(st, st.input_ids, streams)
+            if self.prefill_graph and st.step.mode == "prefill":
+                # Through the attribute, as _target: SGLang's body dispatch, or a
+                # breakable prefill graph's replay of the captured body.
+                hidden, hc_hidden = lm.model.forward(
+                    st.input_ids, st.positions, fb, streams
+                )
+                if is_in_breakable_cuda_graph():
+                    st.ran("layers", "prefill_graph")
+            else:
+                hidden, hc_hidden = self._language_model(st, st.input_ids, streams)
         logits = bf16_gemm_pins.logits_processor(lm.logits_processor)
         out = logits(st.input_ids, hidden, lm.lm_head, fb)
         st.ran("logits", STOCK)
@@ -417,8 +541,14 @@ class Qwen3_8Executor:
         m, fb = st.model, st.fb
         hidden = inputs_embeds if inputs_embeds is not None else m.embed_tokens(input_ids)
         residual_batch.start(fb)
+        if st.graph:
+            from sgl_nvidia_mega.qwen3_8.runtime import prefill_graph
         if m.has_ple:
-            st.ple_batch = ple.prepare(st, input_ids, options=self.ple_options)
+            st.ple_batch = (
+                prefill_graph.ple_prepare(self, input_ids, st)
+                if st.graph
+                else ple.prepare(st, input_ids, options=self.ple_options)
+            )
         recorder = get_global_expert_distribution_recorder()
         normalized_input = None
         for i in range(m.start_layer, m.end_layer):
@@ -426,7 +556,9 @@ class Qwen3_8Executor:
             next_norm = None
             if i + 1 < m.end_layer:
                 next_layer = m.layers[i + 1]
-                if next_layer.ple is not None:
+                if next_layer.ple is not None and st.graph:
+                    prefill_graph.ple_prefetch(self, next_layer, st)
+                elif next_layer.ple is not None:
                     ple.prefetch(next_layer, st.ple_batch, st, options=self.ple_options)
                 else:
                     next_norm = next_layer.attn_hyper_connection.hc_norm
@@ -453,7 +585,10 @@ class Qwen3_8Executor:
             normalized_input = norms.output
             if self.parity is not None:
                 self.parity.record_layer(i, hidden)
-        ple.commit(st.ple_batch, st)
+        if st.graph and m.has_ple:
+            prefill_graph.ple_commit(self, st)
+        else:
+            ple.commit(st.ple_batch, st)
         hc_hidden = hidden
         mixer = bf16_gemm_pins.MixStreams if bf16_gemm_pins.routed() else _MixStreams
         mix = mixer(m.hyper_connection_mixer, normalized_input)
@@ -479,6 +614,14 @@ class Qwen3_8Executor:
         st.ran("moe+hc.ffn", STOCK)
         return hidden
 
+    def _ple_add(self, layer, streams, st):
+        """``ple.add`` on the layer's streams; a graph break in a prefill graph."""
+        if st.graph:
+            from sgl_nvidia_mega.qwen3_8.runtime import prefill_graph
+
+            return prefill_graph.ple_add(self, layer, streams, st)
+        return ple.add(layer, streams, st.ple_batch, st, options=self.ple_options)
+
     def _layer_streams(self, i, layer, streams, st):
         """S1: the decoder layer on the HC streams, at TP1. The stage boundaries
         there apply the attention write-back at the FFN read and the FFN
@@ -495,7 +638,7 @@ class Qwen3_8Executor:
         use_hc = self.hc_ready and rows <= hc.MAX_ROWS
         if layer.ple is not None:
             # _attn_mix's PLE add, then its read of the changed streams
-            streams = ple.add(layer, streams, st.ple_batch, st, options=self.ple_options)
+            streams = self._ple_add(layer, streams, st)
             x, (res, normed, partials) = bf16_gemm_pins.gated_mix(
                 layer.attn_hyper_connection, streams, None
             )
@@ -552,7 +695,7 @@ class Qwen3_8Executor:
         mixed = st.scratch.pop("hc.mixed", None)
         normalized = norms.attn_input
         if layer.ple is not None:
-            streams = ple.add(layer, streams, st.ple_batch, st, options=self.ple_options)
+            streams = self._ple_add(layer, streams, st)
             # the PLE embedding changed the streams after the last write-back
             normalized = carried = None
         if mixed is not None:

@@ -2386,6 +2386,9 @@ class _Stream:
         self.log.append(f"{self.name} waits {other.name}")
 
 
+SEL = ("select", None, None)  # slot qsa_indexer's select, with no step or projection
+
+
 class TestQsaIndexerStreams(unittest.TestCase):
     """The source's streams for a decomposed QSA step's indexer
     (``attention._qkv_and_indices``): under capture, not in a breakable graph and below
@@ -2394,7 +2397,7 @@ class TestQsaIndexerStreams(unittest.TestCase):
     runs on the main stream."""
 
     SIDE = [
-        "alt waits main", "qkv", "enter alt", ("select",), "exit alt",
+        "alt waits main", "qkv", "enter alt", SEL, "exit alt",
         "main waits alt", "record main", "attn",
     ]
 
@@ -2473,7 +2476,7 @@ class TestQsaIndexerStreams(unittest.TestCase):
         self.assertIn(("qsa.index_stream", "side"), ran)
         # SGLang's indexer (slot qsa_indexer off) takes the same streams
         log, ran = self.run_step(indexer=False)
-        self.assertEqual(log, [s if s != ("select",) else "sglang" for s in self.SIDE])
+        self.assertEqual(log, [s if s != SEL else "sglang" for s in self.SIDE])
         self.assertIn(("qsa.indexer", "stock"), ran)
 
     def test_draft_extend_and_decode_take_the_side_stream(self):
@@ -2483,7 +2486,7 @@ class TestQsaIndexerStreams(unittest.TestCase):
             self.assertIn(("qsa.index_stream", "side"), ran)
         # a draft extend without slot qsa_indexer: SGLang's indexer and the seed capture
         log, _ = self.run_step(_Mode.DRAFT_EXTEND_V2, indexer=False, glue="glue")
-        want = [s if s != ("select",) else "draft_indices" for s in self.SIDE]
+        want = [s if s != SEL else "draft_indices" for s in self.SIDE]
         self.assertEqual(log, want)
 
     def test_main_stream_outside_the_overlap(self):
@@ -2494,7 +2497,7 @@ class TestQsaIndexerStreams(unittest.TestCase):
             dict(alt=False),
         ):
             log, ran = self.run_step(**kw)
-            self.assertEqual(log, ["qkv", ("select",), "attn"], kw)
+            self.assertEqual(log, ["qkv", SEL, "attn"], kw)
             self.assertNotIn("qsa.index_stream", dict(ran), kw)
 
     def test_early_indexer(self):
@@ -2510,7 +2513,7 @@ class TestQsaIndexerStreams(unittest.TestCase):
         self.assertEqual(
             log,
             [
-                "alt waits main", "enter alt", ("select",), "exit alt", "qkv",
+                "alt waits main", "enter alt", SEL, "exit alt", "qkv",
                 "main waits alt", "record main", "attn",
             ],
         )
@@ -2529,7 +2532,126 @@ class TestQsaIndexerStreams(unittest.TestCase):
             self.assertIn(("qsa.index_stream", "side"), ran)
         # eager: no side stream, so no early indexer
         log, _ = self.run_step(patches=(early, cuda), capture=False, **kw)
-        self.assertEqual(log, ["qkv", ("select",), "attn"])
+        self.assertEqual(log, ["qkv", SEL, "attn"])
+
+    def pdl_step(self, mode=_Mode.TARGET_VERIFY, rows=8, *, frontier=("node",),
+                 prepared=True, backend="cutedsl", quant=None, env=True,
+                 dtype=torch.bfloat16, **kw):
+        """A step with Q38_QSA_PDL_INDEX's conditions met unless changed."""
+        from sgl_nvidia_mega.qwen3_8.runtime import attention, bf16_gemm_pins, capture_fork
+
+        class Unquant:
+            pass
+
+        projection = SimpleNamespace(
+            quant_method=(quant or Unquant)(),
+            weight=torch.empty(640, 2560, dtype=torch.bfloat16),
+        )
+        fused = kw.pop("fused", True)
+        layer_kw = kw.pop("layer_kw", {})
+        layer_kw.setdefault(
+            "indexer",
+            SimpleNamespace(index_qk_proj=projection, _use_fused_prep=lambda x: fused),
+        )
+        unquant = types.ModuleType("sglang.srt.layers.quantization.unquant")
+        unquant.UnquantizedLinearMethod = Unquant
+        unquant.get_bf16_gemm_backend = lambda: SimpleNamespace(
+            is_cutedsl=lambda: backend == "cutedsl"
+        )
+        # the source's split-K table at (N, K) = (640, 2560): M 1-4 and 8
+        unquant.use_bf16_splitk_gemm = lambda m, n, k: (
+            (n, k) == (640, 2560) and m in (1, 2, 3, 4, 8)
+        )
+        self.step = SimpleNamespace(rows=rows)
+        kernels = SimpleNamespace(
+            prepare=lambda layer, x, positions, fb: self.log.append("prepare")
+            or (self.step if prepared else None)
+        )
+        self.projected = []
+
+        def linear(module, x):
+            if module is not projection:
+                return module(x)[0]
+            self.log.append(("index_qk", x.shape[0]))
+            self.projected.append(_Indices(self.log))
+            return self.projected[-1]
+
+        patches = (
+            (attention, "QSA_PDL_INDEX", env),
+            (torch.Tensor, "is_cuda", property(lambda t: True)),
+            (bf16_gemm_pins, "linear", linear),
+            (
+                capture_fork,
+                "projection_frontier",
+                lambda s: self.log.append(f"frontier {s.name}") or frontier,
+            ),
+            (
+                capture_fork,
+                "fork_after_projection",
+                lambda s, nodes: self.log.append((f"{s.name} after", nodes)),
+            ),
+        )
+        with mock.patch.dict(sys.modules, {unquant.__name__: unquant}):
+            return self.run_step(
+                mode, rows, patches=patches, layer_kw=layer_kw, dtype=dtype,
+                indexer=kw.pop("indexer", kernels), **kw
+            )
+
+    def test_pdl_index_projects_on_the_main_stream(self):
+        """Q38_QSA_PDL_INDEX: index_qk_proj before the QKV on the main stream, no event
+        between them; the side stream depends on the projection's completion only and
+        runs the rest of the indexer on it."""
+        for mode, rows in (
+            (_Mode.TARGET_VERIFY, 4),
+            (_Mode.TARGET_VERIFY, 8),
+            (_Mode.DRAFT_EXTEND_V2, 8),
+        ):
+            log, ran = self.pdl_step(mode, rows)
+            (qk,) = self.projected
+            self.assertEqual(
+                log,
+                [
+                    "prepare", ("index_qk", rows), "frontier main", "qkv",
+                    "alt waits main", ("alt after", ("node",)), "enter alt",
+                    ("select", self.step, qk), "exit alt", "record alt",
+                    "main waits alt", "record main", "attn",
+                ],
+                (mode, rows),
+            )
+            self.assertIn(("qsa.index_stream", "pdl_index"), ran)
+        # not capturing (a warmup): the side stream waits for the whole QKV
+        log, _ = self.pdl_step(frontier=None)
+        self.assertNotIn(("alt after", None), log)
+        self.assertEqual(
+            log[:6],
+            ["prepare", ("index_qk", 8), "frontier main", "qkv", "alt waits main",
+             "enter alt"],
+        )
+
+    def test_pdl_index_declines_to_the_side_stream(self):
+        prepared = ["prepare"] + self.SIDE
+        for name, kw, want in (
+            ("off", dict(env=False), self.SIDE),
+            ("decode", dict(mode=_Mode.DECODE), self.SIDE),
+            ("float32", dict(dtype=torch.float32), self.SIDE),
+            ("no gate", dict(layer_kw=dict(attn_output_gate=False)), self.SIDE),
+            ("plugin indexer declines", dict(prepared=False), prepared),
+            ("12 rows: no split-K", dict(rows=12), prepared),
+            ("20 rows", dict(rows=20), prepared),
+            ("not CuTe DSL", dict(backend="cublas"), prepared),
+            ("quantized", dict(quant=object), prepared),
+            ("unfused prep", dict(fused=False), prepared),
+        ):
+            log, ran = self.pdl_step(**kw)
+            self.assertEqual(log, want, name)
+            self.assertIn(("qsa.index_stream", "side"), ran)
+            self.assertEqual(self.projected, [], name)
+        # SGLang's indexer takes no projection
+        log, _ = self.pdl_step(indexer=False)
+        self.assertEqual(log, [s if s != SEL else "sglang" for s in self.SIDE])
+        # eager: no overlap, no projection
+        log, _ = self.pdl_step(capture=False)
+        self.assertEqual(log, ["qkv", SEL, "attn"])
 
     def test_draft_decode_glue_keeps_the_main_stream(self):
         out = torch.zeros(8, 6144)
@@ -2539,7 +2661,7 @@ class TestQsaIndexerStreams(unittest.TestCase):
         self.assertEqual((log, packs), (["qkv"], ["pack"]))  # no indexer, no fork
         glue.decode = lambda *a: packs.append("pack")  # declines: SGLang's lookup
         log, ran = self.run_step(_Mode.DECODE, glue=glue)
-        self.assertEqual(log, ["qkv", ("select",), "attn"])
+        self.assertEqual(log, ["qkv", SEL, "attn"])
         self.assertNotIn("qsa.index_stream", dict(ran))
 
 

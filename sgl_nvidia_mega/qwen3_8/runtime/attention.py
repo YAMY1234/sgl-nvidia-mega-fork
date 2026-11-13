@@ -56,6 +56,11 @@ def _env_bool(name: str) -> bool:
 # The source's switches of its QSA self_attention (qwen4_exp.py), read as it reads them.
 # Q38_QSA_EARLY_INDEXER: the side-stream indexer is enqueued before the QKV
 QSA_EARLY_INDEXER = _env_bool("Q38_QSA_EARLY_INDEXER")
+# Q38_QSA_PDL_INDEX: a 1-16 row verify / draft extend projects the index Q/K on the main
+# stream before the QKV; only the rest of the indexer forks to the side stream
+QSA_PDL_INDEX = _env_bool("Q38_QSA_PDL_INDEX")
+# The index projection's (N, K) the source's PDL_INDEX branch takes
+INDEX_QK_SHAPE = (640, 2560)
 # Test only: on eager steps, also run SGLang's attention on the same q/k/v and selected
 # indices and log how far the pool kernel's output is from it, per row.
 OPCHECK = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_OPCHECK") == "1"
@@ -125,7 +130,14 @@ SGLANG_READS = {
         "prefetch_cp_kv",
     ),
     "srt/layers/attention/qsa/config.py": ("budget", "block_topk"),
-    "srt/layers/attention/qsa/qsa_indexer.py": ("_use_fused_prep",),
+    "srt/layers/attention/qsa/qsa_indexer.py": ("_use_fused_prep", "index_qk_proj"),
+    "srt/layers/quantization/unquant.py": (
+        "UnquantizedLinearMethod",
+        "get_bf16_gemm_backend",
+        "is_cutedsl",
+        "use_bf16_splitk_gemm",
+    ),
+    "srt/layers/linear.py": ("quant_method", "weight"),
     "srt/layers/attention/qsa/metadata.py": ("is_cuda_graph",),
     "srt/mem_cache/kv/router.py": ("layer", "read", "key", "value"),
 }
@@ -386,11 +398,55 @@ def _overlap_indexer(layer, x) -> bool:
     )
 
 
+def _pdl_index_projection(executor, layer, x, positions, fb):
+    """Q38_QSA_PDL_INDEX's branch of ``self_attention``: (slot qsa_indexer's step, the
+    step's rows of ``index_qk_proj`` launched here on the current stream) where the
+    projection is the native BF16 split-K of 1-16 rows, else (None, None). The step
+    hands the projection to the plugin's indexer (SGLang's takes none)."""
+    mode = fb.forward_mode
+    kernels = executor.qsa_indexer
+    if not (
+        QSA_PDL_INDEX
+        and kernels is not None
+        and layer.attn_output_gate
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and (mode.is_target_verify() or mode.is_draft_extend_v2())
+    ):
+        return None, None
+    step = kernels.prepare(layer, x, positions, fb)
+    if step is None:
+        return None, None
+    from sglang.srt.layers.quantization.unquant import (
+        UnquantizedLinearMethod,
+        get_bf16_gemm_backend,
+        use_bf16_splitk_gemm,
+    )
+
+    rows = step.rows
+    projection = layer.indexer.index_qk_proj
+    if not (
+        0 < rows <= 16
+        and rows <= x.shape[0]
+        and layer.indexer._use_fused_prep(x)
+        and isinstance(projection.quant_method, UnquantizedLinearMethod)
+        and projection.weight.dtype == torch.bfloat16
+        and tuple(projection.weight.shape) == INDEX_QK_SHAPE
+        # SGLang enables its BF16 split-K with the CuTe DSL backend
+        and get_bf16_gemm_backend().is_cutedsl()
+        and use_bf16_splitk_gemm(rows, *INDEX_QK_SHAPE)
+    ):
+        return None, None
+    return step, bf16_gemm_pins.linear(projection, x[:rows])
+
+
 def _qkv_and_indices(executor, layer, x, st, indices):
     """``self_attention`` up to its attention call, in its order and streams: (q, k, v,
-    gate, top-k indices), ``indices()`` running the indexer. Where the source overlaps
-    it, the indexer runs on the layer's side stream beside the QKV / gate projection
-    and the current stream joins it before the attention."""
+    gate, top-k indices), ``indices(step, projected_qk)`` running the indexer. Where the
+    source overlaps it, the indexer runs on the layer's side stream beside the QKV /
+    gate projection and the current stream joins it before the attention; with
+    Q38_QSA_PDL_INDEX the index projection stays on the current stream before the QKV
+    and the side stream depends on its completion only."""
     fb, positions = st.fb, st.positions
     overlap = _overlap_indexer(layer, x)
     early = (
@@ -401,33 +457,52 @@ def _qkv_and_indices(executor, layer, x, st, indices):
         and x.dtype == torch.bfloat16
         and layer.indexer._use_fused_prep(x)
     )
+    step = projected_qk = nodes = None
     if overlap:
         # the indexer reads only hidden_states / positions and writes QSA-private buffers
         current = torch.cuda.current_stream()
-        layer.alt_stream.wait_stream(current)
-        if early:
+        step, projected_qk = _pdl_index_projection(executor, layer, x, positions, fb)
+        if projected_qk is not None:
+            from sgl_nvidia_mega.qwen3_8.runtime import capture_fork
+
+            nodes = capture_fork.projection_frontier(current)
+        else:
+            layer.alt_stream.wait_stream(current)
+        if early and projected_qk is None:
             with torch.cuda.stream(layer.alt_stream):
                 topk = indices()
     q, k, v, gate = _qkv_gate(layer, x, positions, fb)
     if not overlap:
         return q, k, v, gate, indices()
-    if not early:
+    if projected_qk is not None:
+        # No event between the projection and the QKV keeps their PDL chain. Outside a
+        # capture (no frontier) the side stream waits for the whole QKV instead.
+        layer.alt_stream.wait_stream(current)
+        if nodes is not None:
+            capture_fork.fork_after_projection(layer.alt_stream, nodes)
         with torch.cuda.stream(layer.alt_stream):
-            topk = indices()
+            topk = indices(step, projected_qk)
+        projected_qk.record_stream(layer.alt_stream)
+        impl = "pdl_index"
+    else:
+        if not early:
+            with torch.cuda.stream(layer.alt_stream):
+                topk = indices()
+        impl = "side_early" if early else "side"
     current.wait_stream(layer.alt_stream)
     # allocated on the side stream, read by the attention on this one
     topk.record_stream(current)
-    st.ran(INDEX_STREAM, "side_early" if early else "side")
+    st.ran(INDEX_STREAM, impl)
     return q, k, v, gate, topk
 
 
-def _indices(executor, layer, x, positions, st):
+def _indices(executor, layer, x, positions, st, step=None, projected_qk=None):
     """``layer._compute_qsa_topk_indices``: slot qsa_indexer's ``select`` where it is
-    on, else SGLang's."""
+    on (with Q38_QSA_PDL_INDEX's step and projection), else SGLang's."""
     if executor.qsa_indexer is not None:
         from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
 
-        return qsa_indexer.select(executor, layer, x, positions, st)
+        return qsa_indexer.select(executor, layer, x, positions, st, step, projected_qk)
     st.ran("qsa.indexer", STOCK)
     return layer._compute_qsa_topk_indices(x, positions, st.fb)
 
@@ -448,7 +523,11 @@ def _decomposed(executor, layer, x, st):
         indices = _indices(executor, layer, x, positions, st)
     else:
         q, k, v, gate, indices = _qkv_and_indices(
-            executor, layer, x, st, lambda: _indices(executor, layer, x, positions, st)
+            executor,
+            layer,
+            x,
+            st,
+            lambda step=None, qk=None: _indices(executor, layer, x, positions, st, step, qk),
         )
     rows = q.shape[0]
     out = None

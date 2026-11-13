@@ -320,6 +320,18 @@ def routed(executor, mlp, x, st):
     return out
 
 
+def fused_from_logits(mlp, x, logits, st):
+    """``routed``'s fused path on router logits the caller computed."""
+    experts = mlp.experts
+    topk_output = mlp.topk(x, logits)
+    out = _fused(experts, x, topk_output)
+    if out is None:
+        st.ran(OP, STOCK)
+        return experts.forward_deferred_finalize(x, topk_output)
+    st.ran(OP, "fused_routing")
+    return out
+
+
 def quantize(mlp, x):
     """The source's ``quantize_nvfp4_routed_input``: SGLang's quant of the routed input on
     the current stream, and the event the routed experts wait for (``deferred``)."""

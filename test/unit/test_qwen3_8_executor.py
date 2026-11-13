@@ -10,6 +10,7 @@ import sys
 import types
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -195,9 +196,9 @@ class TestStepFallbacks(unittest.TestCase):
             moe.step(ex, layer, x, st)
             self.assertEqual(st.ran_ops, [("moe", "stock")])
 
-    def test_moe_routed_before_shared(self):
-        """Eager (not capturing): SGLang's order, the routed experts then the shared
-        expert, then the finalize kernel."""
+    def test_moe_shared_before_routed(self):
+        """Eager (not capturing): the source's order, the shared expert then the routed
+        experts, then the finalize kernel."""
         from sgl_nvidia_mega.qwen3_8.runtime import moe
 
         calls = []
@@ -207,11 +208,21 @@ class TestStepFallbacks(unittest.TestCase):
             "sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.moe_finalize"
         )
 
-        class Kernel:
-            def __getitem__(self, grid):
-                return lambda *a, **k: calls.append("finalize")
+        launches = []
 
-        fin._fused_finalize_gate_sigmoid_mul_add_kernel = Kernel()
+        class Kernel:
+            def __init__(self, name):
+                self.name = name
+
+            def __getitem__(self, grid):
+                def launch(*a, **k):
+                    calls.append("finalize")
+                    launches.append((self.name, grid, k))
+
+                return launch
+
+        fin._fused_finalize_gate_sigmoid_mul_add_kernel = Kernel("rows")
+        fin._fused_finalize_gate_sigmoid_mul_add_chunked_kernel = Kernel("chunked")
         saved = {n: sys.modules.get(n) for n in (runner.__name__, fin.__name__)}
         sys.modules.update({runner.__name__: runner, fin.__name__: fin})
         self.addCleanup(
@@ -243,9 +254,24 @@ class TestStepFallbacks(unittest.TestCase):
         ex = SimpleNamespace(moe_finalize_ready=True, moe_routing=None, smallm_gemm=None)
         layer = SimpleNamespace(mlp=Block())
         st = _St(_Mode.TARGET_VERIFY)
+        self.enterContext(mock.patch.object(moe, "FINALIZE_COLUMN_CHUNK", 1024))
         moe.step(ex, layer, torch.zeros(rows, 2560), st)
-        self.assertEqual(calls, ["routed", "shared", "finalize"])
+        self.assertEqual(calls, ["shared", "routed", "finalize"])
         self.assertEqual(st.ran_ops, [("moe", "finalize_permuted")])
+        # the source's decode-size launch: 16 warps, PDL where supported, and up to 64
+        # rows the (row, 1024-column) grid
+        from sglang.kernels.jit.utils import is_arch_support_pdl
+
+        pdl = is_arch_support_pdl()
+        name, grid, kw = launches[0]
+        self.assertEqual((name, grid), ("chunked", (rows, 3)))
+        self.assertEqual((kw["CHUNK"], kw["num_warps"], kw["USE_PDL"]), (1024, 16, pdl))
+        self.assertEqual(kw.get("launch_pdl", False), pdl)
+        # the recipe's chunk 0 (the source's default): one row a program
+        with mock.patch.object(moe, "FINALIZE_COLUMN_CHUNK", 0):
+            moe.step(ex, layer, torch.zeros(rows, 2560), _St(_Mode.TARGET_VERIFY))
+        name, grid, kw = launches[1]
+        self.assertEqual((name, grid, "CHUNK" in kw), ("rows", (rows,), False))
 
     def test_gdn_stock_outside_verify(self):
         from sgl_nvidia_mega.qwen3_8.runtime import gdn

@@ -21,6 +21,7 @@ SGLang's deferred dual stream; from it on it is the source's extend-size MoE
 from __future__ import annotations
 
 import contextlib
+import os
 
 import torch
 
@@ -32,6 +33,18 @@ HIDDEN, TOP_K = 2560, 10
 # extend order, and a launch capped at 64 registers (3 -> 4 CTAs per SM, same math).
 EXTEND_MIN_ROWS = 1024
 EXTEND_MAX_REGISTERS = 64
+# Below it, the source's launch (fused_moe_finalize_gate_sigmoid_mul_add): its warp rule
+# max(min(next_pow2(ceil(hidden / 256)), 32), 4) at hidden 2560, PDL, and up to 64 rows the
+# (row, chunk-column) grid when the recipe sets the source's column chunk (0: off).
+FINALIZE_NUM_WARPS = 16
+FINALIZE_COLUMN_CHUNK_ENV = "SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK"
+FINALIZE_COLUMN_CHUNK = int(os.environ.get(FINALIZE_COLUMN_CHUNK_ENV) or 0)
+if FINALIZE_COLUMN_CHUNK not in (0, 128, 256, 512, 1024):
+    raise ValueError(
+        f"{FINALIZE_COLUMN_CHUNK_ENV} must be 0 or one of (128, 256, 512, 1024), "
+        f"got {FINALIZE_COLUMN_CHUNK}"
+    )
+FINALIZE_COLUMN_CHUNK_MAX_ROWS = 64
 
 SGLANG_READS = {
     "srt/models/qwen2_moe.py": (
@@ -57,6 +70,7 @@ SGLANG_READS = {
         "top_k",
     ),
     "kernels/jit/utils/__init__.py": ("is_arch_support_pdl",),
+    "srt/batch_invariant_ops/__init__.py": ("is_batch_invariant_mode_enabled",),
 }
 
 
@@ -112,28 +126,65 @@ def step(executor, layer, x, st):
         return mlp(x)
     if rows >= EXTEND_MIN_ROWS:
         return _extend(executor, mlp, x, st)
-    from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
-
-    # SGLang's order (Qwen2MoeSparseMoeBlock.forward_normal_dual_stream): the routed
-    # experts on the current stream; while capturing, the shared expert on the block's
-    # side stream, so it runs beside the routed GEMMs.
     side = _side_stream(mlp)
-    if side is not None:
+    options = executor.moe_routing
+    if side is None:
+        # The source's eager order: the shared expert, then the routed experts.
+        shared = _shared(executor, mlp, x, st)
+        deferred = moe_routing.routed(executor, mlp, x, st)
+        if deferred is None:
+            deferred = _router_experts(mlp, x)
+    else:
+        # The source's forward_normal_dual_stream: on the current stream the routed input's
+        # quant (when the fused routing does not quantize it) and the shared expert; on the
+        # block's side stream the router and the routed experts; then the finalize. Under
+        # slot moe_routing the shared expert waits for the router GEMM, as in the source's
+        # executed graph, so it overlaps the routing and routed GEMMs and the router GEMM is
+        # not delayed by it.
         current = torch.cuda.current_stream()
         side.wait_stream(current)
-    # slot moe_routing: None when it does not take these rows
-    deferred = moe_routing.routed(executor, mlp, x, st)
-    if deferred is None:
-        deferred = _router_experts(mlp, x)
-    with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
-        shared = smallm_gemm.shared_expert(executor, mlp.shared_expert, x, st)
-        if shared is None:
-            shared = _shared_experts(mlp, x)
-        shared = shared.contiguous()
-    if side is not None:
-        shared.record_stream(current)
+        fused = options is not None and moe_routing._takes_fused(options, mlp, x)
+        quant = None
+        if options is not None and not fused and options.prequant_overlap:
+            quant = moe_routing.quantize(mlp, x)
+        if fused or quant is not None:
+            with torch.cuda.stream(side):
+                logits = bf16_gemm_pins.linear(mlp.gate, x)
+                router_done = side.record_event()
+            current.wait_event(router_done)
+            shared = _shared(executor, mlp, x, st)
+            with torch.cuda.stream(side):
+                if fused:
+                    deferred = moe_routing.fused_from_logits(mlp, x, logits, st)
+                else:
+                    deferred = moe_routing.deferred(mlp, x, logits, quant)
+                    st.ran(moe_routing.OP, "prequant")
+        else:
+            shared = _shared(executor, mlp, x, st)
+            with torch.cuda.stream(side):
+                deferred = _router_experts(mlp, x)
         current.wait_stream(side)
-    out = _finalize(mlp, x, shared, deferred, USE_PDL=False, num_warps=8)
+        for t in (
+            deferred.gemm2_out,
+            deferred.expert_weights,
+            deferred.expanded_idx_to_permuted_idx,
+        ):
+            t.record_stream(current)
+    from sglang.kernels.jit.utils import is_arch_support_pdl
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    pdl = is_arch_support_pdl()
+    out = _finalize(
+        mlp,
+        x,
+        shared,
+        deferred,
+        chunk=FINALIZE_COLUMN_CHUNK if rows <= FINALIZE_COLUMN_CHUNK_MAX_ROWS else 0,
+        USE_PDL=pdl,
+        # the source caps the warps at 8 in batch-invariant mode
+        num_warps=8 if is_batch_invariant_mode_enabled() else FINALIZE_NUM_WARPS,
+        **({"launch_pdl": True} if pdl else {}),
+    )
     st.ran("moe", "finalize_permuted")
     return out
 
@@ -185,11 +236,20 @@ def _extend(executor, mlp, x, st):
     return out
 
 
-def _finalize(mlp, x, shared, deferred, **launch):
-    """The finalize kernel on the deferred output, one row a program."""
-    from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.moe_finalize import (
-        _fused_finalize_gate_sigmoid_mul_add_kernel as kernel,
-    )
+def _shared(executor, mlp, x, st):
+    """The ungated shared expert: slot smallm_gemm's where it serves, else SGLang's."""
+    from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
+
+    shared = smallm_gemm.shared_expert(executor, mlp.shared_expert, x, st)
+    if shared is None:
+        shared = _shared_experts(mlp, x)
+    return shared.contiguous()
+
+
+def _finalize(mlp, x, shared, deferred, chunk=0, **launch):
+    """The finalize kernel on the deferred output, one row a program; with ``chunk``,
+    one (row, ``chunk`` columns) a program."""
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise import moe_finalize
 
     rows = x.shape[0]
     top_k = int(deferred.top_k)
@@ -199,7 +259,13 @@ def _finalize(mlp, x, shared, deferred, **launch):
     if top_k != TOP_K or perm.dtype != torch.int32:
         raise RuntimeError(f"moe_finalize: deferred output layout differs (top_k {top_k})")
     out = torch.empty_like(x)
-    kernel[(rows,)](
+    if chunk:
+        kernel = moe_finalize._fused_finalize_gate_sigmoid_mul_add_chunked_kernel
+        grid, launch = (rows, -(-HIDDEN // chunk)), dict(launch, CHUNK=chunk)
+    else:
+        kernel = moe_finalize._fused_finalize_gate_sigmoid_mul_add_kernel
+        grid = (rows,)
+    kernel[grid](
         x.contiguous(),
         mlp.shared_expert_gate.weight.view(-1),
         shared.contiguous(),

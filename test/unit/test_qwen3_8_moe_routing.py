@@ -743,22 +743,54 @@ class TestExtendStep(_Case):
         self.assertNotIn("launch_pdl", launch)
         self.assertEqual(launch["maxnreg"], 64)
 
-    def test_fewer_rows_keep_the_deferred_dual_stream(self):
+    def test_fewer_rows_prequant_on_the_shared_stream(self):
+        # rows the fused routing does not take: the source's prequant on the current
+        # stream before the shared expert, the router and routed experts on the side stream
+        rows = moe.EXTEND_MIN_ROWS - 1
+        with mock.patch.object(mr, "_takes_fused", lambda *a: False):
+            order, launch = self.run_moe(rows=rows)
+        # the shared expert waits for the router GEMM (the source's executed order)
+        self.assertEqual(
+            order[:10],
+            [
+                ("wait", "alt", "current"),
+                ("quant", "current"),
+                ("record_event", "current"),
+                ("gate", "alt"),
+                ("record_event", "alt"),
+                ("wait_event", "current", "alt"),
+                ("shared", "current", False),
+                ("topk",),
+                ("wait_event", "alt", "current"),
+                ("run_moe_core",),
+            ],
+        )
+        self.assertEqual(order[-1], ("finalize", "current", (rows,)))
+        self.assertEqual(self.st.ran_ops[0], (mr.OP, "prequant"))
+
+    def test_fewer_rows_take_the_source_dual_stream(self):
+        # the source's forward_normal_dual_stream at decode sizes: the shared expert on the
+        # current stream, the routed experts on the side stream, the finalize after the join
         rows = moe.EXTEND_MIN_ROWS - 1
         order, launch = self.run_moe(rows=rows, options=None)
         self.assertEqual(
             order,
             [
                 ("wait", "alt", "current"),
-                ("routed", "current", True),
-                ("shared", "alt", False),
-                ("record_stream", (rows, HIDDEN), "current"),
+                ("shared", "current", False),
+                ("routed", "alt", True),
                 ("wait", "current", "alt"),
+                ("record_stream", (rows * TOP_K, HIDDEN), "current"),
+                ("record_stream", (rows, TOP_K), "current"),
+                ("record_stream", (rows * TOP_K,), "current"),
                 ("finalize", "current", (rows,)),
             ],
         )
-        self.assertEqual((launch["USE_PDL"], launch["num_warps"]), (False, 8))
+        # the source's decode-size launch: its warp rule (16) and PDL; one row a program
+        # above 64 rows
+        self.assertEqual((launch["USE_PDL"], launch["num_warps"]), (self.pdl, 16))
         self.assertNotIn("maxnreg", launch)
+        self.assertNotIn("CHUNK", launch)
         self.assertEqual(self.st.ran_ops, [("moe", "finalize_permuted")])
 
 

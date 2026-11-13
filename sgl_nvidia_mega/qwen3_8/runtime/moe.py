@@ -137,22 +137,31 @@ def step(executor, layer, x, st):
     else:
         # The source's forward_normal_dual_stream: on the current stream the routed input's
         # quant (when the fused routing does not quantize it) and the shared expert; on the
-        # block's side stream the router and the routed experts; then the finalize.
+        # block's side stream the router and the routed experts; then the finalize. Under
+        # slot moe_routing the shared expert waits for the router GEMM, as in the source's
+        # executed graph, so it overlaps the routing and routed GEMMs and the router GEMM is
+        # not delayed by it.
         current = torch.cuda.current_stream()
         side.wait_stream(current)
         fused = options is not None and moe_routing._takes_fused(options, mlp, x)
         quant = None
         if options is not None and not fused and options.prequant_overlap:
             quant = moe_routing.quantize(mlp, x)
-        shared = _shared(executor, mlp, x, st)
-        with torch.cuda.stream(side):
-            if fused:
-                deferred = moe_routing.routed(executor, mlp, x, st)
-            elif quant is not None:
+        if fused or quant is not None:
+            with torch.cuda.stream(side):
                 logits = bf16_gemm_pins.linear(mlp.gate, x)
-                deferred = moe_routing.deferred(mlp, x, logits, quant)
-                st.ran(moe_routing.OP, "prequant")
-            else:
+                router_done = side.record_event()
+            current.wait_event(router_done)
+            shared = _shared(executor, mlp, x, st)
+            with torch.cuda.stream(side):
+                if fused:
+                    deferred = moe_routing.fused_from_logits(mlp, x, logits, st)
+                else:
+                    deferred = moe_routing.deferred(mlp, x, logits, quant)
+                    st.ran(moe_routing.OP, "prequant")
+        else:
+            shared = _shared(executor, mlp, x, st)
+            with torch.cuda.stream(side):
                 deferred = _router_experts(mlp, x)
         current.wait_stream(side)
         for t in (

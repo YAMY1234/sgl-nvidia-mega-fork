@@ -749,14 +749,17 @@ class TestExtendStep(_Case):
         rows = moe.EXTEND_MIN_ROWS - 1
         with mock.patch.object(mr, "_takes_fused", lambda *a: False):
             order, launch = self.run_moe(rows=rows)
+        # the shared expert waits for the router GEMM (the source's executed order)
         self.assertEqual(
-            order[:8],
+            order[:10],
             [
                 ("wait", "alt", "current"),
                 ("quant", "current"),
                 ("record_event", "current"),
-                ("shared", "current", False),
                 ("gate", "alt"),
+                ("record_event", "alt"),
+                ("wait_event", "current", "alt"),
+                ("shared", "current", False),
                 ("topk",),
                 ("wait_event", "alt", "current"),
                 ("run_moe_core",),

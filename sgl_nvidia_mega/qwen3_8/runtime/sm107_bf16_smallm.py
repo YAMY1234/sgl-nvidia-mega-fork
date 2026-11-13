@@ -54,6 +54,8 @@ SGLANG_READS = {
         "_bf16_gemm_dispatch_impl",
         "_enable_bf16_splitk_gemm",
         "_cutedsl_bf16_gemm",
+        "_run_splitk_dense",
+        "_splitk_tactic",
     ),
     "srt/runtime_context.py": ("get_parallel",),
     "kernels/ops/gemm/dense_bf16_gemm_sm100_splitk_epilogue.py": (
@@ -106,6 +108,13 @@ ROUTES = {
     # Stock runs TGV tactic 18 here; tactic 21 is the same unsplit K order.
     (64, *_OUT_PROJ): ("tgv", 21),
 }
+
+# Keys where the source's executed dispatch and SGLang main's differ. The source's dispatch has no low-M autotune: at
+# the router's M 4 it runs its split-K path at its tuned tactic (64, 8, 4, 10), 8 x 4 CTAs. SGLang main's dispatch takes
+# FlashInfer's direct dense GEMM there (512 CTAs), with other bits. These keys follow the source: each runs the cluster
+# split-K kernel at the source's tactic and is checked bit for bit against SGLang's split-K kernel at that tactic
+# (``source_gemm`` in ``precompile``), not against SGLang's dispatch.
+SOURCE_SPLITK_ROUTES = {(4, *_ROUTER): ("cl", (64, 8, 4, 10, 64))}  # 10 stages need the 64-wide K tile
 
 _routes: Optional[dict] = None
 _fi = None  # (the split-K module, CUstream constructor)
@@ -183,7 +192,8 @@ def install(device_sm: int, splitk_enabled: bool, cutedsl_available: bool) -> bo
             err,
         )
         return False
-    for (m, n, k), (kind, tactic) in ROUTES.items():
+    table = {**ROUTES, **SOURCE_SPLITK_ROUTES}
+    for (m, n, k), (kind, tactic) in table.items():
         if (kind == "tgvc" and not _tgvc_ok(*tactic)) or (
             kind == "cl" and not _cluster_ok(k, tactic, fi_splitk._SMEM_CAPACITY_BYTES)
         ):
@@ -196,8 +206,8 @@ def install(device_sm: int, splitk_enabled: bool, cutedsl_available: bool) -> bo
             )
             return False
     _fi = (fi_splitk, cuda_driver.CUstream)
-    _routes = ROUTES
-    kinds = [route[0] for route in ROUTES.values()]
+    _routes = table
+    kinds = [route[0] for route in table.values()]
     logger.info(
         "SM107 bitwise small-M BF16 GEMM routes on: %d keys (cluster split-K %d, TGV %d)",
         len(kinds),
@@ -337,6 +347,7 @@ def gemm(x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
 def precompile(
     *,
     stock_gemm: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    source_gemm: Optional[Callable[[torch.Tensor, torch.Tensor, tuple], torch.Tensor]] = None,
     device=None,
 ) -> bool:
     """JIT-compile every key at load and check it bit for bit against ``stock_gemm`` (the dispatch with the routes
@@ -357,8 +368,16 @@ def precompile(
             ).to(torch.bfloat16)
         x = torch.randn(m, k, generator=gen, device=device).to(torch.bfloat16)
         got = gemm(x, weights[(n, k)])
-        want = stock_gemm(x, weights[(n, k)])
-        if got is None or not torch.equal(
+        if (m, n, k) in SOURCE_SPLITK_ROUTES:
+            # the source's split-K path at its tactic (the route's first four fields)
+            want = (
+                None
+                if source_gemm is None
+                else source_gemm(x, weights[(n, k)], _routes[(m, n, k)][1][:4])
+            )
+        else:
+            want = stock_gemm(x, weights[(n, k)])
+        if got is None or want is None or not torch.equal(
             got.view(torch.int16), want.view(torch.int16)
         ):
             logger.warning(
@@ -414,16 +433,29 @@ def _build(call_sites: dict) -> str:
     ):
         return "not installed (see the warning above)"
     # Checked against SGLang's dispatch, which has no routes; a mismatch keeps them off.
-    if not precompile(stock_gemm=lambda x, w: _bf16_gemm_dispatch_impl(x, w, None)):
+    if not precompile(
+        stock_gemm=lambda x, w: _bf16_gemm_dispatch_impl(x, w, None),
+        source_gemm=_source_splitk,
+    ):
         return "a route differs from SGLang's dispatch (see the warning above)"
     logger.info(
         "NVIDIA megakernel: Qwen3.8 SM107 small-M BF16 routes (%s) serve %d keys, each "
-        "checked bit-equal to SGLang's dispatch (a BF16 pin at a key runs first): %s",
+        "checked bit-equal to SGLang's dispatch, the source-dispatch keys to SGLang's split-K kernel at the "
+        "source's tactic (a BF16 pin at a key runs first): %s",
         ENV,
         len(_routes),
         _summary(call_sites),
     )
     return ""
+
+
+def _source_splitk(x: torch.Tensor, weight: torch.Tensor, tactic: tuple) -> torch.Tensor:
+    """SGLang's split-K kernel at ``tactic``, the path the source's dispatch runs at SOURCE_SPLITK_ROUTES."""
+    from sglang.srt.layers.quantization.unquant import _run_splitk_dense, _splitk_tactic
+
+    out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+    _run_splitk_dense(x, weight.T, None, out, True, _splitk_tactic(*tactic))
+    return out
 
 
 def _summary(call_sites: dict) -> str:

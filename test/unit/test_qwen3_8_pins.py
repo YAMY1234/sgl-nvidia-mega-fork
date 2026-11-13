@@ -1268,6 +1268,14 @@ class _Routes(_Gemm):
         unquant = sys.modules["sglang.srt.layers.quantization.unquant"]
         unquant._enable_bf16_splitk_gemm = True
         unquant._cutedsl_bf16_gemm = object()
+        self.source_calls = []
+
+        def run_splitk_dense(x, w_t, bias, out, swap, tactic):
+            self.source_calls.append(tactic)
+            out.copy_(_gemm(x, w_t.t()))
+
+        unquant._run_splitk_dense = run_splitk_dense
+        unquant._splitk_tactic = lambda *t: tuple(t)
         patcher = mock.patch.object(
             torch.cuda, "get_device_capability", lambda *a: (10, 7)
         )
@@ -1282,7 +1290,9 @@ class _Routes(_Gemm):
         if keys is not None:
             sr._routes = {key: sr.ROUTES[key] for key in keys}
         return sr.precompile(
-            stock_gemm=lambda x, w: _gemm(x, w), device=torch.device("cpu")
+            stock_gemm=lambda x, w: _gemm(x, w),
+            source_gemm=lambda x, w, tactic: _gemm(x, w),
+            device=torch.device("cpu"),
         )
 
 
@@ -1315,6 +1325,11 @@ class TestSmallmRoutes(_Routes):
         self.assertEqual(sr.ROUTES[(64, 2560, 6144)], ("tgv", 21))
         for key in [(8, *ROUTER), (4, 16480, 2560), (17, 1280, 2560), (48, 2560, 6144)]:
             self.assertNotIn(key, sr.ROUTES)  # stock keeps these keys
+        # the source's dispatch at the router's M 4: its split-K path at its tactic
+        self.assertNotIn((4, *ROUTER), sr.ROUTES)
+        self.assertEqual(
+            sr.SOURCE_SPLITK_ROUTES, {(4, *ROUTER): ("cl", (64, 8, 4, 10, 64))}
+        )
 
     def test_install_gates(self):
         for args in ((100, True, True), (107, False, True), (107, True, False)):
@@ -1322,8 +1337,8 @@ class TestSmallmRoutes(_Routes):
                 self.assertFalse(sr.install(*args))
         with self.assertLogs(sr.logger, "INFO") as logs:
             self.assertTrue(self.install_routes())
-        self.assertIn("87 keys (cluster split-K 70, TGV 17)", logs.output[0])
-        self.assertIs(sr._routes, sr.ROUTES)
+        self.assertIn("88 keys (cluster split-K 71, TGV 17)", logs.output[0])
+        self.assertEqual(sr._routes, {**sr.ROUTES, **sr.SOURCE_SPLITK_ROUTES})
         # installed, not checked: nothing served yet
         self.assertIsNone(sr.route_for(_x(12, k=2560), torch.zeros(ROUTER, dtype=BF16)))
         self.splitk._SMEM_CAPACITY_BYTES = 64 << 10  # a "cl" tactic no longer fits
@@ -1411,14 +1426,13 @@ class TestSmallmRoutes(_Routes):
             with self.assertLogs(sr.logger, "INFO") as logs:
                 self.assertEqual(sr.build(sites), "")
             self.assertIn(sr.ENV, logs.output[-1])
-            self.assertIn(
-                "serve 54 keys, each checked bit-equal to SGLang's dispatch",
-                logs.output[-1],
-            )
-            self.assertIn("moe.gate cl M 5-7,9-32; qsa.index_qk_proj cl M 5-7,9-32",
+            self.assertIn("serve 55 keys", logs.output[-1])
+            self.assertIn("moe.gate cl M 4-7,9-32; qsa.index_qk_proj cl M 5-7,9-32",
                           logs.output[-1])  # fmt: skip
             checked = len(self.stock_calls)
-            self.assertEqual(checked, 54)  # against SGLang's dispatch, every key
+            self.assertEqual(checked, 54)  # against SGLang's dispatch, every ROUTES key
+            # the router's M 4 against SGLang's split-K kernel at the source's tactic
+            self.assertEqual(self.source_calls, [(64, 8, 4, 10)])
             self.assertEqual(sr.build({}), "")  # once a process
             self.assertEqual(len(self.stock_calls), checked)
             sr._built = None

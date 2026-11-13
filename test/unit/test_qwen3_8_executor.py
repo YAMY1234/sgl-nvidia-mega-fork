@@ -418,7 +418,9 @@ class TestStepFallbacks(unittest.TestCase):
         layer = SimpleNamespace(
             is_qsa=True, self_attention=lambda **kw: "qsa-stock"
         )
-        ex = SimpleNamespace(qsa_pool_ready=False, qsa_indexer=None, qsa_prefill="o")
+        ex = SimpleNamespace(
+            qsa_pool_ready=False, qsa_union=None, qsa_indexer=None, qsa_prefill="o"
+        )
         for served, want in ((None, "qsa-stock"), ("qsa-prefill", "qsa-prefill")):
             with mock.patch.object(qsa_prefill, "extend", return_value=served) as ext:
                 out = attention.step(ex, layer, torch.zeros(8, 4), _St(_Mode.EXTEND))
@@ -453,7 +455,9 @@ class TestStepFallbacks(unittest.TestCase):
         )
         for ready, mode in ((False, _Mode.TARGET_VERIFY), (True, _Mode.EXTEND)):
             st = _St(mode, 8)
-            ex = SimpleNamespace(qsa_pool_ready=ready, qsa_indexer=None, qsa_prefill=None)
+            ex = SimpleNamespace(
+                qsa_pool_ready=ready, qsa_union=None, qsa_indexer=None, qsa_prefill=None
+            )
             out = attention.step(ex, layer, torch.zeros(8, 4), st)
             self.assertEqual(out, "qsa-stock")
             self.assertEqual(st.ran_ops, [("qsa", "stock")])
@@ -611,6 +615,310 @@ class TestGdnFront(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 front.run(*args(), pad_slot=0)  # a layout no eager step compiled
             self.assertEqual(calls, ["compile", "launch", "launch"])
+
+
+class _QsaAttn:  # the layer's RadixAttention: SGLang's sparse attention when called
+    layer_id, scaling = 7, 0.0625
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    def __call__(self, q, k, v, fb, topk_indices=None):
+        self.calls.append("stock")
+        return torch.full((q.shape[0], 24 * 256), 5.0)
+
+
+class _KvRouter:
+    def __init__(self, dtype, shape=(64, 2, 256)):
+        self.k = torch.empty(shape, dtype=dtype)
+        self.v = torch.empty(shape, dtype=dtype)
+        self.reads = []
+
+    def layer(self, layer_id):
+        return SimpleNamespace(key=lambda: self.k, value=lambda: self.v)
+
+    def read(self, layer_id):
+        self.reads.append(layer_id)
+        return self.layer(layer_id)
+
+
+def _qsa_backend(dtype, positions="qpos"):
+    md = SimpleNamespace(
+        indexer_metadata=SimpleNamespace(decode_logical_positions=positions),
+        row_req_pool_indices="row_requests",
+        sequence_lengths="lengths",
+    )
+    return SimpleNamespace(
+        token_to_kv_pool=SimpleNamespace(layer_router=_KvRouter(dtype)),
+        req_to_token_pool=SimpleNamespace(req_to_token="req_to_token"),
+        _resolve_metadata=lambda fb: md,
+        _uses_block_indices=lambda indices: indices.shape[1] == 512,
+        _fused_kv_pool_eligible=True,
+        compress_ratio=4,
+    )
+
+
+class _Kernels:  # PoolKernels / UnionKernels doubles that record their inputs
+    def __init__(self, out, impl=None):
+        self.out, self.impl, self.seen = out, impl, []
+
+    def run(self, **kw):
+        self.seen.append(kw)
+        rows = kw["q"].shape[0]
+        out = torch.full((rows, 24 * 256), self.out)
+        return out if self.impl is None else (out, self.impl)
+
+
+class TestQsaPoolFp8(unittest.TestCase):
+    """Slot qsa_pool_fp8: which verify widths and pools run the union kernels, what
+    they read, and the build / pool checks that turn the slot off."""
+
+    def setUp(self):
+        from unittest import mock
+
+        elementwise = types.ModuleType("sglang.kernels.ops.elementwise.elementwise")
+        self.gated = []
+        elementwise.fused_sigmoid_mul = (
+            lambda x, gate, inplace: self.gated.append(float(x[0, 0])) or x + 1
+        )
+        patch = mock.patch.dict(sys.modules, {elementwise.__name__: elementwise})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def run_step(self, dtype, rows, *, union=True, split_k=True, mode=None, draft=4,
+                 positions="qpos", blocks=512, q_dtype=torch.bfloat16):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+        calls = []
+        layer = SimpleNamespace(
+            is_qsa=True,
+            attn=_QsaAttn(calls),
+            _prepare_qkv_gate=lambda positions, hidden_states, forward_batch: (
+                torch.zeros(rows, 24 * 256, dtype=q_dtype),
+                torch.zeros(rows, 2 * 256),
+                torch.zeros(rows, 2 * 256),
+                torch.zeros(rows, 24 * 256),
+            ),
+            _compute_qsa_topk_indices=lambda x, positions, fb: torch.zeros(
+                rows, blocks, dtype=torch.int64
+            ),
+            o_proj=lambda x: (x, None),
+        )
+        ex = SimpleNamespace(
+            qsa_pool_ready=split_k,
+            qsa_pool=_Kernels(3.0),
+            qsa_union=_Kernels(1.0, "union_ws_fp8") if union else None,
+            qsa_indexer=None,
+            qsa_prefill=None,
+            smallm_gemm=None,
+        )
+        st = _St(mode or _Mode.TARGET_VERIFY, rows)
+        st.fb.spec_info.draft_token_num = draft
+        st.fb.req_pool_indices = torch.zeros(rows // 4)
+        st.fb.out_cache_loc = "out_cache_loc"
+        backend = _qsa_backend(dtype, positions)
+        with mock.patch.object(attention, "sparse_backend", lambda: backend):
+            out = attention.step(ex, layer, torch.zeros(rows, 8), st)
+        impl = [i for op, i in st.ran_ops if op == "qsa"]
+        return impl, out, ex, calls, backend
+
+    def test_widths_and_pools(self):
+        fp8, bf16 = torch.float8_e4m3fn, torch.bfloat16
+        for dtype, rows, union, want in (
+            (bf16, 8, False, "pool_splitk"),
+            (bf16, 64, False, "pool_splitk"),
+            (bf16, 128, False, "stock"),  # the pool check turned the union off
+            (fp8, 8, True, "stock"),
+            (fp8, 32, True, "stock"),
+            (fp8, 52, True, "stock"),  # below the measured bound (56)
+            (fp8, 56, True, "union_ws_fp8"),
+            (fp8, 64, True, "union_ws_fp8"),  # the split-K kernels read BF16 only
+            (fp8, 288, True, "union_ws_fp8"),
+            (fp8, 512, True, "union_ws_fp8"),
+            (fp8, 576, True, "union_ws_fp8"),
+            (fp8, 580, True, "stock"),
+        ):
+            impl, _, ex, calls, _ = self.run_step(dtype, rows, union=union)
+            self.assertEqual(impl, [want], (dtype, rows))
+            self.assertEqual(calls, ["stock"] if want == "stock" else [], (dtype, rows))
+            if union:
+                self.assertEqual(len(ex.qsa_union.seen), want != "stock", rows)
+
+    def test_union_reads_and_gate(self):
+        rows = 288
+        impl, out, ex, _, backend = self.run_step(torch.float8_e4m3fn, rows)
+        self.assertEqual(impl, ["union_ws_fp8"])
+        (kw,) = ex.qsa_union.seen
+        self.assertEqual(tuple(kw["q"].shape), (rows, 24, 256))
+        self.assertEqual(tuple(kw["new_k"].shape), (rows, 2, 256))
+        self.assertEqual(tuple(kw["new_v"].shape), (rows, 2, 256))
+        self.assertEqual(kw["indices"].dtype, torch.int32)
+        self.assertEqual(tuple(kw["indices"].shape), (rows, 512))
+        router = backend.token_to_kv_pool.layer_router
+        self.assertIs(kw["key_cache"], router.k)
+        self.assertIs(kw["value_cache"], router.v)
+        self.assertEqual(router.reads, [7])  # waits for a layer-wise load-back
+        self.assertEqual(
+            (kw["locations"], kw["slot_map"], kw["row_requests"]),
+            ("out_cache_loc", "req_to_token", "row_requests"),
+        )
+        self.assertEqual(kw["sequence_lengths"], "lengths")
+        self.assertEqual(kw["query_positions"], "qpos")
+        self.assertEqual(kw["scale"], 0.0625)
+        self.assertNotIn("gate", kw)
+        # SGLang's gate on the union output, then o_proj on the gated rows
+        self.assertEqual(self.gated, [1.0])
+        self.assertTrue(torch.equal(out, torch.full((rows, 24 * 256), 2.0)))
+
+    def test_other_steps_run_stock(self):
+        fp8 = torch.float8_e4m3fn
+        for kw in (
+            dict(mode=_Mode.DECODE),
+            dict(draft=3),
+            dict(positions=None),  # no logical positions: nothing launched
+            dict(blocks=2048),  # token indices, not blocks
+            dict(q_dtype=torch.float16),
+        ):
+            impl, _, ex, calls, _ = self.run_step(fp8, 128, **kw)
+            self.assertEqual(impl, ["stock"], kw)
+            self.assertEqual(calls, ["stock"], kw)
+            self.assertEqual(ex.qsa_union.seen, [], kw)
+
+    def test_union_kernels_workspace_and_launch(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.qsa import pool_union_ws
+        from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+        launches = []
+        launch = lambda *args, **kw: launches.append((args, kw))
+        for rows, served in ((36, True), (288, True), (512, False)):
+            launches.clear()
+            requests = rows // 4
+            with (
+                mock.patch.object(pool_union_ws, "qsa_pool_union_decode_ws", launch),
+                mock.patch.object(pool_union_ws, "supported", lambda q, k, w: served),
+            ):
+                out, impl = attention.UnionKernels().run(
+                    q=torch.zeros(rows, 24, 256, dtype=torch.bfloat16),
+                    key_cache="k", value_cache="v", new_k="nk", new_v="nv",
+                    locations="loc", slot_map="map", row_requests="req",
+                    indices="idx", sequence_lengths="len", query_positions="pos",
+                    scale=0.0625,
+                )
+            self.assertEqual(impl, "union_ws_fp8" if served else "union_fp8")
+            self.assertEqual(tuple(out.shape), (rows, 6144))
+            self.assertEqual(out.dtype, torch.bfloat16)
+            ((args, kw),) = launches
+            names = ("k", "v", "nk", "nv", "loc", "map", "req", "idx", "len", "pos")
+            self.assertEqual(args[1:], names + (4, 0.0625))
+            self.assertIs(kw["out"], out)
+            self.assertEqual(
+                (kw["splits"], kw["union_warps"], kw["pdl"], kw["ws_pdl"], kw["ratio"]),
+                (2, 16, True, True, 4),
+            )
+            # token slots, row masks, sort scratch, counts a request, a row; m, l, acc
+            stats = requests * 2 * 2 * 64
+            sizes = (requests * 8208,) * 2 + (requests * 2048, requests, rows)
+            sizes += (stats, stats, stats * 256)
+            self.assertEqual(tuple(t.numel() for t in kw["workspace"]), sizes)
+            for t in kw["workspace"]:
+                self.assertEqual(t.storage_offset() * t.element_size() % 16, 0, rows)
+
+    def test_build_reasons(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.qsa import pool_union_ws
+        from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+        with mock.patch.object(torch.cuda, "is_available", lambda: False):
+            self.assertIn("SM10x", attention.union_build())
+        sm10x = dict(
+            is_available=lambda: True, get_device_capability=lambda *a: (10, 7)
+        )
+        with mock.patch.multiple(torch.cuda, **sm10x):
+            with mock.patch.object(pool_union_ws, "HAS_GLUON", False):
+                self.assertIn("Gluon", attention.union_build())
+            with mock.patch.object(pool_union_ws, "HAS_GLUON", True):
+                self.assertEqual(attention.union_build(), "")
+                with mock.patch.object(attention, "UNION_SPLITS", 0):
+                    self.assertIn(attention.UNION_SPLITS_ENV, attention.union_build())
+
+    def test_build_agrees_and_checks_the_layers(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+        binding = types.ModuleType("sglang.srt.kernel_plugins.nvidia.binding")
+        agreed = []
+        binding.megakernel_agree = lambda reason, what: agreed.append((reason, what))
+        self.assertIn("qsa_pool_fp8", runtime.KNOWN_SLOTS)
+        with (
+            mock.patch.dict(sys.modules, {binding.__name__: binding}),
+            mock.patch.object(attention, "union_build", return_value=""),
+        ):
+            for heads, built in (((24, 2, 256), True), ((6, 1, 256), False)):
+                agreed.clear()
+                model = _model((_Linear, _Attention))
+                layer = model.model.layers[1]
+                layer.is_qsa = True
+                layer.attn = SimpleNamespace(
+                    tp_q_head_num=heads[0], tp_k_head_num=heads[1], head_dim=heads[2]
+                )
+                kernels = runtime._build_qsa_union(model)
+                self.assertEqual(isinstance(kernels, attention.UnionKernels), built)
+                ((reason, what),) = agreed
+                self.assertEqual(what, "Qwen3.8 slot qsa_pool_fp8")
+                self.assertEqual(bool(reason), not built)
+
+    def test_pool_reasons(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.qsa import pool_decode
+        from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+        fp8 = torch.float8_e4m3fn
+        with mock.patch.object(pool_decode, "write_new_kv_e4m3_ok", return_value=True):
+            self.assertEqual(attention.union_pool_reasons(_qsa_backend(fp8), 7), "")
+            reason = attention.union_pool_reasons(_qsa_backend(torch.bfloat16), 7)
+            self.assertIn("bfloat16", reason)
+            strided = torch.empty(64, 256, 2, dtype=fp8).transpose(1, 2)
+            for change in (
+                # a scaled or non-token pool
+                lambda b: setattr(b, "_fused_kv_pool_eligible", False),
+                lambda b: setattr(b, "compress_ratio", 8),
+                lambda b: setattr(b.token_to_kv_pool.layer_router, "k", strided),
+                lambda b: setattr(
+                    b.token_to_kv_pool, "layer_router", _KvRouter(fp8, (64, 1, 256))
+                ),
+            ):
+                backend = _qsa_backend(fp8)
+                change(backend)
+                self.assertTrue(attention.union_pool_reasons(backend, 7))
+        with mock.patch.object(pool_decode, "write_new_kv_e4m3_ok", return_value=False):
+            self.assertIn("cast", attention.union_pool_reasons(_qsa_backend(fp8), 7))
+
+    def test_pool_check_turns_the_slot_off(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+        for reason in ("KV pool dtype torch.bfloat16", ""):
+            ex = _executor()
+            ex.lm.model.layers[2].attn = SimpleNamespace(layer_id=7)
+            ex.qsa_union = "kernels"
+            with (
+                mock.patch.object(attention, "sparse_backend", lambda: "backend"),
+                mock.patch.object(
+                    attention, "union_pool_reasons", return_value=reason
+                ) as r,
+            ):
+                fb = SimpleNamespace(spec_info=SimpleNamespace(draft_token_num=4))
+                ex._check_pools(fb)
+            r.assert_called_once_with("backend", 7)
+            self.assertEqual(ex.qsa_union, None if reason else "kernels")
 
 
 class _State:  # a UcacheState double that records the calls

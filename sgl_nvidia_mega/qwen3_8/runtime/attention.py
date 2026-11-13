@@ -8,10 +8,18 @@ Slot ``qsa_pool``: a TP1 target verify of up to 64 rows (16 requests x 4) on a B
 pool runs the sparse attention as the plugin's split-K pool kernels
 (``qsa/pool_decode.py``): the new K/V write at the step's slots, the split-K partials
 over the selected blocks (and the request's own uncompressed tail) and the merge, which
-also applies the sigmoid output gate. The QKV / gate projection with its norms and
-RoPE, the indexer (selection) and o_proj stay SGLang's. Every other step runs SGLang's
-``self_attention``. Numerics: split-K online softmax against TRT-LLM's sparse decode, a
-tolerance slot.
+also applies the sigmoid output gate.
+
+Slot ``qsa_pool_fp8``: a TP1 target verify of 56-576 rows (14-144 requests x 4) on an FP8
+E4M3 KV pool runs it as the union kernels (``qsa/pool_union_ws.py``): the new BF16 K/V
+cast to E4M3 in the pool write, each request's union of selected tokens, the
+warp-specialized attention over it (launched with PDL) and the split merge; SGLang's
+output gate follows. It replaces SGLang's K/V pack and TRT-LLM decode.
+
+The QKV / gate projection with its norms and RoPE, the indexer (selection) and o_proj
+stay SGLang's. Every other step runs SGLang's ``self_attention``. Numerics: both
+reorder the FP32 softmax reduction against TRT-LLM's sparse decode (the union kernel
+also rescales lazily), tolerance slots; the E4M3 pool bytes are torch's cast.
 
 Reads: the layer's K/V pool, ``req_to_token``, the backend's step metadata (row
 requests, logical positions). Writes: the new K/V at ``out_cache_loc``."""
@@ -31,6 +39,16 @@ STOCK = "stock"
 OPCHECK = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_OPCHECK") == "1"
 MAX_ROWS = 64
 QUERY_HEADS, KV_HEADS, HEAD_DIM, BLOCKS, RATIO = 24, 2, 256, 512, 4
+# Slot qsa_pool_fp8's verify rows; other widths run SGLang's pack + TRT-LLM decode. On SM107 the union
+# beat it at 56-64 rows at every context and selection overlap measured, not reliably below
+UNION_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_UNION_MIN_ROWS"
+UNION_MIN_ROWS = int(os.environ.get(UNION_MIN_ROWS_ENV) or 56)
+UNION_MAX_ROWS = 576
+# Splits of a request's token list in the union attention (1-16)
+UNION_SPLITS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_UNION_SPLITS"
+UNION_SPLITS = int(os.environ.get(UNION_SPLITS_ENV) or 2)
+# Warps of the token-union kernel (its output does not depend on them)
+UNION_WARPS = 16
 
 SGLANG_READS = {
     "srt/models/qwen4_exp.py": (
@@ -45,13 +63,15 @@ SGLANG_READS = {
     "srt/layers/attention/qwen_sparse_attn_backend.py": (
         "_resolve_metadata",
         "_uses_block_indices",
+        "_fused_kv_pool_eligible",
+        "compress_ratio",
         "row_req_pool_indices",
         "indexer_metadata",
         "decode_logical_positions",
         "req_to_token_pool",
         "token_to_kv_pool",
     ),
-    "srt/mem_cache/kv/router.py": ("read", "key", "value"),
+    "srt/mem_cache/kv/router.py": ("layer", "read", "key", "value"),
 }
 
 
@@ -81,18 +101,74 @@ def build() -> str:
     return ""
 
 
+def union_build() -> str:
+    """Slot qsa_pool_fp8's build reason ('' when its kernels can run here)."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        return "the union kernels need an SM10x GPU"
+    if not 1 <= UNION_SPLITS <= 16:
+        return f"{UNION_SPLITS_ENV}={UNION_SPLITS}, the merge takes 1-16 splits"
+    try:
+        from sgl_nvidia_mega.qwen3_8.qsa import pool_union_ws
+    except Exception as e:
+        return f"union kernels do not import: {type(e).__name__}: {e}"
+    if not pool_union_ws.HAS_GLUON:
+        return "the warp-specialized union kernel needs Triton's Gluon Blackwell API"
+    return ""
+
+
+def union_pool_reasons(backend, layer_id: int) -> str:
+    """'' when the layer's KV pool is what the union kernels read: SGLang's plain FP8
+    E4M3 token pool (no k/v scale) of contiguous [slots, 2, 256] at compress ratio 4,
+    with the BF16 -> E4M3 pool write equal to torch's cast. Eager only: the cast check
+    launches kernels once per device."""
+    from sgl_nvidia_mega.qwen3_8.qsa import pool_decode
+
+    if not backend._fused_kv_pool_eligible:
+        return "not SGLang's plain token KV pool (its fused K/V path declines it too)"
+    if backend.compress_ratio != RATIO:
+        return f"QSA compress ratio {backend.compress_ratio}, the kernels take {RATIO}"
+    kv = backend.token_to_kv_pool.layer_router.layer(layer_id)
+    k, v = kv.key(), kv.value()
+    if k.dtype != torch.float8_e4m3fn:
+        return f"KV pool dtype {k.dtype}, the union kernels read FP8 E4M3"
+    if (
+        k.dim() != 3
+        or tuple(k.shape[1:]) != (KV_HEADS, HEAD_DIM)
+        or v.shape != k.shape
+        or v.dtype != k.dtype
+        or not (k.is_contiguous() and v.is_contiguous())
+    ):
+        return f"KV pool {tuple(k.shape)}, the kernels take contiguous [slots, 2, 256]"
+    if not pool_decode.write_new_kv_e4m3_ok(k, v):
+        return "the BF16 -> E4M3 pool write differs from torch's cast (or was not checked)"
+    return ""
+
+
+def sparse_backend():
+    """The attention backend that owns the QSA layers' pool and step metadata."""
+    from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+
+    return resolve_qsa_sparse_backend(get_attn_backend())
+
+
 def step(executor, layer, x, st):
     """The layer's attention output [rows, hidden] (before the stage's reduction).
 
-    With slot ``qsa_indexer`` or ``qsa_pool``, a decode / verify / draft-extend step
-    runs the attention split into its pieces here: SGLang's QKV + gate projection, the
-    indexer (``qsa_indexer.select``: the plugin's fold, scorers and selects where they
-    serve the step), the sparse attention (the pool kernels where they serve it) and
-    the gate and o_proj. Otherwise SGLang's ``self_attention`` runs whole."""
+    With slot ``qsa_indexer``, ``qsa_pool`` or ``qsa_pool_fp8``, a decode / verify /
+    draft-extend step runs the attention split into its pieces here: SGLang's QKV +
+    gate projection, the indexer (``qsa_indexer.select``: the plugin's fold, scorers
+    and selects where they serve the step), the sparse attention (the pool or union
+    kernels where they serve it) and the gate and o_proj. Otherwise SGLang's
+    ``self_attention`` runs whole."""
     fb = st.fb
     mode = fb.forward_mode
     if (
-        (executor.qsa_indexer is not None or executor.qsa_pool_ready)
+        (
+            executor.qsa_indexer is not None
+            or executor.qsa_pool_ready
+            or executor.qsa_union is not None
+        )
         and layer.is_qsa
         and (mode.is_target_verify() or mode.is_decode() or mode.is_draft_extend_v2())
     ):
@@ -116,13 +192,20 @@ def _pool_eligible(executor, fb, rows) -> bool:
     )
 
 
+def _union_eligible(executor, fb, rows) -> bool:
+    return (
+        executor.qsa_union is not None
+        and fb.forward_mode.is_target_verify()
+        and UNION_MIN_ROWS <= rows <= UNION_MAX_ROWS
+        and int(fb.spec_info.draft_token_num) == 4
+    )
+
+
 def _decomposed(executor, layer, x, st):
     """``self_attention`` from its pieces. The indexer runs on the main stream here
     (SGLang overlaps it on a side stream under capture); both orders compute the
-    same values."""
-    from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
-    from sglang.srt.model_executor.forward_context import get_attn_backend
-
+    same values. The BF16 pool's split-K kernels take a verify first; an FP8 pool's
+    verify goes to the union kernels."""
     from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
 
     fb, positions = st.fb, st.positions
@@ -135,13 +218,32 @@ def _decomposed(executor, layer, x, st):
         indices = layer._compute_qsa_topk_indices(x, positions, fb)
         st.ran("qsa.indexer", STOCK)
     rows = q.shape[0]
+    out = None
     if _pool_eligible(executor, fb, rows):
-        backend = resolve_qsa_sparse_backend(get_attn_backend())
-        out = _verify_pool(executor, layer, backend, q, k, v, gate, indices, st)
-        if out is not None:
-            return out
+        out = _verify_pool(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
+    if out is None and _union_eligible(executor, fb, rows):
+        out = _verify_union(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
+    if out is not None:
+        return out
     attn_out = layer.attn(q, k, v, fb, topk_indices=indices)
     return _finish(executor, layer, attn_out, gate, st, STOCK)
+
+
+def _verify_inputs(backend, fb, indices, rows):
+    """(step metadata, the rows' logical positions) for the pool kernels, or None when
+    this step's layout is not theirs (4-row requests selecting 512 blocks a row)."""
+    md = backend._resolve_metadata(fb)
+    indexer = md.indexer_metadata
+    query_positions = None if indexer is None else indexer.decode_logical_positions
+    if (
+        not backend._uses_block_indices(indices)
+        or tuple(indices.shape) != (rows, BLOCKS)
+        or query_positions is None
+        or md.row_req_pool_indices is None
+        or rows != fb.req_pool_indices.numel() * 4
+    ):
+        return None
+    return md, query_positions
 
 
 def _verify_pool(executor, layer, backend, q, k, v, gate, indices, st):
@@ -151,19 +253,12 @@ def _verify_pool(executor, layer, backend, q, k, v, gate, indices, st):
     pool = backend.token_to_kv_pool
     if pool.layer_router.layer(layer.attn.layer_id).key().dtype != torch.bfloat16:
         return None
-    md = backend._resolve_metadata(fb)
     rows = q.shape[0]
-    indexer = md.indexer_metadata
-    query_positions = None if indexer is None else indexer.decode_logical_positions
-    row_requests = md.row_req_pool_indices
-    if (
-        not backend._uses_block_indices(indices)
-        or tuple(indices.shape) != (rows, BLOCKS)
-        or query_positions is None
-        or row_requests is None
-        or rows != fb.req_pool_indices.numel() * 4
-    ):
+    inputs = _verify_inputs(backend, fb, indices, rows)
+    if inputs is None:
         return None
+    md, query_positions = inputs
+    row_requests = md.row_req_pool_indices
     kv = pool.layer_router.read(layer.attn.layer_id)
     out = executor.qsa_pool.run(
         q=q.reshape(rows, QUERY_HEADS * HEAD_DIM),
@@ -182,11 +277,45 @@ def _verify_pool(executor, layer, backend, q, k, v, gate, indices, st):
     )
     out = out.view(rows, QUERY_HEADS * HEAD_DIM)
     if OPCHECK and not torch.cuda.is_current_stream_capturing():
-        _opcheck(layer, q, k, v, fb, indices, gate, out, md, query_positions)
+        _opcheck(
+            layer, q, k, v, fb, indices, gate, out, md, query_positions, "pool_splitk"
+        )
     return _finish(executor, layer, out, None, st, "pool_splitk")
 
 
-def _opcheck(layer, q, k, v, fb, indices, gate, got, md, query_positions):
+def _verify_union(executor, layer, backend, q, k, v, gate, indices, st):
+    """The union kernels on a TP1 verify of an FP8 pool (checked at the first verify),
+    or None (nothing launched) when this step's layout is not theirs."""
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    fb = st.fb
+    rows = q.shape[0]
+    inputs = _verify_inputs(backend, fb, indices, rows)
+    if inputs is None or q.dtype != torch.bfloat16:
+        return None
+    md, query_positions = inputs
+    kv = backend.token_to_kv_pool.layer_router.read(layer.attn.layer_id)
+    out, impl = executor.qsa_union.run(
+        q=q.reshape(rows, QUERY_HEADS, HEAD_DIM),
+        key_cache=kv.key(),
+        value_cache=kv.value(),
+        new_k=k.reshape(rows, KV_HEADS, HEAD_DIM),
+        new_v=v.reshape(rows, KV_HEADS, HEAD_DIM),
+        locations=fb.out_cache_loc,
+        slot_map=backend.req_to_token_pool.req_to_token,
+        row_requests=md.row_req_pool_indices,
+        indices=indices.to(torch.int32).contiguous(),
+        sequence_lengths=md.sequence_lengths,
+        query_positions=query_positions,
+        scale=layer.attn.scaling,
+    )
+    out = fused_sigmoid_mul(out, gate, inplace=True)
+    if OPCHECK and not torch.cuda.is_current_stream_capturing():
+        _opcheck(layer, q, k, v, fb, indices, gate, out, md, query_positions, impl)
+    return _finish(executor, layer, out, None, st, impl)
+
+
+def _opcheck(layer, q, k, v, fb, indices, gate, got, md, query_positions, impl):
     """Same selection, SGLang's attention (it rewrites the same K/V at the same slots),
     then the gate as SGLang applies it: the remaining difference is the kernel's."""
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
@@ -199,9 +328,10 @@ def _opcheck(layer, q, k, v, fb, indices, gate, got, md, query_positions):
     rel = float((want.float() - got.float()).norm() / want.float().norm().clamp_min(1e-30))
     valid = int((indices[worst] >= 0).sum())
     logger.info(
-        "NVIDIA megakernel opcheck qsa_pool layer=%d rows=%d max_abs=%.4g rel_l2=%.3g "
+        "NVIDIA megakernel opcheck qsa=%s layer=%d rows=%d max_abs=%.4g rel_l2=%.3g "
         "worst_row=%d worst_row_max=%.4g worst_row_valid_blocks=%d worst_row_seq_len=%d "
         "worst_row_pos=%d rows_over_0.05=%d",
+        impl,
         layer.attn.layer_id,
         got.shape[0],
         float(diff.max()),
@@ -288,3 +418,52 @@ class PoolKernels:
             HAS_GATE=True, launch_pdl=True,
         )
         return out
+
+
+class UnionKernels:
+    """The plugin's TP1 union verify of 4-row requests on an FP8 E4M3 pool: the new
+    K/V's BF16 -> E4M3 pool write, each request's token union, the warp-specialized
+    attention (launched with PDL) and the split merge. The output is not gated."""
+
+    def __init__(self):
+        from sgl_nvidia_mega.qwen3_8.qsa import pool_union_ws
+
+        self.ws = pool_union_ws
+
+    def run(
+        self, *, q, key_cache, value_cache, new_k, new_v, locations, slot_map,
+        row_requests, indices, sequence_lengths, query_positions, scale
+    ):
+        """[rows, QUERY_HEADS * HEAD_DIM] in q's dtype, and the engagement name of the
+        attention kernel (the Triton kernel 2 where the warp-specialized one does not
+        serve the shapes)."""
+        ws = self.ws
+        rows, device = q.shape[0], q.device
+        requests = rows // 4
+        nb, _, nt = ws.union.union_buffers(rows, 4, BLOCKS, RATIO)
+        stats = requests * KV_HEADS * UNION_SPLITS * 64
+        ints = torch.empty(
+            requests * (2 * nt + nb + 1) + rows, dtype=torch.int32, device=device
+        )
+        floats = torch.empty(stats * (HEAD_DIM + 2), dtype=torch.float32, device=device)
+        # token slots, row masks, sort scratch, per-row then per-request counts: every
+        # slice starts 16-byte aligned at any request count
+        lists, counts = requests * nt, 2 * requests * nt + requests * nb
+        workspace = (
+            ints[:lists],
+            ints[lists : 2 * lists],
+            ints[2 * lists : counts],
+            ints[counts + rows :],
+            ints[counts : counts + rows],
+            floats[:stats],
+            floats[stats : 2 * stats],
+            floats[2 * stats :],
+        )
+        out = torch.empty(rows, QUERY_HEADS * HEAD_DIM, dtype=q.dtype, device=device)
+        ws.qsa_pool_union_decode_ws(
+            q, key_cache, value_cache, new_k, new_v, locations, slot_map, row_requests,
+            indices, sequence_lengths, query_positions, 4, scale, ratio=RATIO, out=out,
+            workspace=workspace, splits=UNION_SPLITS, union_warps=UNION_WARPS,
+            pdl=True, ws_pdl=True, bn=128, num_warps=8, num_stages=3,
+        )
+        return out, "union_ws_fp8" if ws.supported(q, key_cache, 4) else "union_fp8"

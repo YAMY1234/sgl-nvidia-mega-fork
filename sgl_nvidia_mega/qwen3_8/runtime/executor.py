@@ -150,6 +150,9 @@ class Qwen3_8Executor:
         # slot qsa_pool: set by build with its kernels (attention.PoolKernels)
         self.qsa_pool_ready = False
         self.qsa_pool = None
+        # slot qsa_pool_fp8: attention.UnionKernels, set by build; the pool is checked
+        # at the first verify
+        self.qsa_union = None
         # slot qsa_indexer: qsa_indexer.IndexerKernels, set by build
         self.qsa_indexer = None
         # slot moe_finalize: set by build
@@ -283,6 +286,16 @@ class Qwen3_8Executor:
                 if reason:
                     unavailable("gdn_front", reason)
                     self.gdn_front_ready = False
+        if self.qsa_union is not None:
+            from sgl_nvidia_mega.qwen3_8.runtime import unavailable
+
+            first = next(i for i, f in self.mixers.items() if f == self._qsa)
+            reason = attention.union_pool_reasons(
+                attention.sparse_backend(), self.lm.model.layers[first].attn.layer_id
+            )
+            if reason:
+                unavailable("qsa_pool_fp8", reason)
+                self.qsa_union = None
 
     def _build_ucache_verify(self, mamba, buffers, tokens):
         from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache

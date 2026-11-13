@@ -34,6 +34,9 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # (runtime/gdn.py)
 # qsa_indexer: the QSA indexer's fold, scorer and select (runtime/qsa_indexer.py)
 # qsa_pool: the TP1 QSA verify's sparse attention as split-K pool kernels (<= 64 rows)
+# on a BF16 KV pool
+# qsa_pool_fp8: the TP1 QSA verify's sparse attention on an FP8 E4M3 KV pool as the
+# union kernels, warp-specialized (33-576 rows; runtime/attention.py)
 # moe_finalize: the TP1 MoE's finalize + gated shared expert as one ordered kernel
 # moe_routing: in moe_finalize's step, the routed experts' routing, NVFP4 quant and
 # trtllm-gen metadata as one kernel, else the quant beside the router GEMV
@@ -53,6 +56,7 @@ KNOWN_SLOTS: tuple[str, ...] = (
     "gdn_front",
     "qsa_indexer",
     "qsa_pool",
+    "qsa_pool_fp8",
     "moe_finalize",
     "moe_routing",
     "gdn_prefill",
@@ -208,6 +212,8 @@ def build(model, hf_config, ctx):
             from sgl_nvidia_mega.qwen3_8.runtime.attention import PoolKernels
 
             executor.qsa_pool = PoolKernels()
+    if "qsa_pool_fp8" in slots and not draft:
+        executor.qsa_union = _build_qsa_union(model)
     if "moe_finalize" in slots:
         executor.moe_finalize_ready = _build_moe_finalize(model, decompose)
     if "moe_routing" in slots:
@@ -369,8 +375,8 @@ def _build_qsa_indexer(model):
     return kernels
 
 
-def _build_qsa_pool(model) -> bool:
-    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+def _qsa_layers_reason(model) -> str:
+    """'' when every attention layer is a QSA layer of the pool kernels' TP1 heads."""
     from sglang.srt.models.qwen4_exp import Qwen4ExpAttentionDecoderLayer
 
     from sgl_nvidia_mega.qwen3_8.runtime import attention
@@ -380,11 +386,34 @@ def _build_qsa_pool(model) -> bool:
     for i in range(m.start_layer, m.end_layer):
         if isinstance(m.layers[i], Qwen4ExpAttentionDecoderLayer):
             reason = reason or attention.layer_reasons(m.layers[i])
-    reason = reason or attention.build()
+    return reason
+
+
+def _build_qsa_pool(model) -> bool:
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+    reason = _qsa_layers_reason(model) or attention.build()
     megakernel_agree(reason, what="Qwen3.8 slot qsa_pool")
     if reason:
         unavailable("qsa_pool", reason)
     return not reason
+
+
+def _build_qsa_union(model):
+    """The union kernels (attention.UnionKernels), or None (stock); the pool is checked
+    at the first verify (Qwen3_8Executor._check_pools)."""
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+    reason = _qsa_layers_reason(model) or attention.union_build()
+    megakernel_agree(reason, what="Qwen3.8 slot qsa_pool_fp8")
+    if reason:
+        unavailable("qsa_pool_fp8", reason)
+        return None
+    return attention.UnionKernels()
 
 
 def _build_moe_finalize(model, decompose) -> bool:

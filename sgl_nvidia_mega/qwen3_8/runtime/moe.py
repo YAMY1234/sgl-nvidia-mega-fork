@@ -63,6 +63,7 @@ SGLANG_READS = {
         "top_k",
     ),
     "kernels/jit/utils/__init__.py": ("is_arch_support_pdl",),
+    "srt/batch_invariant_ops/__init__.py": ("is_batch_invariant_mode_enabled",),
 }
 
 
@@ -140,6 +141,7 @@ def step(executor, layer, x, st):
         shared.record_stream(current)
         current.wait_stream(side)
     from sglang.kernels.jit.utils import is_arch_support_pdl
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
     pdl = is_arch_support_pdl()
     out = _finalize(
@@ -149,7 +151,8 @@ def step(executor, layer, x, st):
         deferred,
         chunk=FINALIZE_COLUMN_CHUNK if rows <= FINALIZE_COLUMN_CHUNK_MAX_ROWS else 0,
         USE_PDL=pdl,
-        num_warps=FINALIZE_NUM_WARPS,
+        # the source caps the warps at 8 in batch-invariant mode
+        num_warps=8 if is_batch_invariant_mode_enabled() else FINALIZE_NUM_WARPS,
         **({"launch_pdl": True} if pdl else {}),
     )
     st.ran("moe", "finalize_permuted")

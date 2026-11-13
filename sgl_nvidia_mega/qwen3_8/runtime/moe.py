@@ -13,6 +13,8 @@ ungated, and one plugin kernel (``_fused_finalize_gate_sigmoid_mul_add_kernel``)
 
 from __future__ import annotations
 
+import contextlib
+
 import torch
 
 from sgl_nvidia_mega.qwen3_8.runtime import moe_routing
@@ -29,7 +31,9 @@ SGLANG_READS = {
         "_forward_router_experts",
         "supports_deferred_finalize",
         "shared_expert_gate",
+        "alt_stream",
     ),
+    "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
     "srt/layers/moe/moe_runner/flashinfer_trtllm.py": (
         "gemm2_out",
         "expanded_idx_to_permuted_idx",
@@ -64,6 +68,13 @@ def build(parallel) -> str:
     return ""
 
 
+def _side_stream(mlp):
+    """The block's side stream while a graph is captured, as SGLang uses it; else None."""
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+    return mlp.alt_stream if mlp.alt_stream is not None and get_is_capture_mode() else None
+
+
 def step(executor, layer, x, st):
     """The MoE output [rows, hidden] (TP1: nothing left to reduce)."""
     from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
@@ -80,14 +91,25 @@ def step(executor, layer, x, st):
     )
     from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
 
-    shared = smallm_gemm.shared_expert(executor, mlp.shared_expert, x, st)
-    if shared is None:
-        shared = mlp._forward_shared_experts(x, apply_gate=False)
-    shared = shared.contiguous()
+    # SGLang's order (Qwen2MoeSparseMoeBlock.forward_normal_dual_stream): the routed
+    # experts on the current stream; while capturing, the shared expert on the block's
+    # side stream, so it runs beside the routed GEMMs.
+    side = _side_stream(mlp)
+    if side is not None:
+        current = torch.cuda.current_stream()
+        side.wait_stream(current)
     # slot moe_routing: None when it does not take these rows
     deferred = moe_routing.routed(executor, mlp, x, st)
     if deferred is None:
         deferred = mlp._forward_router_experts(x, defer_finalize=True)
+    with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
+        shared = smallm_gemm.shared_expert(executor, mlp.shared_expert, x, st)
+        if shared is None:
+            shared = mlp._forward_shared_experts(x, apply_gate=False)
+        shared = shared.contiguous()
+    if side is not None:
+        shared.record_stream(current)
+        current.wait_stream(side)
     top_k = int(deferred.top_k)
     gemm2 = deferred.gemm2_out.view(-1, deferred.gemm2_out.shape[-1])
     perm = deferred.expanded_idx_to_permuted_idx.view(-1, top_k)[:rows].contiguous()

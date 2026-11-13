@@ -74,7 +74,9 @@ INDEX_QK_SHAPE = (640, 2560)
 # SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1 (qwen_sparse_attn_backend.py, exactly
 # "1"): a one-request verify on a BF16 pool runs the tcgen05 core before the pool kernels
 # (slot qsa_pool)
-ATTN_CORE_V1 = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1", "0") == "1"
+ATTN_CORE_V1 = (
+    os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1", "0") == "1"
+)
 # SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_GATE_V2 (a 4-row verify) or
 # SGLANG_ENABLE_QSA_POOL_MERGE_GATE (any verify): the source hands the output gate to the
 # attention, whose tcgen05 core merge applies it
@@ -206,7 +208,9 @@ def core_build() -> str:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         return "the tcgen05 core needs an SM10x GPU"
     try:
-        from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import qsa_tcgen05_v1  # noqa: F401
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import (  # noqa: F401
+            qsa_tcgen05_v1,
+        )
     except Exception as e:
         return f"the tcgen05 core does not import: {type(e).__name__}: {e}"
     return ""
@@ -251,7 +255,9 @@ def union_pool_reasons(backend, layer_id: int) -> str:
     ):
         return f"KV pool {tuple(k.shape)}, the kernels take contiguous [slots, 2, 256]"
     if not pool_decode.write_new_kv_e4m3_ok(k, v):
-        return "the BF16 -> E4M3 pool write differs from torch's cast (or was not checked)"
+        return (
+            "the BF16 -> E4M3 pool write differs from torch's cast (or was not checked)"
+        )
     return ""
 
 
@@ -298,7 +304,9 @@ def step(executor, layer, x, st):
     st.ran("qsa", STOCK)
     if bf16_gemm_pins.routed():
         return _self_attention(layer, x, st.positions, fb)
-    return layer.self_attention(positions=st.positions, hidden_states=x, forward_batch=fb)
+    return layer.self_attention(
+        positions=st.positions, hidden_states=x, forward_batch=fb
+    )
 
 
 def _self_attention(layer, hidden_states, positions, forward_batch):
@@ -591,18 +599,28 @@ def _decomposed(executor, layer, x, st):
             layer,
             x,
             st,
-            lambda step=None, qk=None: _indices(executor, layer, x, positions, st, step, qk),
+            lambda step=None, qk=None: _indices(
+                executor, layer, x, positions, st, step, qk
+            ),
         )
     rows = q.shape[0]
     out = None
     if _core_eligible(executor, fb, rows):
-        out = _verify_core(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
+        out = _verify_core(
+            executor, layer, sparse_backend(), q, k, v, gate, indices, st
+        )
     if out is None and _pool_eligible(executor, fb, rows):
-        out = _verify_pool(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
+        out = _verify_pool(
+            executor, layer, sparse_backend(), q, k, v, gate, indices, st
+        )
     if out is None and _union_eligible(executor, fb, rows):
-        out = _verify_union(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
+        out = _verify_union(
+            executor, layer, sparse_backend(), q, k, v, gate, indices, st
+        )
     if out is None and _draft_union_eligible(executor, fb, rows):
-        out = _draft_union(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
+        out = _draft_union(
+            executor, layer, sparse_backend(), q, k, v, gate, indices, st
+        )
     if out is not None:
         return out
     attn_out = layer.attn(q, k, v, fb, topk_indices=indices)
@@ -617,11 +635,17 @@ def _draft_extend(executor, layer, x, st):
 
     fb, positions = st.fb, st.positions
     q, k, v, gate, indices = _qkv_and_indices(
-        executor, layer, x, st, lambda: qsa_draft.indices(executor, layer, x, positions, st)
+        executor,
+        layer,
+        x,
+        st,
+        lambda: qsa_draft.indices(executor, layer, x, positions, st),
     )
     st.ran("qsa.indexer", STOCK)
     if _draft_union_eligible(executor, fb, q.shape[0]):
-        out = _draft_union(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
+        out = _draft_union(
+            executor, layer, sparse_backend(), q, k, v, gate, indices, st
+        )
         if out is not None:
             return out
     attn_out = layer.attn(q, k, v, fb, topk_indices=indices)
@@ -854,7 +878,9 @@ def _opcheck(layer, q, k, v, fb, indices, gate, got, md, query_positions, impl):
     diff = (want.float() - got.float()).abs()
     per_row = diff.amax(dim=1)
     worst = int(per_row.argmax())
-    rel = float((want.float() - got.float()).norm() / want.float().norm().clamp_min(1e-30))
+    rel = float(
+        (want.float() - got.float()).norm() / want.float().norm().clamp_min(1e-30)
+    )
     valid = int((indices[worst] >= 0).sum())
     logger.info(
         "NVIDIA megakernel opcheck qsa=%s layer=%d rows=%d max_abs=%.4g rel_l2=%.3g "
@@ -902,8 +928,21 @@ class PoolKernels:
         self._configs: dict = {}
 
     def run(
-        self, *, q, key_cache, value_cache, new_k, new_v, locations, slot_map,
-        row_requests, indices, sequence_lengths, query_positions, gate, scale
+        self,
+        *,
+        q,
+        key_cache,
+        value_cache,
+        new_k,
+        new_v,
+        locations,
+        slot_map,
+        row_requests,
+        indices,
+        sequence_lengths,
+        query_positions,
+        gate,
+        scale,
     ):
         raw = self.raw
         rows, dim = q.shape[0], HEAD_DIM
@@ -923,28 +962,87 @@ class PoolKernels:
         acc = scratch[2 * stats :]
         out = torch.empty(rows, QUERY_HEADS, dim, dtype=q.dtype, device=device)
         out2 = out.view(rows, QUERY_HEADS * dim)
-        nk2, nv2 = new_k.reshape(rows, KV_HEADS * dim), new_v.reshape(rows, KV_HEADS * dim)
+        nk2, nv2 = (
+            new_k.reshape(rows, KV_HEADS * dim),
+            new_v.reshape(rows, KV_HEADS * dim),
+        )
         scale = float(scale) * raw.LOG2E
         raw._qsa_write_new_kv[(rows, KV_HEADS)](
-            key_cache, value_cache, nk2, nv2, locations, nk2.stride(0), nv2.stride(0),
-            KV_HEADS, dim, True, num_warps=1, launch_pdl=True,
+            key_cache,
+            value_cache,
+            nk2,
+            nv2,
+            locations,
+            nk2.stride(0),
+            nv2.stride(0),
+            KV_HEADS,
+            dim,
+            True,
+            num_warps=1,
+            launch_pdl=True,
         )
         raw._qsa_pool_splitk[(rows, KV_HEADS, splits)](
-            q, key_cache, value_cache, nk2, nv2, locations, slot_map, row_requests,
-            indices, sequence_lengths, query_positions, maximum, sums, acc, maximum,
-            out2, out2.stride(0), scale, q.stride(0), slot_map.stride(0),
-            nk2.stride(0), nv2.stride(0), indices.stride(0),
-            KV_HEADS, dim, QUERY_HEADS // KV_HEADS, gp, BLOCKS, RATIO, 4,
-            splits, chunk, bn, 0, False, False, True,
-            num_warps=4, num_stages=4, launch_pdl=True,
+            q,
+            key_cache,
+            value_cache,
+            nk2,
+            nv2,
+            locations,
+            slot_map,
+            row_requests,
+            indices,
+            sequence_lengths,
+            query_positions,
+            maximum,
+            sums,
+            acc,
+            maximum,
+            out2,
+            out2.stride(0),
+            scale,
+            q.stride(0),
+            slot_map.stride(0),
+            nk2.stride(0),
+            nv2.stride(0),
+            indices.stride(0),
+            KV_HEADS,
+            dim,
+            QUERY_HEADS // KV_HEADS,
+            gp,
+            BLOCKS,
+            RATIO,
+            4,
+            splits,
+            chunk,
+            bn,
+            0,
+            False,
+            False,
+            True,
+            num_warps=4,
+            num_stages=4,
+            launch_pdl=True,
         )
         gate3 = gate.reshape(rows, QUERY_HEADS, dim) if gate.ndim == 2 else gate
         raw._qsa_pool_merge[(rows * QUERY_HEADS,)](
-            maximum, sums, acc, out2, out2.stride(0), KV_HEADS, dim,
-            QUERY_HEADS // KV_HEADS, gp, splits, min(16, 1 << (splits - 1).bit_length()),
-            True, num_warps=2,
-            GATE=gate3, GATE_STRIDE_ROW=gate3.stride(0), GATE_STRIDE_HEAD=gate3.stride(1),
-            HAS_GATE=True, launch_pdl=True,
+            maximum,
+            sums,
+            acc,
+            out2,
+            out2.stride(0),
+            KV_HEADS,
+            dim,
+            QUERY_HEADS // KV_HEADS,
+            gp,
+            splits,
+            min(16, 1 << (splits - 1).bit_length()),
+            True,
+            num_warps=2,
+            GATE=gate3,
+            GATE_STRIDE_ROW=gate3.stride(0),
+            GATE_STRIDE_HEAD=gate3.stride(1),
+            HAS_GATE=True,
+            launch_pdl=True,
         )
         return out
 
@@ -956,8 +1054,21 @@ class CoreKernels:
     applies it."""
 
     def run(
-        self, *, q, key_cache, value_cache, new_k, new_v, locations, slot_map,
-        row_requests, indices, sequence_lengths, query_positions, scale, gate=None
+        self,
+        *,
+        q,
+        key_cache,
+        value_cache,
+        new_k,
+        new_v,
+        locations,
+        slot_map,
+        row_requests,
+        indices,
+        sequence_lengths,
+        query_positions,
+        scale,
+        gate=None,
     ):
         """[4, QUERY_HEADS, HEAD_DIM] in q's dtype."""
         from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import (
@@ -966,8 +1077,18 @@ class CoreKernels:
         )
 
         args = (
-            q, key_cache, value_cache, new_k, new_v, locations, slot_map, row_requests,
-            indices, sequence_lengths, query_positions, scale,
+            q,
+            key_cache,
+            value_cache,
+            new_k,
+            new_v,
+            locations,
+            slot_map,
+            row_requests,
+            indices,
+            sequence_lengths,
+            query_positions,
+            scale,
         )
         if gate is None:
             return qsa_tcgen05_v1.run(*args, width=4, store_new_kv=True)
@@ -988,8 +1109,20 @@ class UnionKernels:
         self.ws = pool_union_ws
 
     def run(
-        self, *, q, key_cache, value_cache, new_k, new_v, locations, slot_map,
-        row_requests, indices, sequence_lengths, query_positions, scale
+        self,
+        *,
+        q,
+        key_cache,
+        value_cache,
+        new_k,
+        new_v,
+        locations,
+        slot_map,
+        row_requests,
+        indices,
+        sequence_lengths,
+        query_positions,
+        scale,
     ):
         """[rows, QUERY_HEADS * HEAD_DIM] in q's dtype, and the engagement name of the
         attention kernel (the Triton kernel 2 where the warp-specialized one does not
@@ -1018,9 +1151,28 @@ class UnionKernels:
         )
         out = torch.empty(rows, QUERY_HEADS * HEAD_DIM, dtype=q.dtype, device=device)
         ws.qsa_pool_union_decode_ws(
-            q, key_cache, value_cache, new_k, new_v, locations, slot_map, row_requests,
-            indices, sequence_lengths, query_positions, 4, scale, ratio=RATIO, out=out,
-            workspace=workspace, splits=UNION_SPLITS, union_warps=UNION_WARPS,
-            pdl=True, ws_pdl=True, bn=128, num_warps=8, num_stages=3,
+            q,
+            key_cache,
+            value_cache,
+            new_k,
+            new_v,
+            locations,
+            slot_map,
+            row_requests,
+            indices,
+            sequence_lengths,
+            query_positions,
+            4,
+            scale,
+            ratio=RATIO,
+            out=out,
+            workspace=workspace,
+            splits=UNION_SPLITS,
+            union_warps=UNION_WARPS,
+            pdl=True,
+            ws_pdl=True,
+            bn=128,
+            num_warps=8,
+            num_stages=3,
         )
         return out, "union_ws_fp8" if ws.supported(q, key_cache, 4) else "union_fp8"

@@ -650,7 +650,9 @@ class TestExtendStep(_Case):
             _STATE["log"].append(("record_stream", tuple(t.shape), stream.name))
 
         for patcher in (
-            mock.patch("sglang.kernels.jit.utils.is_arch_support_pdl", lambda: self.pdl),
+            mock.patch(
+                "sglang.kernels.jit.utils.is_arch_support_pdl", lambda: self.pdl
+            ),
             mock.patch.object(torch.Tensor, "record_stream", record_stream),
         ):
             patcher.start()

@@ -22,10 +22,23 @@ MAX_REQUESTS = 256
 
 @triton.jit
 def _mtp_capture_metadata_batched(
-    TOPK, EXTEND, ACCEPT, REQ, SEQLENS, T2B, SEED, CAPTURED, BS, ROWS,
-    BS_P2: tl.constexpr, COLS: tl.constexpr,
-    TOPK_STRIDE: tl.constexpr, SEED_STRIDE: tl.constexpr,
-    FRONT: tl.constexpr, TRASH: tl.constexpr, HAS_ACCEPT: tl.constexpr,
+    TOPK,
+    EXTEND,
+    ACCEPT,
+    REQ,
+    SEQLENS,
+    T2B,
+    SEED,
+    CAPTURED,
+    BS,
+    ROWS,
+    BS_P2: tl.constexpr,
+    COLS: tl.constexpr,
+    TOPK_STRIDE: tl.constexpr,
+    SEED_STRIDE: tl.constexpr,
+    FRONT: tl.constexpr,
+    TRASH: tl.constexpr,
+    HAS_ACCEPT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # One program per (request, column block). Integer-only, the torch expression of
@@ -103,9 +116,23 @@ def capture(
     bs = req.numel()
     block = 256
     _mtp_capture_metadata_batched[(bs, triton.cdiv(topk.shape[1], block))](
-        topk, extend, accept if accept is not None else extend, req, seq_lens,
-        token_to_batch, seed, captured, bs, topk.shape[0],
-        BS_P2=triton.next_power_of_2(bs), COLS=topk.shape[1],
-        TOPK_STRIDE=topk.stride(0), SEED_STRIDE=seed.stride(0), FRONT=int(front),
-        TRASH=int(trash), HAS_ACCEPT=accept is not None, BLOCK=block, num_warps=4,
+        topk,
+        extend,
+        accept if accept is not None else extend,
+        req,
+        seq_lens,
+        token_to_batch,
+        seed,
+        captured,
+        bs,
+        topk.shape[0],
+        BS_P2=triton.next_power_of_2(bs),
+        COLS=topk.shape[1],
+        TOPK_STRIDE=topk.stride(0),
+        SEED_STRIDE=seed.stride(0),
+        FRONT=int(front),
+        TRASH=int(trash),
+        HAS_ACCEPT=accept is not None,
+        BLOCK=block,
+        num_warps=4,
     )

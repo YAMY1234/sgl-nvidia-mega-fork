@@ -41,7 +41,6 @@ def conv_update(
     channel tile ``block_n`` and, with ``token_major_out``, an output whose
     transpose(1, 2) is contiguous."""
     import triton
-
     from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         PAD_SLOT_ID,
         _causal_conv1d_update_kernel,

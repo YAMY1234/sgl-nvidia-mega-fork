@@ -10,10 +10,10 @@ Uses independent K/V, padded 12-head GQA, FP32 unnormalized split states,
 and compensated BF16 probability hi/lo as in the mature DSv4 path.
 Softmax/accumulation order differs from TRTLLM; final quality is unmeasured.
 """
+
 import torch
 import triton
 import triton.language as tl
-
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.blackwell import (
@@ -44,8 +44,19 @@ except ImportError:
 
 
 @triton.jit
-def _store(K, V, NK, NV, LOC, KS: tl.constexpr, VS: tl.constexpr,
-           NKS: tl.constexpr, NVS: tl.constexpr, H: tl.constexpr, D: tl.constexpr):
+def _store(
+    K,
+    V,
+    NK,
+    NV,
+    LOC,
+    KS: tl.constexpr,
+    VS: tl.constexpr,
+    NKS: tl.constexpr,
+    NVS: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+):
     row = tl.program_id(0)
     h = tl.program_id(1)
     d = tl.arange(0, D)
@@ -58,13 +69,32 @@ def _store(K, V, NK, NV, LOC, KS: tl.constexpr, VS: tl.constexpr,
 
 @gluon.jit
 def partial_tcgen05(
-    Q, K, V, NK, NV, LOC, MAP, REQ, IDX, LENGTH, QPOS,
-    PART, MAX, SUM,
-    QS: gl.constexpr, QH: gl.constexpr,
-    KS: gl.constexpr, VS: gl.constexpr,
-    NKS: gl.constexpr, NVS: gl.constexpr, MS: gl.constexpr,
-    IS: gl.constexpr, NT: gl.constexpr, GROUP: gl.constexpr,
-    WIDTH: gl.constexpr, SCALE: gl.constexpr,
+    Q,
+    K,
+    V,
+    NK,
+    NV,
+    LOC,
+    MAP,
+    REQ,
+    IDX,
+    LENGTH,
+    QPOS,
+    PART,
+    MAX,
+    SUM,
+    QS: gl.constexpr,
+    QH: gl.constexpr,
+    KS: gl.constexpr,
+    VS: gl.constexpr,
+    NKS: gl.constexpr,
+    NVS: gl.constexpr,
+    MS: gl.constexpr,
+    IS: gl.constexpr,
+    NT: gl.constexpr,
+    GROUP: gl.constexpr,
+    WIDTH: gl.constexpr,
+    SCALE: gl.constexpr,
 ):
     # Fixed tiles, rather than the old 32-split online log/exp recurrence.
     # Every CTA produces one raw FP32 state for one query and one KV head.
@@ -86,7 +116,8 @@ def partial_tcgen05(
     tail_off = col - selected
     tail = tail_start + tail_off
     pos = gl.where(
-        (col < selected) & (block >= 0), expanded,
+        (col < selected) & (block >= 0),
+        expanded,
         gl.where((tail_off >= 0) & (tail_off < 3) & (tail < qpos + 1), tail, -1),
     )
     valid = (col < count) & (pos >= 0) & (pos < length)
@@ -104,18 +135,25 @@ def partial_tcgen05(
     h = gl.arange(0, 16, gl.SliceLayout(1, kv_layout))
     q = gl.load(
         Q + row * QS + (head * GROUP + h[:, None]) * QH + d[None, :],
-        (h < GROUP)[:, None], 0,
+        (h < GROUP)[:, None],
+        0,
     )
     q_smem = gl.allocate_shared_memory(
-        gl.bfloat16, [16, 256],
-        gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16), value=q,
+        gl.bfloat16,
+        [16, 256],
+        gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16),
+        value=q,
     )
     k_smem = gl.allocate_shared_memory(
-        gl.bfloat16, [64, 256],
-        gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16), value=k,
+        gl.bfloat16,
+        [64, 256],
+        gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16),
+        value=k,
     )
     score_tmem = allocate_tensor_memory(
-        gl.float32, [64, 16], TensorMemoryLayout(block=(64, 16), col_stride=1),
+        gl.float32,
+        [64, 16],
+        TensorMemoryLayout(block=(64, 16), col_stride=1),
     )
     bar = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     mbarrier.init(bar, count=1)
@@ -135,26 +173,35 @@ def partial_tcgen05(
     # Finish QK reads before V initializes the reused shared buffer.
     mbarrier.wait(bar, phase=0)
     v_smem = gl.allocate_shared_memory(
-        gl.bfloat16, [64, 256],
-        gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16), value=v,
+        gl.bfloat16,
+        [64, 256],
+        gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16),
+        value=v,
     )
     score_layout: gl.constexpr = get_tmem_reg_layout(
-        gl.float32, (64, 16), TensorMemoryLayout(block=(64, 16), col_stride=1), 4,
+        gl.float32,
+        (64, 16),
+        TensorMemoryLayout(block=(64, 16), col_stride=1),
+        4,
     )
     scores = score_tmem.load(score_layout) * SCALE
     valid_scores = gl.convert_layout(valid, gl.SliceLayout(1, score_layout))
-    scores = gl.where(valid_scores[:, None], scores, -float('inf'))
+    scores = gl.where(valid_scores[:, None], scores, -float("inf"))
     mx = gl.max(scores, 0)
-    safe_max = gl.where(mx == -float('inf'), 0.0, mx)
+    safe_max = gl.where(mx == -float("inf"), 0.0, mx)
     prob = gl.exp(scores - safe_max[None, :])
     denom = gl.sum(prob, 0)
     p_hi = prob.to(gl.bfloat16)
     p_smem = gl.allocate_shared_memory(
-        gl.bfloat16, [64, 16],
-        gl.NVMMASharedLayout(swizzle_byte_width=32, element_bitwidth=16), value=p_hi,
+        gl.bfloat16,
+        [64, 16],
+        gl.NVMMASharedLayout(swizzle_byte_width=32, element_bitwidth=16),
+        value=p_hi,
     )
     out_tmem = allocate_tensor_memory(
-        gl.float32, [256, 16], TensorMemoryLayout(block=(128, 16), col_stride=1),
+        gl.float32,
+        [256, 16],
+        TensorMemoryLayout(block=(128, 16), col_stride=1),
     )
     fence_async_shared()
     tcgen05_mma(v_smem.permute((1, 0)), p_smem, out_tmem, use_acc=False)
@@ -169,7 +216,10 @@ def partial_tcgen05(
     mbarrier.wait(bar, phase=0)
     mbarrier.invalidate(bar)
     out_layout: gl.constexpr = get_tmem_reg_layout(
-        gl.float32, (256, 16), TensorMemoryLayout(block=(128, 16), col_stride=1), 4,
+        gl.float32,
+        (256, 16),
+        TensorMemoryLayout(block=(128, 16), col_stride=1),
+        4,
     )
     value = out_tmem.load(out_layout)
     hd_layout: gl.constexpr = gl.BlockedLayout([1, 4], [4, 8], [4, 1], [1, 0])
@@ -192,22 +242,37 @@ def _merge(P, MAX, SUM, OUT, NT: tl.constexpr, ST: tl.constexpr):
     kv_head = head // 12
     hh = head % 12
     state = (row * 2 + kv_head) * NT + t
-    mx = tl.load(MAX + state * 16 + hh, t < NT, -float('inf'))
-    denom = tl.load(SUM + state * 16 + hh, t < NT, 0.)
+    mx = tl.load(MAX + state * 16 + hh, t < NT, -float("inf"))
+    denom = tl.load(SUM + state * 16 + hh, t < NT, 0.0)
     maximum = tl.max(mx, 0)
-    safe_max = tl.where(maximum > -float('inf'), maximum, 0.)
+    safe_max = tl.where(maximum > -float("inf"), maximum, 0.0)
     weights = tl.exp(mx - safe_max)
     total = tl.sum(denom * weights, 0)
     partial = tl.load(
         P + (state[:, None] * 16 + hh) * 256 + d[None, :],
-        (t < NT)[:, None], 0.,
+        (t < NT)[:, None],
+        0.0,
     )
-    value = tl.sum(partial * weights[:, None], 0) / tl.where(total > 0, total, 1.)
+    value = tl.sum(partial * weights[:, None], 0) / tl.where(total > 0, total, 1.0)
     tl.store(OUT + (row * 24 + head) * 256 + d, value)
 
 
-def run(q, k_pool, v_pool, k_new, v_new, loc, req_to_token, row_requests,
-        block_indices, lengths, qpos, scale, width=4, store_new_kv=True):
+def run(
+    q,
+    k_pool,
+    v_pool,
+    k_new,
+    v_new,
+    loc,
+    req_to_token,
+    row_requests,
+    block_indices,
+    lengths,
+    qpos,
+    scale,
+    width=4,
+    store_new_kv=True,
+):
     """Original v11 ABI, chain TARGET_VERIFY M4 only; BF16 [4,24,256].
 
     Native top512-block order, graph padding, page-map, chain fresh/tail and
@@ -219,7 +284,10 @@ def run(q, k_pool, v_pool, k_new, v_new, loc, req_to_token, row_requests,
     assert m == width == 4 and nh == 24 and h == 2 and d == 256
     assert block_indices.shape == (m, 512)
     assert all(t.dtype == torch.bfloat16 for t in (q, k_pool, v_pool, k_new, v_new))
-    assert all(t.stride(-1) == 1 and t.stride(-2) == d for t in (q, k_pool, v_pool, k_new, v_new))
+    assert all(
+        t.stride(-1) == 1 and t.stride(-2) == d
+        for t in (q, k_pool, v_pool, k_new, v_new)
+    )
     assert block_indices.stride(1) == 1
     # 32 complete 64-token tiles plus one tile for the native <=3-token tail.
     # This is a fixed mature TCGEN05 tile, not a tuned split-KV configuration.
@@ -230,21 +298,55 @@ def run(q, k_pool, v_pool, k_new, v_new, loc, req_to_token, row_requests,
     output = torch.empty_like(q, memory_format=torch.contiguous_format)
     if store_new_kv:
         _store[(m, h)](
-            k_pool, v_pool, k_new, v_new, loc,
-            k_pool.stride(0), v_pool.stride(0), k_new.stride(0), v_new.stride(0), h, d,
+            k_pool,
+            v_pool,
+            k_new,
+            v_new,
+            loc,
+            k_pool.stride(0),
+            v_pool.stride(0),
+            k_new.stride(0),
+            v_new.stride(0),
+            h,
+            d,
             num_warps=4,
         )
     partial_tcgen05[(m, nt, h)](
-        q, k_pool, v_pool, k_new, v_new, loc, req_to_token, row_requests,
-        block_indices, lengths, qpos, partial, maximum, sums,
-        QS=q.stride(0), QH=q.stride(1), KS=k_pool.stride(0), VS=v_pool.stride(0),
-        NKS=k_new.stride(0), NVS=v_new.stride(0), MS=req_to_token.stride(0),
-        IS=block_indices.stride(0), NT=nt, GROUP=12, WIDTH=width, SCALE=float(scale),
+        q,
+        k_pool,
+        v_pool,
+        k_new,
+        v_new,
+        loc,
+        req_to_token,
+        row_requests,
+        block_indices,
+        lengths,
+        qpos,
+        partial,
+        maximum,
+        sums,
+        QS=q.stride(0),
+        QH=q.stride(1),
+        KS=k_pool.stride(0),
+        VS=v_pool.stride(0),
+        NKS=k_new.stride(0),
+        NVS=v_new.stride(0),
+        MS=req_to_token.stride(0),
+        IS=block_indices.stride(0),
+        NT=nt,
+        GROUP=12,
+        WIDTH=width,
+        SCALE=float(scale),
         num_warps=4,
     )
     _merge[(m, nh, triton.cdiv(d, 64))](
-        partial, maximum, sums, output, nt, triton.next_power_of_2(nt), num_warps=4,
+        partial,
+        maximum,
+        sums,
+        output,
+        nt,
+        triton.next_power_of_2(nt),
+        num_warps=4,
     )
     return output
-
-

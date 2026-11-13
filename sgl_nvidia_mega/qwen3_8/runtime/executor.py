@@ -387,9 +387,7 @@ class Qwen3_8Executor:
             from sgl_nvidia_mega.qwen3_8.runtime import unavailable
 
             m = self.lm.model
-            first = next(
-                i for i, f in self.mixers.items() if f == self._gdn
-            )
+            first = next(i for i, f in self.mixers.items() if f == self._gdn)
             args = (
                 gdn.linear_backend(),
                 m.layers[first].linear_attn.attn.layer_id,
@@ -569,7 +567,9 @@ class Qwen3_8Executor:
         from sglang.srt.models.qwen4_exp import _MixStreams
 
         m, fb = st.model, st.fb
-        hidden = inputs_embeds if inputs_embeds is not None else m.embed_tokens(input_ids)
+        hidden = (
+            inputs_embeds if inputs_embeds is not None else m.embed_tokens(input_ids)
+        )
         residual_batch.start(fb)
         if st.graph:
             from sgl_nvidia_mega.qwen3_8.runtime import prefill_graph
@@ -599,7 +599,9 @@ class Qwen3_8Executor:
                 )
                 # the next read a wide write-back may take over (hc_wide.boundary)
                 st.scratch["hc.next_hc"] = (
-                    None if next_layer.ple is not None else next_layer.attn_hyper_connection
+                    None
+                    if next_layer.ple is not None
+                    else next_layer.attn_hyper_connection
                 )
             elif m.pp_group.is_last_rank:
                 next_norm = m.hyper_connection_mixer.hc_norm
@@ -736,7 +738,8 @@ class Qwen3_8Executor:
                 attn_hc, streams, normalized, carried, limits=self.hc_limits
             )
             st.ran(
-                "hc.attn_read", hc_wide.mix_route(attn_hc, normed, limits=self.hc_limits)
+                "hc.attn_read",
+                hc_wide.mix_route(attn_hc, normed, limits=self.hc_limits),
             )
         if not fb.forward_mode.is_idle():
             x = self.mixers[i](layer, x, st)
@@ -755,12 +758,23 @@ class Qwen3_8Executor:
             st.ran(
                 "hc.attn_write",
                 hc_wide.write_route(
-                    attn_hc, x, streams, normed, partials, mlp_hc.hc_norm,
+                    attn_hc,
+                    x,
+                    streams,
+                    normed,
+                    partials,
+                    mlp_hc.hc_norm,
                     limits=self.hc_limits,
                 ),
             )
             streams, ffn_in, ffn_partials = hc_wide.write(
-                attn_hc, x, streams, normed, partials, mlp_hc.hc_norm, inject,
+                attn_hc,
+                x,
+                streams,
+                normed,
+                partials,
+                mlp_hc.hc_norm,
+                inject,
                 limits=self.hc_limits,
             )
             norms.ffn_input = ffn_in
@@ -783,7 +797,13 @@ class Qwen3_8Executor:
                 st.scratch["hc.partials"],
                 st.scratch["hc.mixed"],
             ) = hc_wide.boundary(
-                mlp_hc, x, streams, partials, next_hc, next_inject, limits=self.hc_limits
+                mlp_hc,
+                x,
+                streams,
+                partials,
+                next_hc,
+                next_inject,
+                limits=self.hc_limits,
             )
             st.ran("hc.ffn_write", "hc_boundary_ks")
             return streams
@@ -794,7 +814,13 @@ class Qwen3_8Executor:
             ),
         )
         streams, norms.output, st.scratch["hc.partials"] = hc_wide.write(
-            mlp_hc, x, streams, normed, partials, next_norm, next_inject,
+            mlp_hc,
+            x,
+            streams,
+            normed,
+            partials,
+            next_norm,
+            next_inject,
             limits=self.hc_limits,
         )
         return streams

@@ -407,7 +407,9 @@ class TestMoePrefillAutotune(_Files):
             self.assertEqual(self.pa.reasons(self.model), "")
         reasons.assert_called_once_with(self.mlp)
         self.pa.install(self.model, self.executor)
-        self.assertEqual(self.model.autotune_prefill_kernels(2048, dtype=torch.float32), 2)
+        self.assertEqual(
+            self.model.autotune_prefill_kernels(2048, dtype=torch.float32), 2
+        )
         self.assertEqual(len(self.calls), 1)
 
 
@@ -767,7 +769,11 @@ class TestQkvGate(_Gemm):
         def fused(q_gate, k, *args, has_gate, mrope_axis_map, qsa_pdl_fix):
             launches.append((q_gate.shape[0], args[5:7], qsa_pdl_fix))
             rows = q_gate.shape[0]
-            return (torch.zeros(rows, 2, 4), torch.zeros(rows, 1, 4), torch.zeros(rows, 2, 4))
+            return (
+                torch.zeros(rows, 2, 4),
+                torch.zeros(rows, 1, 4),
+                torch.zeros(rows, 2, 4),
+            )
 
         self.layer.num_heads, self.layer.num_kv_heads = 24, 2
         with mock.patch.object(plugin, "fused_qk_gemma_rmsnorm_rope_gate", fused):
@@ -793,7 +799,9 @@ class TestQkvGate(_Gemm):
                     )
                     self.assertEqual(got, "sglang", (rows, heads))
             self.layer.num_heads, self.layer.num_kv_heads = 24, 2
-            got = self.attention._qkv_gate(self.layer, _x(4, k=16), torch.arange(4), "fb")
+            got = self.attention._qkv_gate(
+                self.layer, _x(4, k=16), torch.arange(4), "fb"
+            )
             self.assertEqual(got, "sglang")  # switch off
         self.assertEqual(len(launches), 2)
 
@@ -1260,9 +1268,17 @@ class _Routes(_Gemm):
         # ``import sglang.kernels.ops.gemm.<module> as m`` binds through the parents'
         # attributes: fake the chain down from ``sglang``
         child = self.splitk
-        for parent in ("sglang.kernels.ops.gemm", "sglang.kernels.ops", "sglang.kernels"):
-            child = self.fake_module(parent, **{child.__name__.rsplit(".", 1)[1]: child})
-        patcher = mock.patch.object(sys.modules["sglang"], "kernels", child, create=True)
+        for parent in (
+            "sglang.kernels.ops.gemm",
+            "sglang.kernels.ops",
+            "sglang.kernels",
+        ):
+            child = self.fake_module(
+                parent, **{child.__name__.rsplit(".", 1)[1]: child}
+            )
+        patcher = mock.patch.object(
+            sys.modules["sglang"], "kernels", child, create=True
+        )
         patcher.start()
         self.addCleanup(patcher.stop)
         unquant = sys.modules["sglang.srt.layers.quantization.unquant"]

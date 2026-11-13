@@ -48,7 +48,6 @@ from typing import Sequence
 
 import torch
 
-
 logger = logging.getLogger(__name__)
 
 # The source's environment defaults (it read them once at import).

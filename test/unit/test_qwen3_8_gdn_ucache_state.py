@@ -183,7 +183,8 @@ class TestBytes(unittest.TestCase):
         )
         slots = _state(_model(), by_request_row=False)
         self.assertEqual(
-            (slots.state_bytes_per_slot, slots.state_bytes_per_request_row), (per_row, 0)
+            (slots.state_bytes_per_slot, slots.state_bytes_per_request_row),
+            (per_row, 0),
         )
 
     def test_head_shapes_must_agree(self):
@@ -374,7 +375,9 @@ class TestCommit(unittest.TestCase):
         io, view = _io(track=True), _view(conv_numels=(1, 0))
         self.assertIs(self._commit(state, io, view), True)
         calls = _FakeTrack.calls
-        self.assertEqual([c[0] for c in calls], ["cursors", "materialize", "conv", "conv"])
+        self.assertEqual(
+            [c[0] for c in calls], ["cursors", "materialize", "conv", "conv"]
+        )
         cursors = calls[0][1]
         self.assertIs(cursors["buffers"], state.buffers)
         self.assertIs(cursors["slots"], io.state_slots)
@@ -442,7 +445,9 @@ def _cfg(**kw):
 class TestConfigReasons(unittest.TestCase):
     def test_recipe_passes(self):
         self.assertEqual(UcacheState.config_reasons(_cfg()), [])
-        self.assertEqual(UcacheState.config_reasons(_cfg(speculative_algorithm="NEXTN")), [])
+        self.assertEqual(
+            UcacheState.config_reasons(_cfg(speculative_algorithm="NEXTN")), []
+        )
         self.assertTrue(S.extra_buffer_radix(_cfg()))
         self.assertFalse(S.extra_buffer_radix(_cfg(disable_radix_cache=True)))
 
@@ -498,8 +503,9 @@ class TestConfigReasons(unittest.TestCase):
             self.assertEqual(UcacheState.config_reasons(adaptive), [])
         with mock.patch(target, return_value=[1, 3, 8]):
             self.assertEqual(len(UcacheState.config_reasons(adaptive)), 1)
-        with mock.patch("torch.cuda.is_available", return_value=True), mock.patch(
-            "torch.cuda.get_device_capability", return_value=(10, 0)
+        with (
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch("torch.cuda.get_device_capability", return_value=(10, 0)),
         ):
             self.assertEqual(len(UcacheState.config_reasons(_cfg())), 1)
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # From SGLang python/sglang/kernels/ops/embeddings/qwen4_ple_verify_prepare.py
-#, unchanged.
+# , unchanged.
 """Qwen4 PLE target-verify layout in one launch, at any batch.
 
 ``_prepare_ple_batch`` builds a target-verify PLE layout from about 20 one-CTA torch ops

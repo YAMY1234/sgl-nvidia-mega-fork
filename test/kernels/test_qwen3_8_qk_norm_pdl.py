@@ -6,7 +6,9 @@ head shape it serves, 1-D and M-RoPE positions, after a QKV GEMM on the same str
 import pytest
 import torch
 
-from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import fused_qk_rmsnorm_rope_gate as plugin
+from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import (
+    fused_qk_rmsnorm_rope_gate as plugin,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,

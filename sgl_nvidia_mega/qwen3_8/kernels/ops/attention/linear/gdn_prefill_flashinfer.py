@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # From SGLang python/sglang/srt/layers/attention/linear/kernels/gdn_flashinfer.py
-#.
+# .
 """FlashInfer's chunked GDN prefill as the stock ``FlashInferGDNKernel.extend`` runs
 it, with the q / k l2norm on the prefill launches and the state rows gathered and
 written back in one launch each.

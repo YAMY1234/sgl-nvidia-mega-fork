@@ -56,9 +56,9 @@ def _mtp_lookup_positions(
     base = tl.load(CAPTURED_LEN + req).to(tl.int64)
     tail = base + c - (T - TAIL)
     qpos = tl.load(QPOS + row).to(tl.int64)
-    return tl.where(
-        c < T - TAIL, pos, tl.where((c < T) & (tail <= qpos), tail, -1)
-    ).to(tl.int32)
+    return tl.where(c < T - TAIL, pos, tl.where((c < T) & (tail <= qpos), tail, -1)).to(
+        tl.int32
+    )
 
 
 @triton.jit

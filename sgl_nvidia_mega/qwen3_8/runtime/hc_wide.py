@@ -253,7 +253,9 @@ def build(
             raise RuntimeError(
                 "SGLang's split-K epilogue GEMM takes no max_m (sgl-project/sglang#50194)"
             )
-        importlib.import_module("sgl_nvidia_mega.qwen3_8.kernels.ops.gemm.hc_mix_up_gate")
+        importlib.import_module(
+            "sgl_nvidia_mega.qwen3_8.kernels.ops.gemm.hc_mix_up_gate"
+        )
 
     def extend():
         from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.hc_combine_extend import (

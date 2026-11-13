@@ -157,10 +157,15 @@ def recipe_options() -> Options:
         out_proj_low_m=DEFAULT.out_proj_low_m
         if routes and _env_on(NONBITWISE_LOWM_ENV)
         else (),
-        out_proj_mid_m=DEFAULT.out_proj_mid_m if routes and _env_on(NONBITWISE_ENV) else (),
+        out_proj_mid_m=DEFAULT.out_proj_mid_m
+        if routes and _env_on(NONBITWISE_ENV)
+        else (),
         shared_fused_act=routes and _env_on(FUSED_ACT_ENV),
-        shared_down_tgv_rows=DEFAULT.shared_down_tgv_rows if _env_on(DOWN_TGV_ENV) else (),
+        shared_down_tgv_rows=DEFAULT.shared_down_tgv_rows
+        if _env_on(DOWN_TGV_ENV)
+        else (),
     )
+
 
 # Process-wide, as the source's: what build resolved, checked and prepared.
 _k = None  # the kernels (_kernels)
@@ -187,9 +192,8 @@ def _out_proj_tactics(options: Options) -> dict:
 
 def _kernels():
     import cuda.bindings.driver as cuda_driver
-    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm
-
     import sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue as epi
+    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm
 
     from sgl_nvidia_mega.qwen3_8.kernels.ops.gemm import splitk_act_mul as act
 

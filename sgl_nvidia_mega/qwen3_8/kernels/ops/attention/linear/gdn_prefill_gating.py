@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # From SGLang python/sglang/kernels/ops/attention/linear/fused_gdn_gating.py
-#.
+# .
 """The GDN gates ``g = -exp(A_log) * softplus(a + dt_bias)`` and ``beta = sigmoid(b)``
 with the extend-sized 2D launch: one program per 16 tokens x all heads.
 

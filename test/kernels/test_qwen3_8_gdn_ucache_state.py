@@ -32,8 +32,12 @@ def _buffers(n, by_row, seed):
         k_ring=torch.empty(0, device="cuda"),
         u_ring=torch.empty(0, device="cuda"),
         g_ring=torch.empty(0, device="cuda"),
-        hist_len=torch.randint(0, 17, (n,), generator=g, device="cuda", dtype=torch.int32),
-        cache_base=torch.randint(0, 32, (n,), generator=g, device="cuda", dtype=torch.int32),
+        hist_len=torch.randint(
+            0, 17, (n,), generator=g, device="cuda", dtype=torch.int32
+        ),
+        cache_base=torch.randint(
+            0, 32, (n,), generator=g, device="cuda", dtype=torch.int32
+        ),
         flush_min=K.gdn_ucache_flush_min(T),
         by_request_row=by_row,
     )
@@ -77,10 +81,17 @@ def test_commit_cursors(by_row):
     b = _buffers(ROWS if by_row else SLOTS, by_row, seed=1)
     slots, rows, accepted = _batch(seed=2)
     want = _ref_commit(
-        b.hist_len, b.cache_base, slots, rows if by_row else slots, accepted, b.flush_min
+        b.hist_len,
+        b.cache_base,
+        slots,
+        rows if by_row else slots,
+        accepted,
+        b.flush_min,
     )
     K.commit_gdn_ucache_cursors(
-        buffers=b, slots=slots, num_accept_tokens=accepted,
+        buffers=b,
+        slots=slots,
+        num_accept_tokens=accepted,
         request_rows=rows if by_row else None,
     )
     torch.cuda.synchronize()
@@ -199,8 +210,13 @@ def test_commit_in_a_cuda_graph():
         fresh = _buffers(SLOTS, False, seed=seed)
         b.hist_len.copy_(fresh.hist_len)
         b.cache_base.copy_(fresh.cache_base)
-        want = _ref_commit(b.hist_len, b.cache_base, slots, slots, accepted, b.flush_min)
-        conv0, window = view.mamba.conv[0].clone(), view.mamba.intermediate_conv_window[0]
+        want = _ref_commit(
+            b.hist_len, b.cache_base, slots, slots, accepted, b.flush_min
+        )
+        conv0, window = (
+            view.mamba.conv[0].clone(),
+            view.mamba.intermediate_conv_window[0],
+        )
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(b.hist_len, want[0]) and torch.equal(b.cache_base, want[1])

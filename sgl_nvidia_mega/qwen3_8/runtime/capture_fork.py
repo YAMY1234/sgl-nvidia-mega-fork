@@ -3,6 +3,7 @@
 # python/sglang/srt/layers/attention/qsa/capture_fork.py. Changed: the driver library
 # loads at the first call instead of at import, so the module imports without a GPU.
 """Fork a captured side stream from completed projection, without a main event."""
+
 import ctypes as c
 import functools
 
@@ -11,12 +12,24 @@ import functools
 def _driver():
     driver = c.CDLL("libcuda.so.1")
     info = driver.cuStreamGetCaptureInfo_v3
-    info.argtypes = [c.c_void_p, c.POINTER(c.c_int), c.POINTER(c.c_uint64),
-                     c.POINTER(c.c_void_p), c.POINTER(c.POINTER(c.c_void_p)),
-                     c.POINTER(c.c_void_p), c.POINTER(c.c_size_t)]
+    info.argtypes = [
+        c.c_void_p,
+        c.POINTER(c.c_int),
+        c.POINTER(c.c_uint64),
+        c.POINTER(c.c_void_p),
+        c.POINTER(c.POINTER(c.c_void_p)),
+        c.POINTER(c.c_void_p),
+        c.POINTER(c.c_size_t),
+    ]
     info.restype = c.c_int
     update = driver.cuStreamUpdateCaptureDependencies_v2
-    update.argtypes = [c.c_void_p, c.POINTER(c.c_void_p), c.c_void_p, c.c_size_t, c.c_uint]
+    update.argtypes = [
+        c.c_void_p,
+        c.POINTER(c.c_void_p),
+        c.c_void_p,
+        c.c_size_t,
+        c.c_uint,
+    ]
     update.restype = c.c_int
     return info, update
 
@@ -25,8 +38,15 @@ def projection_frontier(stream):
     info, _ = _driver()
     status, capture_id, graph = c.c_int(), c.c_uint64(), c.c_void_p()
     nodes, edge_data, count = c.POINTER(c.c_void_p)(), c.c_void_p(), c.c_size_t()
-    error = info(stream.cuda_stream, c.byref(status), c.byref(capture_id),
-                 c.byref(graph), c.byref(nodes), c.byref(edge_data), c.byref(count))
+    error = info(
+        stream.cuda_stream,
+        c.byref(status),
+        c.byref(capture_id),
+        c.byref(graph),
+        c.byref(nodes),
+        c.byref(edge_data),
+        c.byref(count),
+    )
     if error:
         raise RuntimeError(f"cuStreamGetCaptureInfo_v3: {error}")
     if status.value == 0:

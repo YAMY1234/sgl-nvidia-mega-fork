@@ -25,7 +25,9 @@ def _case(seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
     rows = 4
     q = torch.randn(rows, 24, 256, generator=g, device="cuda").bfloat16() * 0.25
-    pool = lambda: torch.randn(CONTEXT + 1, 2, 256, generator=g, device="cuda").bfloat16()
+    pool = lambda: torch.randn(
+        CONTEXT + 1, 2, 256, generator=g, device="cuda"
+    ).bfloat16()
     k, v = pool() * 0.25, pool()
     k[0], v[0] = float("nan"), float("nan")  # slot 0: no row reads it
     table = torch.arange(1, CONTEXT + 1, device="cuda", dtype=torch.int32)[None]
@@ -41,9 +43,18 @@ def _case(seed):
 
 def _args(q, k, v, nk, nv, table, req, positions, loc, idx):
     return dict(
-        q=q, key_cache=k, value_cache=v, new_k=nk, new_v=nv, locations=loc,
-        slot_map=table, row_requests=req, indices=idx, sequence_lengths=positions + 1,
-        query_positions=positions, scale=SCALE,
+        q=q,
+        key_cache=k,
+        value_cache=v,
+        new_k=nk,
+        new_v=nv,
+        locations=loc,
+        slot_map=table,
+        row_requests=req,
+        indices=idx,
+        sequence_lengths=positions + 1,
+        query_positions=positions,
+        scale=SCALE,
     )
 
 
@@ -53,7 +64,9 @@ def _reference(q, k, v, nk, nv, table, positions, loc, idx):
     out = []
     for row in range(q.shape[0]):
         p = int(positions[row])
-        blocks = idx[row].long().repeat_interleave(4) * 4 + torch.arange(4, device="cuda").repeat(512)
+        blocks = idx[row].long().repeat_interleave(4) * 4 + torch.arange(
+            4, device="cuda"
+        ).repeat(512)
         tail = torch.arange((p + 1) // 4 * 4, p + 1, device="cuda")
         slots = table[0, torch.cat((blocks, tail))].long()
         kk = k[slots].double().repeat_interleave(12, 1)
@@ -90,8 +103,18 @@ def test_core_tolerance_and_store(seed, record_property):
     # the split-K pool kernels on the same step, for the record
     gate = torch.zeros(4, 24 * 256, device="cuda", dtype=torch.bfloat16)
     pool = PoolKernels().run(
-        **_args(q.reshape(4, -1), k.clone(), v.clone(), nk, nv, table, req, positions,
-                loc, idx),
+        **_args(
+            q.reshape(4, -1),
+            k.clone(),
+            v.clone(),
+            nk,
+            nv,
+            table,
+            req,
+            positions,
+            loc,
+            idx,
+        ),
         gate=gate,
     )
     torch.cuda.synchronize()

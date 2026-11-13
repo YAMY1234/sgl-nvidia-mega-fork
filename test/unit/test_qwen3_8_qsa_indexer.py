@@ -428,7 +428,14 @@ class TestDispatch(unittest.TestCase):
 
     def test_grouped_ctas(self):
         # 4096 CTAs over rows / 4 groups, on the levels 16 .. 1024
-        for rows, ctas in ((4, 1024), (16, 1024), (20, 512), (32, 512), (36, 256), (64, 256)):
+        for rows, ctas in (
+            (4, 1024),
+            (16, 1024),
+            (20, 512),
+            (32, 512),
+            (36, 256),
+            (64, 256),
+        ):
             self.assertEqual(qi.grouped_ctas(rows), ctas, rows)
 
     def test_compressed_capacity(self):
@@ -475,11 +482,18 @@ class TestSelect(_Case):
         projected = []
         ix = _indexer()
         with mock.patch.object(
-            qi, "_project_qk", lambda *a, **kw: projected.append(kw["projected_qk"])
-            or (torch.zeros(8, 8, 128), torch.zeros(8, 1, 128), True),
+            qi,
+            "_project_qk",
+            lambda *a, **kw: (
+                projected.append(kw["projected_qk"])
+                or (torch.zeros(8, 8, 128), torch.zeros(8, 1, 128), True)
+            ),
         ):
             r = self.run_select(
-                _Mode.TARGET_VERIFY, 8, kernels=_kernels(prologue_fold=False), ix=ix,
+                _Mode.TARGET_VERIFY,
+                8,
+                kernels=_kernels(prologue_fold=False),
+                ix=ix,
                 ahead=ahead,
             )
         self.assertEqual(r.st.record, [(qi.OP, "stock+score_v4+select_v1")])
@@ -509,7 +523,9 @@ class TestSelect(_Case):
         ((topk, fb, metadata, layer_id),) = seen
         self.assertIs(topk, r.out)
         self.assertIs(metadata, md)
-        self.assertNotIn("capture", [c[0] for c in r.backend.calls if isinstance(c, tuple)])
+        self.assertNotIn(
+            "capture", [c[0] for c in r.backend.calls if isinstance(c, tuple)]
+        )
         # where the plugin's indexer declines, SGLang's indexer then the glue's capture
         with mock.patch.object(qsa_draft, "indices", return_value="glue") as indices:
             r = self.run_select(_Mode.DRAFT_EXTEND_V2, 128, kernels=None, glue=glue)

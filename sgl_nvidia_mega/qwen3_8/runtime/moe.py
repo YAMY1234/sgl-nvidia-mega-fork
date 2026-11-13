@@ -100,7 +100,9 @@ def build(parallel) -> str:
     if parallel.tp_size != 1 or getattr(parallel, "moe_ep_size", 1) != 1:
         return "the finalize kernel takes TP1 without expert parallelism"
     try:
-        from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise import moe_finalize  # noqa: F401
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise import (  # noqa: F401
+            moe_finalize,
+        )
     except Exception as e:
         return f"finalize kernel does not import: {type(e).__name__}: {e}"
     return ""
@@ -110,7 +112,9 @@ def _side_stream(mlp):
     """The block's side stream while a graph is captured, as SGLang uses it; else None."""
     from sglang.srt.model_executor.runner import get_is_capture_mode
 
-    return mlp.alt_stream if mlp.alt_stream is not None and get_is_capture_mode() else None
+    return (
+        mlp.alt_stream if mlp.alt_stream is not None and get_is_capture_mode() else None
+    )
 
 
 def step(executor, layer, x, st):
@@ -257,7 +261,9 @@ def _finalize(mlp, x, shared, deferred, chunk=0, **launch):
     perm = deferred.expanded_idx_to_permuted_idx.view(-1, top_k)[:rows].contiguous()
     weights = deferred.expert_weights.view(-1, top_k)[:rows].contiguous()
     if top_k != TOP_K or perm.dtype != torch.int32:
-        raise RuntimeError(f"moe_finalize: deferred output layout differs (top_k {top_k})")
+        raise RuntimeError(
+            f"moe_finalize: deferred output layout differs (top_k {top_k})"
+        )
     out = torch.empty_like(x)
     if chunk:
         kernel = moe_finalize._fused_finalize_gate_sigmoid_mul_add_chunked_kernel

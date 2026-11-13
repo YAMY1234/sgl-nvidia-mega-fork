@@ -83,6 +83,7 @@ def hc_mix_wide(
     from sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue import (
         run_splitk_dense_silu,
     )
+
     from sgl_nvidia_mega.qwen3_8.kernels.ops.gemm.hc_mix_up_gate import hc_up_gate
 
     global _wide_logged

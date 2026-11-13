@@ -34,7 +34,6 @@ else:
 from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear import (  # noqa: E402
     gdn_ucache_state as ucache,
 )
-
 from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache as U  # noqa: E402
 
 SM107 = CAPABILITY == (10, 7)

@@ -382,7 +382,9 @@ def build(model, hf_config, ctx):
     logger.info(
         "NVIDIA megakernel: Qwen3.8 %s executor: %s%s; slots %s; every other op stock",
         "draft" if draft else ("target (own GDN u-cache)" if own_ucache else "target"),
-        "layers decomposed (S1)" if decompose else "layers through the stage boundaries (S0)",
+        "layers decomposed (S1)"
+        if decompose
+        else "layers through the stage boundaries (S0)",
         "; prefill body in breakable prefill graphs" if executor.prefill_graph else "",
         sorted(slots) or "none",
     )
@@ -523,7 +525,9 @@ def _build_qsa_draft(model):
         return None
     lookup = qsa_draft.lookup_reason(model)
     if lookup:
-        logger.info("NVIDIA megakernel: Qwen3.8 slot qsa_draft: stock lookup (%s)", lookup)
+        logger.info(
+            "NVIDIA megakernel: Qwen3.8 slot qsa_draft: stock lookup (%s)", lookup
+        )
     return qsa_draft.DraftGlue(lookup=not lookup)
 
 
@@ -620,9 +624,7 @@ def _build_pins(model, executor) -> None:
 
     if os.environ.get(flashinfer_tactic_pins.FILE_ENV):
         executor.moe_pins = bool(
-            _built_options(
-                "moe_tactic_pins", flashinfer_tactic_pins.build(model), True
-            )
+            _built_options("moe_tactic_pins", flashinfer_tactic_pins.build(model), True)
         )
     if os.environ.get(bf16_gemm_pins.FILE_ENV) and _built_options(
         "bf16_gemm_pins", bf16_gemm_pins.build(model, _gemm_call_sites(model)), True

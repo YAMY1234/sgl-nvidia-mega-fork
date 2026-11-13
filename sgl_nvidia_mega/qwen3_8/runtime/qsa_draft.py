@@ -107,7 +107,10 @@ SGLANG_READS = {
     ),
     "srt/utils/device.py": ("is_sm100_supported",),
     "srt/runtime_context.py": ("get_parallel", "get_spec"),
-    "srt/arg_groups/fields/spec.py": ("speculative_num_steps", "speculative_eagle_topk"),
+    "srt/arg_groups/fields/spec.py": (
+        "speculative_num_steps",
+        "speculative_eagle_topk",
+    ),
     "srt/models/qwen4_exp_mtp.py": ("hidden_size", "hc_count"),
 }
 
@@ -129,7 +132,10 @@ def build(model) -> str:
     ):
         return "no QSA layer"
     try:
-        from sgl_nvidia_mega.qwen3_8.qsa import fused_kv_lookup, mtp_capture  # noqa: F401
+        from sgl_nvidia_mega.qwen3_8.qsa import (  # noqa: F401
+            fused_kv_lookup,
+            mtp_capture,
+        )
     except Exception as e:
         return f"the draft glue kernels do not import: {type(e).__name__}: {e}"
     return ""
@@ -182,7 +188,8 @@ class DraftGlue:
         trtllm_decode = _resolve_trtllm_sparse_decode()
         md = backend._resolve_metadata(fb)
         positions = (
-            None if md.indexer_metadata is None
+            None
+            if md.indexer_metadata is None
             else md.indexer_metadata.decode_logical_positions
         )
         loc = fb.out_cache_loc

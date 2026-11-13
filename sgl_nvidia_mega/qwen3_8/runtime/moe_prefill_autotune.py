@@ -75,7 +75,9 @@ def _route_one_call(executor, num_tokens: int, dtype: torch.dtype) -> bool:
     prequant = options is not None and options.prequant_overlap
     device = mlp.gate.weight.device
     with torch.no_grad():
-        x = torch.randn((num_tokens, mlp.gate.weight.shape[1]), dtype=dtype, device=device)
+        x = torch.randn(
+            (num_tokens, mlp.gate.weight.shape[1]), dtype=dtype, device=device
+        )
         # the router output's shape and dtype; the tuner profiles on its own logits
         logits = torch.randn(
             (num_tokens, mlp.gate.weight.shape[0]),
@@ -97,7 +99,9 @@ def autotune(executor, num_tokens: int, *, dtype: torch.dtype) -> int:
     if num_tokens < _MIN_TOKENS:
         return 0
     # Read before any GPU work: a malformed tuning file fails the boot.
-    pins = flashinfer_tactic_pins.active_moe_tactic_pins() if executor.moe_pins else None
+    pins = (
+        flashinfer_tactic_pins.active_moe_tactic_pins() if executor.moe_pins else None
+    )
     tuner = AutoTuner.get()
     before = _moe_entries(tuner._winner_cache())
     started = time.perf_counter()

@@ -415,8 +415,12 @@ class GdnReplayMtpUmmaRubin:
         self.fused_norm = bool(fused_norm)
         if self.fused_norm:
             assert (
-                self.pro_reorder and not persistent and not self.split and self.parts == 1
-                and self.sr == "" and not self.vsmem
+                self.pro_reorder
+                and not persistent
+                and not self.split
+                and self.parts == 1
+                and self.sr == ""
+                and not self.vsmem
             ), (self.pro_reorder, persistent, self.split, self.parts, self.sr)
         if self.fused_conv:
             assert (
@@ -429,7 +433,14 @@ class GdnReplayMtpUmmaRubin:
                 and self.sr == ""
                 and self.qk_io == self.v_io
                 and 2 * h * K_DIM + hv * V_DIM == self.qk_io * K_DIM
-            ), (self.pdl, self.pro_reorder, persistent, self.split, self.nsub, self.parts)
+            ), (
+                self.pdl,
+                self.pro_reorder,
+                persistent,
+                self.split,
+                self.nsub,
+                self.parts,
+            )
         if (
             self.pdl
             or self.ab_dyn
@@ -1409,7 +1420,9 @@ class GdnReplayMtpUmmaRubin:
                     if j < P:
                         if xc < T2:
                             if cutlass.const_expr(self.k_f16):
-                                cval = s_gram[j * 16 + xc]  # ring x X̂: normalized already
+                                cval = s_gram[
+                                    j * 16 + xc
+                                ]  # ring x X̂: normalized already
                             else:
                                 rnx = cute.math.rsqrt(
                                     s_gram[(16 + xc) * 16 + xc] + Float32(_EPS)
@@ -2269,7 +2282,9 @@ class GdnReplayMtpUmmaRubin:
                     if j < P:
                         if xc < T2:
                             if cutlass.const_expr(self.k_f16):
-                                cval = s_gram[j * 16 + xc]  # ring x X̂: normalized already
+                                cval = s_gram[
+                                    j * 16 + xc
+                                ]  # ring x X̂: normalized already
                             else:
                                 rnx = cute.math.rsqrt(
                                     s_gram[(16 + xc) * 16 + xc] + Float32(_EPS)
@@ -3744,8 +3759,14 @@ class GdnReplayMtpUmmaRubin:
             return U.prmt(words[e_lo // 2], words[e_hi // 2], sel)
 
         # per tap k and channel pair j: (w / state of channel c0 + 2j, of c0 + 2j + 1)
-        w2 = [[pair(wq, 4 * (2 * j) + k, 4 * (2 * j + 1) + k) for j in range(4)] for k in range(4)]
-        s2 = [[pair(sq, 3 * (2 * j) + k, 3 * (2 * j + 1) + k) for j in range(4)] for k in range(3)]
+        w2 = [
+            [pair(wq, 4 * (2 * j) + k, 4 * (2 * j + 1) + k) for j in range(4)]
+            for k in range(4)
+        ]
+        s2 = [
+            [pair(sq, 3 * (2 * j) + k, 3 * (2 * j + 1) + k) for j in range(4)]
+            for k in range(3)
+        ]
         ob = q.iterator.toint() + (Int64(brow) * (T * D) + c0l) * 2
         out0 = None
         for t in range(T):
@@ -3754,8 +3775,14 @@ class GdnReplayMtpUmmaRubin:
                 seq = [s2[0][j], s2[1][j], s2[2][j]] + [xq[i][j] for i in range(T)]
                 ow.append(
                     U.conv4_silu_bf16x2(
-                        seq[t], seq[t + 1], seq[t + 2], seq[t + 3],
-                        w2[0][j], w2[1][j], w2[2][j], w2[3][j],
+                        seq[t],
+                        seq[t + 1],
+                        seq[t + 2],
+                        seq[t + 3],
+                        w2[0][j],
+                        w2[1][j],
+                        w2[2][j],
+                        w2[3][j],
                     )
                 )
             if t == 0:
@@ -3767,7 +3794,9 @@ class GdnReplayMtpUmmaRubin:
         def x_elem_pair(e_lo, e_hi, elem):
             lo_words, lo_e = elem(e_lo)
             hi_words, hi_e = elem(e_hi)
-            sel = (0x10 if lo_e % 2 == 0 else 0x32) | ((0x54 if hi_e % 2 == 0 else 0x76) << 8)
+            sel = (0x10 if lo_e % 2 == 0 else 0x32) | (
+                (0x54 if hi_e % 2 == 0 else 0x76) << 8
+            )
             return U.prmt(lo_words[lo_e // 2], hi_words[hi_e // 2], sel)
 
         def state_elem(e):  # new state element (c, k) at 3c + k = input row T - 3 + k
@@ -4292,7 +4321,9 @@ class GdnReplayMtpUmmaRubin:
         # inputs the norm reads: the stored bf16 output, its weight and the gate z
         xs = [U.u16_as_f32(U.f32_to_u16(y, True), True) for y in ys]
         wv = U.u16_as_f32(U.ldg_u16_if(Int32(1), norm_w + Int64(row) * 2), True)
-        za = norm_z + (Int64(brow) * T * Int64(norm_z_row) + Int64(hv * V_DIM + row)) * 2
+        za = (
+            norm_z + (Int64(brow) * T * Int64(norm_z_row) + Int64(hv * V_DIM + row)) * 2
+        )
         zs = [
             U.u16_as_f32(U.ldg_u16_if(Int32(1), za + Int64(norm_z_row) * (2 * t)), True)
             for t in range(T)
@@ -4639,7 +4670,11 @@ class GdnReplayMtpUmmaRubin:
             return cute.runtime.make_fake_tensor(
                 BFloat16,
                 (batch, T, hv),
-                stride=(cute.sym_int64(divisibility=1), cute.sym_int64(divisibility=1), 1),
+                stride=(
+                    cute.sym_int64(divisibility=1),
+                    cute.sym_int64(divisibility=1),
+                    1,
+                ),
                 assumed_align=2,
             )
 
@@ -4653,7 +4688,9 @@ class GdnReplayMtpUmmaRubin:
             ft(Float32, (hv,), 1),  # dt_bias (fp32)
             fs(Float16, hv, (V_DIM, K_DIM), 8),  # state
             ft(Int32, (batch,), 1),  # state indices
-            fs(Float16 if k_f16 else BFloat16, h, (RING_SLOTS, K_DIM), 8, ring_pool),  # k ring
+            fs(
+                Float16 if k_f16 else BFloat16, h, (RING_SLOTS, K_DIM), 8, ring_pool
+            ),  # k ring
             fs(uring, hv, (RING_SLOTS, V_DIM), 8, ring_pool),  # u ring (bf16 / fp16)
             fs(Float32, hv, (RING_SLOTS,), 1, ring_pool),  # g ring
             ft(Int32, (batch,), 1),  # hist_len
@@ -4706,11 +4743,15 @@ class GdnReplayMtpUmmaRubin:
         return cute.compile[opts](
             obj,
             *args,
-            ft(Int32, (batch,), 1),  # ring rows (the state indices again without ring_rows)
+            ft(
+                Int32, (batch,), 1
+            ),  # ring rows (the state indices again without ring_rows)
             Float32(1.0),
             Int32(1),
             Int32(0),
-            *([Int64(0)] * 5),  # fused conv addresses (x, weight, state, window, window rows)
+            *(
+                [Int64(0)] * 5
+            ),  # fused conv addresses (x, weight, state, window, window rows)
             Int32(0),  # fused conv x row stride
             Int64(0),  # fused norm: z address
             Int32(0),  # fused norm: z row stride (elements a token)
@@ -5180,8 +5221,8 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     strided_inputs: bool = False,
     pdl: bool = False,
     ring_indices: Optional[torch.Tensor] = None,
-    fused_conv: Optional["GdnFusedConv"] = None,
-    fused_norm: Optional["GdnFusedNorm"] = None,
+    fused_conv: Optional[GdnFusedConv] = None,
+    fused_norm: Optional[GdnFusedNorm] = None,
 ) -> torch.Tensor:
     """Rubin (sm_107a) build of ``gated_delta_rule_mtp_ucache_flush_umma`` (the UMMA kernel
     behind ``gated_delta_rule_mtp_ucache_flush`` for the fp16-state arm), 1 <= T <= 8: same
@@ -5362,9 +5403,7 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
             "restart_hist_on_flush=True needs a caller-owned cache_base"
         )
         cache_base = torch.zeros_like(hist_len)
-    io = (
-        strided_inputs_layout(q, k, v, a, b) if strided_inputs and not ugpu else None
-    )
+    io = strided_inputs_layout(q, k, v, a, b) if strided_inputs and not ugpu else None
     if io is None:
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         a, b = a.contiguous().to(torch.bfloat16), b.contiguous().to(torch.bfloat16)
@@ -5496,12 +5535,16 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
             if not ugpu and not persistent and stochastic_rounding in (None, "none")
             else "needs 4-D state, the non-persistent kernel and round to nearest"
         )
-        reason = reason or fused_norm_unsupported_reason(fused_norm, batch=B, T=T, HV=HV)
+        reason = reason or fused_norm_unsupported_reason(
+            fused_norm, batch=B, T=T, HV=HV
+        )
         if reason is not None:
             raise ValueError(f"fused_norm: {reason}")
         common["fused_norm"] = (
             fused_norm.z.data_ptr(),
-            fused_norm.z.stride(1) if fused_norm.z.dim() == 4 else fused_norm.z.stride(0),
+            fused_norm.z.stride(1)
+            if fused_norm.z.dim() == 4
+            else fused_norm.z.stride(0),
             fused_norm.weight.data_ptr(),
             float(fused_norm.eps),
         )
@@ -5596,19 +5639,28 @@ def fused_conv_unsupported_reason(
     H, HV = num_k_heads, num_v_heads
     hpk = HV // H
     bf = torch.bfloat16
-    if T != 4 or D != 2 * H * K_DIM + HV * V_DIM or HV % H:  # build asserts pro_reorder, not split
+    if (
+        T != 4 or D != 2 * H * K_DIM + HV * V_DIM or HV % H
+    ):  # build asserts pro_reorder, not split
         return f"T {T}, D {D}, heads {H} / {HV}"
     target = gdn_device_target(x.device)
     if (target.major, target.minor) not in _HPC_TUNED_CC:
         return f"sm_{target.major}{target.minor} (validated on sm_107a)"
-    hpc = auto_heads_per_cta(B, H, target.num_sms, hpk, T, None, "", 0, whole_device=True)
+    hpc = auto_heads_per_cta(
+        B, H, target.num_sms, hpk, T, None, "", 0, whole_device=True
+    )
     if hpc != hpk:
         return f"{hpc} of {hpk} value heads per CTA at batch {B}"
     if x.dtype != bf or x.stride(2) != 1 or x.stride(0) != T * x.stride(1):
         return f"x {x.dtype} {tuple(x.shape)} {x.stride()}"
     if x.stride(1) % 8 or x.data_ptr() % 16:
         return f"x rows {x.stride()} at {x.data_ptr() % 16} mod 16"
-    if w.dtype != bf or tuple(w.shape) != (D, 4) or w.stride() != (4, 1) or w.data_ptr() % 16:
+    if (
+        w.dtype != bf
+        or tuple(w.shape) != (D, 4)
+        or w.stride() != (4, 1)
+        or w.data_ptr() % 16
+    ):
         return f"weight {w.dtype} {tuple(w.shape)} {w.stride()}"
     if (
         cs.dtype != bf
@@ -5626,7 +5678,12 @@ def fused_conv_unsupported_reason(
         or win.data_ptr() % 16
     ):
         return f"window {win.dtype} {tuple(win.shape)} {win.stride()} (needs the deduplicated rows)"
-    if widx.dtype != torch.int32 or widx.dim() != 1 or widx.shape[0] < B or widx.stride(0) != 1:
+    if (
+        widx.dtype != torch.int32
+        or widx.dim() != 1
+        or widx.shape[0] < B
+        or widx.stride(0) != 1
+    ):
         return f"window indices {widx.dtype} {tuple(widx.shape)}"
     return None
 
@@ -5642,13 +5699,19 @@ class GdnFusedNorm(NamedTuple):
     eps: float
 
 
-def fused_norm_unsupported_reason(fn: GdnFusedNorm, *, batch: int, T: int, HV: int) -> Optional[str]:
+def fused_norm_unsupported_reason(
+    fn: GdnFusedNorm, *, batch: int, T: int, HV: int
+) -> Optional[str]:
     """None when the epilogue can read ``fn`` for a [batch, T, HV, V] output."""
     z, w = fn.z, fn.weight
     zr = z.reshape(batch * T, HV, V_DIM) if z.dim() == 4 else z
     if z.dtype != torch.bfloat16 or tuple(zr.shape) != (batch * T, HV, V_DIM):
         return f"z {z.dtype} {tuple(z.shape)}"
-    if zr.stride(2) != 1 or zr.stride(1) != V_DIM or (z.dim() == 4 and z.stride(1) != zr.stride(0)):
+    if (
+        zr.stride(2) != 1
+        or zr.stride(1) != V_DIM
+        or (z.dim() == 4 and z.stride(1) != zr.stride(0))
+    ):
         return f"z strides {z.stride()}"
     if w.dtype != torch.bfloat16 or tuple(w.shape) != (V_DIM,) or w.stride(0) != 1:
         return f"weight {w.dtype} {tuple(w.shape)}"
@@ -5662,7 +5725,10 @@ def _fused_conv_qkv_reason(q, k, v, D: int) -> Optional[str]:
         return f"q {tuple(q.shape)} {q.stride()} is not a dense [B, T, D] row view"
     if k.data_ptr() != q.data_ptr() + H * K_ * 2 or k.stride()[:2] != q.stride()[:2]:
         return "k is not the k columns of q's rows"
-    if v.data_ptr() != q.data_ptr() + 2 * H * K_ * 2 or v.stride()[:2] != q.stride()[:2]:
+    if (
+        v.data_ptr() != q.data_ptr() + 2 * H * K_ * 2
+        or v.stride()[:2] != q.stride()[:2]
+    ):
         return "v is not the v columns of q's rows"
     return None
 
@@ -5763,7 +5829,9 @@ def _launch(
     strided = ab_dyn or qk_io is not None or v_io is not None
     if ring_idx is not None:
         if persistent:
-            raise ValueError("persistent=True: no ring_indices (the non-persistent kernel only)")
+            raise ValueError(
+                "persistent=True: no ring_indices (the non-persistent kernel only)"
+            )
         persistent = False
     if persistent is None:
         persistent = (

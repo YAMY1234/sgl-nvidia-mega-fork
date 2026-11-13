@@ -226,8 +226,13 @@ class TestOptions(unittest.TestCase):
 
     def test_recipe_values(self):
         self.assertIs(P.DEFAULT, P.HIGH_CONCURRENCY)
-        self.assertEqual(self.fields(P.HIGH_CONCURRENCY), (True, True, True, True, True, 0, 32, 64))
-        self.assertEqual(self.fields(P.HIGH_CONCURRENCY_PLAIN_VERIFY), (True, False, True, True, False, 0, 0, 0))
+        self.assertEqual(
+            self.fields(P.HIGH_CONCURRENCY), (True, True, True, True, True, 0, 32, 64)
+        )
+        self.assertEqual(
+            self.fields(P.HIGH_CONCURRENCY_PLAIN_VERIFY),
+            (True, False, True, True, False, 0, 0, 0),
+        )
         self.assertEqual(
             self.fields(P.MID_CONCURRENCY), (True, True, True, False, False, 0, 32, 64)
         )
@@ -494,7 +499,12 @@ class TestServedAndAdd(unittest.TestCase):
             self.served(o, _batch(_Mode.TARGET_VERIFY)), "gate+verify_conv"
         )
         self.assertEqual(
-            self.served(P.HIGH_CONCURRENCY_PLAIN_VERIFY, _batch(_Mode.TARGET_VERIFY), _ple(fusion=False)), "gate"
+            self.served(
+                P.HIGH_CONCURRENCY_PLAIN_VERIFY,
+                _batch(_Mode.TARGET_VERIFY),
+                _ple(fusion=False),
+            ),
+            "gate",
         )
         self.assertEqual(self.served(o, _batch(_Mode.DECODE, fast=True)), "")
         self.assertEqual(self.served(o, _batch(_Mode.DECODE)), "gate")
@@ -603,7 +613,10 @@ class TestForward(unittest.TestCase):
             return args[0] + args[1]
 
         batch = _batch(_Mode.TARGET_VERIFY, lengths=(4, 4), physical=10)
-        for options, impl in ((P.DEFAULT, "verify_conv"), (P.HIGH_CONCURRENCY_PLAIN_VERIFY, "stock")):
+        for options, impl in (
+            (P.DEFAULT, "verify_conv"),
+            (P.HIGH_CONCURRENCY_PLAIN_VERIFY, "stock"),
+        ):
             with mock.patch.object(
                 qwen4_verify_conv, "fused_qwen4_verify_conv", verify
             ):
@@ -738,7 +751,9 @@ class TestShortConv(unittest.TestCase):
         _STATE["varlen"] = True
         try:
             with (
-                mock.patch.object(qwen4_ple_fused, "conv_engages", lambda *a, **k: True),
+                mock.patch.object(
+                    qwen4_ple_fused, "conv_engages", lambda *a, **k: True
+                ),
                 mock.patch.object(
                     qwen4_ple_fused,
                     "fused_short_conv_extend",

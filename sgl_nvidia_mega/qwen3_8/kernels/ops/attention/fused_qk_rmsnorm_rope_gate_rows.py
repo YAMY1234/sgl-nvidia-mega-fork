@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # From SGLang python/sglang/kernels/ops/attention/fused_qk_rmsnorm_rope_gate_rows.py
-#. Changed: ``applies`` no longer reads the
+# . Changed: ``applies`` no longer reads the
 # SGLANG_OPT_FUSED_QK_NORM_ROPE_ROWS switch (the executor's runtime/qsa_prefill.py
 # Options.qk_rows decides whether it is asked), and SGLANG_FUSED_QK_NORM_ROPE_ROWS_MIN_TOKENS,
 # _ROWS and _CHECK_CALLS are the constants MIN_TOKENS, ROWS and CHECK_CALLS at their
@@ -28,7 +28,6 @@ import logging
 import time
 
 import torch
-
 
 logger = logging.getLogger(__name__)
 

@@ -69,7 +69,7 @@ def _install_fakes():
     )
     bcg.is_in_breakable_cuda_graph = lambda: _STATE["breakable"]
     # outside a capture a break runs its body (tests of the real decorator: TestBreaks)
-    bcg.eager_on_graph = lambda enable: (lambda fn: fn)
+    bcg.eager_on_graph = lambda enable: lambda fn: fn
     sys.modules[bcg.__name__] = bcg
 
 
@@ -110,7 +110,9 @@ class TestPlan(unittest.TestCase):
     def test_target(self):
         ex = _executor()
         self.assertEqual(self.plan(ex, _Mode.TARGET_VERIFY, 8), ("target_verify", 8))
-        self.assertEqual(self.plan(ex, _Mode.TARGET_VERIFY, 1024), ("target_verify", 1024))
+        self.assertEqual(
+            self.plan(ex, _Mode.TARGET_VERIFY, 1024), ("target_verify", 1024)
+        )
         self.assertIsNone(self.plan(ex, _Mode.TARGET_VERIFY, 6))  # not a built width
         self.assertIsNone(self.plan(ex, _Mode.TARGET_VERIFY, 1028))
         self.assertEqual(self.plan(ex, _Mode.DECODE, 4), ("decode", 4))
@@ -243,7 +245,9 @@ class TestStepFallbacks(unittest.TestCase):
                 return SimpleNamespace(
                     top_k=10,
                     gemm2_out=torch.zeros(rows * 10, 2560),
-                    expanded_idx_to_permuted_idx=torch.zeros(rows, 10, dtype=torch.int32),
+                    expanded_idx_to_permuted_idx=torch.zeros(
+                        rows, 10, dtype=torch.int32
+                    ),
                     expert_weights=torch.zeros(rows, 10),
                 )
 
@@ -251,7 +255,9 @@ class TestStepFallbacks(unittest.TestCase):
                 calls.append("shared")
                 return torch.zeros_like(x)
 
-        ex = SimpleNamespace(moe_finalize_ready=True, moe_routing=None, smallm_gemm=None)
+        ex = SimpleNamespace(
+            moe_finalize_ready=True, moe_routing=None, smallm_gemm=None
+        )
         layer = SimpleNamespace(mlp=Block())
         st = _St(_Mode.TARGET_VERIFY)
         self.enterContext(mock.patch.object(moe, "FINALIZE_COLUMN_CHUNK", 1024))
@@ -287,7 +293,10 @@ class TestStepFallbacks(unittest.TestCase):
         from sgl_nvidia_mega.qwen3_8.runtime import gdn
 
         ex = SimpleNamespace(
-            gdn_glue_ready=True, gdn_pdl_ready=False, gdn_ucache=None, gdn_prefill=None,
+            gdn_glue_ready=True,
+            gdn_pdl_ready=False,
+            gdn_ucache=None,
+            gdn_prefill=None,
             gdn_front_ready=False,
         )
         layer = SimpleNamespace(linear_attn=lambda x, fb: "gdn-stock")
@@ -312,31 +321,45 @@ class TestStepFallbacks(unittest.TestCase):
         kmod.gdn_fused_verify_glue = glue
         umod = types.ModuleType("sglang.srt.layers.attention.linear.utils")
         selected = []
-        umod.select_verify_intermediate_state_indices = (
-            lambda idx, req, valid, size: selected.append(valid) or idx
+        umod.select_verify_intermediate_state_indices = lambda idx, req, valid, size: (
+            selected.append(valid) or idx
         )
         umod.pp_spec_stable_rows_enabled = lambda: False
         cache = SimpleNamespace(
-            conv=[torch.zeros(1)], intermediate_conv_window=[torch.zeros(1)],
-            temporal="ckpt", replayssm_d="d", replayssm_k="k", replayssm_g="g",
-            replayssm_rawv=None, replayssm_rawk=None, replayssm_beta=None,
+            conv=[torch.zeros(1)],
+            intermediate_conv_window=[torch.zeros(1)],
+            temporal="ckpt",
+            replayssm_d="d",
+            replayssm_k="k",
+            replayssm_g="g",
+            replayssm_rawv=None,
+            replayssm_rawk=None,
+            replayssm_beta=None,
         )
         backend = SimpleNamespace(
             forward_metadata=SimpleNamespace(
-                retrieve_next_token=None, retrieve_next_sibling=None,
-                retrieve_parent_token=None, mamba_cache_indices=torch.arange(2),
+                retrieve_next_token=None,
+                retrieve_next_sibling=None,
+                retrieve_parent_token=None,
+                mamba_cache_indices=torch.arange(2),
             ),
             state_layer_cache=lambda layer_id: cache,
             state_pool=SimpleNamespace(
-                replayssm_spec_write_pos="wp", replayssm_cache_base="cb",
+                replayssm_spec_write_pos="wp",
+                replayssm_cache_base="cb",
                 replayssm_is_flush="fl",
             ),
             verify_intermediate_state_indices=torch.arange(2),
             req_to_token_pool=SimpleNamespace(size=16),
         )
         attn = SimpleNamespace(
-            layer_id=0, conv_weights="w", activation="silu", A_log="al", dt_bias="dt",
-            num_k_heads=4, head_k_dim=128,
+            layer_id=0,
+            conv_weights="w",
+            activation="silu",
+            A_log="al",
+            dt_bias="dt",
+            num_k_heads=4,
+            head_k_dim=128,
         )
         linear = SimpleNamespace(
             attn=attn,
@@ -346,22 +369,35 @@ class TestStepFallbacks(unittest.TestCase):
         )
         # slot gdn_front declines 8 rows before it imports its kernels
         ex = SimpleNamespace(
-            gdn_glue_ready=True, gdn_pdl_ready=False, gdn_ucache=None,
-            gdn_prefill=None, smallm_gemm=None, gdn_front_ready=True,
+            gdn_glue_ready=True,
+            gdn_pdl_ready=False,
+            gdn_ucache=None,
+            gdn_prefill=None,
+            smallm_gemm=None,
+            gdn_front_ready=True,
         )
         st = _St(_Mode.TARGET_VERIFY, rows=rows)
         st.fb.req_pool_indices = torch.arange(2)
-        with mock.patch.dict(sys.modules, {kmod.__name__: kmod, umod.__name__: umod}), \
-                mock.patch.object(gdn, "linear_backend", lambda: backend):
-            out = gdn.step(ex, SimpleNamespace(linear_attn=linear), torch.zeros(rows, 8), st)
+        with (
+            mock.patch.dict(sys.modules, {kmod.__name__: kmod, umod.__name__: umod}),
+            mock.patch.object(gdn, "linear_backend", lambda: backend),
+        ):
+            out = gdn.step(
+                ex, SimpleNamespace(linear_attn=linear), torch.zeros(rows, 8), st
+            )
         self.assertTrue(torch.equal(out, torch.full((rows, 6), 2.0)))
         self.assertEqual(st.ran_ops, [("gdn", "verify_glue")])
         self.assertEqual((seen["mixed_qkvz"], seen["mixed_ba"]), ("qkvz", "ba"))
-        self.assertEqual((seen["draft_token_num"], seen["norm_activation"]), (4, "swish"))
+        self.assertEqual(
+            (seen["draft_token_num"], seen["norm_activation"]), (4, "swish")
+        )
         self.assertIsNone(seen["conv_bias"])
         # without PP stable rows, the source's call: no mask, the backend's own indices
         self.assertEqual(selected, [])
-        self.assertIs(seen["intermediate_state_indices"], backend.verify_intermediate_state_indices)
+        self.assertIs(
+            seen["intermediate_state_indices"],
+            backend.verify_intermediate_state_indices,
+        )
 
     def test_gdn_front_runs_one_request(self):
         """4 rows: the front's projection + conv, then the core with the fused norm on
@@ -375,9 +411,14 @@ class TestStepFallbacks(unittest.TestCase):
         width = 2 * qk + 2 * hv * vd + 2 * hv
         seen, selects = {}, []
         pkg = "sgl_nvidia_mega.qwen3_8.kernels.ops.attention.gdn_front."
-        front, core = types.ModuleType(pkg + "mk_front"), types.ModuleType(pkg + "mk_core")
+        front, core = (
+            types.ModuleType(pkg + "mk_front"),
+            types.ModuleType(pkg + "mk_core"),
+        )
 
-        def run(x, weight, conv_w, conv_b, conv_state, state_idx, window, w_rows, pad_slot):
+        def run(
+            x, weight, conv_w, conv_b, conv_state, state_idx, window, w_rows, pad_slot
+        ):
             seen["run"] = (weight, conv_b, state_idx, w_rows, pad_slot)
             return torch.arange(width, dtype=torch.float32).repeat(rows, 1), "qkv"
 
@@ -389,30 +430,45 @@ class TestStepFallbacks(unittest.TestCase):
         conv = types.ModuleType("sglang.kernels.ops.mamba.causal_conv1d_triton")
         conv.PAD_SLOT_ID = -1
         umod = types.ModuleType("sglang.srt.layers.attention.linear.utils")
-        umod.select_verify_intermediate_state_indices = (
-            lambda idx, req, valid, size: selects.append(size) or idx
+        umod.select_verify_intermediate_state_indices = lambda idx, req, valid, size: (
+            selects.append(size) or idx
         )
         cache = SimpleNamespace(
-            conv=["conv"], intermediate_conv_window=["window"], temporal="ckpt",
-            replayssm_d="d", replayssm_k="k", replayssm_g="g", replayssm_rawv="dlo",
+            conv=["conv"],
+            intermediate_conv_window=["window"],
+            temporal="ckpt",
+            replayssm_d="d",
+            replayssm_k="k",
+            replayssm_g="g",
+            replayssm_rawv="dlo",
             replayssm_rawk="klo",
         )
         backend = SimpleNamespace(
             forward_metadata=SimpleNamespace(
-                retrieve_next_token=None, retrieve_next_sibling=None,
-                retrieve_parent_token=None, mamba_cache_indices=torch.tensor([5, -1]),
+                retrieve_next_token=None,
+                retrieve_next_sibling=None,
+                retrieve_parent_token=None,
+                mamba_cache_indices=torch.tensor([5, -1]),
             ),
             state_layer_cache=lambda layer_id: cache,
             state_pool=SimpleNamespace(
-                replayssm_spec_write_pos="wp", replayssm_cache_base="cb",
+                replayssm_spec_write_pos="wp",
+                replayssm_cache_base="cb",
                 replayssm_is_flush="fl",
             ),
             verify_intermediate_state_indices=torch.tensor([7, 8]),
             req_to_token_pool=SimpleNamespace(size=16),
         )
         attn = SimpleNamespace(
-            layer_id=0, conv_weights="w", A_log="al", dt_bias="dt", q_dim=qk, k_dim=qk,
-            v_dim=hv * vd, num_v_heads=hv, head_v_dim=vd,
+            layer_id=0,
+            conv_weights="w",
+            A_log="al",
+            dt_bias="dt",
+            q_dim=qk,
+            k_dim=qk,
+            v_dim=hv * vd,
+            num_v_heads=hv,
+            head_v_dim=vd,
         )
         linear = SimpleNamespace(
             attn=attn,
@@ -421,14 +477,20 @@ class TestStepFallbacks(unittest.TestCase):
             out_proj=lambda core: (core * 2, None),
         )
         ex = SimpleNamespace(
-            gdn_front_ready=True, gdn_glue_ready=True, gdn_pdl_ready=False,
-            gdn_ucache=None, gdn_prefill=None, smallm_gemm=None,
+            gdn_front_ready=True,
+            gdn_glue_ready=True,
+            gdn_pdl_ready=False,
+            gdn_ucache=None,
+            gdn_prefill=None,
+            smallm_gemm=None,
         )
         st = _St(_Mode.TARGET_VERIFY, rows=rows)
         st.fb.req_pool_indices = torch.tensor([3])
         mods = {m.__name__: m for m in (front, core, conv, umod)}
-        with mock.patch.dict(sys.modules, mods), \
-                mock.patch.object(gdn, "linear_backend", lambda: backend):
+        with (
+            mock.patch.dict(sys.modules, mods),
+            mock.patch.object(gdn, "linear_backend", lambda: backend),
+        ):
             for _ in range(2):  # two GDN layers of one step
                 out = gdn.step(
                     ex, SimpleNamespace(linear_attn=linear), torch.zeros(rows, 8), st
@@ -454,11 +516,12 @@ class TestStepFallbacks(unittest.TestCase):
 
         from sgl_nvidia_mega.qwen3_8.runtime import attention, qsa_prefill
 
-        layer = SimpleNamespace(
-            is_qsa=True, self_attention=lambda **kw: "qsa-stock"
-        )
+        layer = SimpleNamespace(is_qsa=True, self_attention=lambda **kw: "qsa-stock")
         ex = SimpleNamespace(
-            qsa_pool_ready=False, qsa_union=None, qsa_indexer=None, qsa_prefill="o",
+            qsa_pool_ready=False,
+            qsa_union=None,
+            qsa_indexer=None,
+            qsa_prefill="o",
             qsa_draft=None,
         )
         for served, want in ((None, "qsa-stock"), ("qsa-prefill", "qsa-prefill")):
@@ -478,8 +541,11 @@ class TestStepFallbacks(unittest.TestCase):
 
         layer = SimpleNamespace(is_qsa=True, self_attention=lambda **kw: "qsa-stock")
         ex = SimpleNamespace(
-            qsa_pool_ready=False, qsa_union="union", qsa_indexer="indexer",
-            qsa_prefill="o", qsa_draft="glue",
+            qsa_pool_ready=False,
+            qsa_union="union",
+            qsa_indexer="indexer",
+            qsa_prefill="o",
+            qsa_draft="glue",
         )
         with (
             mock.patch.object(qsa_prefill, "extend", return_value="qsa-prefill") as ext,
@@ -504,7 +570,9 @@ class TestStepFallbacks(unittest.TestCase):
                 ext.assert_called_once()
                 # a verify never asks the prefill kernels
                 st = _St(_Mode.DECODE)
-                self.assertEqual(gdn.step(ex, layer, torch.zeros(8, 4), st), "gdn-stock")
+                self.assertEqual(
+                    gdn.step(ex, layer, torch.zeros(8, 4), st), "gdn-stock"
+                )
                 ext.assert_called_once()
 
     def test_qsa_stock_when_off_or_prefill(self):
@@ -517,7 +585,10 @@ class TestStepFallbacks(unittest.TestCase):
         for ready, mode in ((False, _Mode.TARGET_VERIFY), (True, _Mode.EXTEND)):
             st = _St(mode, 8)
             ex = SimpleNamespace(
-                qsa_pool_ready=ready, qsa_union=None, qsa_indexer=None, qsa_prefill=None,
+                qsa_pool_ready=ready,
+                qsa_union=None,
+                qsa_indexer=None,
+                qsa_prefill=None,
                 qsa_draft=None,
             )
             out = attention.step(ex, layer, torch.zeros(8, 4), st)
@@ -537,17 +608,25 @@ class TestReasons(unittest.TestCase):
         from unittest import mock
 
         with mock.patch.object(runtime, "gdn_graph_tables", return_value=False):
-            with mock.patch.object(runtime, "prefill_graph_supported", return_value=True):
+            with mock.patch.object(
+                runtime, "prefill_graph_supported", return_value=True
+            ):
                 for backend in ("breakable", "Backend.BREAKABLE", "disabled"):
-                    self.assertEqual(runtime.config_reasons(_prefill_cfg(backend), None), [])
+                    self.assertEqual(
+                        runtime.config_reasons(_prefill_cfg(backend), None), []
+                    )
                 self.assertEqual(runtime.config_reasons(SimpleNamespace(), None), [])
                 for backend in ("full", "tc_piecewise"):  # capture the whole step
                     self.assertTrue(runtime.config_reasons(_prefill_cfg(backend), None))
             # an SGLang without MegakernelSpec.prefill_graph
-            with mock.patch.object(runtime, "prefill_graph_supported", return_value=False):
+            with mock.patch.object(
+                runtime, "prefill_graph_supported", return_value=False
+            ):
                 (reason,) = runtime.config_reasons(_prefill_cfg("breakable"), None)
                 self.assertIn("prefill_graph", reason)
-                self.assertEqual(runtime.config_reasons(_prefill_cfg("disabled"), None), [])
+                self.assertEqual(
+                    runtime.config_reasons(_prefill_cfg("disabled"), None), []
+                )
 
     def test_flashinfer_gdn_tables_need_slot_gdn_prefill(self):
         from unittest import mock
@@ -560,7 +639,9 @@ class TestReasons(unittest.TestCase):
             with mock.patch.dict(runtime.os.environ, {runtime.SLOTS_ENV: "ple"}):
                 (reason,) = runtime.config_reasons(cfg, None)
                 self.assertIn("gdn_prefill", reason)
-            with mock.patch.dict(runtime.os.environ, {runtime.SLOTS_ENV: "gdn_prefill"}):
+            with mock.patch.dict(
+                runtime.os.environ, {runtime.SLOTS_ENV: "gdn_prefill"}
+            ):
                 self.assertEqual(runtime.config_reasons(cfg, None), [])
 
     def test_flashinfer_gdn_tables_refuse_attention_cp(self):
@@ -588,19 +669,38 @@ class TestReasons(unittest.TestCase):
 def _gdn_front_model():
     """One GDN layer of the TP1 shape slot gdn_front takes."""
     attn = SimpleNamespace(
-        q_dim=2048, k_dim=2048, v_dim=6144, num_v_heads=48, num_q_heads=16,
-        head_q_dim=128, num_k_heads=16, head_k_dim=128, bias=None, activation="silu",
-        A_log=torch.zeros(48), dt_bias=torch.zeros(48, dtype=torch.bfloat16),
+        q_dim=2048,
+        k_dim=2048,
+        v_dim=6144,
+        num_v_heads=48,
+        num_q_heads=16,
+        head_q_dim=128,
+        num_k_heads=16,
+        head_k_dim=128,
+        bias=None,
+        activation="silu",
+        A_log=torch.zeros(48),
+        dt_bias=torch.zeros(48, dtype=torch.bfloat16),
     )
     norm = SimpleNamespace(
-        group_size=None, norm_before_gate=True, bias=None, activation="sigmoid",
+        group_size=None,
+        norm_before_gate=True,
+        bias=None,
+        activation="sigmoid",
         weight=torch.zeros(128, dtype=torch.bfloat16),
     )
     layer = _Linear()
     layer.linear_attn = SimpleNamespace(
-        attn=attn, norm=norm, attn_tp_size=1, num_k_heads=16, num_v_heads=48,
-        head_k_dim=128, head_v_dim=128,
-        _fused_in_proj_weight=SimpleNamespace(shape=(16480, 2560), dtype=torch.bfloat16),
+        attn=attn,
+        norm=norm,
+        attn_tp_size=1,
+        num_k_heads=16,
+        num_v_heads=48,
+        head_k_dim=128,
+        head_v_dim=128,
+        _fused_in_proj_weight=SimpleNamespace(
+            shape=(16480, 2560), dtype=torch.bfloat16
+        ),
     )
     m = SimpleNamespace(layers=[layer, _Attention()], start_layer=0, end_layer=2)
     return SimpleNamespace(model=m), layer.linear_attn
@@ -609,8 +709,11 @@ def _gdn_front_model():
 def _gdn_front_backend():
     bf16 = torch.bfloat16
     cache = SimpleNamespace(
-        replayssm_d=torch.zeros(2, 1, 16, 1, dtype=bf16), replayssm_rawv="dlo",
-        replayssm_rawk="klo", replayssm_beta=None, temporal=torch.zeros(1, dtype=bf16),
+        replayssm_d=torch.zeros(2, 1, 16, 1, dtype=bf16),
+        replayssm_rawv="dlo",
+        replayssm_rawk="klo",
+        replayssm_beta=None,
+        temporal=torch.zeros(1, dtype=bf16),
         conv=[torch.zeros(2, 4, 3, dtype=bf16)],
         intermediate_conv_window=[torch.zeros(2, 4, 4, 3, dtype=bf16)],
     )
@@ -629,10 +732,14 @@ class TestGdnFront(unittest.TestCase):
         for change in (
             lambda: setattr(linear, "_fused_in_proj_weight", None),
             lambda: setattr(linear._fused_in_proj_weight, "shape", (16480, 4096)),
-            lambda: setattr(linear.norm, "activation", "swish"),  # the core's is sigmoid
+            lambda: setattr(
+                linear.norm, "activation", "swish"
+            ),  # the core's is sigmoid
             lambda: setattr(linear, "attn_tp_size", 4),
             lambda: setattr(linear.attn, "bias", torch.zeros(1)),
-            lambda: setattr(linear.attn, "A_log", torch.zeros(48, dtype=torch.bfloat16)),
+            lambda: setattr(
+                linear.attn, "A_log", torch.zeros(48, dtype=torch.bfloat16)
+            ),
         ):
             model, linear = _gdn_front_model()
             change()
@@ -664,8 +771,10 @@ class TestGdnFront(unittest.TestCase):
         ex.lm.model.layers[0].linear_attn = SimpleNamespace(attn=attn)
         ex.gdn_front_ready = True
         fb = SimpleNamespace(spec_info=SimpleNamespace(draft_token_num=4))
-        with mock.patch.object(gdn, "linear_backend", lambda: "backend"), \
-                mock.patch.object(gdn, "front_pool_reasons", return_value="no rings") as r:
+        with (
+            mock.patch.object(gdn, "linear_backend", lambda: "backend"),
+            mock.patch.object(gdn, "front_pool_reasons", return_value="no rings") as r,
+        ):
             ex._check_pools(fb)
         r.assert_called_once_with("backend", 3, 4)
         self.assertFalse(ex.gdn_front_ready)
@@ -680,16 +789,19 @@ class TestGdnFront(unittest.TestCase):
 
         calls, capturing = [], [False]
         cuda, bindings, driver = (
-            types.ModuleType(n) for n in ("cuda", "cuda.bindings", "cuda.bindings.driver")
+            types.ModuleType(n)
+            for n in ("cuda", "cuda.bindings", "cuda.bindings.driver")
         )
         cuda.bindings, bindings.driver, driver.CUstream = bindings, driver, lambda s: s
         cutlass, cute, runtime = (
-            types.ModuleType(n) for n in ("cutlass", "cutlass.cute", "cutlass.cute.runtime")
+            types.ModuleType(n)
+            for n in ("cutlass", "cutlass.cute", "cutlass.cute.runtime")
         )
         cutlass.cute, cute.runtime, cutlass.BFloat16 = cute, runtime, "bf16"
         cute.experimental = SimpleNamespace(
-            compile=lambda op, *args: calls.append("compile")
-            or (lambda *a: calls.append("launch"))
+            compile=lambda op, *args: (
+                calls.append("compile") or (lambda *a: calls.append("launch"))
+            )
         )
         runtime.from_dlpack = lambda t, assumed_align: t
         kernel = types.ModuleType(package.__name__ + ".mk_front_kernel")
@@ -699,8 +811,14 @@ class TestGdnFront(unittest.TestCase):
         bf = lambda *shape: torch.empty(shape, dtype=torch.bfloat16, device="meta")
         idx = lambda: torch.empty(1, dtype=torch.int32, device="meta")
         args = lambda: (
-            bf(4, 2560), bf(16480, 2560), bf(10240, 4), None, bf(3, 10240, 3), idx(),
-            bf(2, 4, 10240, 3), idx(),
+            bf(4, 2560),
+            bf(16480, 2560),
+            bf(10240, 4),
+            None,
+            bf(3, 10240, 3),
+            idx(),
+            bf(2, 4, 10240, 3),
+            idx(),
         )
         cuda_fns = dict(
             is_current_stream_capturing=lambda: capturing[0],
@@ -708,11 +826,16 @@ class TestGdnFront(unittest.TestCase):
             get_device_capability=lambda d: (10, 7),
         )
         self.addCleanup(lambda: vars(package).pop("mk_front", None))
-        with mock.patch.dict(sys.modules, mods), mock.patch.multiple(torch.cuda, **cuda_fns):
+        with (
+            mock.patch.dict(sys.modules, mods),
+            mock.patch.multiple(torch.cuda, **cuda_fns),
+        ):
             sys.modules.pop(package.__name__ + ".mk_front", None)
             front = importlib.import_module(package.__name__ + ".mk_front")
             packed, conv = front.run(*args(), pad_slot=-1)
-            self.assertEqual(tuple(packed.shape) + tuple(conv.shape), (4, 16480, 4, 10240))
+            self.assertEqual(
+                tuple(packed.shape) + tuple(conv.shape), (4, 16480, 4, 10240)
+            )
             capturing[0] = True
             front.run(*args(), pad_slot=-1)
             self.assertEqual(calls, ["compile", "launch", "launch"])
@@ -782,15 +905,26 @@ class TestQsaPoolFp8(unittest.TestCase):
 
         elementwise = types.ModuleType("sglang.kernels.ops.elementwise.elementwise")
         self.gated = []
-        elementwise.fused_sigmoid_mul = (
-            lambda x, gate, inplace: self.gated.append(float(x[0, 0])) or x + 1
+        elementwise.fused_sigmoid_mul = lambda x, gate, inplace: (
+            self.gated.append(float(x[0, 0])) or x + 1
         )
         patch = mock.patch.dict(sys.modules, {elementwise.__name__: elementwise})
         patch.start()
         self.addCleanup(patch.stop)
 
-    def run_step(self, dtype, rows, *, union=True, split_k=True, mode=None, draft=4,
-                 positions="qpos", blocks=512, q_dtype=torch.bfloat16):
+    def run_step(
+        self,
+        dtype,
+        rows,
+        *,
+        union=True,
+        split_k=True,
+        mode=None,
+        draft=4,
+        positions="qpos",
+        blocks=512,
+        q_dtype=torch.bfloat16,
+    ):
         from unittest import mock
 
         from sgl_nvidia_mega.qwen3_8.runtime import attention
@@ -910,9 +1044,16 @@ class TestQsaPoolFp8(unittest.TestCase):
             ):
                 out, impl = attention.UnionKernels().run(
                     q=torch.zeros(rows, 24, 256, dtype=torch.bfloat16),
-                    key_cache="k", value_cache="v", new_k="nk", new_v="nv",
-                    locations="loc", slot_map="map", row_requests="req",
-                    indices="idx", sequence_lengths="len", query_positions="pos",
+                    key_cache="k",
+                    value_cache="v",
+                    new_k="nk",
+                    new_v="nv",
+                    locations="loc",
+                    slot_map="map",
+                    row_requests="req",
+                    indices="idx",
+                    sequence_lengths="len",
+                    query_positions="pos",
                     scale=0.0625,
                 )
             self.assertEqual(impl, "union_ws_fp8" if served else "union_fp8")
@@ -1055,8 +1196,17 @@ class TestQsaPoolFp8(unittest.TestCase):
             self.assertIs(checked[0], batches[first], draft)
 
     def draft_extend(
-        self, rows, *, indexer=False, glue=True, union=True, tokens=None,
-        q_dtype=torch.bfloat16, requests=None, loc=None, **backend_kw
+        self,
+        rows,
+        *,
+        indexer=False,
+        glue=True,
+        union=True,
+        tokens=None,
+        q_dtype=torch.bfloat16,
+        requests=None,
+        loc=None,
+        **backend_kw,
     ):
         """One draft extend step of the draft's QSA layer, with the indexer's expanded
         token indices from SGLang's indexer (with or without slot qsa_draft's capture)
@@ -1180,14 +1330,24 @@ class TestQsaPoolFp8(unittest.TestCase):
             self.assertEqual(ex.qsa_union.seen, [], kw)
 
 
-def _core_backend(rows=4, *, graph=True, lengths=None, positions="qpos", requests=True,
-                  dtype=torch.bfloat16, **kw):
+def _core_backend(
+    rows=4,
+    *,
+    graph=True,
+    lengths=None,
+    positions="qpos",
+    requests=True,
+    dtype=torch.bfloat16,
+    **kw,
+):
     """The verify's QSA backend as the tcgen05 core's gates read it."""
     md = SimpleNamespace(
         is_cuda_graph=graph,
         sequence_lengths=torch.arange(rows) + 100 if lengths is None else lengths,
         indexer_metadata=SimpleNamespace(
-            decode_logical_positions=None if positions is None else torch.arange(rows) + 99
+            decode_logical_positions=None
+            if positions is None
+            else torch.arange(rows) + 99
         ),
         row_req_pool_indices=torch.zeros(rows, dtype=torch.int32) if requests else None,
     )
@@ -1213,16 +1373,29 @@ class TestQsaCore(unittest.TestCase):
     def setUp(self):
         elementwise = types.ModuleType("sglang.kernels.ops.elementwise.elementwise")
         self.gated = []
-        elementwise.fused_sigmoid_mul = (
-            lambda x, gate, inplace: self.gated.append(float(x[0, 0])) or x + 1
+        elementwise.fused_sigmoid_mul = lambda x, gate, inplace: (
+            self.gated.append(float(x[0, 0])) or x + 1
         )
         patch = mock.patch.dict(sys.modules, {elementwise.__name__: elementwise})
         patch.start()
         self.addCleanup(patch.stop)
 
-    def run_core(self, rows=4, *, core=True, topk=1, draft=4, mode=_Mode.TARGET_VERIFY,
-                 loc=None, blocks=512, k=None, v=None, backend=None, gate_v2=False,
-                 merge_gate=False):
+    def run_core(
+        self,
+        rows=4,
+        *,
+        core=True,
+        topk=1,
+        draft=4,
+        mode=_Mode.TARGET_VERIFY,
+        loc=None,
+        blocks=512,
+        k=None,
+        v=None,
+        backend=None,
+        gate_v2=False,
+        merge_gate=False,
+    ):
         from sgl_nvidia_mega.qwen3_8.runtime import attention
 
         calls = []
@@ -1282,7 +1455,9 @@ class TestQsaCore(unittest.TestCase):
         self.assertEqual(router.reads, [7])
         self.assertIs(kw["locations"], st.fb.out_cache_loc)
         self.assertIs(kw["row_requests"], backend.md.row_req_pool_indices)
-        self.assertEqual((kw["indices"].dtype, tuple(kw["indices"].shape)), (torch.int32, (4, 512)))
+        self.assertEqual(
+            (kw["indices"].dtype, tuple(kw["indices"].shape)), (torch.int32, (4, 512))
+        )
         self.assertIs(kw["sequence_lengths"], backend.md.sequence_lengths)
         self.assertIs(
             kw["query_positions"], backend.md.indexer_metadata.decode_logical_positions
@@ -1301,7 +1476,11 @@ class TestQsaCore(unittest.TestCase):
         """SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_GATE_V2, or
         SGLANG_ENABLE_QSA_POOL_MERGE_GATE, hands the gate to the core: its epilogue merge
         applies it and nothing gates after it."""
-        for kw in (dict(gate_v2=True), dict(merge_gate=True), dict(gate_v2=True, merge_gate=True)):
+        for kw in (
+            dict(gate_v2=True),
+            dict(merge_gate=True),
+            dict(gate_v2=True, merge_gate=True),
+        ):
             self.gated.clear()
             impl, out, ex, _, _, _ = self.run_core(**kw)
             self.assertEqual(impl, ["tcgen05_gate_v2"], kw)
@@ -1319,16 +1498,27 @@ class TestQsaCore(unittest.TestCase):
             ("two requests", dict(rows=8), "pool_splitk"),
             ("topk 2", dict(topk=2), "pool_splitk"),
             ("eager metadata", dict(backend=_core_backend(graph=False)), "pool_splitk"),
-            ("lengths", dict(backend=_core_backend(lengths=torch.zeros(3))), "pool_splitk"),
-            ("not the plain pool", dict(backend=_core_backend(_fused_kv_pool_eligible=False)),
-             "pool_splitk"),
+            (
+                "lengths",
+                dict(backend=_core_backend(lengths=torch.zeros(3))),
+                "pool_splitk",
+            ),
+            (
+                "not the plain pool",
+                dict(backend=_core_backend(_fused_kv_pool_eligible=False)),
+                "pool_splitk",
+            ),
             ("ratio 8", dict(backend=_core_backend(compress_ratio=8)), "pool_splitk"),
             ("strided loc", dict(loc=torch.arange(8)[::2]), "pool_splitk"),
             ("strided k", dict(k=strided_k.reshape(4, 2, 256)), "pool_splitk"),
             ("three draft tokens", dict(draft=3), "stock"),
             ("no positions", dict(backend=_core_backend(positions=None)), "stock"),
             ("token indices", dict(blocks=2051), "stock"),
-            ("FP8 pool", dict(backend=_core_backend(dtype=torch.float8_e4m3fn)), "stock"),
+            (
+                "FP8 pool",
+                dict(backend=_core_backend(dtype=torch.float8_e4m3fn)),
+                "stock",
+            ),
         ):
             impl, _, ex, calls, _, _ = self.run_core(**kw)
             self.assertEqual(impl, [want], name)
@@ -1339,9 +1529,20 @@ class TestQsaCore(unittest.TestCase):
         from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import qsa_tcgen05_v1
         from sgl_nvidia_mega.qwen3_8.runtime import attention
 
-        names = ("q", "key_cache", "value_cache", "new_k", "new_v", "locations",
-                 "slot_map", "row_requests", "indices", "sequence_lengths",
-                 "query_positions", "scale")
+        names = (
+            "q",
+            "key_cache",
+            "value_cache",
+            "new_k",
+            "new_v",
+            "locations",
+            "slot_map",
+            "row_requests",
+            "indices",
+            "sequence_lengths",
+            "query_positions",
+            "scale",
+        )
         with mock.patch.object(qsa_tcgen05_v1, "run", lambda *a, **kw: (a, kw)):
             args, kw = attention.CoreKernels().run(**{n: n for n in names})
         self.assertEqual(args, names)
@@ -1350,10 +1551,14 @@ class TestQsaCore(unittest.TestCase):
 
         for fix in (False, True):  # the QSA PDL fix: the merge waits for the partials
             with (
-                mock.patch.object(qsa_gate_epilogue_v2, "run_gated", lambda *a, **kw: (a, kw)),
+                mock.patch.object(
+                    qsa_gate_epilogue_v2, "run_gated", lambda *a, **kw: (a, kw)
+                ),
                 mock.patch.object(attention, "QSA_PDL_FIX", fix),
             ):
-                args, kw = attention.CoreKernels().run(**{n: n for n in names}, gate="gate")
+                args, kw = attention.CoreKernels().run(
+                    **{n: n for n in names}, gate="gate"
+                )
             self.assertEqual(args, names + ("gate",))
             self.assertEqual(kw, dict(width=4, store_new_kv=True, wait_primary=fix))
 
@@ -1369,13 +1574,19 @@ class TestQsaCore(unittest.TestCase):
             self.assertEqual(agreed, [])
             with mock.patch.object(attention, "ATTN_CORE_V1", True):
                 with mock.patch.object(attention, "core_build", return_value=""):
-                    self.assertIsInstance(runtime._build_qsa_core(), attention.CoreKernels)
-                with mock.patch.object(attention, "core_build", return_value="no SM10x"):
+                    self.assertIsInstance(
+                        runtime._build_qsa_core(), attention.CoreKernels
+                    )
+                with mock.patch.object(
+                    attention, "core_build", return_value="no SM10x"
+                ):
                     self.assertIsNone(runtime._build_qsa_core())
         self.assertEqual(
             agreed,
-            [("", "Qwen3.8 slot qsa_pool tcgen05 core"),
-             ("no SM10x", "Qwen3.8 slot qsa_pool tcgen05 core")],
+            [
+                ("", "Qwen3.8 slot qsa_pool tcgen05 core"),
+                ("no SM10x", "Qwen3.8 slot qsa_pool tcgen05 core"),
+            ],
         )
         with mock.patch.object(torch.cuda, "is_available", lambda: False):
             self.assertIn("SM10x", attention.core_build())
@@ -1398,8 +1609,13 @@ def _expanded(rows):
 
 
 def _draft_extend_backend(
-    rows, *, graph=True, profile=(512, 2048), row_requests=None, lengths=None,
-    positions="qpos"
+    rows,
+    *,
+    graph=True,
+    profile=(512, 2048),
+    row_requests=None,
+    lengths=None,
+    positions="qpos",
 ):
     md = SimpleNamespace(
         is_cuda_graph=graph,
@@ -1462,7 +1678,9 @@ class TestOwnUcache(unittest.TestCase):
 
     def test_delegates_to_state(self):
         ex = self._executor()
-        self.assertEqual((ex.state_bytes_per_slot, ex.state_bytes_per_request_row), (0, 123))
+        self.assertEqual(
+            (ex.state_bytes_per_slot, ex.state_bytes_per_request_row), (0, 123)
+        )
         self.assertFalse(ex.keeps_draft_ssm or ex.tracks_decode_state)
         self.assertFalse(ex.backs_up_state)
         ex.reset_state_slots("slots", "rows")
@@ -1482,9 +1700,7 @@ class TestOwnUcache(unittest.TestCase):
         runtime.prepare(ex, view)
         runtime.prepare(ex, view)  # a recapture repeats prepare
         self.assertEqual(built, [("pools", "rings", 4)])
-        self.assertEqual(
-            ex.ucache_state.calls, [("prepare", view), ("prepare", view)]
-        )
+        self.assertEqual(ex.ucache_state.calls, [("prepare", view), ("prepare", view)])
         runtime.prepare(_executor(), view)  # no own u-cache: nothing to prepare
 
     def test_config_reasons(self):
@@ -1603,12 +1819,17 @@ class TestPrefillBody(unittest.TestCase):
             self.assertEqual(
                 self.body(ex, _Mode.EXTEND, 64, input_embeds="slot"), ("prefill", 64)
             )
-            self.assertEqual(self.body(ex, _Mode.EXTEND, 64, ids=False), ("prefill", 64))
+            self.assertEqual(
+                self.body(ex, _Mode.EXTEND, 64, ids=False), ("prefill", 64)
+            )
             # the outer step around a replay
             step = ex.plan(torch.zeros(64), _batch(_Mode.EXTEND, 64))
             self.assertEqual((step.mode, step.rows), ("prefill", 64))
         for mode in (
-            _Mode.TARGET_VERIFY, _Mode.DECODE, _Mode.DRAFT_EXTEND_V2, _Mode.IDLE,
+            _Mode.TARGET_VERIFY,
+            _Mode.DECODE,
+            _Mode.DRAFT_EXTEND_V2,
+            _Mode.IDLE,
             _Mode.PREBUILT,
         ):
             self.assertIsNone(self.body(ex, mode, 8), mode)
@@ -1630,14 +1851,19 @@ class TestPrefillBody(unittest.TestCase):
                 ("prefill", 8192),
             )
             # the draft's outer step passes the streams positionally
-            self.assertEqual(self.body(ex, _Mode.EXTEND, 64, "streams"), ("prefill", 64))
+            self.assertEqual(
+                self.body(ex, _Mode.EXTEND, 64, "streams"), ("prefill", 64)
+            )
             self.assertEqual(self.body(ex, _Mode.MIXED, 37), ("prefill", 37))
             # the outer step around a replay
             step = ex.plan(torch.zeros(64), _batch(_Mode.EXTEND, 64))
             self.assertEqual((step.mode, step.rows), ("prefill", 64))
         # draft extend and decode stay in the draft's own graphs (plan)
         for mode in (
-            _Mode.DRAFT_EXTEND_V2, _Mode.DECODE, _Mode.TARGET_VERIFY, _Mode.IDLE,
+            _Mode.DRAFT_EXTEND_V2,
+            _Mode.DECODE,
+            _Mode.TARGET_VERIFY,
+            _Mode.IDLE,
             _Mode.PREBUILT,
         ):
             self.assertIsNone(self.body(ex, mode, 8, inputs_embeds="slot"), mode)
@@ -1701,7 +1927,9 @@ class TestPrefillBody(unittest.TestCase):
         fb = _batch(_Mode.EXTEND, 16384)
         with (
             mock.patch.object(torch.cuda, "is_available", return_value=True),
-            mock.patch.object(torch.cuda, "is_current_stream_capturing", return_value=True),
+            mock.patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ),
             self.assertLogs(
                 "sgl_nvidia_mega.qwen3_8.runtime.engagement", logging.INFO
             ) as logs,
@@ -1772,7 +2000,9 @@ class TestPrefillBody(unittest.TestCase):
         context.get_parallel = lambda: SimpleNamespace(tp_size=1)
         context.get_exec = lambda: SimpleNamespace(mamba=None)
         ctx = SimpleNamespace(widths=(4, 8), binding=None, tokens_per_request=4)
-        env = {k: v for k, v in runtime.os.environ.items() if not k.startswith("SGLANG_")}
+        env = {
+            k: v for k, v in runtime.os.environ.items() if not k.startswith("SGLANG_")
+        }
         with (
             mock.patch.dict(sys.modules, {context.__name__: context}),
             mock.patch.dict(runtime.os.environ, env, clear=True),
@@ -1784,7 +2014,9 @@ class TestPrefillBody(unittest.TestCase):
                     self.assertEqual((built.draft, built.prefill_graph), (True, on))
                     if not on:
                         built = runtime.build(_model(), None, ctx)
-                        self.assertEqual((built.draft, built.prefill_graph), (False, on))
+                        self.assertEqual(
+                            (built.draft, built.prefill_graph), (False, on)
+                        )
             # FlashInfer's GDN tables need slot gdn_prefill on the target only: the MTP
             # draft has no GDN layer
             with mock.patch.object(runtime, "prefill_graphs_on", return_value=True):
@@ -1825,7 +2057,9 @@ class TestPrefillBody(unittest.TestCase):
         ex._language_model = lambda st, ids, embeds: ("hidden2", "hc2")
         out = self.run_prefill(ex)
         self.assertEqual(lm.calls, [])
-        self.assertEqual((out.hidden_states, lm.model.last_hc_hidden_states), ("hc2", "hc2"))
+        self.assertEqual(
+            (out.hidden_states, lm.model.last_hc_hidden_states), ("hc2", "hc2")
+        )
 
     def test_forward_body_sets_the_streams(self):
         from sglang.kernels.plugin_kernels.nvidia.spec import Step
@@ -1875,7 +2109,9 @@ class TestLayerLoopInGraph(unittest.TestCase):
         from unittest import mock
 
         _STATE.update(breakable=False, cp=False)
-        recorder = SimpleNamespace(with_current_layer=lambda i: contextlib.nullcontext())
+        recorder = SimpleNamespace(
+            with_current_layer=lambda i: contextlib.nullcontext()
+        )
         eplb = types.ModuleType("sglang.srt.eplb.expert_distribution")
         eplb.get_global_expert_distribution_recorder = lambda: recorder
         pkg = types.ModuleType("sglang.srt.layers.layer_boundary.residual")
@@ -1893,7 +2129,11 @@ class TestLayerLoopInGraph(unittest.TestCase):
         self.calls = []
         spied = (
             (ple, "ple", ("prepare", "prefetch", "commit", "add")),
-            (pg, "prefill_graph", ("ple_prepare", "ple_prefetch", "ple_commit", "ple_add")),
+            (
+                pg,
+                "prefill_graph",
+                ("ple_prepare", "ple_prefetch", "ple_commit", "ple_add"),
+            ),
         )
         for module, label, names in spied:
             for name in names:
@@ -1915,7 +2155,10 @@ class TestLayerLoopInGraph(unittest.TestCase):
 
         layers = (_PleLayer("ple0"), _PleLayer("ple1"), _PleLayer(None))
         m = SimpleNamespace(
-            layers=list(layers), start_layer=0, end_layer=3, has_ple=True,
+            layers=list(layers),
+            start_layer=0,
+            end_layer=3,
+            has_ple=True,
             pp_group=SimpleNamespace(is_last_rank=True),
             hyper_connection_mixer=SimpleNamespace(hc_norm="final"),
         )
@@ -1925,8 +2168,13 @@ class TestLayerLoopInGraph(unittest.TestCase):
         ex._layer = lambda i, layer, hidden, st: hidden + 1
         fb = _batch(_Mode.EXTEND, 4)
         st = StepState(
-            lm=ex.lm, step=Step(mode="prefill", rows=4), forward_batch=fb,
-            positions=None, input_ids=fb.input_ids, slots=frozenset(), binding=None,
+            lm=ex.lm,
+            step=Step(mode="prefill", rows=4),
+            forward_batch=fb,
+            positions=None,
+            input_ids=fb.input_ids,
+            slots=frozenset(),
+            binding=None,
             engagement=ex.engagement,
         )
         st.graph = graph
@@ -1983,9 +2231,11 @@ class TestBreaks(unittest.TestCase):
         name = "sgl_nvidia_mega.qwen3_8.runtime.prefill_graph"
         old = vars(package).get("prefill_graph")
         self.addCleanup(
-            lambda: setattr(package, "prefill_graph", old)
-            if old is not None
-            else vars(package).pop("prefill_graph", None)
+            lambda: (
+                setattr(package, "prefill_graph", old)
+                if old is not None
+                else vars(package).pop("prefill_graph", None)
+            )
         )
         bcg = "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph"
         with mock.patch.dict(sys.modules):
@@ -1993,7 +2243,11 @@ class TestBreaks(unittest.TestCase):
                 del sys.modules[module]
             pg = importlib.import_module(name)
             for fn in (
-                "_qsa", "_gdn_core", "_ple_prepare", "_ple_prefetch", "_ple_add",
+                "_qsa",
+                "_gdn_core",
+                "_ple_prepare",
+                "_ple_prefetch",
+                "_ple_add",
                 "_ple_commit",
             ):
                 self.assertTrue(hasattr(getattr(pg, fn), "run_eager"), fn)
@@ -2050,6 +2304,7 @@ class TestBreaks(unittest.TestCase):
 
     def test_ple_prepare_prefetch_commit_on_the_live_batch(self):
         holder, seen = _Holder(), []
+
         def prepare(st, ids, options):
             seen.append(("prepare", st, ids, options))
             return "batch"
@@ -2174,7 +2429,10 @@ class TestQsaDraft(unittest.TestCase):
         from unittest import mock
 
         # imported before sys.modules is patched (its restore would unload Triton)
-        from sgl_nvidia_mega.qwen3_8.qsa import fused_kv_lookup, mtp_capture  # noqa: F401
+        from sgl_nvidia_mega.qwen3_8.qsa import (  # noqa: F401
+            fused_kv_lookup,
+            mtp_capture,
+        )
         from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft  # noqa: F401
 
         self.trtllm = []
@@ -2232,7 +2490,9 @@ class TestQsaDraft(unittest.TestCase):
     def test_decode_packs_with_the_lookup_then_trtllm(self):
         out, packs, backend, fb = self.decode(rows=3)
         self.assertEqual(tuple(out.shape), (3, 6144))
-        ((kc, vc, k, v, loc, r2t, row_requests, lookup, lengths, counts, pk, pv),) = packs
+        ((kc, vc, k, v, loc, r2t, row_requests, lookup, lengths, counts, pk, pv),) = (
+            packs
+        )
         router = backend.token_to_kv_pool.layer_router
         self.assertEqual(router.reads, [7])
         self.assertIs(kc, router.k)
@@ -2243,9 +2503,13 @@ class TestQsaDraft(unittest.TestCase):
         state = backend._mtp_shared_sparse_indices
         # the decoder layer 7's slot, the batch's requests and logical positions
         self.assertEqual(lookup.indices.data_ptr(), state.indices[1].data_ptr())
-        self.assertEqual(lookup.captured_len.data_ptr(), state.captured_len[1].data_ptr())
+        self.assertEqual(
+            lookup.captured_len.data_ptr(), state.captured_len[1].data_ptr()
+        )
         self.assertIs(lookup.requests, fb.req_pool_indices)
-        self.assertIs(lookup.positions, backend.md.indexer_metadata.decode_logical_positions)
+        self.assertIs(
+            lookup.positions, backend.md.indexer_metadata.decode_logical_positions
+        )
         self.assertEqual((lookup.shape, lookup.tail_width), ((3, 2055), 4))
         self.assertIs(lengths, backend.md.sequence_lengths)
         self.assertIs(counts, backend.md.fa2_valid_counts)
@@ -2260,7 +2524,9 @@ class TestQsaDraft(unittest.TestCase):
         self.assertEqual(tuple(kw["kv_cache"][0].shape), (99, 2, 64, 256))
         self.assertEqual(kw["block_tables"], "block_tables")
         self.assertIs(kw["seq_lens"], counts)
-        self.assertEqual((kw["max_seq_len"], kw["bmm1_scale"], kw["bmm2_scale"]), (2112, 0.0625, 1.0))
+        self.assertEqual(
+            (kw["max_seq_len"], kw["bmm1_scale"], kw["bmm2_scale"]), (2112, 0.0625, 1.0)
+        )
         self.assertEqual(kw["workspace_buffer"], "backend_workspace")
         self.assertEqual(kw["multi_ctas_kv_counter_buffer"].numel(), 8)
 
@@ -2272,7 +2538,10 @@ class TestQsaDraft(unittest.TestCase):
         with mock.patch.object(qsa_draft, "WORKSPACE_BYTES", 32):
             glue = qsa_draft.DraftGlue()
             _, packs, backend, _ = self.decode(
-                rows=2, glue=glue, graph=False, workspace=None,
+                rows=2,
+                glue=glue,
+                graph=False,
+                workspace=None,
                 row_requests=torch.tensor([5, 6]),
             )
             self.decode(rows=2, glue=glue, workspace=None)
@@ -2285,7 +2554,8 @@ class TestQsaDraft(unittest.TestCase):
         self.assertIs(second["workspace_buffer"], glue._workspace)  # one, shared
         self.assertEqual(glue._workspace.numel(), 32)
         self.assertIs(
-            first["multi_ctas_kv_counter_buffer"], second["multi_ctas_kv_counter_buffer"]
+            first["multi_ctas_kv_counter_buffer"],
+            second["multi_ctas_kv_counter_buffer"],
         )
 
     def test_decode_declines_launching_nothing(self):
@@ -2310,8 +2580,15 @@ class TestQsaDraft(unittest.TestCase):
         self.assertIsNone(out)
         self.assertEqual(packs, [])
 
-    def capture(self, *, graph=True, mode=_Mode.DRAFT_EXTEND_V2, bs=3, accept=True,
-                topk_dtype=torch.int32):
+    def capture(
+        self,
+        *,
+        graph=True,
+        mode=_Mode.DRAFT_EXTEND_V2,
+        bs=3,
+        accept=True,
+        topk_dtype=torch.int32,
+    ):
         from unittest import mock
 
         from sgl_nvidia_mega.qwen3_8.qsa import mtp_capture
@@ -2374,8 +2651,8 @@ class TestQsaDraft(unittest.TestCase):
 
         calls = []
         backend = SimpleNamespace(
-            capture_mtp_sparse_indices=lambda topk, fb, layer_id, metadata=None: calls.append(
-                (layer_id, metadata)
+            capture_mtp_sparse_indices=lambda topk, fb, layer_id, metadata=None: (
+                calls.append((layer_id, metadata))
             )
         )
         for glue, want in (
@@ -2397,26 +2674,32 @@ class TestQsaDraft(unittest.TestCase):
 
         order = []
         backend = SimpleNamespace(
-            should_capture_mtp_sparse_indices=lambda fb: order.append("should_capture")
-            or True
+            should_capture_mtp_sparse_indices=lambda fb: (
+                order.append("should_capture") or True
+            )
         )
         glue = types.ModuleType("sglang.srt.layers.attention.qsa.glue")
-        glue.get_qsa_indexer_metadata = lambda b, layer_id, fb: order.append(
-            ("metadata", layer_id)
-        ) or "md"
+        glue.get_qsa_indexer_metadata = lambda b, layer_id, fb: (
+            order.append(("metadata", layer_id)) or "md"
+        )
         glue.resolve_qsa_sparse_backend = lambda b: b
         context = types.ModuleType("sglang.srt.model_executor.forward_context")
         context.get_attn_backend = lambda: backend
         layer = SimpleNamespace(
             layer_id=7,
-            indexer=lambda x, positions, fb, md: order.append(("indexer", md)) or "topk",
-            _compute_qsa_topk_indices=lambda x, positions, fb: order.append("stock")
-            or "stock-topk",
+            indexer=lambda x, positions, fb, md: (
+                order.append(("indexer", md)) or "topk"
+            ),
+            _compute_qsa_topk_indices=lambda x, positions, fb: (
+                order.append("stock") or "stock-topk"
+            ),
         )
         ex = SimpleNamespace(qsa_draft="glue")
         capture = lambda *a: order.append(("capture",) + a[1:6])
         with (
-            mock.patch.dict(sys.modules, {glue.__name__: glue, context.__name__: context}),
+            mock.patch.dict(
+                sys.modules, {glue.__name__: glue, context.__name__: context}
+            ),
             mock.patch.object(qsa_draft, "capture", capture),
         ):
             st = _St(_Mode.DRAFT_EXTEND_V2)
@@ -2438,7 +2721,9 @@ class TestQsaDraft(unittest.TestCase):
                 _STATE["breakable"] = False
             self.assertEqual((out, order), ("stock-topk", ["stock"]))
 
-    def attention_step(self, mode, *, glue_out=None, alt_stream=None, capture_mode=True):
+    def attention_step(
+        self, mode, *, glue_out=None, alt_stream=None, capture_mode=True
+    ):
         from unittest import mock
 
         from sgl_nvidia_mega.qwen3_8.runtime import attention, qsa_draft
@@ -2449,34 +2734,41 @@ class TestQsaDraft(unittest.TestCase):
             is_qsa=True,
             layer_id=7,
             alt_stream=alt_stream,
-            attn=lambda q, k, v, fb, topk_indices=None: order.append(
-                ("attn", topk_indices)
-            )
-            or torch.zeros(rows, 6144),
-            _prepare_qkv_gate=lambda positions, hidden_states, forward_batch: order.append(
-                "qkv"
-            )
-            or (torch.zeros(rows, 6144), "k", "v", None),
-            _compute_qsa_topk_indices=lambda x, positions, fb: order.append("lookup")
-            or "stock-indices",
+            attn=lambda q, k, v, fb, topk_indices=None: (
+                order.append(("attn", topk_indices)) or torch.zeros(rows, 6144)
+            ),
+            _prepare_qkv_gate=lambda positions, hidden_states, forward_batch: (
+                order.append("qkv") or (torch.zeros(rows, 6144), "k", "v", None)
+            ),
+            _compute_qsa_topk_indices=lambda x, positions, fb: (
+                order.append("lookup") or "stock-indices"
+            ),
             o_proj=lambda x: (x, None),
         )
         glue = SimpleNamespace(
             decode=lambda *a: order.append("lookup_pack") or glue_out
         )
         ex = SimpleNamespace(
-            qsa_pool_ready=False, qsa_core=None, qsa_union=None, qsa_indexer=None,
+            qsa_pool_ready=False,
+            qsa_core=None,
+            qsa_union=None,
+            qsa_indexer=None,
             qsa_draft=glue,
-            qsa_prefill=None, smallm_gemm=None,
+            qsa_prefill=None,
+            smallm_gemm=None,
         )
         runner = types.ModuleType("sglang.srt.model_executor.runner")
         runner.get_is_capture_mode = lambda: capture_mode
         elementwise = types.ModuleType("sglang.kernels.ops.elementwise.elementwise")
         elementwise.fused_sigmoid_mul = lambda x, gate, inplace: x
         st = _St(mode, rows)
-        indices = mock.Mock(side_effect=lambda *a: order.append("indices") or _Indices(order))
+        indices = mock.Mock(
+            side_effect=lambda *a: order.append("indices") or _Indices(order)
+        )
         with (
-            mock.patch.dict(sys.modules, {m.__name__: m for m in (runner, elementwise)}),
+            mock.patch.dict(
+                sys.modules, {m.__name__: m for m in (runner, elementwise)}
+            ),
             mock.patch.object(
                 sys.modules["sglang.srt.models.qwen4_exp"],
                 "_QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD",
@@ -2491,12 +2783,16 @@ class TestQsaDraft(unittest.TestCase):
 
     def test_draft_decode_serves_or_falls_back(self):
         order, ran = self.attention_step(_Mode.DECODE, glue_out=torch.zeros(4, 6144))
-        self.assertEqual(order, ["qkv", "lookup_pack"])  # no torch lookup, no stock attn
+        self.assertEqual(
+            order, ["qkv", "lookup_pack"]
+        )  # no torch lookup, no stock attn
         self.assertEqual(
             ran, [("qsa.indexer", "mtp_lookup_in_pack"), ("qsa", "fused_kv_lookup")]
         )
         order, ran = self.attention_step(_Mode.DECODE, glue_out=None)
-        self.assertEqual(order, ["qkv", "lookup_pack", "lookup", ("attn", "stock-indices")])
+        self.assertEqual(
+            order, ["qkv", "lookup_pack", "lookup", ("attn", "stock-indices")]
+        )
         self.assertEqual(ran, [("qsa.indexer", "stock"), ("qsa", "stock")])
 
     def test_draft_extend_keeps_sglang_stream_order(self):
@@ -2509,7 +2805,11 @@ class TestQsaDraft(unittest.TestCase):
         alt, current = _Stream("alt", []), None
         current = _Stream("main", alt.log)
         entered = contextlib.contextmanager(
-            lambda s: (alt.log.append(f"enter {s.name}"), (yield), alt.log.append(f"exit {s.name}"))
+            lambda s: (
+                alt.log.append(f"enter {s.name}"),
+                (yield),
+                alt.log.append(f"exit {s.name}"),
+            )
         )
         with (
             mock.patch.object(torch.cuda, "current_stream", lambda: current),
@@ -2518,7 +2818,13 @@ class TestQsaDraft(unittest.TestCase):
             order, _ = self.attention_step(_Mode.DRAFT_EXTEND_V2, alt_stream=alt)
         self.assertEqual(
             alt.log,
-            ["alt waits main", "enter alt", "exit alt", "main waits alt", "record main"],
+            [
+                "alt waits main",
+                "enter alt",
+                "exit alt",
+                "main waits alt",
+                "record main",
+            ],
         )
         self.assertEqual(order[:2], ["qkv", "indices"])
         order, _ = self.attention_step(
@@ -2544,7 +2850,9 @@ class TestQsaDraft(unittest.TestCase):
         model = _model((_Linear, _Attention))
         model.model.layers[1].is_qsa = True
         model.hidden_size, model.hc_count = 2560, 4
-        sm10x = dict(is_available=lambda: True, get_device_capability=lambda *a: (10, 7))
+        sm10x = dict(
+            is_available=lambda: True, get_device_capability=lambda *a: (10, 7)
+        )
         with (
             mock.patch.dict(sys.modules, {m.__name__: m for m in (context, binding)}),
             mock.patch.multiple(torch.cuda, **sm10x),
@@ -2601,13 +2909,28 @@ class TestQsaIndexerStreams(unittest.TestCase):
     runs on the main stream."""
 
     SIDE = [
-        "alt waits main", "qkv", "enter alt", SEL, "exit alt",
-        "main waits alt", "record main", "attn",
+        "alt waits main",
+        "qkv",
+        "enter alt",
+        SEL,
+        "exit alt",
+        "main waits alt",
+        "record main",
+        "attn",
     ]
 
     def run_step(
-        self, mode=_Mode.TARGET_VERIFY, rows=8, *, capture=True, breakable=False,
-        alt=True, indexer=True, glue=None, patches=(), layer_kw=None,
+        self,
+        mode=_Mode.TARGET_VERIFY,
+        rows=8,
+        *,
+        capture=True,
+        breakable=False,
+        alt=True,
+        indexer=True,
+        glue=None,
+        patches=(),
+        layer_kw=None,
         dtype=torch.float32,
     ):
         """One decomposed QSA step; returns (the stream log, the engagement record).
@@ -2617,28 +2940,38 @@ class TestQsaIndexerStreams(unittest.TestCase):
         log = self.log = []
         main = _Stream("main", log)
         entered = contextlib.contextmanager(
-            lambda s: (log.append(f"enter {s.name}"), (yield), log.append(f"exit {s.name}"))
+            lambda s: (
+                log.append(f"enter {s.name}"),
+                (yield),
+                log.append(f"exit {s.name}"),
+            )
         )
         layer = SimpleNamespace(
             is_qsa=True,
             layer_id=7,
             alt_stream=_Stream("alt", log) if alt else None,
             attn_output_gate=True,
-            attn=lambda q, k, v, fb, topk_indices=None: log.append("attn")
-            or torch.zeros(rows, 6144),
-            _prepare_qkv_gate=lambda positions, hidden_states, forward_batch: log.append(
-                "qkv"
-            )
-            or (torch.zeros(rows, 6144), "k", "v", None),
-            _compute_qsa_topk_indices=lambda x, positions, fb: log.append("sglang")
-            or _Indices(log),
+            attn=lambda q, k, v, fb, topk_indices=None: (
+                log.append("attn") or torch.zeros(rows, 6144)
+            ),
+            _prepare_qkv_gate=lambda positions, hidden_states, forward_batch: (
+                log.append("qkv") or (torch.zeros(rows, 6144), "k", "v", None)
+            ),
+            _compute_qsa_topk_indices=lambda x, positions, fb: (
+                log.append("sglang") or _Indices(log)
+            ),
             o_proj=lambda x: (x, None),
         )
         layer.__dict__.update(layer_kw or {})
         ex = SimpleNamespace(
             # the union never takes these widths: SGLang's attention runs
-            qsa_pool_ready=False, qsa_pool=None, qsa_union="union", qsa_core=None,
-            qsa_indexer=indexer or None, qsa_draft=glue, qsa_prefill=None,
+            qsa_pool_ready=False,
+            qsa_pool=None,
+            qsa_union="union",
+            qsa_core=None,
+            qsa_indexer=indexer or None,
+            qsa_draft=glue,
+            qsa_prefill=None,
             smallm_gemm=None,
         )
         runner = types.ModuleType("sglang.srt.model_executor.runner")
@@ -2717,8 +3050,14 @@ class TestQsaIndexerStreams(unittest.TestCase):
         self.assertEqual(
             log,
             [
-                "alt waits main", "enter alt", SEL, "exit alt", "qkv",
-                "main waits alt", "record main", "attn",
+                "alt waits main",
+                "enter alt",
+                SEL,
+                "exit alt",
+                "qkv",
+                "main waits alt",
+                "record main",
+                "attn",
             ],
         )
         self.assertIn(("qsa.index_stream", "side_early"), ran)
@@ -2726,10 +3065,21 @@ class TestQsaIndexerStreams(unittest.TestCase):
         for name, patches, step_kw in (
             ("off", (cuda,), kw),
             ("float32", (early, cuda), dict(kw, dtype=torch.float32)),
-            ("unfused prep", (early, cuda), dict(kw, layer_kw=dict(indexer=SimpleNamespace(
-                _use_fused_prep=lambda x: False)))),
-            ("no output gate", (early, cuda), dict(kw, layer_kw=dict(
-                indexer=indexer, attn_output_gate=False))),
+            (
+                "unfused prep",
+                (early, cuda),
+                dict(
+                    kw,
+                    layer_kw=dict(
+                        indexer=SimpleNamespace(_use_fused_prep=lambda x: False)
+                    ),
+                ),
+            ),
+            (
+                "no output gate",
+                (early, cuda),
+                dict(kw, layer_kw=dict(indexer=indexer, attn_output_gate=False)),
+            ),
         ):
             log, ran = self.run_step(patches=patches, **step_kw)
             self.assertEqual(log, self.SIDE, name)
@@ -2738,11 +3088,25 @@ class TestQsaIndexerStreams(unittest.TestCase):
         log, _ = self.run_step(patches=(early, cuda), capture=False, **kw)
         self.assertEqual(log, ["qkv", SEL, "attn"])
 
-    def pdl_step(self, mode=_Mode.TARGET_VERIFY, rows=8, *, frontier=("node",),
-                 prepared=True, backend="cutedsl", quant=None, env=True,
-                 dtype=torch.bfloat16, **kw):
+    def pdl_step(
+        self,
+        mode=_Mode.TARGET_VERIFY,
+        rows=8,
+        *,
+        frontier=("node",),
+        prepared=True,
+        backend="cutedsl",
+        quant=None,
+        env=True,
+        dtype=torch.bfloat16,
+        **kw,
+    ):
         """A step with the PDL-index branch's conditions met unless changed."""
-        from sgl_nvidia_mega.qwen3_8.runtime import attention, bf16_gemm_pins, capture_fork
+        from sgl_nvidia_mega.qwen3_8.runtime import (
+            attention,
+            bf16_gemm_pins,
+            capture_fork,
+        )
 
         class Unquant:
             pass
@@ -2768,8 +3132,9 @@ class TestQsaIndexerStreams(unittest.TestCase):
         )
         self.step = SimpleNamespace(rows=rows)
         kernels = SimpleNamespace(
-            prepare=lambda layer, x, positions, fb: self.log.append("prepare")
-            or (self.step if prepared else None)
+            prepare=lambda layer, x, positions, fb: (
+                self.log.append("prepare") or (self.step if prepared else None)
+            )
         )
         self.projected = []
 
@@ -2797,8 +3162,13 @@ class TestQsaIndexerStreams(unittest.TestCase):
         )
         with mock.patch.dict(sys.modules, {unquant.__name__: unquant}):
             return self.run_step(
-                mode, rows, patches=patches, layer_kw=layer_kw, dtype=dtype,
-                indexer=kw.pop("indexer", kernels), **kw
+                mode,
+                rows,
+                patches=patches,
+                layer_kw=layer_kw,
+                dtype=dtype,
+                indexer=kw.pop("indexer", kernels),
+                **kw,
             )
 
     def test_pdl_index_projects_on_the_main_stream(self):
@@ -2815,10 +3185,19 @@ class TestQsaIndexerStreams(unittest.TestCase):
             self.assertEqual(
                 log,
                 [
-                    "prepare", ("index_qk", rows), "frontier main", "qkv",
-                    "alt waits main", ("alt after", ("node",)), "enter alt",
-                    ("select", self.step, qk), "exit alt", "record alt",
-                    "main waits alt", "record main", "attn",
+                    "prepare",
+                    ("index_qk", rows),
+                    "frontier main",
+                    "qkv",
+                    "alt waits main",
+                    ("alt after", ("node",)),
+                    "enter alt",
+                    ("select", self.step, qk),
+                    "exit alt",
+                    "record alt",
+                    "main waits alt",
+                    "record main",
+                    "attn",
                 ],
                 (mode, rows),
             )
@@ -2828,8 +3207,14 @@ class TestQsaIndexerStreams(unittest.TestCase):
         self.assertNotIn(("alt after", None), log)
         self.assertEqual(
             log[:6],
-            ["prepare", ("index_qk", 8), "frontier main", "qkv", "alt waits main",
-             "enter alt"],
+            [
+                "prepare",
+                ("index_qk", 8),
+                "frontier main",
+                "qkv",
+                "alt waits main",
+                "enter alt",
+            ],
         )
 
     def test_pdl_index_declines_to_the_side_stream(self):
@@ -2906,14 +3291,28 @@ class TestSourceSwitches(unittest.TestCase):
 
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         done = subprocess.run(
-            [sys.executable, "-c", _SWITCHES], env=env, capture_output=True, text=True,
+            [sys.executable, "-c", _SWITCHES],
+            env=env,
+            capture_output=True,
+            text=True,
             timeout=300,
         )
         self.assertEqual(done.returncode, 0, done.stderr[-2000:])
         got = json.loads(done.stdout.strip().splitlines()[-1])
-        boolean = ("QSA_EARLY_INDEXER", "QSA_PDL_INDEX", "ATTN_GATE_V2", "POOL_MERGE_GATE")
-        for value, on in (("None", ()), ("1", "all"), ("true", boolean),
-                          ("True", boolean), ("0", ()), ("yes", ())):
+        boolean = (
+            "QSA_EARLY_INDEXER",
+            "QSA_PDL_INDEX",
+            "ATTN_GATE_V2",
+            "POOL_MERGE_GATE",
+        )
+        for value, on in (
+            ("None", ()),
+            ("1", "all"),
+            ("true", boolean),
+            ("True", boolean),
+            ("0", ()),
+            ("yes", ()),
+        ):
             want = {a: on == "all" or a in on for a in got[value]}
             self.assertEqual(got[value], want, value)
 
@@ -3099,8 +3498,12 @@ class TestDraftFold(unittest.TestCase):
         weight = kw.pop("weight", torch.zeros(20000, 2560, dtype=torch.bfloat16))
         embed = SimpleNamespace(
             weight=SimpleNamespace(
-                is_cuda=True, dtype=weight.dtype, ndim=weight.ndim, shape=weight.shape,
-                is_contiguous=lambda: True, device="cpu",
+                is_cuda=True,
+                dtype=weight.dtype,
+                ndim=weight.ndim,
+                shape=weight.shape,
+                is_contiguous=lambda: True,
+                device="cpu",
             ),
             tp_size=kw.pop("tp", 1),
             quant_method=method.UnquantizedEmbeddingMethod(),
@@ -3128,7 +3531,9 @@ class TestDraftFold(unittest.TestCase):
                 kernels, "make_slot", lambda w, bs: SimpleNamespace(bs=bs, w=w)
             ):
                 fold = draft_fold.make(ex, batch_size=4, num_steps=3)
-                self.assertEqual((fold.slot.bs, fold.num_steps, fold.bf16), (4, 3, True))
+                self.assertEqual(
+                    (fold.slot.bs, fold.num_steps, fold.bf16), (4, 3, True)
+                )
                 self.assertIs(fold.slot.w, model.model.embed_tokens.weight)
                 # logits the FP32 copy also transforms: the fold reads the FP32 ones
                 for kw in (dict(softcap=30.0), dict(gather=True), dict(fp32=True)):
@@ -3151,7 +3556,9 @@ class TestDraftFold(unittest.TestCase):
         for scale, want in ((None, 1.0), (0.5, 0.5)):
             lm, *_ = self.model(scale=scale)
             logits = draft_fold.bf16_logits(lm, torch.zeros(3, 4))
-            self.assertEqual((tuple(logits.shape), logits.dtype), ((3, 6), torch.bfloat16))
+            self.assertEqual(
+                (tuple(logits.shape), logits.dtype), ((3, 6), torch.bfloat16)
+            )
             self.assertTrue(torch.all(logits == want))
             ((_, _, head, bias),) = lm.logits_processor.calls
             self.assertIs(head, lm.lm_head)

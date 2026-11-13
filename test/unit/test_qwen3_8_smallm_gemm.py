@@ -260,7 +260,9 @@ class TestOptions(unittest.TestCase):
         off = dict(envs, SGLANG_OPT_SM107_BF16_SMALLM_ROUTES="0")
         with mock.patch.dict("os.environ", off, clear=True):
             o = sg.recipe_options()
-        self.assertEqual((o.out_proj_low_m, o.out_proj_mid_m, o.shared_fused_act), ((), (), False))
+        self.assertEqual(
+            (o.out_proj_low_m, o.out_proj_mid_m, o.shared_fused_act), ((), (), False)
+        )
         self.assertEqual(o.shared_down_tgv_rows, (4, 8, 16))
 
     def test_overlapping_ranges_are_refused(self):
@@ -539,6 +541,7 @@ class TestKernelCopy(unittest.TestCase):
                 "mul.ftz.f32",
             ],
         )
+
 
 if __name__ == "__main__":
     unittest.main()

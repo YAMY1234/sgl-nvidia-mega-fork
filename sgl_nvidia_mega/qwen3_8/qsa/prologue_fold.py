@@ -427,7 +427,9 @@ def _source_path() -> str:
         tmp = root / f".{path.name}.{os.getpid()}"
         tmp.write_text(_SOURCE)
         os.replace(tmp, path)
-    logger.info("QWEN3_8_PROLOGUE_FOLD_SOURCE path=%s source_digest=%s", path, _SOURCE_DIGEST)
+    logger.info(
+        "QWEN3_8_PROLOGUE_FOLD_SOURCE path=%s source_digest=%s", path, _SOURCE_DIGEST
+    )
     return str(path)
 
 

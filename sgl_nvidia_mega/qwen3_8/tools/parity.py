@@ -34,7 +34,10 @@ logger = logging.getLogger(__name__)
 SGLANG_READS = {
     "srt/mem_cache/kv/decl.py": ("STATE_PART",),
     "srt/mem_cache/ple_state_pool.py": ("NGRAM_PART", "SHORT_CONV_PART"),
-    "srt/model_executor/forward_context.py": ("get_attn_backend", "get_token_to_kv_pool"),
+    "srt/model_executor/forward_context.py": (
+        "get_attn_backend",
+        "get_token_to_kv_pool",
+    ),
     "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
 }
 
@@ -205,7 +208,10 @@ class Parity:
             ]
         )
         dist = torch.stack(
-            [_max_abs(want_logits, got_logits, device), _max_abs(want_hidden, got_hidden, device)]
+            [
+                _max_abs(want_logits, got_logits, device),
+                _max_abs(want_hidden, got_hidden, device),
+            ]
         )
         per_layer = None
         if want_layers and got_layers:

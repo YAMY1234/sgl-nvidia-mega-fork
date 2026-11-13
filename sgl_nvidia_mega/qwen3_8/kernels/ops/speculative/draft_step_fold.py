@@ -23,7 +23,6 @@ from typing import NamedTuple
 import torch
 import triton
 import triton.language as tl
-
 from sglang.kernels.ops.speculative.topk1 import (
     _DRAFT_TOPK1_BLOCK,
     _draft_topk1_partial_argmax_kernel,

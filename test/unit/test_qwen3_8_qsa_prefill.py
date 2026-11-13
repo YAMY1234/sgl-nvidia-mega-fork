@@ -402,8 +402,9 @@ class TestExtend(unittest.TestCase):
         output = torch.full((8, 8), 7.0)
         rows = [torch.zeros(8, 4) for _ in range(4)]
         ex = SimpleNamespace(qsa_prefill=qp.DEFAULT)
-        with mock.patch.object(pg, "_live", lambda executor: live), mock.patch.object(
-            qp, "attend", attend
+        with (
+            mock.patch.object(pg, "_live", lambda executor: live),
+            mock.patch.object(qp, "attend", attend),
         ):
             pg._qsa(ex, SimpleNamespace(), rows[0], torch.arange(8), *rows[1:], output)
         self.assertEqual(scopes, [(5, 5)])
@@ -411,8 +412,9 @@ class TestExtend(unittest.TestCase):
         self.assertTrue(torch.equal(output[5:], torch.zeros(3, 8)))
         # the union kernel writing the output rows in place: no copy
         output.fill_(7.0)
-        with mock.patch.object(pg, "_live", lambda executor: live), mock.patch.object(
-            qp, "attend", lambda *a: fb._attn_output.fill_(2.0)
+        with (
+            mock.patch.object(pg, "_live", lambda executor: live),
+            mock.patch.object(qp, "attend", lambda *a: fb._attn_output.fill_(2.0)),
         ):
             pg._qsa(ex, SimpleNamespace(), rows[0], torch.arange(8), *rows[1:], output)
         self.assertTrue(torch.equal(output[:5], torch.full((5, 8), 2.0)))

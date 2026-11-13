@@ -35,7 +35,9 @@ class Engagement:
         self._step[op] = impl
 
     def end(self, mode: str, rows: int) -> None:
-        captured = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        captured = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
         key = (mode, rows if captured else _bucket(rows), captured)
         ops = tuple(sorted(self._step.items()))
         if self._seen.get(key) == ops:

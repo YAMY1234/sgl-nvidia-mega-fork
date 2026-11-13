@@ -29,7 +29,6 @@ Only the epilogue warp is overridden, after that reduction:
   differs from it on 87,313,176 of the 4,261,478,400 finite pairs.
 """
 
-
 import torch
 
 SGLANG_READS = {
@@ -96,12 +95,11 @@ def _kernel_module():
     import cutlass
     import cutlass.cute as cute
     import cutlass.utils.blackwell_helpers as sm100_utils
+    import sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue as epi
     from cutlass import Int32
     from cutlass._mlir.dialects import llvm
     from cutlass.cute import experimental as cute_ext
     from cutlass.cutlass_dsl import T, dsl_user_op
-
-    import sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue as epi
 
     def make_silu_mul(asm: str):
         @dsl_user_op

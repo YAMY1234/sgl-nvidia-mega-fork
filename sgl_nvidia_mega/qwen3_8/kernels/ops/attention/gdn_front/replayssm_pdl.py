@@ -524,7 +524,10 @@ def verify(
             "USE_GDC": True,
             "launch_pdl": True,
             "WAIT_FOR_GATE_PRODUCER": wait_for_gate_producer,
-            "PREFETCH_CHECKPOINT": os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_GDN_STATE_PREFETCH") == "1",
+            "PREFETCH_CHECKPOINT": os.environ.get(
+                "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_GDN_STATE_PREFETCH"
+            )
+            == "1",
         }
         if pdl
         else {}

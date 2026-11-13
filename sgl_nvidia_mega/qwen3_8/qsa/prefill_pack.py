@@ -29,7 +29,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 logger = logging.getLogger(__name__)
 
 # The executor decides when this path runs (Options.pack_rows).

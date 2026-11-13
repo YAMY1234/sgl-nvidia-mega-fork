@@ -45,9 +45,18 @@ def _case(rows, seed):
 
 def _run(q, k, v, nk, nv, table, req, positions, loc, idx):
     return UnionKernels().run(
-        q=q, key_cache=k, value_cache=v, new_k=nk, new_v=nv, locations=loc,
-        slot_map=table, row_requests=req, indices=idx, sequence_lengths=positions + 1,
-        query_positions=positions, scale=SCALE,
+        q=q,
+        key_cache=k,
+        value_cache=v,
+        new_k=nk,
+        new_v=nv,
+        locations=loc,
+        slot_map=table,
+        row_requests=req,
+        indices=idx,
+        sequence_lengths=positions + 1,
+        query_positions=positions,
+        scale=SCALE,
     )
 
 

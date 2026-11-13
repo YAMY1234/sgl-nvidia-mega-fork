@@ -52,7 +52,8 @@ def _check_file(module, path: str) -> None:
 
 _check_file(_fi_chunked, "flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py")
 _check_file(
-    _fi_chunked_sm107, "flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked_sm107.py"
+    _fi_chunked_sm107,
+    "flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked_sm107.py",
 )
 _check_file(_fi_prefill, "flashinfer/gdn_kernels/blackwell/gdn_prefill.py")
 

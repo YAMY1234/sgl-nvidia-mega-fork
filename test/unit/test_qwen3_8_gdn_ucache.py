@@ -11,17 +11,14 @@ import subprocess
 import sys
 import types
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
 from unittest import mock
 
 import torch
 
+from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.gdn_front import conv as front_conv
 from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear import gdn_ucache_verify as K
-from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.gdn_front import (
-    conv as front_conv,
-)
 from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache as U
 
 RUBIN = (
@@ -369,7 +366,12 @@ def _core(uv, buffers, *, layer_id, packed=True, request_rows=None, fused=None):
 class TestOptions(unittest.TestCase):
     def test_presets(self):
         self.assertEqual(
-            (U.HIGH_CONCURRENCY.strided_qkv, U.HIGH_CONCURRENCY.pdl, U.HIGH_CONCURRENCY.flush_first, U.HIGH_CONCURRENCY.fused_norm),
+            (
+                U.HIGH_CONCURRENCY.strided_qkv,
+                U.HIGH_CONCURRENCY.pdl,
+                U.HIGH_CONCURRENCY.flush_first,
+                U.HIGH_CONCURRENCY.fused_norm,
+            ),
             (True, True, True, True),
         )
         self.assertFalse(U.HIGH_CONCURRENCY.fused_conv)
@@ -392,7 +394,9 @@ class TestOptions(unittest.TestCase):
             self.assertTrue(uv.fused_conv_capable)
             self.assertFalse(uv.fused_conv_enabled)
             self.assertTrue(uv.fused_norm_enabled)
-            self.assertTrue(_verifier(options=U.HIGH_CONCURRENCY_FUSED_CONV).fused_conv_enabled)
+            self.assertTrue(
+                _verifier(options=U.HIGH_CONCURRENCY_FUSED_CONV).fused_conv_enabled
+            )
             # the fused prologue / epilogue ride on the strided, dependent launch
             uv = _verifier(options=U.Options(pdl=False, fused_conv=True))
             self.assertFalse(uv.fused_conv_enabled or uv.fused_norm_enabled)
@@ -662,7 +666,9 @@ class TestVerify(unittest.TestCase):
 
     def test_fused_conv(self):
         with _Env() as env:
-            out, gdn, st, view = self.run_verify(env, options=U.HIGH_CONCURRENCY_FUSED_CONV)
+            out, gdn, st, view = self.run_verify(
+                env, options=U.HIGH_CONCURRENCY_FUSED_CONV
+            )
             self.assertNotIn("hoisted_conv", env.names())
             self.assertNotIn("stock_conv", env.names())
             (kw,) = env.flushes()
@@ -685,7 +691,9 @@ class TestVerify(unittest.TestCase):
             dict(kw=dict(bias=torch.zeros(D, dtype=BF16))),
         ):
             with self.subTest(case=case), _Env(**case.get("env", {})) as env:
-                self.run_verify(env, options=U.HIGH_CONCURRENCY_FUSED_CONV, **case.get("kw", {}))
+                self.run_verify(
+                    env, options=U.HIGH_CONCURRENCY_FUSED_CONV, **case.get("kw", {})
+                )
                 self.assertIn("hoisted_conv", env.names())
                 self.assertNotIn("fused_conv", env.flushes()[0])
 
@@ -706,7 +714,9 @@ class TestVerify(unittest.TestCase):
             uv = _verifier(first_layer_id=7)
             gdn, st = _gdn(env), _St()
             x = torch.zeros(len(CACHE_INDICES) * T, 16)
-            executor = SimpleNamespace(gdn_ucache=uv, ucache_state=None, smallm_gemm=None)
+            executor = SimpleNamespace(
+                gdn_ucache=uv, ucache_state=None, smallm_gemm=None
+            )
             U.verify(executor, gdn, x, st, view, buffers)
             (kw,) = env.flushes()
             self.assertIs(kw["k_cache"]._base, buffers.k_ring)

@@ -11,12 +11,11 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
-
 from sglang.kernels.ops.elementwise.qwen4_gate import (
     _QWEN4_HC_COUNT,
     _QWEN4_HIDDEN_SIZE,
 )
+from triton.language.extra.cuda import libdevice
 
 logger = logging.getLogger(__name__)
 

@@ -545,7 +545,9 @@ class TestBuild(_Case):
         self.assertEqual(len(self.spies.named("ks.warmup")), 1)
 
     def test_wide_mix_needs_the_split_k_max_m(self):
-        gemm = sys.modules["sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue"]
+        gemm = sys.modules[
+            "sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue"
+        ]
         with mock.patch.object(gemm, "validate_tactic", lambda tactic, m, n, k: None):
             reason = self.build(HIGH_CONCURRENCY)
         self.assertIn("hc_mix_wide", reason)

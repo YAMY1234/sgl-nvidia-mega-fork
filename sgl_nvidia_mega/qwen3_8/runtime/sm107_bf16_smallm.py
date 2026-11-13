@@ -114,7 +114,9 @@ ROUTES = {
 # FlashInfer's direct dense GEMM there (512 CTAs), with other bits. These keys follow the source: each runs the cluster
 # split-K kernel at the source's tactic and is checked bit for bit against SGLang's split-K kernel at that tactic
 # (``source_gemm`` in ``precompile``), not against SGLang's dispatch.
-SOURCE_SPLITK_ROUTES = {(4, *_ROUTER): ("cl", (64, 8, 4, 10, 64))}  # 10 stages need the 64-wide K tile
+SOURCE_SPLITK_ROUTES = {
+    (4, *_ROUTER): ("cl", (64, 8, 4, 10, 64))
+}  # 10 stages need the 64-wide K tile
 
 _routes: Optional[dict] = None
 _fi = None  # (the split-K module, CUstream constructor)
@@ -347,7 +349,9 @@ def gemm(x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
 def precompile(
     *,
     stock_gemm: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    source_gemm: Optional[Callable[[torch.Tensor, torch.Tensor, tuple], torch.Tensor]] = None,
+    source_gemm: Optional[
+        Callable[[torch.Tensor, torch.Tensor, tuple], torch.Tensor]
+    ] = None,
     device=None,
 ) -> bool:
     """JIT-compile every key at load and check it bit for bit against ``stock_gemm`` (the dispatch with the routes
@@ -377,8 +381,10 @@ def precompile(
             )
         else:
             want = stock_gemm(x, weights[(n, k)])
-        if got is None or want is None or not torch.equal(
-            got.view(torch.int16), want.view(torch.int16)
+        if (
+            got is None
+            or want is None
+            or not torch.equal(got.view(torch.int16), want.view(torch.int16))
         ):
             logger.warning(
                 "%s: route %s at %s differs from the stock dispatch on this build; the stock dispatch stays",
@@ -449,7 +455,9 @@ def _build(call_sites: dict) -> str:
     return ""
 
 
-def _source_splitk(x: torch.Tensor, weight: torch.Tensor, tactic: tuple) -> torch.Tensor:
+def _source_splitk(
+    x: torch.Tensor, weight: torch.Tensor, tactic: tuple
+) -> torch.Tensor:
     """SGLang's split-K kernel at ``tactic``, the path the source's dispatch runs at SOURCE_SPLITK_ROUTES."""
     from sglang.srt.layers.quantization.unquant import _run_splitk_dense, _splitk_tactic
 

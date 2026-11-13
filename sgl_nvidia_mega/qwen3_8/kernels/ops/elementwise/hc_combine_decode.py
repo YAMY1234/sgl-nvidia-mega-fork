@@ -16,10 +16,18 @@ from sgl_nvidia_mega.qwen3_8._jit import cache_once, load_jit
 _cluster_m4only = EnvBool(False)
 _cluster_m4only.name = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_CLUSTER_M4ONLY"
 _HC_CLUSTER_M4ONLY = _cluster_m4only.get()
-_HC_DISABLE_CLUSTER = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_DISABLE_CLUSTER", "0") == "1"
-_HC_PARTS_OVERRIDE = int(os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_PARTS", "0"))
-_HC_P2_M16_GATE = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_P2_M16_GATE", "0") == "1"
-_HC_P2_M4_ONLY = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_P2_M4_ONLY", "0") == "1"
+_HC_DISABLE_CLUSTER = (
+    os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_DISABLE_CLUSTER", "0") == "1"
+)
+_HC_PARTS_OVERRIDE = int(
+    os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_PARTS", "0")
+)
+_HC_P2_M16_GATE = (
+    os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_P2_M16_GATE", "0") == "1"
+)
+_HC_P2_M4_ONLY = (
+    os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_P2_M4_ONLY", "0") == "1"
+)
 
 
 @cache_once

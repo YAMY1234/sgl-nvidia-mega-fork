@@ -107,7 +107,10 @@ SGLANG_READS = {
         "fused_qkvzba_split_reshape_cat_contiguous",
         "fused_qkv_split_gdn_prefill",
     ),
-    "kernels/ops/mamba/causal_conv1d_triton.py": ("causal_conv1d_update", "PAD_SLOT_ID"),
+    "kernels/ops/mamba/causal_conv1d_triton.py": (
+        "causal_conv1d_update",
+        "PAD_SLOT_ID",
+    ),
     "srt/mem_cache/memory_pool.py": (
         "conv",
         "temporal",
@@ -153,7 +156,10 @@ def verify_reasons(model) -> str:
         if not isinstance(layer, Qwen4ExpLinearDecoderLayer):
             continue
         attn = layer.linear_attn
-        h, hv = attn.num_k_heads // attn.attn_tp_size, attn.num_v_heads // attn.attn_tp_size
+        h, hv = (
+            attn.num_k_heads // attn.attn_tp_size,
+            attn.num_v_heads // attn.attn_tp_size,
+        )
         if (h, hv) not in ((4, 12), (16, 48)):
             return f"GDN heads per rank {(h, hv)}, the kernel takes (4, 12) or (16, 48)"
         if attn.head_k_dim != 128 or attn.head_v_dim != 128:
@@ -172,7 +178,9 @@ def pool_reasons(backend, layer_id: int, tokens_per_request: int) -> str:
     if pool.replayssm_spec_fold or pool.replayssm_is_kda:
         return "the pool's ReplaySSM rings fold every commit or are KDA's"
     if cache.replayssm_d.shape[-2] != 16:
-        return f"ReplaySSM ring length {cache.replayssm_d.shape[-2]}, the kernel takes 16"
+        return (
+            f"ReplaySSM ring length {cache.replayssm_d.shape[-2]}, the kernel takes 16"
+        )
     if cache.temporal.dtype not in (torch.bfloat16, torch.float32):
         return f"GDN checkpoint dtype {cache.temporal.dtype}"
     if tokens_per_request != 4:
@@ -240,9 +248,7 @@ def forward(gdn, hidden_states, forward_batch):
         packed_verify = getattr(backend, "supports_packed_verify", False)
     use_fused_proj_conv = (
         _gdn_decode_fused_proj_conv
-        and not (
-            _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu"
-        )
+        and not (_is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu")
         and (forward_batch.forward_mode.is_decode() or packed_verify)
         and isinstance(projected_states_qkvz, torch.Tensor)
         and isinstance(projected_states_ba, torch.Tensor)
@@ -353,7 +359,11 @@ def glue_reasons(model) -> str:
         norm = gdn.norm
         if gdn.attn_tp_size != 1:
             return "the kernel takes TP1"
-        if norm.group_size is not None or not norm.norm_before_gate or norm.bias is not None:
+        if (
+            norm.group_size is not None
+            or not norm.norm_before_gate
+            or norm.bias is not None
+        ):
             return "the gated RMSNorm is grouped, gate-first or has a bias"
         if norm.activation not in GLUE_NORM_ACTIVATIONS:
             return f"gated RMSNorm activation {norm.activation!r}"
@@ -400,7 +410,9 @@ def front_reasons(model) -> str:
         if weight is None or weight.dtype != torch.bfloat16:
             return "no packed BF16 in_proj weight (SGLang's _fused_in_proj_weight)"
         if tuple(weight.shape) != shape:
-            return f"packed in_proj weight {tuple(weight.shape)}, the front takes {shape}"
+            return (
+                f"packed in_proj weight {tuple(weight.shape)}, the front takes {shape}"
+            )
         if gdn.norm.activation != "sigmoid":
             return f"gated RMSNorm activation {gdn.norm.activation!r}, not sigmoid"
         if gdn.norm.weight.dtype not in (torch.bfloat16, torch.float32):
@@ -700,8 +712,19 @@ def _verify_core(executor, layer, fb, mixed_qkv, a, b):
 
 
 def _native_pdl_core(
-    executor, *, layer, backend, cache, query, key, value, a, b, cache_indices,
-    replay_indices, query_start_loc
+    executor,
+    *,
+    layer,
+    backend,
+    cache,
+    query,
+    key,
+    value,
+    a,
+    b,
+    cache_indices,
+    replay_indices,
+    query_start_loc,
 ):
     """``_replayssm_target_verify`` with the plugin's PDL launch of the same circular
     verify kernel (``gdn_front/replayssm_pdl.py``)."""
@@ -724,18 +747,60 @@ def _native_pdl_core(
     rawv = cache.replayssm_rawv if cache.replayssm_rawv is not None else d
     rawk = cache.replayssm_rawk if cache.replayssm_rawk is not None else kc
     beta = cache.replayssm_beta if cache.replayssm_beta is not None else g
-    storage = 2 if cache.replayssm_beta is not None else (1 if cache.replayssm_rawv is not None else 0)
+    storage = (
+        2
+        if cache.replayssm_beta is not None
+        else (1 if cache.replayssm_rawv is not None else 0)
+    )
     gdn_replayssm_spec_circular_kernel[(2, bsz, hv)](
-        q, k, v, a, b, layer.A_log, layer.dt_bias, out,
-        cache.temporal, d, kc, g, rawv, rawk, beta,
-        query_start_loc, cache_indices, replay_indices,
-        pool.replayssm_spec_write_pos, pool.replayssm_cache_base, pool.replayssm_is_flush,
+        q,
+        k,
+        v,
+        a,
+        b,
+        layer.A_log,
+        layer.dt_bias,
+        out,
+        cache.temporal,
+        d,
+        kc,
+        g,
+        rawv,
+        rawk,
+        beta,
+        query_start_loc,
+        cache_indices,
+        replay_indices,
+        pool.replayssm_spec_write_pos,
+        pool.replayssm_cache_base,
+        pool.replayssm_is_flush,
         k_dim**-0.5,
-        q.stride(0), k.stride(0), v.stride(0), a.stride(0), b.stride(0), out.stride(0),
-        cache.temporal.stride(0), d.stride(0), kc.stride(0), g.stride(0),
-        rawv.stride(0), rawk.stride(0), beta.stride(0),
-        query_start_loc.stride(0), cache_indices.stride(0), replay_indices.stride(0),
-        H=h, HV=hv, K=k_dim, V=v_dim, BK=128, BV=64, BS=4, BC=16, NK=2, BKT=64,
+        q.stride(0),
+        k.stride(0),
+        v.stride(0),
+        a.stride(0),
+        b.stride(0),
+        out.stride(0),
+        cache.temporal.stride(0),
+        d.stride(0),
+        kc.stride(0),
+        g.stride(0),
+        rawv.stride(0),
+        rawk.stride(0),
+        beta.stride(0),
+        query_start_loc.stride(0),
+        cache_indices.stride(0),
+        replay_indices.stride(0),
+        H=h,
+        HV=hv,
+        K=k_dim,
+        V=v_dim,
+        BK=128,
+        BV=64,
+        BS=4,
+        BC=16,
+        NK=2,
+        BKT=64,
         MAX_CACHE_LEN=16,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=True,

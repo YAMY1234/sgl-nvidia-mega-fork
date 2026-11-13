@@ -24,12 +24,8 @@ from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear import (
     gdn_prefill_norm as norm_mod,
 )
 from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba import gdn_prefill_conv as conv_mod
-from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba import (
-    gdn_prefill_cp_tail as tail_mod,
-)
-from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba import (
-    gdn_prefill_state_glue as glue_mod,
-)
+from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba import gdn_prefill_cp_tail as tail_mod
+from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba import gdn_prefill_state_glue as glue_mod
 from sgl_nvidia_mega.qwen3_8.runtime import gdn_prefill as gp
 from sgl_nvidia_mega.qwen3_8.runtime import prefill_graph as pg
 
@@ -575,7 +571,10 @@ class TestFallbacks(_Case):
 def _graph_meta(track=False, flashinfer=True):
     """A bucket's static tables (GDNPrefillGraphMetadata), with FlashInfer's."""
     tables = SimpleNamespace(
-        cp_single=True, pre_track_mode="pre_mode", track_mode="mode", track_h_row="h_row"
+        cp_single=True,
+        pre_track_mode="pre_mode",
+        track_mode="mode",
+        track_h_row="h_row",
     )
     return SimpleNamespace(
         track=track,
@@ -605,7 +604,9 @@ class TestPrefillGraph(_Case):
         track.gdn_track_ssm_state = lambda **kw: self.spies.calls.append(
             ("track_ssm", kw)
         )
-        tables = types.ModuleType("sglang.srt.layers.attention.linear.gdn_prefill_graph")
+        tables = types.ModuleType(
+            "sglang.srt.layers.attention.linear.gdn_prefill_graph"
+        )
         tables.GDN_CHUNK_SIZE = 64
         patcher = mock.patch.dict(sys.modules, {m.__name__: m for m in (track, tables)})
         patcher.start()
@@ -631,7 +632,9 @@ class TestPrefillGraph(_Case):
         # bucket rows past the batch's tokens: the eager step's DP padding decline
         self.st = _St(_batch(lens, padded=sum(lens)))
         self.st.view = SimpleNamespace(prefill_graph_metadata=meta)
-        return gp.extend(self.ex, SimpleNamespace(linear_attn=self.gdn), self.x, self.st)
+        return gp.extend(
+            self.ex, SimpleNamespace(linear_attn=self.gdn), self.x, self.st
+        )
 
     def test_core_in_the_segment_on_the_tables(self):
         meta = _graph_meta()
@@ -764,13 +767,17 @@ class TestPrefillGraph(_Case):
         output = torch.zeros(1, 5, HV, D)
         qkvz, ba = gdn._forward_input_proj(torch.zeros(5, HIDDEN))
         qkv = qkvz[:, :QKV]
-        impl = gp.core_rows(gp.DEFAULT, step, gdn, fb, qkv, ba[:, :HV], ba[:, HV:], output)
+        impl = gp.core_rows(
+            gp.DEFAULT, step, gdn, fb, qkv, ba[:, :HV], ba[:, HV:], output
+        )
         self.assertEqual(impl, "conv_split+fi+rows_fused")
         self.assertIs(self.spies.kwargs("flashinfer")["output"], output)
         # an MIS batch keeps SGLang's extend
         backend.mis_metadata = object()
         backend.forward_extend = lambda layer, fb_, *a: torch.ones(1, 5, HV, D)
-        impl = gp.core_rows(gp.DEFAULT, step, gdn, fb, qkv, ba[:, :HV], ba[:, HV:], output)
+        impl = gp.core_rows(
+            gp.DEFAULT, step, gdn, fb, qkv, ba[:, :HV], ba[:, HV:], output
+        )
         self.assertEqual(impl, "mis_stock")
         self.assertTrue(torch.equal(output, torch.ones(1, 5, HV, D)))
 
@@ -801,8 +808,16 @@ class TestExtendInGraph(unittest.TestCase):
             ),
         ):
             out = fi_mod.extend_in_graph(
-                kernel, q, q, v, g, beta, ssm_states=self.ssm, tables=tables,
-                output=self.output, checkpoint_rows=checkpoint_rows,
+                kernel,
+                q,
+                q,
+                v,
+                g,
+                beta,
+                ssm_states=self.ssm,
+                tables=tables,
+                output=self.output,
+                checkpoint_rows=checkpoint_rows,
                 checkpoint_every_n_tokens=64,
             )
         return calls, tails, tables, out

@@ -1187,7 +1187,8 @@ def norm_rstd16(p, eps: Float32, *, loc=None, ip=None) -> Float32:
     butterfly at lane offsets 8, 4, 2, 1, then rsqrt(sum * (1 / 128) + eps) as one fma."""
     r = llvm.inline_asm(
         T.f32(),
-        [Float32(v).ir_value(loc=loc, ip=ip) for v in p] + [Float32(eps).ir_value(loc=loc, ip=ip)],
+        [Float32(v).ir_value(loc=loc, ip=ip) for v in p]
+        + [Float32(eps).ir_value(loc=loc, ip=ip)],
         "{\n\t.reg .f32 a<8>, b<4>, c<2>, d, n, rc;\n\t"
         + "".join(f"add.rn.f32 a{i}, ${1 + i}, ${1 + i + 8};\n\t" for i in range(8))
         + "".join(f"add.rn.f32 b{i}, a{i}, a{i + 4};\n\t" for i in range(4))
@@ -1204,7 +1205,9 @@ def norm_rstd16(p, eps: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def norm_gate_out(x: Float32, rstd: Float32, w: Float32, z: Float32, *, loc=None, ip=None) -> Uint32:
+def norm_gate_out(
+    x: Float32, rstd: Float32, w: Float32, z: Float32, *, loc=None, ip=None
+) -> Uint32:
     """bf16 bits of (x * rstd) * w * sigmoid(z), sigmoid(z) = 1 / (1 + ex2.approx(z * -log2 e))
     with div.full, as the Triton gated norm (norm before gate) computes it."""
     r = llvm.inline_asm(

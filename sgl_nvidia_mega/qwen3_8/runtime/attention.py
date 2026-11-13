@@ -46,6 +46,16 @@ logger = logging.getLogger(__name__)
 STOCK = "stock"
 # The engagement op naming the stream the indexer ran on, recorded off the main stream
 INDEX_STREAM = "qsa.index_stream"
+
+
+def _env_bool(name: str) -> bool:
+    """SGLang's ``get_bool_env_var(name)`` at its default, as the source reads it."""
+    return os.environ.get(name, "false").lower() in ("true", "1")
+
+
+# The source's switches of its QSA self_attention (qwen4_exp.py), read as it reads them.
+# Q38_QSA_EARLY_INDEXER: the side-stream indexer is enqueued before the QKV
+QSA_EARLY_INDEXER = _env_bool("Q38_QSA_EARLY_INDEXER")
 # Test only: on eager steps, also run SGLang's attention on the same q/k/v and selected
 # indices and log how far the pool kernel's output is from it, per row.
 OPCHECK = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_OPCHECK") == "1"
@@ -67,6 +77,7 @@ SGLANG_READS = {
         "_compute_qsa_topk_indices",
         "self_attention",
         "is_qsa",
+        "indexer",
         "_QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD",
         "_shards_rows_over_cp",
         "fused_sigmoid_mul",
@@ -114,6 +125,7 @@ SGLANG_READS = {
         "prefetch_cp_kv",
     ),
     "srt/layers/attention/qsa/config.py": ("budget", "block_topk"),
+    "srt/layers/attention/qsa/qsa_indexer.py": ("_use_fused_prep",),
     "srt/layers/attention/qsa/metadata.py": ("is_cuda_graph",),
     "srt/mem_cache/kv/router.py": ("layer", "read", "key", "value"),
 }
@@ -381,19 +393,31 @@ def _qkv_and_indices(executor, layer, x, st, indices):
     and the current stream joins it before the attention."""
     fb, positions = st.fb, st.positions
     overlap = _overlap_indexer(layer, x)
+    early = (
+        overlap
+        and QSA_EARLY_INDEXER
+        and layer.attn_output_gate
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and layer.indexer._use_fused_prep(x)
+    )
     if overlap:
         # the indexer reads only hidden_states / positions and writes QSA-private buffers
         current = torch.cuda.current_stream()
         layer.alt_stream.wait_stream(current)
+        if early:
+            with torch.cuda.stream(layer.alt_stream):
+                topk = indices()
     q, k, v, gate = _qkv_gate(layer, x, positions, fb)
     if not overlap:
         return q, k, v, gate, indices()
-    with torch.cuda.stream(layer.alt_stream):
-        topk = indices()
+    if not early:
+        with torch.cuda.stream(layer.alt_stream):
+            topk = indices()
     current.wait_stream(layer.alt_stream)
     # allocated on the side stream, read by the attention on this one
     topk.record_stream(current)
-    st.ran(INDEX_STREAM, "side")
+    st.ran(INDEX_STREAM, "side_early" if early else "side")
     return q, k, v, gate, topk
 
 

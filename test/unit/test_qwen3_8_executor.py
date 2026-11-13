@@ -2401,6 +2401,7 @@ class TestQsaIndexerStreams(unittest.TestCase):
     def run_step(
         self, mode=_Mode.TARGET_VERIFY, rows=8, *, capture=True, breakable=False,
         alt=True, indexer=True, glue=None, patches=(), layer_kw=None,
+        dtype=torch.float32,
     ):
         """One decomposed QSA step; returns (the stream log, the engagement record).
         ``patches``: (target, name, value) applied for the step."""
@@ -2463,7 +2464,7 @@ class TestQsaIndexerStreams(unittest.TestCase):
                 *patches,
             ):
                 stack.enter_context(mock.patch.object(target, name, value))
-            attention.step(ex, layer, torch.zeros(rows, 8), st)
+            attention.step(ex, layer, torch.zeros(rows, 8, dtype=dtype), st)
         return log, st.ran_ops
 
     def test_verify_indexer_beside_the_qkv(self):
@@ -2495,6 +2496,40 @@ class TestQsaIndexerStreams(unittest.TestCase):
             log, ran = self.run_step(**kw)
             self.assertEqual(log, ["qkv", ("select",), "attn"], kw)
             self.assertNotIn("qsa.index_stream", dict(ran), kw)
+
+    def test_early_indexer(self):
+        """Q38_QSA_EARLY_INDEXER: the side stream's indexer is enqueued before the QKV."""
+        from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+        fused = []
+        indexer = SimpleNamespace(_use_fused_prep=lambda x: fused.append(x) or True)
+        early = (attention, "QSA_EARLY_INDEXER", True)
+        cuda = (torch.Tensor, "is_cuda", property(lambda t: True))
+        kw = dict(layer_kw=dict(indexer=indexer), dtype=torch.bfloat16)
+        log, ran = self.run_step(patches=(early, cuda), **kw)
+        self.assertEqual(
+            log,
+            [
+                "alt waits main", "enter alt", ("select",), "exit alt", "qkv",
+                "main waits alt", "record main", "attn",
+            ],
+        )
+        self.assertIn(("qsa.index_stream", "side_early"), ran)
+        self.assertEqual(len(fused), 1)
+        for name, patches, step_kw in (
+            ("off", (cuda,), kw),
+            ("float32", (early, cuda), dict(kw, dtype=torch.float32)),
+            ("unfused prep", (early, cuda), dict(kw, layer_kw=dict(indexer=SimpleNamespace(
+                _use_fused_prep=lambda x: False)))),
+            ("no output gate", (early, cuda), dict(kw, layer_kw=dict(
+                indexer=indexer, attn_output_gate=False))),
+        ):
+            log, ran = self.run_step(patches=patches, **step_kw)
+            self.assertEqual(log, self.SIDE, name)
+            self.assertIn(("qsa.index_stream", "side"), ran)
+        # eager: no side stream, so no early indexer
+        log, _ = self.run_step(patches=(early, cuda), capture=False, **kw)
+        self.assertEqual(log, ["qkv", ("select",), "attn"])
 
     def test_draft_decode_glue_keeps_the_main_stream(self):
         out = torch.zeros(8, 6144)

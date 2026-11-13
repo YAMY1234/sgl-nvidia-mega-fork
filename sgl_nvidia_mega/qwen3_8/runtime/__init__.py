@@ -85,8 +85,9 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # qsa_draft: the MTP draft's QSA glue (runtime/qsa_draft.py): a draft decode step's
 # lookup of the draft extend's selection inside the K/V pack, and the draft extend's
 # seed capture as one launch
-# draft_fold: an MTP draft step's top-1 finalize with the next step's M-RoPE + 1 and
-# input embedding folded in (runtime/draft_fold.py); needs an SGLang draft-loop hook
+# draft_fold: an MTP draft step's top-1 finalize with the M-RoPE + 1 and the next
+# step's input embedding folded in, on the LM head's BF16 logits (runtime/draft_fold.py,
+# through SGLang's draft_step_fold entry)
 KNOWN_SLOTS: tuple[str, ...] = (
     "hc",
     "hc_wide",

@@ -176,7 +176,7 @@ class Qwen3_8Executor:
         # slot qsa_draft: qsa_draft.DraftGlue, set by build (the draft only)
         self.qsa_draft = None
         # slot draft_fold: the entry draft_step_fold (draft_fold.make), set by build;
-        # the embedding its last finalize gathered for the next draft step
+        # the embedding its finalize gathered for the round's next draft step
         self.draft_step_fold = None
         self.step_embedding = None
         # slot moe_finalize: set by build
@@ -495,11 +495,18 @@ class Qwen3_8Executor:
         from sglang.srt.eplb.expert_distribution import (
             get_global_expert_distribution_recorder,
         )
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+        from sgl_nvidia_mega.qwen3_8.runtime import draft_fold
 
         lm, fb = st.lm, st.fb
-        embeds = self.step_embedding if st.step.mode == "decode" else None
+        # slot draft_fold: this round's fold (an SGLang with the draft_step_fold entry)
+        fold = getattr(fb, "draft_step_fold", None)
+        if not isinstance(fold, draft_fold.StepFold) or fold.executor is not self:
+            fold = None
+        embeds = self.step_embedding if fold is not None else None
         if embeds is not None:
-            # slot draft_fold: the previous step's finalize gathered this embedding
+            # the previous step's finalize gathered this embedding
             self.step_embedding = None
             st.ran("embed", "draft_fold")
         else:
@@ -509,9 +516,15 @@ class Qwen3_8Executor:
         st.ran("mtp_fusion", STOCK)
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden, hc_hidden = self._language_model(st, st.input_ids, streams)
-        logits = bf16_gemm_pins.logits_processor(lm.logits_processor)
-        out = logits(st.input_ids, hidden, lm.lm_head, fb)
-        st.ran("logits", STOCK)
+        if fold is not None and fold.bf16:
+            # the fold's top-1 reads the LM head's BF16 logits: no FP32 copy
+            logits = draft_fold.bf16_logits(lm, hidden)
+            out = LogitsProcessorOutput(next_token_logits=logits)
+            st.ran("logits", "lm_head_bf16")
+        else:
+            logits = bf16_gemm_pins.logits_processor(lm.logits_processor)
+            out = logits(st.input_ids, hidden, lm.lm_head, fb)
+            st.ran("logits", STOCK)
         lm._set_hc_logits_hidden_states(out, hc_hidden, fb)
         return out
 

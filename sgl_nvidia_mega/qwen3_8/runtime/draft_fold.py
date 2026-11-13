@@ -3,36 +3,49 @@
 # Adapted from SGLang (Apache-2.0, SGLang Team):
 # python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py (the fold slots made
 # at each capture), python/sglang/srt/speculative/eagle_worker_v2.py (draft_forward's
-# finalize of a step that feeds another) and python/sglang/srt/models/qwen4_exp_mtp.py
-# (_prepare_input_embeds taking the folded embedding).
-"""Slot ``draft_fold``: an MTP draft step's top-1 finalize with the next step's input
-folded in (``kernels/ops/speculative/draft_step_fold.py``).
+# finalize of each draft step), python/sglang/srt/models/qwen4_exp_mtp.py
+# (_prepare_input_embeds taking the folded embedding) and
+# python/sglang/srt/layers/logits_processor.py (LogitsProcessor._get_logits before
+# its FP32 copy).
+"""Slot ``draft_fold``: an MTP draft step's top-1 finalize with the M-RoPE + 1 and the
+next step's input folded in (``kernels/ops/speculative/draft_step_fold.py``), through
+SGLang's ``draft_step_fold`` entry:
 
-It runs behind an SGLang hook binding v2 does not have (its draft_loop entry refuses
-a QSA draft and gets no forward batch for the executor's layer loop):
-
-- before each draft graph is captured, the draft runner calls the draft executor's
-  ``draft_step_fold(batch_size, num_steps)`` (None: SGLang's own top-1);
-- in a topk-1 chain without draft probabilities, the draft loop calls the fold's
-  ``finalize`` in place of ``draft_topk1_postprocess`` and the M-RoPE + 1 for each
-  step whose output feeds another step (the first of a 3-step chain);
-- the next draft step's forward then takes the folded embedding instead of embedding
-  the token (``Qwen3_8Executor._draft``).
-
-Until SGLang calls the entry, nothing here runs.
+- before each draft graph of a topk-1 chain is captured, SGLang calls the draft
+  executor's ``draft_step_fold(batch_size=, num_steps=)`` (``make``; None: SGLang's
+  own top-1);
+- in a greedy chain without logprobs, the round's draft forwards see the fold
+  (``ForwardBatch.draft_step_fold``): they return the LM head's BF16 logits
+  (``bf16_logits``) and the second takes the folded embedding;
+- SGLang hands each step's logits to ``StepFold.finalize`` in place of its
+  ``draft_topk1_postprocess`` and the M-RoPE + 1.
 """
 
 from __future__ import annotations
 
 import logging
 
+import torch
+
 logger = logging.getLogger(__name__)
+
+SGLANG_READS = {
+    "srt/layers/logits_processor.py": (
+        "_compute_lm_head",
+        "logit_scale",
+        "vocab_size",
+        "final_logit_softcapping",
+        "do_tensor_parallel_all_gather",
+        "do_tensor_parallel_all_gather_dp_attn",
+        "use_fp32_lm_head",
+        "use_fp32_lm_head_output",
+    ),
+    "srt/models/qwen4_exp_mtp.py": ("logits_processor", "lm_head"),
+}
 
 
 def build() -> str:
     """'' when the fold's kernels import here, else why not."""
-    import torch
-
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         return "the draft fold needs an SM10x GPU"
     try:
@@ -44,25 +57,58 @@ def build() -> str:
     return ""
 
 
-class StepFold:
-    """One captured draft graph's fold: its slot, and the executor whose next draft
-    step takes the folded embedding."""
+def bf16_logits_reason(lm) -> str:
+    """'' when the draft's logits before the logits processor's FP32 copy are its LM
+    head's output alone (no softcap, gather or FP32 head), else why not."""
+    lp = lm.logits_processor
+    if lp.final_logit_softcapping:
+        return "a logit softcap (fused into the FP32 copy)"
+    if lp.do_tensor_parallel_all_gather or lp.do_tensor_parallel_all_gather_dp_attn:
+        return "a TP / DP logits gather"
+    if lp.use_fp32_lm_head or lp.use_fp32_lm_head_output:
+        return "an FP32 LM head"
+    if lm.lm_head.weight.dtype != torch.bfloat16:
+        return f"a {lm.lm_head.weight.dtype} LM head"
+    return ""
 
-    def __init__(self, executor, slot):
+
+def bf16_logits(lm, hidden):
+    """``LogitsProcessor._get_logits`` of a draft decode up to its FP32 copy: the LM
+    head (with its logit scale), cut to the vocabulary; ``bf16_logits_reason`` ''."""
+    lp = lm.logits_processor
+    logits = lp._compute_lm_head(hidden, lm.lm_head, None)
+    if lp.logit_scale is not None:
+        logits.mul_(lp.logit_scale)
+    return logits[:, : lp.vocab_size]
+
+
+class StepFold:
+    """One captured draft graph's fold: its slot, the chain's length, and the
+    executor whose draft forwards take the folded embedding and return BF16 logits
+    (``bf16``) while it is the round's."""
+
+    def __init__(self, executor, slot, num_steps, bf16):
         self.executor = executor
         self.slot = slot
+        self.num_steps = num_steps
+        self.bf16 = bf16
 
     def finalize(self, logits, positions, draft_tokens, column, mrope_positions=None):
         """``draft_topk1_postprocess(logits, positions, draft_tokens, column)`` and the
-        M-RoPE positions' + 1 (when given), with the token's embedding row gathered
-        for the next draft step; returns (topk_p, topk_index) in the slot."""
+        M-RoPE positions' + 1 (when given); before another draft step, with the
+        token's embedding row gathered for it. Returns (topk_p, topk_index)."""
         from sgl_nvidia_mega.qwen3_8.kernels.ops.speculative import draft_step_fold
 
-        out = draft_step_fold.finalize_next_input(
-            logits, positions, draft_tokens, column, self.slot, mrope_positions
+        if column < self.num_steps - 1:
+            out = draft_step_fold.finalize_next_input(
+                logits, positions, draft_tokens, column, self.slot, mrope_positions
+            )
+            self.executor.step_embedding = self.slot.embedding
+            return out
+        self.executor.step_embedding = None
+        return draft_step_fold.draft_topk1_postprocess(
+            logits, positions, draft_tokens, column, mrope_positions
         )
-        self.executor.step_embedding = self.slot.embedding
-        return out
 
 
 def make(executor, batch_size: int, num_steps: int):
@@ -74,5 +120,9 @@ def make(executor, batch_size: int, num_steps: int):
     if reason:
         logger.info("Qwen3.8 slot draft_fold: bs %d stock (%s)", batch_size, reason)
         return None
+    logits = bf16_logits_reason(executor.lm)
+    if logits:
+        logger.info("Qwen3.8 slot draft_fold: FP32 logits (%s)", logits)
     weight = executor.lm.model.embed_tokens.weight
-    return StepFold(executor, draft_step_fold.make_slot(weight, batch_size))
+    slot = draft_step_fold.make_slot(weight, batch_size)
+    return StepFold(executor, slot, num_steps, bf16=not logits)

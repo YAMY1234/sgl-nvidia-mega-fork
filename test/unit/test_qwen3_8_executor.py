@@ -10,6 +10,7 @@ import sys
 import types
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -253,6 +254,7 @@ class TestStepFallbacks(unittest.TestCase):
         ex = SimpleNamespace(moe_finalize_ready=True, moe_routing=None, smallm_gemm=None)
         layer = SimpleNamespace(mlp=Block())
         st = _St(_Mode.TARGET_VERIFY)
+        self.enterContext(mock.patch.object(moe, "FINALIZE_COLUMN_CHUNK", 1024))
         moe.step(ex, layer, torch.zeros(rows, 2560), st)
         self.assertEqual(calls, ["routed", "shared", "finalize"])
         self.assertEqual(st.ran_ops, [("moe", "finalize_permuted")])
@@ -265,6 +267,11 @@ class TestStepFallbacks(unittest.TestCase):
         self.assertEqual((name, grid), ("chunked", (rows, 3)))
         self.assertEqual((kw["CHUNK"], kw["num_warps"], kw["USE_PDL"]), (1024, 16, pdl))
         self.assertEqual(kw.get("launch_pdl", False), pdl)
+        # the recipe's chunk 0 (the source's default): one row a program
+        with mock.patch.object(moe, "FINALIZE_COLUMN_CHUNK", 0):
+            moe.step(ex, layer, torch.zeros(rows, 2560), _St(_Mode.TARGET_VERIFY))
+        name, grid, kw = launches[1]
+        self.assertEqual((name, grid, "CHUNK" in kw), ("rows", (rows,), False))
 
     def test_gdn_stock_outside_verify(self):
         from sgl_nvidia_mega.qwen3_8.runtime import gdn

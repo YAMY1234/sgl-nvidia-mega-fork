@@ -21,6 +21,7 @@ SGLang's deferred dual stream; from it on it is the source's extend-size MoE
 from __future__ import annotations
 
 import contextlib
+import os
 
 import torch
 
@@ -34,9 +35,15 @@ EXTEND_MIN_ROWS = 1024
 EXTEND_MAX_REGISTERS = 64
 # Below it, the source's launch (fused_moe_finalize_gate_sigmoid_mul_add): its warp rule
 # max(min(next_pow2(ceil(hidden / 256)), 32), 4) at hidden 2560, PDL, and up to 64 rows the
-# (row, 1024-column) grid of its SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK=1024 recipes.
+# (row, chunk-column) grid when the recipe sets the source's column chunk (0: off).
 FINALIZE_NUM_WARPS = 16
-FINALIZE_COLUMN_CHUNK = 1024
+FINALIZE_COLUMN_CHUNK_ENV = "SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK"
+FINALIZE_COLUMN_CHUNK = int(os.environ.get(FINALIZE_COLUMN_CHUNK_ENV) or 0)
+if FINALIZE_COLUMN_CHUNK not in (0, 128, 256, 512, 1024):
+    raise ValueError(
+        f"{FINALIZE_COLUMN_CHUNK_ENV} must be 0 or one of (128, 256, 512, 1024), "
+        f"got {FINALIZE_COLUMN_CHUNK}"
+    )
 FINALIZE_COLUMN_CHUNK_MAX_ROWS = 64
 
 SGLANG_READS = {

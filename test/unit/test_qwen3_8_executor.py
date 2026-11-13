@@ -2492,6 +2492,252 @@ class TestQsaDraftKernels(unittest.TestCase):
         self.assertEqual(got["capture"], [["", True, True]] * 4)
 
 
+_INTERPRETED_FOLD = r"""
+import json
+import torch
+from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sgl_nvidia_mega.qwen3_8.kernels.ops.speculative import draft_step_fold as F
+
+torch.manual_seed(0)
+out = []
+for bs, vocab, tie in ((1, 20000, False), (3, 17000, True), (4, 8192, False)):
+    weight = torch.randn(vocab, 2560).to(torch.bfloat16)
+    logits = torch.randn(bs, vocab).to(torch.bfloat16)
+    if tie:  # a tie across splits: the first split's index in both
+        logits[1, 100] = logits[1, 9000] = 50.0
+    pos0, mrope0 = torch.randint(10, 100, (bs,)), torch.randint(10, 100, (3, bs))
+    for column in (1, 2):  # a step that feeds another, then the last
+        tokens_a = torch.zeros(bs, 3, dtype=torch.int64)
+        tokens_b = tokens_a.clone()
+        pa, ma = pos0.clone(), mrope0.clone()
+        if column == 1:
+            slot = F.make_slot(weight, bs)
+            p_a, i_a = F.finalize_next_input(logits, pa, tokens_a, column, slot, ma)
+        else:
+            p_a, i_a = F.draft_topk1_postprocess(logits, pa, tokens_a, column, ma)
+        # SGLang: its top-1 on the FP32 logits, the M-RoPE + 1, the next step's embedding
+        pb, mb = pos0.clone(), mrope0.clone()
+        p_b, i_b = draft_topk1_postprocess(logits.float(), pb, tokens_b, column)
+        mb.add_(1)
+        same = [
+            torch.equal(i_a, i_b), torch.equal(p_a, p_b), torch.equal(pa, pb),
+            torch.equal(ma, mb), torch.equal(tokens_a, tokens_b),
+        ]
+        if column == 1:
+            same.append(torch.equal(slot.embedding, weight[i_b.flatten()]))
+        out.append(same)
+print(json.dumps(out))
+"""
+
+
+class _LogitsProcessor:  # the draft's LogitsProcessor fields the BF16 logits read
+    def __init__(self, **kw):
+        self.final_logit_softcapping = kw.get("softcap")
+        self.do_tensor_parallel_all_gather = kw.get("gather", False)
+        self.do_tensor_parallel_all_gather_dp_attn = False
+        self.use_fp32_lm_head = kw.get("fp32", False)
+        self.use_fp32_lm_head_output = False
+        self.logit_scale = kw.get("scale")
+        self.vocab_size = 6
+        self.calls = []
+
+    def _compute_lm_head(self, hidden, lm_head, bias):
+        self.calls.append(("lm_head", hidden, lm_head, bias))
+        return torch.ones(hidden.shape[0], 8, dtype=torch.bfloat16)
+
+    def __call__(self, *args):
+        self.calls.append("stock")
+        return _LogitsOutput()
+
+
+class TestDraftFold(unittest.TestCase):
+    """Slot draft_fold through SGLang's draft_step_fold entry: the entry's gate, the
+    finalize of each draft step, the round's draft forwards taking the folded
+    embedding and returning the LM head's BF16 logits; the kernels under Triton's
+    interpreter against SGLang's top-1 on the FP32 logits."""
+
+    method = types.ModuleType("sglang.srt.layers.vocab_parallel_embedding")
+    method.UnquantizedEmbeddingMethod = type("UnquantizedEmbeddingMethod", (), {})
+
+    def model(self, **kw):
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.speculative import draft_step_fold
+
+        method = self.method
+        weight = kw.pop("weight", torch.zeros(20000, 2560, dtype=torch.bfloat16))
+        embed = SimpleNamespace(
+            weight=SimpleNamespace(
+                is_cuda=True, dtype=weight.dtype, ndim=weight.ndim, shape=weight.shape,
+                is_contiguous=lambda: True, device="cpu",
+            ),
+            tp_size=kw.pop("tp", 1),
+            quant_method=method.UnquantizedEmbeddingMethod(),
+            output_dtype=None,
+            num_embeddings=20000,
+            org_vocab_size=20000,
+        )
+        model = SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=embed),
+            hc_count=kw.pop("hc", 4),
+            logits_processor=_LogitsProcessor(**kw),
+            lm_head=SimpleNamespace(weight=torch.zeros(1, dtype=torch.bfloat16)),
+        )
+        return model, method, draft_step_fold
+
+    def test_gate_and_slot(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import draft_fold
+
+        model, method, kernels = self.model()
+        ex = SimpleNamespace(lm=model)
+        with mock.patch.dict(sys.modules, {method.__name__: method}):
+            with mock.patch.object(
+                kernels, "make_slot", lambda w, bs: SimpleNamespace(bs=bs, w=w)
+            ):
+                fold = draft_fold.make(ex, batch_size=4, num_steps=3)
+                self.assertEqual((fold.slot.bs, fold.num_steps, fold.bf16), (4, 3, True))
+                self.assertIs(fold.slot.w, model.model.embed_tokens.weight)
+                # logits the FP32 copy also transforms: the fold reads the FP32 ones
+                for kw in (dict(softcap=30.0), dict(gather=True), dict(fp32=True)):
+                    m, *_ = self.model(**kw)
+                    self.assertFalse(draft_fold.make(SimpleNamespace(lm=m), 2, 3).bf16)
+            for bs, steps in ((5, 3), (0, 3), (2, 4)):
+                self.assertIsNone(draft_fold.make(ex, bs, steps))
+            for kw in (dict(hc=1), dict(tp=4)):
+                m, *_ = self.model(**kw)
+                self.assertIsNone(draft_fold.make(SimpleNamespace(lm=m), 2, 3))
+        self.assertIn("draft_fold", runtime.KNOWN_SLOTS)
+        # the capture's own scratch: 3 splits of SGLang's 8192-column top-1 blocks
+        slot = kernels.make_slot(torch.zeros(20000, 2560, dtype=torch.bfloat16), 2)
+        self.assertEqual(tuple(slot.embedding.shape), (2, 2560))
+        self.assertEqual(tuple(slot.partial_values.shape), (2, 3))
+
+    def test_bf16_logits_are_the_lm_head_scaled_and_cut(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import draft_fold
+
+        for scale, want in ((None, 1.0), (0.5, 0.5)):
+            lm, *_ = self.model(scale=scale)
+            logits = draft_fold.bf16_logits(lm, torch.zeros(3, 4))
+            self.assertEqual((tuple(logits.shape), logits.dtype), ((3, 6), torch.bfloat16))
+            self.assertTrue(torch.all(logits == want))
+            ((_, _, head, bias),) = lm.logits_processor.calls
+            self.assertIs(head, lm.lm_head)
+            self.assertIsNone(bias)
+
+    def test_finalize_each_step(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.speculative import draft_step_fold
+        from sgl_nvidia_mega.qwen3_8.runtime import draft_fold
+
+        ex = _executor(draft=True)
+        slot = SimpleNamespace(embedding=torch.ones(2, 2560))
+        launched = []
+        with (
+            mock.patch.object(
+                draft_step_fold,
+                "finalize_next_input",
+                lambda *a: launched.append(("fold",) + a) or ("p", "i"),
+            ),
+            mock.patch.object(
+                draft_step_fold,
+                "draft_topk1_postprocess",
+                lambda *a: launched.append(("last",) + a) or ("p2", "i2"),
+            ),
+        ):
+            fold = draft_fold.StepFold(ex, slot, 3, True)
+            self.assertEqual(fold.finalize("lg", "pos", "tok", 1, "mrope"), ("p", "i"))
+            self.assertIs(ex.step_embedding, slot.embedding)
+            self.assertEqual(fold.finalize("lg2", "pos", "tok", 2, None), ("p2", "i2"))
+            self.assertIsNone(ex.step_embedding)
+        self.assertEqual(
+            launched,
+            [
+                ("fold", "lg", "pos", "tok", 1, slot, "mrope"),
+                ("last", "lg2", "pos", "tok", 2, None),
+            ],
+        )
+
+    def test_the_rounds_forwards_take_the_embedding_and_bf16_logits(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import draft_fold
+
+        ex = _executor(draft=True)
+        recorder = types.ModuleType("sglang.srt.eplb.expert_distribution")
+        recorder.get_global_expert_distribution_recorder = lambda: SimpleNamespace(
+            disable_this_region=contextlib.nullcontext
+        )
+        logits_module = types.ModuleType("sglang.srt.layers.logits_processor")
+        logits_module.LogitsProcessorOutput = lambda next_token_logits: SimpleNamespace(
+            next_token_logits=next_token_logits, hidden_states=None
+        )
+        seen = []
+        lm, *_ = self.model()
+        lm._prepare_input_embeds = lambda ids, fb, e: seen.append("embed") or "stock"
+        lm._mtp_input_fusion = lambda embeds, hidden: seen.append(embeds) or "streams"
+        lm._set_hc_logits_hidden_states = lambda out, hc, fb: seen.append(("hc", hc))
+        ex._language_model = lambda st, ids, streams: (torch.zeros(2, 4), "hc")
+        ex.lm = lm
+        embedding = torch.ones(2, 2560)
+        fold = draft_fold.StepFold(ex, SimpleNamespace(embedding=embedding), 3, True)
+        stock_fold = draft_fold.StepFold(ex, None, 3, False)
+        other = draft_fold.StepFold(_executor(draft=True), None, 3, True)
+
+        def run(fb_fold, pending=None):
+            ex.step_embedding = pending
+            seen.clear()
+            lm.logits_processor.calls.clear()
+            st = _St(_Mode.DECODE, 2)
+            st.lm, st.input_ids, st.step.mode = lm, torch.zeros(2), "decode"
+            st.fb.spec_info.hidden_states = "h"
+            if fb_fold != "absent":
+                st.fb.draft_step_fold = fb_fold
+            with mock.patch.dict(
+                sys.modules, {m.__name__: m for m in (recorder, logits_module)}
+            ):
+                out = ex._draft(st)
+            return out, list(seen), dict(st.ran_ops), lm.logits_processor.calls
+
+        out, seen_ops, ran, calls = run(fold, pending=embedding)
+        self.assertIs(seen_ops[0], embedding)  # the folded embedding, no embed
+        self.assertEqual(ran["logits"], "lm_head_bf16")
+        self.assertEqual(out.next_token_logits.dtype, torch.bfloat16)
+        self.assertEqual(seen_ops[-1], ("hc", "hc"))
+        self.assertIsNone(ex.step_embedding)
+        out, seen_ops, ran, _ = run(fold)  # the round's first step embeds its tokens
+        self.assertEqual((seen_ops[0], ran["embed"]), ("embed", "stock"))
+        self.assertEqual(ran["logits"], "lm_head_bf16")
+        # no fold of this executor this round: SGLang's embedding and logits
+        for fb_fold in (None, "absent", other):
+            out, seen_ops, ran, calls = run(fb_fold, pending=embedding)
+            self.assertEqual(seen_ops[0], "embed", fb_fold)
+            self.assertEqual((ran["logits"], calls), ("stock", ["stock"]), fb_fold)
+        # a fold over FP32 logits still takes the folded embedding
+        _, seen_ops, ran, calls = run(stock_fold, pending=embedding)
+        self.assertEqual((ran["embed"], ran["logits"]), ("draft_fold", "stock"))
+        self.assertEqual(calls, ["stock"])
+
+    def test_kernels_match_sglang_top1(self):
+        import json
+        import os
+        import subprocess
+
+        env = dict(os.environ, TRITON_INTERPRET="1", PYTHONDONTWRITEBYTECODE="1")
+        done = subprocess.run(
+            [sys.executable, "-c", _INTERPRETED_FOLD],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        got = json.loads(done.stdout.strip().splitlines()[-1])
+        # token, topk_p, positions, M-RoPE, draft tokens (and the embedding) on the
+        # BF16 logits, for a step that feeds another and for the last
+        self.assertEqual(got, [[True] * 6, [True] * 5] * 3)
+
+
 class TestEngagement(unittest.TestCase):
     def test_logs_each_new_set_once(self):
         e = Engagement("target")

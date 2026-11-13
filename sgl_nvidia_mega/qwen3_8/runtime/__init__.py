@@ -88,6 +88,9 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # qsa_draft: the MTP draft's QSA glue (runtime/qsa_draft.py): a draft decode step's
 # lookup of the draft extend's selection inside the K/V pack, and the draft extend's
 # seed capture as one launch
+# draft_fold: an MTP draft step's top-1 finalize with the M-RoPE + 1 and the next
+# step's input embedding folded in, on the LM head's BF16 logits (runtime/draft_fold.py,
+# through SGLang's draft_step_fold entry)
 KNOWN_SLOTS: tuple[str, ...] = (
     "hc",
     "hc_wide",
@@ -104,6 +107,7 @@ KNOWN_SLOTS: tuple[str, ...] = (
     "ple",
     "smallm_gemm",
     "qsa_draft",
+    "draft_fold",
 )
 # A node-local directory for the JIT sources some kernels write before compiling.
 SOURCE_DIR_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_SOURCE_DIR"
@@ -351,6 +355,13 @@ def build(model, hf_config, ctx):
         executor.ple_options = _built_options("ple", ple.build(model), ple.DEFAULT)
     if "qsa_draft" in slots and draft:
         executor.qsa_draft = _build_qsa_draft(model)
+    if "draft_fold" in slots and draft:
+        from functools import partial
+
+        from sgl_nvidia_mega.qwen3_8.runtime import draft_fold
+
+        if _built_options("draft_fold", draft_fold.build(), True):
+            executor.draft_step_fold = partial(draft_fold.make, executor)
     if "smallm_gemm" in slots:
         from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
 

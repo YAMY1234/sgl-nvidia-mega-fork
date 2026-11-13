@@ -311,7 +311,11 @@ class TestStepFallbacks(unittest.TestCase):
 
         kmod.gdn_fused_verify_glue = glue
         umod = types.ModuleType("sglang.srt.layers.attention.linear.utils")
-        umod.select_verify_intermediate_state_indices = lambda idx, req, valid, size: idx
+        selected = []
+        umod.select_verify_intermediate_state_indices = (
+            lambda idx, req, valid, size: selected.append(valid) or idx
+        )
+        umod.pp_spec_stable_rows_enabled = lambda: False
         cache = SimpleNamespace(
             conv=[torch.zeros(1)], intermediate_conv_window=[torch.zeros(1)],
             temporal="ckpt", replayssm_d="d", replayssm_k="k", replayssm_g="g",
@@ -355,6 +359,9 @@ class TestStepFallbacks(unittest.TestCase):
         self.assertEqual((seen["mixed_qkvz"], seen["mixed_ba"]), ("qkvz", "ba"))
         self.assertEqual((seen["draft_token_num"], seen["norm_activation"]), (4, "swish"))
         self.assertIsNone(seen["conv_bias"])
+        # without PP stable rows, the source's call: no mask, the backend's own indices
+        self.assertEqual(selected, [])
+        self.assertIs(seen["intermediate_state_indices"], backend.verify_intermediate_state_indices)
 
     def test_gdn_front_runs_one_request(self):
         """4 rows: the front's projection + conv, then the core with the fused norm on

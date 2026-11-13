@@ -124,7 +124,10 @@ SGLANG_READS = {
         "replayssm_spec_fold",
         "replayssm_is_kda",
     ),
-    "srt/layers/attention/linear/utils.py": ("select_verify_intermediate_state_indices",),
+    "srt/layers/attention/linear/utils.py": (
+        "select_verify_intermediate_state_indices",
+        "pp_spec_stable_rows_enabled",
+    ),
 }
 
 # forward mirrors GatedDeltaNet.forward when BF16 pins are on
@@ -521,6 +524,7 @@ def _verify_glue(executor, gdn, x, st):
     glue launch (split, causal conv update, ReplaySSM verify, gated RMSNorm) and the
     output projection; None outside 2-8 requests or for a tree verify."""
     from sglang.srt.layers.attention.linear.utils import (
+        pp_spec_stable_rows_enabled,
         select_verify_intermediate_state_indices,
     )
 
@@ -548,12 +552,16 @@ def _verify_glue(executor, gdn, x, st):
     pool = backend.state_pool
     cache_indices = md.mamba_cache_indices
     batch = rows // tokens
-    rows_state = select_verify_intermediate_state_indices(
-        backend.verify_intermediate_state_indices,
-        fb.req_pool_indices,
-        cache_indices[:batch] >= 0,
-        backend.req_to_token_pool.size,
-    )
+    if pp_spec_stable_rows_enabled():
+        rows_state = select_verify_intermediate_state_indices(
+            backend.verify_intermediate_state_indices,
+            fb.req_pool_indices,
+            cache_indices[:batch] >= 0,
+            backend.req_to_token_pool.size,
+        )
+    else:
+        # as the source: the stock call evaluates the >= 0 mask (a launch a layer) and discards it
+        rows_state = backend.verify_intermediate_state_indices
     core = gdn_fused_verify_glue(
         mixed_qkvz=qkvz,
         mixed_ba=ba,

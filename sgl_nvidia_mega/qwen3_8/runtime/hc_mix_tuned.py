@@ -27,6 +27,8 @@ SGLANG_READS = {
 }
 
 ENV = "SGLANG_HC_MACRO"
+# The source's split-K mix rows with the switch on at TP1 (SGLang main: 24)
+MAX_ROWS = 32
 _cache: dict = {}
 
 

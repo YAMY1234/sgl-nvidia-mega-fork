@@ -67,7 +67,8 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # qsa_pool: the TP1 QSA verify's sparse attention as split-K pool kernels (<= 64 rows)
 # on a BF16 KV pool
 # qsa_pool_fp8: the TP1 QSA verify's sparse attention on an FP8 E4M3 KV pool as the
-# union kernels, warp-specialized (33-576 rows; runtime/attention.py)
+# union kernels, warp-specialized (56-576 rows; runtime/attention.py), and the MTP
+# draft extend's (four rows a request) the same way
 # moe_finalize: the TP1 MoE's finalize + gated shared expert as one ordered kernel; from
 # 1024 rows the source's extend-size MoE, and on the target a FlashInfer tuning pass of
 # its routed experts at prefill sizes (runtime/moe.py, runtime/moe_prefill_autotune.py)
@@ -84,6 +85,9 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # The tuning-pin tables are on when their files are set, as in the source, not by slot:
 # SGLANG_FLASHINFER_TACTIC_PIN_FILE (runtime/flashinfer_tactic_pins.py) and
 # SGLANG_BF16_GEMM_PIN_FILE (runtime/bf16_gemm_pins.py).
+# qsa_draft: the MTP draft's QSA glue (runtime/qsa_draft.py): a draft decode step's
+# lookup of the draft extend's selection inside the K/V pack, and the draft extend's
+# seed capture as one launch
 KNOWN_SLOTS: tuple[str, ...] = (
     "hc",
     "hc_wide",
@@ -99,6 +103,7 @@ KNOWN_SLOTS: tuple[str, ...] = (
     "qsa_prefill",
     "ple",
     "smallm_gemm",
+    "qsa_draft",
 )
 # A node-local directory for the JIT sources some kernels write before compiling.
 SOURCE_DIR_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_SOURCE_DIR"
@@ -305,7 +310,7 @@ def build(model, hf_config, ctx):
             from sgl_nvidia_mega.qwen3_8.runtime.attention import PoolKernels
 
             executor.qsa_pool = PoolKernels()
-    if "qsa_pool_fp8" in slots and not draft:
+    if "qsa_pool_fp8" in slots:
         executor.qsa_union = _build_qsa_union(model)
     if "moe_finalize" in slots:
         executor.moe_finalize_ready = _build_moe_finalize(model, decompose)
@@ -344,6 +349,8 @@ def build(model, hf_config, ctx):
         from sgl_nvidia_mega.qwen3_8.runtime import ple
 
         executor.ple_options = _built_options("ple", ple.build(model), ple.DEFAULT)
+    if "qsa_draft" in slots and draft:
+        executor.qsa_draft = _build_qsa_draft(model)
     if "smallm_gemm" in slots:
         from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
 
@@ -488,6 +495,23 @@ def _build_qsa_indexer(model):
     return kernels
 
 
+def _build_qsa_draft(model):
+    """The draft glue (qsa_draft.DraftGlue), or None (SGLang's lookup and capture)."""
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+    reason = qsa_draft.build(model)
+    megakernel_agree(reason, what="Qwen3.8 slot qsa_draft")
+    if reason:
+        unavailable("qsa_draft", reason)
+        return None
+    lookup = qsa_draft.lookup_reason(model)
+    if lookup:
+        logger.info("NVIDIA megakernel: Qwen3.8 slot qsa_draft: stock lookup (%s)", lookup)
+    return qsa_draft.DraftGlue(lookup=not lookup)
+
+
 def _qsa_layers_reason(model) -> str:
     """'' when every attention layer is a QSA layer of the pool kernels' TP1 heads."""
     from sglang.srt.models.qwen4_exp import Qwen4ExpAttentionDecoderLayer
@@ -516,7 +540,8 @@ def _build_qsa_pool(model) -> bool:
 
 def _build_qsa_union(model):
     """The union kernels (attention.UnionKernels), or None (stock); the pool is checked
-    at the first verify (Qwen3_8Executor._check_pools)."""
+    at the first verify, the draft's at its first draft extend
+    (Qwen3_8Executor._check_pools)."""
     from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
 
     from sgl_nvidia_mega.qwen3_8.runtime import attention

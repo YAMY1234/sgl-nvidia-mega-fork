@@ -171,10 +171,12 @@ class Qwen3_8Executor:
         self.qsa_pool_ready = False
         self.qsa_pool = None
         # slot qsa_pool_fp8: attention.UnionKernels, set by build; the pool is checked
-        # at the first verify
+        # at the first verify (the draft's first draft extend)
         self.qsa_union = None
         # slot qsa_indexer: qsa_indexer.IndexerKernels, set by build
         self.qsa_indexer = None
+        # slot qsa_draft: qsa_draft.DraftGlue, set by build (the draft only)
+        self.qsa_draft = None
         # slot moe_finalize: set by build
         self.moe_finalize_ready = False
         # slot moe_routing: moe_routing.Options, set by build
@@ -367,8 +369,9 @@ class Qwen3_8Executor:
         return attention.step(self, layer, x, st)
 
     def _check_pools(self, forward_batch):
-        """The pools exist from the first covered verify on (a capture warmup runs it
-        eagerly before any graph is captured); refuse a slot they cannot serve."""
+        """The pools exist from the first covered verify (the draft's first draft
+        extend) on; a capture warmup runs it eagerly before any graph is captured.
+        Refuse a slot they cannot serve."""
         self._pools_checked = True
         if self.gdn_ucache is not None:
             # the u-cache verify serves every GDN verify
@@ -428,7 +431,8 @@ class Qwen3_8Executor:
 
     @torch.no_grad()
     def _forward(self, step, input_ids, positions, forward_batch):
-        if not self._pools_checked and step.mode == "target_verify":
+        first = "draft_extend" if self.draft else "target_verify"
+        if not self._pools_checked and step.mode == first:
             self._check_pools(forward_batch)
         lm = self.lm
         st = StepState(

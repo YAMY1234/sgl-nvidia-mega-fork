@@ -14,7 +14,11 @@ Slot ``qsa_pool_fp8``: a TP1 target verify of 56-576 rows (14-144 requests x 4) 
 E4M3 KV pool runs it as the union kernels (``qsa/pool_union_ws.py``): the new BF16 K/V
 cast to E4M3 in the pool write, each request's union of selected tokens, the
 warp-specialized attention over it (launched with PDL) and the split merge; SGLang's
-output gate follows. It replaces SGLang's K/V pack and TRT-LLM decode.
+output gate follows. It replaces SGLang's K/V pack and TRT-LLM decode. The slot also
+runs the MTP draft's CUDA-graph draft extend of 56-576 rows the same way: four rows a
+request in position order, as a verify lays them out, with the blocks read back from
+the indexer's expanded token indices. It replaces the K/V store, ``_compact_kv`` pack
+and TRT-LLM decode there.
 
 The QKV / gate projection with its norms and RoPE, the indexer (selection) and o_proj
 stay SGLang's (with BF16 GEMM pins on, the projection's CUDA branch runs here so
@@ -84,6 +88,10 @@ SGLANG_READS = {
     "kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py": (
         "fused_qk_gemma_rmsnorm_rope_gate",
     ),
+    "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
+    "srt/model_executor/runner_backend_utils/breakable_cuda_graph/__init__.py": (
+        "is_in_breakable_cuda_graph",
+    ),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "kernels/ops/elementwise/elementwise.py": ("fused_sigmoid_mul",),
     "srt/layers/attention/qsa/glue.py": ("resolve_qsa_sparse_backend",),
@@ -92,6 +100,7 @@ SGLANG_READS = {
         "_uses_block_indices",
         "_fused_kv_pool_eligible",
         "compress_ratio",
+        "qsa_profile",
         "row_req_pool_indices",
         "indexer_metadata",
         "decode_logical_positions",
@@ -99,6 +108,8 @@ SGLANG_READS = {
         "token_to_kv_pool",
         "prefetch_cp_kv",
     ),
+    "srt/layers/attention/qsa/config.py": ("budget", "block_topk"),
+    "srt/layers/attention/qsa/metadata.py": ("is_cuda_graph",),
     "srt/mem_cache/kv/router.py": ("layer", "read", "key", "value"),
 }
 
@@ -191,12 +202,13 @@ def sparse_backend():
 def step(executor, layer, x, st):
     """The layer's attention output [rows, hidden] (before the stage's reduction).
 
-    With slot ``qsa_indexer``, ``qsa_pool`` or ``qsa_pool_fp8``, a decode / verify /
-    draft-extend step runs the attention split into its pieces here: SGLang's QKV +
-    gate projection, the indexer (``qsa_indexer.select``: the plugin's fold, scorers
-    and selects where they serve the step), the sparse attention (the pool or union
-    kernels where they serve it) and the gate and o_proj. Otherwise SGLang's
-    ``self_attention`` runs whole."""
+    With slot ``qsa_indexer``, ``qsa_pool``, ``qsa_pool_fp8`` or ``qsa_draft``, a
+    decode / verify / draft-extend step runs the attention split into its pieces here:
+    SGLang's QKV + gate projection, the indexer (``qsa_indexer.select``: the plugin's
+    fold, scorers and selects where they serve the step; a draft decode's lookup inside
+    ``qsa_draft``'s pack), the sparse attention (the pool, union or lookup kernels where
+    they serve it) and the gate and o_proj. Otherwise SGLang's ``self_attention`` runs
+    whole."""
     fb = st.fb
     mode = fb.forward_mode
     if (
@@ -204,10 +216,14 @@ def step(executor, layer, x, st):
             executor.qsa_indexer is not None
             or executor.qsa_pool_ready
             or executor.qsa_union is not None
+            or executor.qsa_draft is not None
         )
         and layer.is_qsa
         and (mode.is_target_verify() or mode.is_decode() or mode.is_draft_extend_v2())
     ):
+        # only the draft plans a draft extend: slot qsa_draft or qsa_pool_fp8 is on
+        if mode.is_draft_extend_v2() and executor.qsa_indexer is None:
+            return _draft_extend(executor, layer, x, st)
         return _decomposed(executor, layer, x, st)
     if executor.qsa_prefill is not None and layer.is_qsa and st.step.mode == "prefill":
         from sgl_nvidia_mega.qwen3_8.runtime import qsa_prefill
@@ -327,15 +343,29 @@ def _union_eligible(executor, fb, rows) -> bool:
     )
 
 
+def _draft_union_eligible(executor, fb, rows) -> bool:
+    return (
+        executor.qsa_union is not None
+        and fb.forward_mode.is_draft_extend_v2()
+        and UNION_MIN_ROWS <= rows <= UNION_MAX_ROWS
+    )
+
+
 def _decomposed(executor, layer, x, st):
     """``self_attention`` from its pieces. The indexer runs on the main stream here
     (SGLang overlaps it on a side stream under capture); both orders compute the
     same values. The BF16 pool's split-K kernels take a verify first; an FP8 pool's
-    verify goes to the union kernels."""
+    verify or draft extend goes to the union kernels; a draft decode that reuses the
+    draft extend's selection goes to slot qsa_draft's lookup pack."""
     from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
 
     fb, positions = st.fb, st.positions
     q, k, v, gate = _qkv_gate(layer, x, positions, fb)
+    if executor.qsa_draft is not None and fb.forward_mode.is_decode():
+        out = executor.qsa_draft.decode(layer, sparse_backend(), q, k, v, fb)
+        if out is not None:
+            st.ran("qsa.indexer", "mtp_lookup_in_pack")
+            return _finish(executor, layer, out, gate, st, "fused_kv_lookup")
     if executor.qsa_indexer is not None:
         indices = qsa_indexer.select(executor, layer, x, positions, st)
     else:
@@ -347,8 +377,52 @@ def _decomposed(executor, layer, x, st):
         out = _verify_pool(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
     if out is None and _union_eligible(executor, fb, rows):
         out = _verify_union(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
+    if out is None and _draft_union_eligible(executor, fb, rows):
+        out = _draft_union(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
     if out is not None:
         return out
+    attn_out = layer.attn(q, k, v, fb, topk_indices=indices)
+    return _finish(executor, layer, attn_out, gate, st, STOCK)
+
+
+def _draft_extend(executor, layer, x, st):
+    """``self_attention`` of a draft extend with no plugin indexer: SGLang's order and
+    streams (under capture the indexer, with the seed capture of ``qsa_draft.indices``,
+    runs on the layer's side stream beside the QKV), then the union kernels where they
+    serve it."""
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
+    from sglang.srt.models.qwen4_exp import _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
+
+    from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+    fb, positions = st.fb, st.positions
+    overlap = (
+        layer.alt_stream is not None
+        and get_is_capture_mode()
+        and not is_in_breakable_cuda_graph()
+        and x.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
+    )
+    if overlap:
+        current = torch.cuda.current_stream()
+        layer.alt_stream.wait_stream(current)
+    q, k, v, gate = layer._prepare_qkv_gate(
+        positions=positions, hidden_states=x, forward_batch=fb
+    )
+    if overlap:
+        with torch.cuda.stream(layer.alt_stream):
+            indices = qsa_draft.indices(executor, layer, x, positions, st)
+        current.wait_stream(layer.alt_stream)
+        indices.record_stream(current)
+    else:
+        indices = qsa_draft.indices(executor, layer, x, positions, st)
+    st.ran("qsa.indexer", STOCK)
+    if _draft_union_eligible(executor, fb, q.shape[0]):
+        out = _draft_union(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
+        if out is not None:
+            return out
     attn_out = layer.attn(q, k, v, fb, topk_indices=indices)
     return _finish(executor, layer, attn_out, gate, st, STOCK)
 
@@ -434,6 +508,61 @@ def _verify_union(executor, layer, backend, q, k, v, gate, indices, st):
         scale=layer.attn.scaling,
     )
     out = fused_sigmoid_mul(out, gate, inplace=True)
+    if OPCHECK and not torch.cuda.is_current_stream_capturing():
+        _opcheck(layer, q, k, v, fb, indices, gate, out, md, query_positions, impl)
+    return _finish(executor, layer, out, None, st, impl)
+
+
+def _draft_union(executor, layer, backend, q, k, v, gate, indices, st):
+    """The union kernels on a CUDA-graph draft extend of an FP8 pool (checked at the
+    first draft extend), or None (nothing launched) when this step's layout is not
+    theirs: four rows a request, expanded token indices [rows, 2051]."""
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    fb = st.fb
+    rows = q.shape[0]
+    md = backend._resolve_metadata(fb)
+    indexer = md.indexer_metadata
+    profile = backend.qsa_profile
+    loc = fb.out_cache_loc
+    if not (
+        md.is_cuda_graph
+        and q.dtype == torch.bfloat16
+        and profile is not None
+        and (profile.block_topk, profile.budget) == (BLOCKS, BLOCKS * RATIO)
+        and tuple(indices.shape) == (rows, BLOCKS * RATIO + RATIO - 1)
+        and rows == fb.req_pool_indices.numel() * 4
+        and indexer is not None
+        and indexer.decode_logical_positions is not None
+        and md.row_req_pool_indices is not None
+        and md.row_req_pool_indices.numel() == rows
+        and md.sequence_lengths.numel() == rows
+        and isinstance(loc, torch.Tensor)
+        and loc.ndim == 1
+        and loc.numel() == rows
+        and loc.is_contiguous()
+    ):
+        return None
+    # column RATIO * c of the expansion holds block c's first token (or -1)
+    blocks = indices[:, : BLOCKS * RATIO : RATIO].div(RATIO, rounding_mode="floor")
+    query_positions = indexer.decode_logical_positions
+    kv = backend.token_to_kv_pool.layer_router.read(layer.attn.layer_id)
+    out, impl = executor.qsa_union.run(
+        q=q.reshape(rows, QUERY_HEADS, HEAD_DIM),
+        key_cache=kv.key(),
+        value_cache=kv.value(),
+        new_k=k.reshape(rows, KV_HEADS, HEAD_DIM),
+        new_v=v.reshape(rows, KV_HEADS, HEAD_DIM),
+        locations=loc,
+        slot_map=backend.req_to_token_pool.req_to_token,
+        row_requests=md.row_req_pool_indices,
+        indices=blocks.to(torch.int32).contiguous(),
+        sequence_lengths=md.sequence_lengths,
+        query_positions=query_positions,
+        scale=layer.attn.scaling,
+    )
+    out = fused_sigmoid_mul(out, gate, inplace=True)
+    impl += "_draft"
     if OPCHECK and not torch.cuda.is_current_stream_capturing():
         _opcheck(layer, q, k, v, fb, indices, gate, out, md, query_positions, impl)
     return _finish(executor, layer, out, None, st, impl)
@@ -545,9 +674,10 @@ class PoolKernels:
 
 
 class UnionKernels:
-    """The plugin's TP1 union verify of 4-row requests on an FP8 E4M3 pool: the new
-    K/V's BF16 -> E4M3 pool write, each request's token union, the warp-specialized
-    attention (launched with PDL) and the split merge. The output is not gated."""
+    """The plugin's TP1 union attention of 4-row requests (a verify or a draft extend)
+    on an FP8 E4M3 pool: the new K/V's BF16 -> E4M3 pool write, each request's token
+    union, the warp-specialized attention (launched with PDL) and the split merge. The
+    output is not gated."""
 
     def __init__(self):
         from sgl_nvidia_mega.qwen3_8.qsa import pool_union_ws

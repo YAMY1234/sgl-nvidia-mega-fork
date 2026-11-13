@@ -458,7 +458,8 @@ class TestStepFallbacks(unittest.TestCase):
             is_qsa=True, self_attention=lambda **kw: "qsa-stock"
         )
         ex = SimpleNamespace(
-            qsa_pool_ready=False, qsa_union=None, qsa_indexer=None, qsa_prefill="o"
+            qsa_pool_ready=False, qsa_union=None, qsa_indexer=None, qsa_prefill="o",
+            qsa_draft=None,
         )
         for served, want in ((None, "qsa-stock"), ("qsa-prefill", "qsa-prefill")):
             with mock.patch.object(qsa_prefill, "extend", return_value=served) as ext:
@@ -478,11 +479,12 @@ class TestStepFallbacks(unittest.TestCase):
         layer = SimpleNamespace(is_qsa=True, self_attention=lambda **kw: "qsa-stock")
         ex = SimpleNamespace(
             qsa_pool_ready=False, qsa_union="union", qsa_indexer="indexer",
-            qsa_prefill="o",
+            qsa_prefill="o", qsa_draft="glue",
         )
         with (
             mock.patch.object(qsa_prefill, "extend", return_value="qsa-prefill") as ext,
             mock.patch.object(attention, "_decomposed", side_effect=AssertionError),
+            mock.patch.object(attention, "_draft_extend", side_effect=AssertionError),
         ):
             out = attention.step(ex, layer, torch.zeros(8, 4), _St(_Mode.EXTEND))
         self.assertEqual(out, "qsa-prefill")
@@ -515,7 +517,8 @@ class TestStepFallbacks(unittest.TestCase):
         for ready, mode in ((False, _Mode.TARGET_VERIFY), (True, _Mode.EXTEND)):
             st = _St(mode, 8)
             ex = SimpleNamespace(
-                qsa_pool_ready=ready, qsa_union=None, qsa_indexer=None, qsa_prefill=None
+                qsa_pool_ready=ready, qsa_union=None, qsa_indexer=None, qsa_prefill=None,
+                qsa_draft=None,
             )
             out = attention.step(ex, layer, torch.zeros(8, 4), st)
             self.assertEqual(out, "qsa-stock")
@@ -812,6 +815,7 @@ class TestQsaPoolFp8(unittest.TestCase):
             qsa_pool=_Kernels(3.0),
             qsa_union=_Kernels(1.0, "union_ws_fp8") if union else None,
             qsa_indexer=None,
+            qsa_draft=None,
             qsa_prefill=None,
             smallm_gemm=None,
         )
@@ -1006,8 +1010,13 @@ class TestQsaPoolFp8(unittest.TestCase):
 
         from sgl_nvidia_mega.qwen3_8.runtime import attention
 
-        for reason in ("KV pool dtype torch.bfloat16", ""):
-            ex = _executor()
+        for reason, draft in (
+            ("KV pool dtype torch.bfloat16", False),
+            ("", False),
+            ("KV pool dtype torch.bfloat16", True),  # the draft's own pool
+            ("", True),
+        ):
+            ex = _executor(draft=draft)
             ex.lm.model.layers[2].attn = SimpleNamespace(layer_id=7)
             ex.qsa_union = "kernels"
             with (
@@ -1020,6 +1029,188 @@ class TestQsaPoolFp8(unittest.TestCase):
                 ex._check_pools(fb)
             r.assert_called_once_with("backend", 7)
             self.assertEqual(ex.qsa_union, None if reason else "kernels")
+
+    def test_pools_are_checked_at_the_first_verify_or_draft_extend(self):
+        from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+        for draft, modes, first in (
+            (False, ("decode", "target_verify", "target_verify"), 1),
+            (True, ("decode", "draft_extend", "draft_extend"), 1),
+        ):
+            ex = _executor(draft=draft)
+            checked = []
+
+            def check(fb, ex=ex, checked=checked):
+                checked.append(fb)
+                ex._pools_checked = True
+
+            ex._check_pools = check
+            ex._draft = ex._target = lambda st: st.step.mode
+            batches = [SimpleNamespace(forward_mode=m) for m in modes]
+            for mode, fb in zip(modes, batches):
+                ex._forward(Step(mode=mode, rows=4), None, "pos", fb)
+            self.assertEqual(len(checked), 1, draft)
+            self.assertIs(checked[0], batches[first], draft)
+
+    def draft_extend(
+        self, rows, *, indexer=False, glue=True, union=True, tokens=None,
+        q_dtype=torch.bfloat16, requests=None, loc=None, **backend_kw
+    ):
+        """One draft extend step of the draft's QSA layer, with the indexer's expanded
+        token indices from SGLang's indexer (with or without slot qsa_draft's capture)
+        or the plugin's."""
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import attention, qsa_draft, qsa_indexer
+
+        calls = []
+        if tokens is None:
+            tokens, _, _ = _expanded(rows)
+        layer = SimpleNamespace(
+            is_qsa=True,
+            layer_id=7,
+            alt_stream=None,
+            attn=_QsaAttn(calls),
+            _prepare_qkv_gate=lambda positions, hidden_states, forward_batch: (
+                torch.zeros(rows, 24 * 256, dtype=q_dtype),
+                torch.zeros(rows, 2 * 256),
+                torch.zeros(rows, 2 * 256),
+                torch.zeros(rows, 24 * 256),
+            ),
+            o_proj=lambda x: (x, None),
+        )
+        ex = SimpleNamespace(
+            qsa_pool_ready=False,
+            qsa_pool=None,
+            qsa_union=_Kernels(1.0, "union_ws_fp8") if union else None,
+            qsa_indexer="kernels" if indexer else None,
+            qsa_draft="glue" if glue else None,
+            qsa_prefill=None,
+            smallm_gemm=None,
+        )
+        st = _St(_Mode.DRAFT_EXTEND_V2, rows)
+        st.fb.req_pool_indices = torch.zeros(requests or rows // 4)
+        st.fb.out_cache_loc = torch.arange(rows) if loc is None else loc
+        backend = _draft_extend_backend(rows, **backend_kw)
+        runner = types.ModuleType("sglang.srt.model_executor.runner")
+        runner.get_is_capture_mode = lambda: True
+        selected = lambda *a: tokens
+        with (
+            mock.patch.dict(sys.modules, {runner.__name__: runner}),
+            mock.patch.object(
+                sys.modules["sglang.srt.models.qwen4_exp"],
+                "_QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD",
+                1024,
+                create=True,
+            ),
+            mock.patch.object(attention, "sparse_backend", lambda: backend),
+            mock.patch.object(qsa_draft, "indices", selected),
+            mock.patch.object(qsa_indexer, "select", selected),
+        ):
+            out = attention.step(ex, layer, torch.zeros(rows, 8), st)
+        impl = [i for op, i in st.ran_ops if op == "qsa"]
+        return impl, out, ex, calls, backend
+
+    def test_draft_extend_widths(self):
+        for indexer, glue in ((False, True), (True, True), (False, False)):
+            for rows, want in (
+                (8, "stock"),
+                (52, "stock"),  # below the verify's bound
+                (56, "union_ws_fp8_draft"),
+                (288, "union_ws_fp8_draft"),
+                (576, "union_ws_fp8_draft"),
+                (580, "stock"),
+            ):
+                impl, _, ex, calls, _ = self.draft_extend(
+                    rows, indexer=indexer, glue=glue
+                )
+                self.assertEqual(impl, [want], (indexer, glue, rows))
+                self.assertEqual(calls, ["stock"] if want == "stock" else [], rows)
+                self.assertEqual(len(ex.qsa_union.seen), want != "stock", rows)
+            impl, _, _, calls, _ = self.draft_extend(288, indexer=indexer, union=False)
+            self.assertEqual((impl, calls), (["stock"], ["stock"]))
+
+    def test_draft_extend_reads_blocks_and_gate(self):
+        rows = 288
+        tokens, blocks, valid = _expanded(rows)
+        impl, out, ex, _, backend = self.draft_extend(rows, tokens=tokens)
+        self.assertEqual(impl, ["union_ws_fp8_draft"])
+        (kw,) = ex.qsa_union.seen
+        got = kw["indices"]
+        self.assertEqual((tuple(got.shape), got.dtype), ((rows, 512), torch.int32))
+        self.assertTrue(got.is_contiguous())
+        for r in range(rows):
+            n = int(valid[r])
+            # each row's selected blocks; past them (and the tail's column) -1
+            self.assertTrue(torch.equal(got[r, :n], blocks[r, :n]), r)
+            self.assertTrue(bool((got[r, n + 1 :] == -1).all()), r)
+        self.assertEqual(tuple(kw["q"].shape), (rows, 24, 256))
+        self.assertEqual(tuple(kw["new_k"].shape), (rows, 2, 256))
+        router = backend.token_to_kv_pool.layer_router
+        self.assertIs(kw["key_cache"], router.k)
+        self.assertEqual(router.reads, [7])
+        md = backend._resolve_metadata(None)
+        self.assertIs(kw["row_requests"], md.row_req_pool_indices)
+        self.assertIs(kw["sequence_lengths"], md.sequence_lengths)
+        self.assertEqual(kw["query_positions"], "qpos")
+        self.assertEqual((kw["slot_map"], kw["scale"]), ("req_to_token", 0.0625))
+        self.assertEqual(kw["locations"].tolist(), list(range(rows)))
+        self.assertEqual(self.gated, [1.0])  # SGLang's gate, then o_proj
+        self.assertTrue(torch.equal(out, torch.full((rows, 24 * 256), 2.0)))
+
+    def test_draft_extend_declines_launching_nothing(self):
+        rows = 288
+        for kw in (
+            dict(graph=False),  # eager metadata
+            dict(profile=None),
+            dict(profile=(256, 1024)),
+            dict(tokens=torch.zeros(rows, 512, dtype=torch.int32)),  # block indices
+            dict(requests=rows),  # one row a request
+            dict(row_requests=torch.zeros(rows // 4)),
+            dict(lengths=torch.zeros(rows - 1)),
+            dict(positions=None),
+            dict(loc=torch.arange(2 * rows)[::2]),
+            dict(q_dtype=torch.float16),
+        ):
+            impl, _, ex, calls, _ = self.draft_extend(rows, **kw)
+            self.assertEqual((impl, calls), (["stock"], ["stock"]), kw)
+            self.assertEqual(ex.qsa_union.seen, [], kw)
+
+
+def _expanded(rows):
+    """Expanded token indices [rows, 2051] as SGLang's Triton expansion lays them out:
+    each row's selected blocks' tokens, its uncompressed tail, then -1; the blocks and
+    each row's count."""
+    gen = torch.Generator().manual_seed(rows)
+    valid = torch.randint(1, 513, (rows,), generator=gen)
+    blocks = torch.full((rows, 512), -1, dtype=torch.int32)
+    tokens = torch.full((rows, 2051), -1, dtype=torch.int32)
+    for r in range(rows):
+        n = int(valid[r])
+        blocks[r, :n] = torch.randperm(4096, generator=gen)[:n].int()
+        tokens[r, : 4 * n] = (blocks[r, :n, None] * 4 + torch.arange(4)).flatten()
+        tokens[r, 4 * n : 4 * n + 2] = 40000 + r
+    return tokens, blocks, valid
+
+
+def _draft_extend_backend(
+    rows, *, graph=True, profile=(512, 2048), row_requests=None, lengths=None,
+    positions="qpos"
+):
+    md = SimpleNamespace(
+        is_cuda_graph=graph,
+        indexer_metadata=SimpleNamespace(decode_logical_positions=positions),
+        row_req_pool_indices=(
+            torch.arange(rows) // 4 if row_requests is None else row_requests
+        ),
+        sequence_lengths=torch.arange(rows) + 100 if lengths is None else lengths,
+    )
+    backend = _qsa_backend(torch.float8_e4m3fn, positions)
+    backend._resolve_metadata = lambda fb: md
+    if profile is not None:
+        profile = SimpleNamespace(block_topk=profile[0], budget=profile[1])
+    backend.qsa_profile = profile
+    return backend
 
 
 class _State:  # a UcacheState double that records the calls
@@ -1717,6 +1908,588 @@ class TestBreaks(unittest.TestCase):
                 ("ple.prepare", "break"),
             ],
         )
+
+
+def _draft_state(tail=4, width=2051):
+    """SGLang's QSAMTPSharedSparseIndices of two QSA layers (3, 7), 6 request slots."""
+    return SimpleNamespace(
+        layer_slots={3: 0, 7: 1},
+        tail_width=tail,
+        trash_row=6,
+        indices=torch.zeros(2, 7, width + tail, dtype=torch.int32),
+        captured_len=torch.ones(2, 7, dtype=torch.int32),
+    )
+
+
+def _draft_backend(rows, **kw):
+    """The draft step's QSA backend, with its MTP selection state and the helpers its
+    fused K/V path calls (recorded)."""
+    calls = []
+    md = SimpleNamespace(
+        indexer_metadata=SimpleNamespace(
+            decode_logical_positions=kw.pop("positions", torch.arange(rows) + 40)
+        ),
+        sequence_lengths=torch.arange(rows) + 41,
+        is_cuda_graph=kw.pop("graph", True),
+        fa2_valid_counts=kw.pop("counts", torch.zeros(16, dtype=torch.int32)),
+        row_req_pool_indices=kw.pop("row_requests", None),
+    )
+    scratch = lambda capacity, heads, dim, dtype, device: (
+        calls.append(("scratch", capacity, heads, dim, dtype))
+        or (torch.zeros(capacity, heads, dim, dtype=dtype),) * 2
+    )
+    backend = SimpleNamespace(
+        _mtp_shared_sparse_indices=kw.pop("state", _draft_state()),
+        should_reuse_mtp_sparse_indices=lambda fb: kw.get("reuse", True),
+        _resolve_metadata=lambda fb: md,
+        _fused_kv_pool_eligible=kw.pop("eligible", True),
+        _uses_block_indices=lambda indices: indices.shape[1] == 512,
+        token_to_kv_pool=SimpleNamespace(
+            layer_router=_KvRouter(kw.pop("kv_dtype", torch.bfloat16))
+        ),
+        req_to_token_pool=SimpleNamespace(req_to_token="req_to_token"),
+        _get_trtllm_sparse_tables=lambda bs, pages, page, device: (
+            calls.append(("tables", bs, pages, page)) or ("cu", "block_tables")
+        ),
+        _get_fa2_scratch=scratch,
+        _cuda_graph_max_tokens=16,
+        _trtllm_workspace=kw.pop("workspace", "backend_workspace"),
+        calls=calls,
+        md=md,
+    )
+    return backend
+
+
+class TestQsaDraft(unittest.TestCase):
+    """Slot qsa_draft: the draft decode's lookup pack and the draft extend's seed
+    capture; what each takes from SGLang's backend, the stock fallbacks, the stream
+    order of the draft extend and the build gates. The kernels themselves run under
+    Triton's interpreter against SGLang's own code (TestQsaDraftKernels)."""
+
+    def setUp(self):
+        from unittest import mock
+
+        # imported before sys.modules is patched (its restore would unload Triton)
+        from sgl_nvidia_mega.qwen3_8.qsa import fused_kv_lookup, mtp_capture  # noqa: F401
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft  # noqa: F401
+
+        self.trtllm = []
+        qsab = types.ModuleType("sglang.srt.layers.attention.qwen_sparse_attn_backend")
+        qsab._TRTLLM_SPARSE_PAGE_SIZE = 64
+        qsab._resolve_trtllm_sparse_decode = lambda: self.decode_fn
+        self.decode_fn = lambda **kw: (
+            self.trtllm.append(kw) or torch.full((kw["query"].shape[0], 6144), 2.0)
+        )
+        flashinfer = types.ModuleType("flashinfer.utils")
+        flashinfer.get_trtllm_gen_multi_ctas_kv_counter_bytes = lambda b, h, sms: 8
+        device = types.ModuleType("sglang.srt.utils.device")
+        device.is_sm100_supported = lambda: True
+        patch = mock.patch.dict(
+            sys.modules,
+            {m.__name__: m for m in (qsab, flashinfer, device)},
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+        props = mock.patch.object(
+            torch.cuda,
+            "get_device_properties",
+            lambda d: SimpleNamespace(multi_processor_count=148),
+        )
+        props.start()
+        self.addCleanup(props.stop)
+
+    def decode(self, rows=3, *, glue=None, q_dtype=torch.bfloat16, **kw):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.qsa import fused_kv_lookup
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+        backend = _draft_backend(rows, **kw)
+        glue = glue or qsa_draft.DraftGlue()
+        layer = SimpleNamespace(
+            layer_id=7,
+            attn=SimpleNamespace(
+                layer_id=7, scaling=0.0625, tp_q_head_num=24, head_dim=256
+            ),
+        )
+        fb = SimpleNamespace(
+            req_pool_indices=torch.arange(rows) + 1,
+            out_cache_loc=torch.arange(rows) + 100,
+        )
+        packs = []
+        q = torch.zeros(rows, 24 * 256, dtype=q_dtype)
+        k = v = torch.zeros(rows, 2 * 256)
+        with mock.patch.object(
+            fused_kv_lookup, "fused_kv_lookup", lambda *a: packs.append(a)
+        ):
+            out = glue.decode(layer, backend, q, k, v, fb)
+        return out, packs, backend, fb
+
+    def test_decode_packs_with_the_lookup_then_trtllm(self):
+        out, packs, backend, fb = self.decode(rows=3)
+        self.assertEqual(tuple(out.shape), (3, 6144))
+        ((kc, vc, k, v, loc, r2t, row_requests, lookup, lengths, counts, pk, pv),) = packs
+        router = backend.token_to_kv_pool.layer_router
+        self.assertEqual(router.reads, [7])
+        self.assertIs(kc, router.k)
+        self.assertEqual((tuple(k.shape), tuple(v.shape)), ((3, 2, 256),) * 2)
+        self.assertIs(loc, fb.out_cache_loc)
+        self.assertEqual(r2t, "req_to_token")
+        self.assertIs(row_requests, fb.req_pool_indices)  # no row requests: the batch's
+        state = backend._mtp_shared_sparse_indices
+        # the decoder layer 7's slot, the batch's requests and logical positions
+        self.assertEqual(lookup.indices.data_ptr(), state.indices[1].data_ptr())
+        self.assertEqual(lookup.captured_len.data_ptr(), state.captured_len[1].data_ptr())
+        self.assertIs(lookup.requests, fb.req_pool_indices)
+        self.assertIs(lookup.positions, backend.md.indexer_metadata.decode_logical_positions)
+        self.assertEqual((lookup.shape, lookup.tail_width), ((3, 2055), 4))
+        self.assertIs(lengths, backend.md.sequence_lengths)
+        self.assertIs(counts, backend.md.fa2_valid_counts)
+        # 2055 columns in 33 pages of 64; the graph's scratch capacity, BF16 pool
+        self.assertEqual(tuple(pk.shape), (3 * 2112, 2, 256))
+        self.assertEqual(
+            backend.calls,
+            [("tables", 3, 33, 64), ("scratch", 16 * 2112, 2, 256, torch.bfloat16)],
+        )
+        (kw,) = self.trtllm
+        self.assertEqual(tuple(kw["query"].shape), (3, 24, 256))
+        self.assertEqual(tuple(kw["kv_cache"][0].shape), (99, 2, 64, 256))
+        self.assertEqual(kw["block_tables"], "block_tables")
+        self.assertIs(kw["seq_lens"], counts)
+        self.assertEqual((kw["max_seq_len"], kw["bmm1_scale"], kw["bmm2_scale"]), (2112, 0.0625, 1.0))
+        self.assertEqual(kw["workspace_buffer"], "backend_workspace")
+        self.assertEqual(kw["multi_ctas_kv_counter_buffer"].numel(), 8)
+
+    def test_decode_eager_and_own_workspace(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+        with mock.patch.object(qsa_draft, "WORKSPACE_BYTES", 32):
+            glue = qsa_draft.DraftGlue()
+            _, packs, backend, _ = self.decode(
+                rows=2, glue=glue, graph=False, workspace=None,
+                row_requests=torch.tensor([5, 6]),
+            )
+            self.decode(rows=2, glue=glue, workspace=None)
+        counts, row_requests = packs[0][9], packs[0][6]
+        self.assertEqual((tuple(counts.shape), counts.dtype), ((2,), torch.int32))
+        self.assertEqual(row_requests.tolist(), [5, 6])
+        self.assertEqual(backend.calls[1][1], 2 * 2112)  # eager: the step's rows only
+        first, second = self.trtllm
+        self.assertIs(first["workspace_buffer"], glue._workspace)
+        self.assertIs(second["workspace_buffer"], glue._workspace)  # one, shared
+        self.assertEqual(glue._workspace.numel(), 32)
+        self.assertIs(
+            first["multi_ctas_kv_counter_buffer"], second["multi_ctas_kv_counter_buffer"]
+        )
+
+    def test_decode_declines_launching_nothing(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+        for kw in (
+            dict(glue=qsa_draft.DraftGlue(lookup=False)),  # the source's gate is off
+            dict(state=None),  # no MTP selection sharing
+            dict(reuse=False),
+            dict(eligible=False),
+            dict(positions=None),
+            dict(positions=torch.arange(4)),
+            dict(graph=True, counts=None),
+            dict(state=_draft_state(tail=4, width=508)),  # 512 columns: block indices
+            dict(kv_dtype=torch.float32, q_dtype=torch.float16),
+        ):
+            out, packs, backend, _ = self.decode(rows=3, **kw)
+            self.assertIsNone(out, kw)
+            self.assertEqual((packs, self.trtllm, backend.calls), ([], [], []), kw)
+        self.decode_fn = None  # no TRT-LLM decode
+        out, packs, _, _ = self.decode(rows=3)
+        self.assertIsNone(out)
+        self.assertEqual(packs, [])
+
+    def capture(self, *, graph=True, mode=_Mode.DRAFT_EXTEND_V2, bs=3, accept=True,
+                topk_dtype=torch.int32):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.qsa import mtp_capture
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+        state = _draft_state()
+        spec = SimpleNamespace(num_front_tokens=1)
+        if accept:
+            spec.num_accept_tokens = torch.tensor([2, 3, 1, 9], dtype=torch.int32)
+        fb = SimpleNamespace(
+            forward_mode=mode,
+            batch_size=bs,
+            req_pool_indices=torch.tensor([3, 0, 5, 1]),
+            spec_info=spec,
+        )
+        extend = torch.tensor([4, 4, 4, 4], dtype=torch.int32)
+        backend = SimpleNamespace(
+            _mtp_shared_sparse_indices=state, _capture_extend_seq_lens=lambda fb: extend
+        )
+        md = SimpleNamespace(
+            is_cuda_graph=graph,
+            sequence_lengths=torch.arange(12, dtype=torch.int32),
+            get_token_to_batch_idx=lambda: torch.arange(12, dtype=torch.int32),
+        )
+        topk = torch.zeros(12, 2051, dtype=topk_dtype)
+        launches = []
+        with mock.patch.object(mtp_capture, "capture", lambda *a: launches.append(a)):
+            done = qsa_draft.DraftGlue().capture(backend, topk, fb, md, 7)
+        return done, launches, state, md, topk
+
+    def test_capture_one_launch(self):
+        done, (args,), state, md, topk = self.capture()
+        self.assertTrue(done)
+        t, extend, accept, front, req, lengths, rows, seed, captured, trash = args
+        self.assertIs(t, topk)
+        self.assertEqual((extend.tolist(), accept.tolist()), ([4, 4, 4], [2, 3, 1]))
+        self.assertEqual((front, req.tolist(), trash), (1, [3, 0, 5], 6))
+        self.assertIs(lengths, md.sequence_lengths)
+        self.assertEqual(rows.tolist(), list(range(12)))
+        self.assertEqual(seed.data_ptr(), state.indices[1].data_ptr())
+        self.assertEqual(captured.data_ptr(), state.captured_len[1].data_ptr())
+        # an extend without accept counts ends each request at its seed row
+        done, (args,), *_ = self.capture(accept=False, mode=_Mode.EXTEND)
+        self.assertTrue(done)
+        self.assertEqual((args[2], args[3]), (None, 0))
+
+    def test_capture_declines_to_sglang(self):
+        for kw in (
+            dict(graph=False, mode=_Mode.EXTEND),  # an eager plain extend: torch's own
+            dict(bs=0),
+            dict(bs=5),  # more requests than the batch has slots for
+            dict(topk_dtype=torch.int64),  # the kernel's input check
+        ):
+            done, launches, *_ = self.capture(**kw)
+            self.assertFalse(done, kw)
+            self.assertEqual(launches, [], kw)
+
+    def test_capture_records_and_falls_back(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+        calls = []
+        backend = SimpleNamespace(
+            capture_mtp_sparse_indices=lambda topk, fb, layer_id, metadata=None: calls.append(
+                (layer_id, metadata)
+            )
+        )
+        for glue, want in (
+            (SimpleNamespace(capture=lambda *a: True), "batched"),
+            (SimpleNamespace(capture=lambda *a: False), "stock"),
+            (None, "stock"),
+        ):
+            calls.clear()
+            st = _St(_Mode.DRAFT_EXTEND_V2)
+            ex = SimpleNamespace(qsa_draft=glue)
+            qsa_draft.capture(ex, backend, "topk", st.fb, "md", 7, st)
+            self.assertEqual(st.ran_ops, [("qsa.mtp_capture", want)])
+            self.assertEqual(calls, [] if want == "batched" else [(7, "md")])
+
+    def test_indices_runs_the_indexer_then_the_capture(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+        order = []
+        backend = SimpleNamespace(
+            should_capture_mtp_sparse_indices=lambda fb: order.append("should_capture")
+            or True
+        )
+        glue = types.ModuleType("sglang.srt.layers.attention.qsa.glue")
+        glue.get_qsa_indexer_metadata = lambda b, layer_id, fb: order.append(
+            ("metadata", layer_id)
+        ) or "md"
+        glue.resolve_qsa_sparse_backend = lambda b: b
+        context = types.ModuleType("sglang.srt.model_executor.forward_context")
+        context.get_attn_backend = lambda: backend
+        layer = SimpleNamespace(
+            layer_id=7,
+            indexer=lambda x, positions, fb, md: order.append(("indexer", md)) or "topk",
+            _compute_qsa_topk_indices=lambda x, positions, fb: order.append("stock")
+            or "stock-topk",
+        )
+        ex = SimpleNamespace(qsa_draft="glue")
+        capture = lambda *a: order.append(("capture",) + a[1:6])
+        with (
+            mock.patch.dict(sys.modules, {glue.__name__: glue, context.__name__: context}),
+            mock.patch.object(qsa_draft, "capture", capture),
+        ):
+            st = _St(_Mode.DRAFT_EXTEND_V2)
+            self.assertEqual(qsa_draft.indices(ex, layer, "x", "pos", st), "topk")
+            self.assertEqual(
+                order,
+                [
+                    ("metadata", 7),
+                    ("indexer", "md"),
+                    "should_capture",
+                    ("capture", backend, "topk", st.fb, "md", 7),
+                ],
+            )
+            order.clear()
+            _STATE["breakable"] = True
+            try:
+                out = qsa_draft.indices(ex, layer, "x", "pos", st)
+            finally:
+                _STATE["breakable"] = False
+            self.assertEqual((out, order), ("stock-topk", ["stock"]))
+
+    def attention_step(self, mode, *, glue_out=None, alt_stream=None, capture_mode=True):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import attention, qsa_draft
+
+        order = []
+        rows = 4
+        layer = SimpleNamespace(
+            is_qsa=True,
+            layer_id=7,
+            alt_stream=alt_stream,
+            attn=lambda q, k, v, fb, topk_indices=None: order.append(
+                ("attn", topk_indices)
+            )
+            or torch.zeros(rows, 6144),
+            _prepare_qkv_gate=lambda positions, hidden_states, forward_batch: order.append(
+                "qkv"
+            )
+            or (torch.zeros(rows, 6144), "k", "v", None),
+            _compute_qsa_topk_indices=lambda x, positions, fb: order.append("lookup")
+            or "stock-indices",
+            o_proj=lambda x: (x, None),
+        )
+        glue = SimpleNamespace(
+            decode=lambda *a: order.append("lookup_pack") or glue_out
+        )
+        ex = SimpleNamespace(
+            qsa_pool_ready=False, qsa_union=None, qsa_indexer=None, qsa_draft=glue,
+            qsa_prefill=None, smallm_gemm=None,
+        )
+        runner = types.ModuleType("sglang.srt.model_executor.runner")
+        runner.get_is_capture_mode = lambda: capture_mode
+        elementwise = types.ModuleType("sglang.kernels.ops.elementwise.elementwise")
+        elementwise.fused_sigmoid_mul = lambda x, gate, inplace: x
+        st = _St(mode, rows)
+        indices = mock.Mock(side_effect=lambda *a: order.append("indices") or _Indices(order))
+        with (
+            mock.patch.dict(sys.modules, {m.__name__: m for m in (runner, elementwise)}),
+            mock.patch.object(
+                sys.modules["sglang.srt.models.qwen4_exp"],
+                "_QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD",
+                1024,
+                create=True,
+            ),
+            mock.patch.object(attention, "sparse_backend", lambda: "backend"),
+            mock.patch.object(qsa_draft, "indices", indices),
+        ):
+            attention.step(ex, layer, torch.zeros(rows, 8), st)
+        return order, st.ran_ops
+
+    def test_draft_decode_serves_or_falls_back(self):
+        order, ran = self.attention_step(_Mode.DECODE, glue_out=torch.zeros(4, 6144))
+        self.assertEqual(order, ["qkv", "lookup_pack"])  # no torch lookup, no stock attn
+        self.assertEqual(
+            ran, [("qsa.indexer", "mtp_lookup_in_pack"), ("qsa", "fused_kv_lookup")]
+        )
+        order, ran = self.attention_step(_Mode.DECODE, glue_out=None)
+        self.assertEqual(order, ["qkv", "lookup_pack", "lookup", ("attn", "stock-indices")])
+        self.assertEqual(ran, [("qsa.indexer", "stock"), ("qsa", "stock")])
+
+    def test_draft_extend_keeps_sglang_stream_order(self):
+        from unittest import mock
+
+        order, ran = self.attention_step(_Mode.DRAFT_EXTEND_V2)  # no side stream
+        self.assertEqual(order[:2], ["qkv", "indices"])
+        self.assertEqual(ran, [("qsa.indexer", "stock"), ("qsa", "stock")])
+        # under capture the indexer and the seed capture run on the layer's side stream
+        alt, current = _Stream("alt", []), None
+        current = _Stream("main", alt.log)
+        entered = contextlib.contextmanager(
+            lambda s: (alt.log.append(f"enter {s.name}"), (yield), alt.log.append(f"exit {s.name}"))
+        )
+        with (
+            mock.patch.object(torch.cuda, "current_stream", lambda: current),
+            mock.patch.object(torch.cuda, "stream", entered),
+        ):
+            order, _ = self.attention_step(_Mode.DRAFT_EXTEND_V2, alt_stream=alt)
+        self.assertEqual(
+            alt.log,
+            ["alt waits main", "enter alt", "exit alt", "main waits alt", "record main"],
+        )
+        self.assertEqual(order[:2], ["qkv", "indices"])
+        order, _ = self.attention_step(
+            _Mode.DRAFT_EXTEND_V2, alt_stream=alt, capture_mode=False
+        )
+        self.assertEqual(order[:2], ["qkv", "indices"])
+
+    def test_build_gates(self):
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import qsa_draft
+
+        self.assertIn("qsa_draft", runtime.KNOWN_SLOTS)
+        cfg = dict(tp=1, steps=3, topk=1)
+        context = types.ModuleType("sglang.srt.runtime_context")
+        context.get_parallel = lambda: SimpleNamespace(tp_size=cfg["tp"])
+        context.get_spec = lambda: SimpleNamespace(
+            speculative_num_steps=cfg["steps"], speculative_eagle_topk=cfg["topk"]
+        )
+        binding = types.ModuleType("sglang.srt.kernel_plugins.nvidia.binding")
+        agreed = []
+        binding.megakernel_agree = lambda reason, what: agreed.append((reason, what))
+        model = _model((_Linear, _Attention))
+        model.model.layers[1].is_qsa = True
+        model.hidden_size, model.hc_count = 2560, 4
+        sm10x = dict(is_available=lambda: True, get_device_capability=lambda *a: (10, 7))
+        with (
+            mock.patch.dict(sys.modules, {m.__name__: m for m in (context, binding)}),
+            mock.patch.multiple(torch.cuda, **sm10x),
+        ):
+            self.assertEqual(qsa_draft.build(model), "")
+            glue = runtime._build_qsa_draft(model)
+            self.assertTrue(glue.lookup_ready)
+            self.assertEqual(agreed, [("", "Qwen3.8 slot qsa_draft")])
+            for change, slot, lookup in (
+                (dict(tp=4), "TP4", None),
+                (dict(steps=4), "", "4-step"),
+                (dict(topk=2), "", "topk-2"),
+            ):
+                cfg.update(change)
+                self.assertIn(slot, qsa_draft.build(model))
+                if lookup:
+                    self.assertIn(lookup, qsa_draft.lookup_reason(model))
+                    self.assertFalse(runtime._build_qsa_draft(model).lookup_ready)
+                else:
+                    self.assertIsNone(runtime._build_qsa_draft(model))
+                cfg.update(tp=1, steps=3, topk=1)
+            model.hc_count = 1
+            self.assertIn("HC", qsa_draft.lookup_reason(model))
+            model.model.layers[1].is_qsa = False
+            self.assertIn("no QSA layer", qsa_draft.build(model))
+        with mock.patch.object(torch.cuda, "is_available", lambda: False):
+            self.assertIn("SM10x", qsa_draft.build(model))
+
+
+class _Indices:  # the indexer's output, recording record_stream
+    def __init__(self, log):
+        self.log = log
+
+    def record_stream(self, stream):
+        stream.log.append(f"record {stream.name}")
+
+
+class _Stream:
+    def __init__(self, name, log):
+        self.name, self.log = name, log
+
+    def wait_stream(self, other):
+        self.log.append(f"{self.name} waits {other.name}")
+
+
+_INTERPRETED_DRAFT = r"""
+import json
+from types import SimpleNamespace as NS
+
+import torch
+from sglang.srt.layers.attention.qsa.metadata import QSAIndexerMetadata
+from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    QSAMTPSharedSparseIndices,
+    QwenSparseAttnBackend,
+)
+
+from sgl_nvidia_mega.qwen3_8.qsa import fused_kv_lookup as L
+from sgl_nvidia_mega.qwen3_8.qsa import mtp_capture as C
+
+torch.manual_seed(0)
+out = {"lookup": [], "capture": []}
+N = 6
+
+
+def state():
+    s = QSAMTPSharedSparseIndices(
+        layer_ids=[3, 7], num_requests=N, token_topk=12, tail_width=4, device="cpu"
+    )
+    s.indices.copy_(torch.randint(-1, 44, s.indices.shape, dtype=torch.int32))
+    s.captured_len.copy_(torch.randint(30, 41, s.captured_len.shape, dtype=torch.int32))
+    return s
+
+
+for req, pos in (([2], [41]), ([2, 5, 0], [41, 33, 0]), ([1, 2, 3, 4, 5], [40, 30, 44, 36, 31])):
+    s = state()
+    req, pos = torch.tensor(req), torch.tensor(pos)
+    slot = s.layer_slots[7]
+    lookup = L.MtpLookup(s.indices[slot], s.captured_len[slot], req, pos, 4)
+    out["lookup"].append(torch.equal(lookup.materialize(), s.lookup(req, pos, 7)))
+
+for extend, accept, req, front in (
+    ([4], [2], [3], 0),
+    ([4, 4, 0], [2, 4, 1], [2, 0, 5], 0),
+    ([4, 4, 4, 4], [1, 0, 4, 3], [1, 2, 3, 4], 1),
+    ([3, 5, 2], None, [5, 1, 2], 0),
+):
+    bs = len(req)
+    extend = torch.tensor(extend, dtype=torch.int32)
+    rows = int(extend.sum())
+    topk = torch.randint(-1, 100, (rows, 10), dtype=torch.int32)
+    seq = torch.randint(10, 50, (rows,), dtype=torch.int32)
+    t2b = torch.arange(rows, dtype=torch.int32)
+    req = torch.tensor(req)
+    acc = None if accept is None else torch.tensor(accept, dtype=torch.int32)
+    a, b = state(), state()
+    b.indices.copy_(a.indices)
+    b.captured_len.copy_(a.captured_len)
+    md = QSAIndexerMetadata(
+        sequence_lengths=seq, token_to_batch_idx=t2b, token_slot_table=None,
+        out_cache_loc=None, token_to_kv_pool=None, compress_ratio=4, block_topk=512,
+        is_cuda_graph=True,
+    )
+    spec = NS(extend_seq_lens_tensor=extend, num_front_tokens=front)
+    if acc is not None:
+        spec.num_accept_tokens = acc
+    fb = NS(batch_size=bs, req_pool_indices=req, spec_info=spec)
+    me = NS(
+        _mtp_shared_sparse_indices=b,
+        _capture_extend_seq_lens=QwenSparseAttnBackend._capture_extend_seq_lens,
+    )
+    QwenSparseAttnBackend._capture_mtp_sparse_indices_from_extend_lens(me, topk, fb, md, 7)
+    slot = a.layer_slots[7]
+    seed, captured = a.indices[slot], a.captured_len[slot]
+    reason = C.reason(topk, extend, acc, req, seq, t2b, seed, captured, a.trash_row)
+    C.capture(topk, extend, acc, front, req, seq, t2b, seed, captured, a.trash_row)
+    keep = slice(0, N)  # the trash row's content is unspecified in both
+    out["capture"].append(
+        [
+            reason,
+            torch.equal(a.indices[:, keep], b.indices[:, keep]),
+            torch.equal(a.captured_len[:, keep], b.captured_len[:, keep]),
+        ]
+    )
+print(json.dumps(out))
+"""
+
+
+class TestQsaDraftKernels(unittest.TestCase):
+    """Slot qsa_draft's lookup rows and seed capture, under Triton's interpreter,
+    against SGLang's own lookup and torch capture (the pack kernel is SGLang's with
+    the lookup's index load, which the interpreter does not run: GPU test)."""
+
+    def test_lookup_rows_and_capture_match_sglang(self):
+        import json
+        import os
+        import subprocess
+
+        env = dict(os.environ, TRITON_INTERPRET="1", PYTHONDONTWRITEBYTECODE="1")
+        done = subprocess.run(
+            [sys.executable, "-c", _INTERPRETED_DRAFT],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        got = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["lookup"], [True] * 3)
+        # one request, a padded slot and an empty extend, front rows, no accept counts
+        self.assertEqual(got["capture"], [["", True, True]] * 4)
 
 
 class TestEngagement(unittest.TestCase):

@@ -68,7 +68,9 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # on a BF16 KV pool
 # qsa_pool_fp8: the TP1 QSA verify's sparse attention on an FP8 E4M3 KV pool as the
 # union kernels, warp-specialized (33-576 rows; runtime/attention.py)
-# moe_finalize: the TP1 MoE's finalize + gated shared expert as one ordered kernel
+# moe_finalize: the TP1 MoE's finalize + gated shared expert as one ordered kernel; from
+# 1024 rows the source's extend-size MoE, and on the target a FlashInfer tuning pass of
+# its routed experts at prefill sizes (runtime/moe.py, runtime/moe_prefill_autotune.py)
 # moe_routing: in moe_finalize's step, the routed experts' routing, NVFP4 quant and
 # trtllm-gen metadata as one kernel, else the quant beside the router GEMV
 # (runtime/moe_routing.py)
@@ -359,6 +361,12 @@ def build(model, hf_config, ctx):
             "smallm_gemm", smallm_gemm.build(model), smallm_gemm.DEFAULT
         )
     _build_pins(model, executor)
+    if not draft and executor.moe_finalize_ready:
+        from sgl_nvidia_mega.qwen3_8.runtime import moe_prefill_autotune
+
+        reason = moe_prefill_autotune.reasons(model)
+        if _built_options("moe_prefill_autotune", reason, True):
+            moe_prefill_autotune.install(model, executor)
     logger.info(
         "NVIDIA megakernel: Qwen3.8 %s executor: %s%s; slots %s; every other op stock",
         "draft" if draft else ("target (own GDN u-cache)" if own_ucache else "target"),

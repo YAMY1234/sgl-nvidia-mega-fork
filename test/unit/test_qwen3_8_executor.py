@@ -184,13 +184,16 @@ class TestStepFallbacks(unittest.TestCase):
         self.assertEqual(st.ran_ops, [("moe", "stock")])
 
     def test_moe_rows_bound(self):
+        """No rows, or another hidden size: SGLang's block (any row count above runs the
+        slot, the extend sizes too: test_qwen3_8_moe_routing.TestExtendStep)."""
         from sgl_nvidia_mega.qwen3_8.runtime import moe
 
         ex = SimpleNamespace(moe_finalize_ready=True)
         layer = SimpleNamespace(mlp=self.Block())
-        st = _St(_Mode.EXTEND)
-        moe.step(ex, layer, torch.zeros(moe.MAX_ROWS + 1, 2560), st)
-        self.assertEqual(st.ran_ops, [("moe", "stock")])
+        for x in (torch.zeros(0, 2560), torch.zeros(moe.EXTEND_MIN_ROWS, 4096)):
+            st = _St(_Mode.EXTEND)
+            moe.step(ex, layer, x, st)
+            self.assertEqual(st.ran_ops, [("moe", "stock")])
 
     def test_moe_routed_before_shared(self):
         """Eager (not capturing): SGLang's order, the routed experts then the shared

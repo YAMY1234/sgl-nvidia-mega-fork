@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The Qwen3.8 executor's MoE routing slot on CPU: which path a call takes (fused
 routing, prequant, stock), what each path launches and in which order, the stock call's
-arguments the fused path rebuilds, and the build refusals. SGLang's and FlashInfer's
-modules are replaced by fakes and the kernel launches by spies, so no GPU, no kernel
-build and no model weights are needed."""
+arguments the fused path rebuilds, and the build refusals; and slot moe_finalize's
+extend-size step, which orders the routed half the source's way. SGLang's and
+FlashInfer's modules are replaced by fakes and the kernel launches by spies, so no GPU,
+no kernel build and no model weights are needed."""
 
 import enum
 import logging
@@ -19,6 +20,7 @@ from unittest import mock
 import torch
 
 from sgl_nvidia_mega.qwen3_8.kernels.ops.moe import fused_routing as op
+from sgl_nvidia_mega.qwen3_8.runtime import moe
 from sgl_nvidia_mega.qwen3_8.runtime import moe_routing as mr
 
 HIDDEN, EXPERTS, TOP_K, INTER = 2560, 512, 10, 64
@@ -89,6 +91,13 @@ class _Stream:
 
     def wait_stream(self, other):
         self.log.append(("wait", self.name, other.name))
+
+    def record_event(self):
+        self.log.append(("record_event", self.name))
+        return ("event", self.name)
+
+    def wait_event(self, event):
+        self.log.append(("wait_event", self.name, event[1]))
 
 
 class _Quantized:  # one of the prequant's outputs
@@ -253,7 +262,7 @@ def _install(test):
         sys.modules[name] = module
         test.addCleanup(_restore, name, old)
     for target, name, value in (
-        (torch.cuda, "current_stream", lambda: _STATE["current"]),
+        (torch.cuda, "current_stream", lambda: _STATE["on"]),
         (torch.cuda, "stream", _on),
         (mr, "_fused_built", True),
     ):
@@ -573,6 +582,184 @@ class TestPrequant(_Case):
         _STATE["capture"] = False
         self.assertIsNone(self.run_step(rows=600))
         self.assertEqual(_STATE["log"], [])
+
+
+class _Block(_Mlp):
+    """The fake Qwen2MoeSparseMoeBlock as moe.step drives it: the deferred output, and
+    SGLang's router and shared expert, each logging the stream it runs on."""
+
+    shared_expert = "shared expert"
+
+    def __init__(self, log, rows):
+        super().__init__(log)
+        self.shared_expert_gate = SimpleNamespace(
+            weight=torch.zeros(1, HIDDEN, dtype=torch.bfloat16)
+        )
+        self.experts.dispatcher = SimpleNamespace(combine=self.combine)
+        self.out = SimpleNamespace(
+            top_k=TOP_K,
+            gemm2_out=torch.zeros(rows * TOP_K, HIDDEN, dtype=torch.bfloat16),
+            expert_weights=torch.zeros(rows, TOP_K),
+            expanded_idx_to_permuted_idx=torch.zeros(rows * TOP_K, dtype=torch.int32),
+        )
+
+    def combine(self, combine_input):
+        self.log.append(("combine",))
+        return self.out
+
+    def _forward_router_experts(self, x, defer_finalize):
+        self.log.append(("routed", _STATE["on"].name, defer_finalize))
+        return self.out
+
+    def _forward_shared_experts(self, x, apply_gate):
+        self.log.append(("shared", _STATE["on"].name, apply_gate))
+        return torch.zeros_like(x)
+
+
+class _Kernel:  # the finalize kernel: logs its launch
+    def __getitem__(self, grid):
+        return lambda *args, **kw: _STATE["log"].append(
+            ("finalize", _STATE["on"].name, grid, kw)
+        )
+
+
+class TestExtendStep(_Case):
+    """Slot moe_finalize from EXTEND_MIN_ROWS rows: the source's extend-size MoE, in a
+    breakable prefill graph's capture as eagerly."""
+
+    WIDTH = dict(
+        wait=3, quant=2, record_event=2, shared=3, gate=2, wait_event=3, routed=3,
+        record_stream=3, finalize=3,
+    )  # fmt: skip
+
+    def setUp(self):
+        super().setUp()
+        _STATE["capture"] = True
+        self.pdl = True
+        kernel = types.ModuleType(
+            "sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.moe_finalize"
+        )
+        kernel._fused_finalize_gate_sigmoid_mul_add_kernel = _Kernel()
+        qwen2 = types.ModuleType("sglang.srt.models.qwen2_moe")
+        qwen2.Qwen2MoeSparseMoeBlock = _Block
+        for module in (kernel, qwen2):
+            self.addCleanup(_restore, module.__name__, sys.modules.get(module.__name__))
+            sys.modules[module.__name__] = module
+
+        def record_stream(t, stream):
+            _STATE["log"].append(("record_stream", tuple(t.shape), stream.name))
+
+        for patcher in (
+            mock.patch("sglang.kernels.jit.utils.is_arch_support_pdl", lambda: self.pdl),
+            mock.patch.object(torch.Tensor, "record_stream", record_stream),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_moe(self, rows=moe.EXTEND_MIN_ROWS, options=mr.DEFAULT):
+        self.mlp = _Block(_STATE["log"], rows)
+        self.x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16)
+        self.st = _St()
+        executor = SimpleNamespace(
+            moe_finalize_ready=True, moe_routing=options, smallm_gemm=None
+        )
+        out = moe.step(executor, SimpleNamespace(mlp=self.mlp), self.x, self.st)
+        self.assertEqual(tuple(out.shape), (rows, HIDDEN))
+        log = _STATE["log"]
+        return [e[: self.WIDTH.get(e[0], 1)] for e in log], log[-1][3]
+
+    def test_capture_quant_and_shared_beside_the_routed_stream(self):
+        rows = moe.EXTEND_MIN_ROWS
+        order, launch = self.run_moe()
+        self.assertEqual(
+            order,
+            [
+                ("wait", "alt", "current"),
+                ("quant", "current"),
+                ("record_event", "current"),
+                ("shared", "current", False),
+                ("gate", "alt"),
+                ("topk",),
+                ("wait_event", "alt", "current"),
+                ("run_moe_core",),
+                ("combine",),
+                ("wait", "current", "alt"),
+                ("record_stream", (rows * TOP_K, HIDDEN), "current"),
+                ("record_stream", (rows, TOP_K), "current"),
+                ("record_stream", (rows * TOP_K,), "current"),
+                ("finalize", "current", (rows,)),
+            ],
+        )
+        log = _STATE["log"]
+        self.assertIs(log[1][2], self.x)
+        self.assertIs(log[1][3], self.mlp.experts.w13_input_scale_quant)
+        _, dispatch, deferred = log[7]
+        self.assertTrue(deferred)
+        self.assertEqual(dispatch.hidden_states.name, "x_fp4")
+        self.assertEqual(dispatch.hidden_states_scale.name, "x_sf")
+        self.assertEqual(
+            {k: launch[k] for k in ("BLOCK_SIZE", "num_warps", "maxnreg", "USE_PDL")},
+            dict(BLOCK_SIZE=4096, num_warps=8, maxnreg=64, USE_PDL=True),
+        )
+        self.assertTrue(launch["launch_pdl"])
+        self.assertEqual(
+            self.st.ran_ops, [("moe.routing", "prequant"), ("moe", "extend_finalize")]
+        )
+
+    def test_eager_shared_then_routed(self):
+        _STATE["capture"] = False
+        order, launch = self.run_moe(rows=4096)
+        self.assertEqual(
+            order,
+            [
+                ("shared", "current", False),
+                ("routed", "current", True),
+                ("finalize", "current", (4096,)),
+            ],
+        )
+        self.assertEqual((launch["maxnreg"], launch["USE_PDL"]), (64, True))
+        self.assertEqual(self.st.ran_ops, [("moe", "extend_finalize")])
+
+    def test_capture_without_the_prequant_routes_on_the_side_stream(self):
+        for options in (None, mr.Options(prequant_overlap=False)):
+            with self.subTest(options=options):
+                _STATE["log"].clear()
+                order, _ = self.run_moe(options=options)
+                self.assertEqual(
+                    order[:4],
+                    [
+                        ("wait", "alt", "current"),
+                        ("shared", "current", False),
+                        ("routed", "alt", True),
+                        ("wait", "current", "alt"),
+                    ],
+                )
+                self.assertEqual(self.st.ran_ops, [("moe", "extend_finalize")])
+
+    def test_no_pdl_launch_without_pdl(self):
+        self.pdl = False
+        _, launch = self.run_moe()
+        self.assertFalse(launch["USE_PDL"])
+        self.assertNotIn("launch_pdl", launch)
+        self.assertEqual(launch["maxnreg"], 64)
+
+    def test_fewer_rows_keep_the_deferred_dual_stream(self):
+        rows = moe.EXTEND_MIN_ROWS - 1
+        order, launch = self.run_moe(rows=rows, options=None)
+        self.assertEqual(
+            order,
+            [
+                ("wait", "alt", "current"),
+                ("routed", "current", True),
+                ("shared", "alt", False),
+                ("record_stream", (rows, HIDDEN), "current"),
+                ("wait", "current", "alt"),
+                ("finalize", "current", (rows,)),
+            ],
+        )
+        self.assertEqual((launch["USE_PDL"], launch["num_warps"]), (False, 8))
+        self.assertNotIn("maxnreg", launch)
+        self.assertEqual(self.st.ran_ops, [("moe", "finalize_permuted")])
 
 
 class TestOptions(unittest.TestCase):

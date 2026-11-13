@@ -11,7 +11,9 @@ act_and_mul as built before SGLang #48942 (compiled here from that source) on se
 rows and on every finite (gate, up) BF16 pair, with a div.full copy as the control that
 must differ; and against main's own Qwen2MoeMLP (gate_up + the current SiluAndMul) on
 random operands, the source's dispatch test. Every route also replays bitwise under a
-CUDA graph.
+CUDA graph. The bitwise routes (runtime/sm107_bf16_smallm.py) pass the source's load
+check against main's dispatch at all 87 keys, and a key of each kind matches it bit for
+bit eagerly and under graph replay, as one kernel where main runs cuBLAS split-K + reduce.
 """
 
 from types import SimpleNamespace
@@ -378,3 +380,59 @@ def test_the_build_check_catches_a_non_stock_divide(env):
     assert smallm_gemm._check_act(env.stock_gemm, device)
     with mock.patch.object(smallm_gemm._k.act, "run", full_divide_run):
         assert not smallm_gemm._check_act(env.stock_gemm, device)
+
+
+# (M, N, K) of each route kind and shape: router and index_qk on both cluster tactics,
+# the shared gate_up, TGV at its own pick and at a fixed tactic, the 2-CTA TGV tile
+BITWISE_KEYS = (
+    (12, 512, 2560),
+    (24, 512, 2560),
+    (12, 640, 2560),
+    (32, 640, 2560),
+    (8, 1280, 2560),
+    (20, 16480, 2560),
+    (28, 16480, 2560),
+    (68, 13312, 2560),
+    (64, 2560, 6144),
+)
+
+
+def test_bitwise_routes_match_main_dispatch(env, record_property):
+    from sgl_nvidia_mega.qwen3_8.runtime import sm107_bf16_smallm as sr
+
+    assert sr.install(device_sm=107, splitk_enabled=True, cutedsl_available=True)
+    # every key, bit for bit: ROUTES against main's dispatch, SOURCE_SPLITK_ROUTES against
+    # main's split-K kernel at the source's tactic
+    assert sr.precompile(stock_gemm=env.stock_gemm, source_gemm=sr._source_splitk)
+    g = torch.Generator(device="cuda").manual_seed(11)
+    names = {}
+    with torch.inference_mode():
+        for m, n, k in BITWISE_KEYS:
+            w = (torch.randn(n, k, generator=g, device="cuda") * 0.02).to(BF16)
+            x = torch.randn(m, k, generator=g, device="cuda").to(BF16)
+            want = env.stock_gemm(x, w)
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CUDA]
+            ) as prof:
+                got = sr.gemm(x, w)
+                torch.cuda.synchronize()
+            kernels = [
+                e.name
+                for e in prof.events()
+                if e.device_type == torch.autograd.DeviceType.CUDA
+            ]
+            assert len(kernels) == 1, ((m, n, k), kernels)
+            names[f"{m}x{n}x{k}"] = kernels[0]
+            assert torch.equal(_bits(got), _bits(want)), ((m, n, k), "eager")
+            state = {}
+            graph = _capture(lambda: state.update(out=sr.gemm(x, w)))
+            state["out"].fill_(float("nan"))
+            graph.replay()
+            assert torch.equal(_bits(state["out"]), _bits(want)), ((m, n, k), "graph")
+            del graph
+    assert all(
+        "dense_bf16_gemm_sm100_splitk" in name
+        for key, name in names.items()
+        if key.split("x")[1] in ("512", "640", "1280")
+    ), names
+    record_property("route_kernels", names)

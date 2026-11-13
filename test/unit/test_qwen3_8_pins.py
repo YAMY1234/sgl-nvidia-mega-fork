@@ -3,10 +3,12 @@
 runtime/bf16_gemm_pins.py, runtime/moe_prefill_autotune.py): the file formats, the
 SHA-256 and metadata gates, which autotuner entries the MoE decode and prefill tables
 rewrite and which they refuse, the prefill tuning pass that adds the prefill entries,
-when a BF16 pin serves an executor projection call and when SGLang's dispatch keeps it.
-FlashInfer's and SGLang's modules are fakes and the pinned kernels CPU stand-ins, so no
-GPU is needed."""
+when a BF16 pin serves an executor projection call and when SGLang's dispatch keeps it,
+and the SM107 small-M BF16 routes (runtime/sm107_bf16_smallm.py) behind and beside the
+pins. FlashInfer's and SGLang's modules are fakes and the pinned kernels CPU stand-ins,
+so no GPU is needed."""
 
+import functools
 import hashlib
 import json
 import os
@@ -25,6 +27,7 @@ import triton  # noqa: F401 - imported after the custom-op test, it aborts the C
 
 from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins as bp
 from sgl_nvidia_mega.qwen3_8.runtime import flashinfer_tactic_pins as tp
+from sgl_nvidia_mega.qwen3_8.runtime import sm107_bf16_smallm as sr
 
 BF16 = torch.bfloat16
 SHAPE = (2560, 640, 512, 10)
@@ -1206,6 +1209,327 @@ class TestStockStepMirrors(_Gemm):
         layer.attn.assert_called_once_with("q", "k", "v", "fb", topk_indices="idx")
         layer._compute_qsa_topk_indices.assert_called_once_with(x, "pos", "fb")
         self.assertEqual(layer.o_proj.calls, 0)
+
+
+# -- SM107 small-M BF16 routes ---------------------------------------------------------
+
+ROUTER = (512, 2560)
+SPLITK_MODULE = "sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue"
+SMEM_SM100 = 232448  # cutlass.utils.get_smem_capacity_in_bytes("sm_100")
+
+
+class _Routes(_Gemm):
+    """The routes' process-wide state fresh, their kernels CPU stand-ins, the split-K
+    module (SGLang's) a fake and SGLang's unquant state set."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop(sr.ENV, None)
+        for name, value in (
+            ("_routes", None),
+            ("_fi", None),
+            ("_compiled", {}),
+            ("_logged", set()),
+            ("_checked", False),
+            ("_agreed", False),
+            ("_built", None),
+        ):
+            patcher = mock.patch.object(sr, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.route_runs, self.route_flip = [], set()
+
+        def runner(kind):
+            def run(x_2d, w, out, tactic):
+                self.route_runs.append((kind, x_2d.shape[0], tactic))
+                out.copy_(_gemm(x_2d, w))
+                if kind in self.route_flip:
+                    out.view(-1).view(torch.int16)[0] ^= 1
+
+            return run
+
+        patcher = mock.patch.object(
+            sr, "_RUNNERS", {kind: runner(kind) for kind in ("cl", "tgvc", "tgv")}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        driver = self.fake_module("cuda.bindings.driver", CUstream=object)
+        bindings = self.fake_module("cuda.bindings", driver=driver)
+        self.fake_module("cuda", bindings=bindings)
+        self.splitk = self.fake_module(SPLITK_MODULE, _SMEM_CAPACITY_BYTES=SMEM_SM100)
+        # ``import sglang.kernels.ops.gemm.<module> as m`` binds through the parents'
+        # attributes: fake the chain down from ``sglang``
+        child = self.splitk
+        for parent in ("sglang.kernels.ops.gemm", "sglang.kernels.ops", "sglang.kernels"):
+            child = self.fake_module(parent, **{child.__name__.rsplit(".", 1)[1]: child})
+        patcher = mock.patch.object(sys.modules["sglang"], "kernels", child, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        unquant = sys.modules["sglang.srt.layers.quantization.unquant"]
+        unquant._enable_bf16_splitk_gemm = True
+        unquant._cutedsl_bf16_gemm = object()
+        self.source_calls = []
+
+        def run_splitk_dense(x, w_t, bias, out, swap, tactic):
+            self.source_calls.append(tactic)
+            out.copy_(_gemm(x, w_t.t()))
+
+        unquant._run_splitk_dense = run_splitk_dense
+        unquant._splitk_tactic = lambda *t: tuple(t)
+        patcher = mock.patch.object(
+            torch.cuda, "get_device_capability", lambda *a: (10, 7)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def install_routes(self):
+        return sr.install(device_sm=107, splitk_enabled=True, cutedsl_available=True)
+
+    def check(self, keys=None):
+        """precompile against the fake stock dispatch on CPU, on ``keys`` of the table."""
+        if keys is not None:
+            sr._routes = {key: sr.ROUTES[key] for key in keys}
+        return sr.precompile(
+            stock_gemm=lambda x, w: _gemm(x, w),
+            source_gemm=lambda x, w, tactic: _gemm(x, w),
+            device=torch.device("cpu"),
+        )
+
+
+def _router_keys(*ms):
+    return [(m, *ROUTER) for m in ms]
+
+
+class TestSmallmRoutes(_Routes):
+    def test_the_switch_and_its_default(self):
+        self.assertFalse(sr.requested())  # unset: off
+        for value, want in (("1", True), ("true", True), ("Y", True), ("0", False)):
+            self.set_env(sr.ENV, value)
+            self.assertEqual(sr.requested(), want, value)
+        self.set_env(sr.ENV, "on")  # EnvBool: invalid warns and keeps the default
+        with self.assertLogs(sr.logger, "WARNING"):
+            self.assertFalse(sr.requested())
+        # the source's name is not read
+        os.environ.pop(sr.ENV)
+        self.set_env("SGLANG_ENABLE_SM107_BF16_SMALLM_ROUTES", "1")
+        self.assertFalse(sr.requested())
+
+    def test_the_table_is_the_sources(self):
+        kinds = [kind for kind, _ in sr.ROUTES.values()]
+        self.assertEqual((len(kinds), kinds.count("cl")), (87, 70))
+        self.assertEqual(sr.ROUTES[(12, *ROUTER)], ("cl", (64, 8, 4, 5, 128)))
+        self.assertEqual(sr.ROUTES[(24, 640, 2560)], ("cl", (64, 16, 8, 5, 64)))
+        self.assertEqual(sr.ROUTES[(16, 1280, 2560)], ("cl", (64, 8, 4, 5, 128)))
+        self.assertEqual(sr.ROUTES[(28, 16480, 2560)], ("tgv", 26))
+        self.assertEqual(sr.ROUTES[(68, 13312, 2560)], ("tgvc", (64, 80, 8, True)))
+        self.assertEqual(sr.ROUTES[(64, 2560, 6144)], ("tgv", 21))
+        for key in [(8, *ROUTER), (4, 16480, 2560), (17, 1280, 2560), (48, 2560, 6144)]:
+            self.assertNotIn(key, sr.ROUTES)  # stock keeps these keys
+        # the source's dispatch at the router's M 4: its split-K path at its tactic
+        self.assertNotIn((4, *ROUTER), sr.ROUTES)
+        self.assertEqual(
+            sr.SOURCE_SPLITK_ROUTES, {(4, *ROUTER): ("cl", (64, 8, 4, 10, 64))}
+        )
+
+    def test_install_gates(self):
+        for args in ((100, True, True), (107, False, True), (107, True, False)):
+            with self.assertLogs(sr.logger, "WARNING"):
+                self.assertFalse(sr.install(*args))
+        with self.assertLogs(sr.logger, "INFO") as logs:
+            self.assertTrue(self.install_routes())
+        self.assertIn("88 keys (cluster split-K 71, TGV 17)", logs.output[0])
+        self.assertEqual(sr._routes, {**sr.ROUTES, **sr.SOURCE_SPLITK_ROUTES})
+        # installed, not checked: nothing served yet
+        self.assertIsNone(sr.route_for(_x(12, k=2560), torch.zeros(ROUTER, dtype=BF16)))
+        self.splitk._SMEM_CAPACITY_BYTES = 64 << 10  # a "cl" tactic no longer fits
+        with self.assertLogs(sr.logger, "WARNING"):
+            self.assertFalse(self.install_routes())
+
+    def test_routes_by_key(self):
+        self.install_routes()
+        sr._checked = True
+        for key, route in (
+            ((12, *ROUTER), ("cl", (64, 8, 4, 5, 128))),
+            ((24, 640, 2560), ("cl", (64, 16, 8, 5, 64))),
+            ((3, 1280, 2560), ("cl", (64, 8, 4, 5, 128))),
+            ((20, 16480, 2560), ("tgv", None)),
+            ((84, 13312, 2560), ("tgvc", (64, 96, 7, True))),
+            ((64, 2560, 6144), ("tgv", 21)),
+        ):
+            m, n, k = key
+            weight = torch.zeros(n, k, dtype=BF16)
+            self.assertEqual(sr.route_for(_x(m, k=k), weight), route, key)
+        weight = _Linear(*ROUTER).weight
+        x = _x(12, k=2560).view(3, 4, 2560)  # M counts every leading row
+        out = sr.gemm(x, weight)
+        self.assertEqual(out.shape, (3, 4, 512))
+        self.assertTrue(torch.equal(out, _gemm(x.view(12, -1), weight).view(3, 4, -1)))
+        self.assertEqual(self.route_runs, [("cl", 12, (64, 8, 4, 5, 128))])
+
+    def test_shapes_and_operands_not_in_the_table(self):
+        self.install_routes()
+        sr._checked = True
+        weight = torch.zeros(ROUTER, dtype=BF16)
+        for x, w in (
+            (_x(8, k=2560), weight),  # M 8: stock (the source's tuned table)
+            (_x(33, k=2560), weight),
+            (_x(12, k=2560), torch.zeros(320, 2560, dtype=BF16)),  # another N
+            (_x(2560, k=12).t(), weight),  # not contiguous
+            (_x(12, k=2560), torch.zeros(2560, 512, dtype=BF16).t()),
+        ):
+            self.assertIsNone(sr.gemm(x, w))
+        self.assertEqual(self.route_runs, [])
+
+    def test_the_load_check(self):
+        self.install_routes()
+        keys = _router_keys(5, 12, 17, 32) + [(16, 1280, 2560)]
+        self.assertTrue(self.check(keys))
+        self.assertTrue(sr._checked)
+        self.assertEqual(
+            sorted((kind, m) for kind, m, _ in self.route_runs),
+            sorted(("cl", m) for m, _, _ in keys),
+        )
+        self.assertFalse(sr.served())  # until every rank agreed
+        sr.enable()
+        self.assertTrue(sr.served())
+
+    def test_a_mismatch_turns_the_routes_off(self):
+        self.install_routes()
+        self.route_flip.add("cl")
+        with self.assertLogs(sr.logger, "WARNING") as logs:
+            self.assertFalse(self.check(_router_keys(5, 12)))
+        self.assertIn("differs from the stock dispatch", logs.output[0])
+        self.assertEqual(len(self.route_runs), 1)  # the first key stops the check
+        sr.enable()
+        self.assertFalse(sr.served())
+        self.assertIsNone(sr._routes)
+        self.assertFalse(bp.routed())
+        proj = _Linear(*ROUTER)
+        bp.linear(proj, _x(12, k=2560))
+        self.assertEqual(proj.calls, 1)
+
+    def test_build(self):
+        sites = {ROUTER: "moe.gate", (640, 2560): "qsa.index_qk_proj"}
+        table = {
+            key: route
+            for key, route in sr.ROUTES.items()
+            if key[1:] in (ROUTER, (640, 2560))
+        }
+        on_cpu = functools.partial(sr.precompile, device=torch.device("cpu"))
+        with (
+            mock.patch.object(sr, "ROUTES", table),
+            mock.patch.object(sr, "precompile", on_cpu),
+        ):
+            self.state["tp"] = 2
+            self.assertIn("TP1 only", sr._build(sites))
+            self.state["tp"] = 1
+            with self.assertLogs(sr.logger, "INFO") as logs:
+                self.assertEqual(sr.build(sites), "")
+            self.assertIn(sr.ENV, logs.output[-1])
+            self.assertIn("serve 55 keys", logs.output[-1])
+            self.assertIn("moe.gate cl M 4-7,9-32; qsa.index_qk_proj cl M 5-7,9-32",
+                          logs.output[-1])  # fmt: skip
+            checked = len(self.stock_calls)
+            self.assertEqual(checked, 54)  # against SGLang's dispatch, every ROUTES key
+            # the router's M 4 against SGLang's split-K kernel at the source's tactic
+            self.assertEqual(self.source_calls, [(64, 8, 4, 10)])
+            self.assertEqual(sr.build({}), "")  # once a process
+            self.assertEqual(len(self.stock_calls), checked)
+            sr._built = None
+            self.route_flip.add("cl")
+            with self.assertLogs(sr.logger, "WARNING"):
+                self.assertIn("differs", sr.build(sites))
+            sr._built = None
+            with mock.patch.object(
+                torch.cuda, "get_device_capability", lambda *a: (10, 3)
+            ):
+                with self.assertLogs(sr.logger, "WARNING"):
+                    self.assertIn("not installed", sr.build(sites))
+
+    def test_the_executor_build_agrees_then_enables(self):
+        from sgl_nvidia_mega.qwen3_8 import runtime
+
+        agreed = []
+        self.fake_module(
+            "sglang.srt.kernel_plugins.nvidia.binding",
+            megakernel_agree=lambda reason, what: agreed.append((reason, what)),
+        )
+        executor = SimpleNamespace()
+        with (
+            mock.patch.object(runtime, "_gemm_call_sites", lambda model: {}),
+            mock.patch.object(sr, "build", return_value="") as build,
+        ):
+            runtime._build_pins(object(), executor)  # switch unset: not built
+            build.assert_not_called()
+            self.set_env(sr.ENV, "1")
+            runtime._build_pins(object(), executor)
+            build.assert_called_once_with({})
+            self.assertEqual(agreed, [("", "Qwen3.8 slot sm107_bf16_smallm")])
+            self.assertTrue(sr._agreed)
+            sr._agreed = False
+            build.return_value = "TP1 only"
+            with self.assertLogs(runtime.logger, "INFO"):
+                runtime._build_pins(object(), executor)
+            self.assertFalse(sr._agreed)
+
+
+class TestSmallmRoutesBesidePins(_Routes):
+    """The executor's projection calls: a pin first, then a route, then SGLang's
+    dispatch, as the source's ``_bf16_gemm_dispatch_impl``."""
+
+    def setUp(self):
+        super().setUp()
+        self.install_routes()
+        self.check(_router_keys(12, 13))
+        sr.enable()
+
+    def test_routes_alone_route_the_calls(self):
+        self.assertTrue(bp.routed())  # no pin file: the routes still route
+        proj = _Linear(*ROUTER)
+        self.route_runs.clear()
+        out = bp.linear(proj, _x(12, k=2560))
+        self.assertTrue(torch.equal(out, _gemm(_x(12, k=2560), proj.weight)))
+        bp.linear(proj, _x(8, k=2560))  # not in the table
+        self.assertEqual(proj.calls, 1)
+        self.assertEqual(self.route_runs, [("cl", 12, (64, 8, 4, 5, 128))])
+        self.state["backend"] = "torch"  # SGLang's linear would not reach its dispatch
+        bp.linear(proj, _x(12, k=2560))
+        self.assertEqual(proj.calls, 2)
+
+    def test_a_pin_takes_precedence(self):
+        self.install([{"m": 12, "n": 512, "k": 2560, "kind": "tgv", "tactic": 18}])
+        bp.enable_routes()
+        proj = _Linear(*ROUTER)
+        self.route_runs.clear()
+        bp.linear(proj, _x(12, k=2560))  # pinned and routed: the pin
+        bp.linear(proj, _x(13, k=2560))  # routed only: the route
+        bp.linear(proj, _x(8, k=2560))  # neither: SGLang's
+        self.assertEqual(self.runs, [("tgv", 12)] * 2)  # the pin's check, its serve
+        self.assertEqual(self.route_runs, [("cl", 13, (64, 8, 4, 5, 128))])
+        self.assertEqual(proj.calls, 1)
+        sr._agreed = False  # routes off, pins on
+        bp.linear(proj, _x(13, k=2560))
+        self.assertEqual(proj.calls, 2)
+
+    def test_in_proj_takes_the_route(self):
+        weight = torch.zeros(16480, 2560, dtype=BF16)
+        gdn = SimpleNamespace(
+            _fused_in_proj_weight=weight, _fused_in_proj_qkvz_width=16384, calls=0
+        )
+
+        def method(x):
+            gdn.calls += 1
+            out = _gemm(x, weight)
+            return out[:, :16384], out[:, 16384:]
+
+        gdn._forward_input_proj = method
+        sr._routes[(20, 16480, 2560)] = sr.ROUTES[(20, 16480, 2560)]
+        self.route_runs.clear()
+        qkvz, ba = bp.in_proj(gdn, _x(20, k=2560))
+        self.assertEqual((qkvz.shape, ba.shape), ((20, 16384), (20, 96)))
+        self.assertEqual(self.route_runs, [("tgv", 20, None)])
+        bp.in_proj(gdn, _x(4, k=2560))  # M 4: stock keeps it
+        self.assertEqual(gdn.calls, 1)
 
 
 if __name__ == "__main__":

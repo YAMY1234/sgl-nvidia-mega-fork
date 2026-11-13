@@ -7,9 +7,10 @@
 # _prepared, fused_act, precompile) and python/sglang/srt/models/qwen2_moe.py
 # (Qwen2MoeMLP.forward with its TGV down_proj).
 # Changed: the environment switches are ``Options``. The routes serve the executor's
-# own projection calls, not SGLang's BF16 dispatch, so the source's bitwise route
-# table under them is not needed. The split-K runs on this package's copy of the
-# kernel at its own K tile, and the static eligibility checks run once, at build.
+# own projection calls, not SGLang's BF16 dispatch; the source's bitwise route table
+# under them is runtime/sm107_bf16_smallm.py, on its own switch, which this slot does
+# not wait for. The split-K runs on SGLang's epilogue copy of the kernel at its own K
+# tile, and the static eligibility checks run once, at build.
 """Small-M BF16 GEMMs of a covered step on SM107 at TP1 (slot ``smallm_gemm``).
 
 ``out_proj``: the GDN out_proj and the attention o_proj (N 2560, K 6144) at 4-16 and
@@ -45,6 +46,7 @@ it does not serve the call, and the caller then runs SGLang's module.
 from __future__ import annotations
 
 import logging
+import os
 import types
 import weakref
 from dataclasses import dataclass
@@ -132,6 +134,33 @@ class Options:
 
 
 DEFAULT = Options()
+
+# The source's switches, read under the names the recipes pass (its own names; the
+# routes' switch is sm107_bf16_smallm.ENV). Its defaults are off.
+NONBITWISE_LOWM_ENV = "SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_LOWM_ROUTES"
+NONBITWISE_ENV = "SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_ROUTES"
+FUSED_ACT_ENV = "SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT"
+DOWN_TGV_ENV = "SGLANG_ENABLE_SHARED_EXPERT_DOWN_TGV"
+
+
+def _env_on(name: str) -> bool:
+    return os.environ.get(name, "false").strip().lower() in ("1", "true", "yes", "y")
+
+
+def recipe_options() -> Options:
+    """``Options`` as the recipe's switches set them, with the source's gating: the
+    non-bitwise out_proj routes and the fused act need the bitwise routes' switch on."""
+    from sgl_nvidia_mega.qwen3_8.runtime import sm107_bf16_smallm
+
+    routes = _env_on(sm107_bf16_smallm.ENV)
+    return Options(
+        out_proj_low_m=DEFAULT.out_proj_low_m
+        if routes and _env_on(NONBITWISE_LOWM_ENV)
+        else (),
+        out_proj_mid_m=DEFAULT.out_proj_mid_m if routes and _env_on(NONBITWISE_ENV) else (),
+        shared_fused_act=routes and _env_on(FUSED_ACT_ENV),
+        shared_down_tgv_rows=DEFAULT.shared_down_tgv_rows if _env_on(DOWN_TGV_ENV) else (),
+    )
 
 # Process-wide, as the source's: what build resolved, checked and prepared.
 _k = None  # the kernels (_kernels)

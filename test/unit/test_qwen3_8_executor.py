@@ -207,11 +207,21 @@ class TestStepFallbacks(unittest.TestCase):
             "sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.moe_finalize"
         )
 
-        class Kernel:
-            def __getitem__(self, grid):
-                return lambda *a, **k: calls.append("finalize")
+        launches = []
 
-        fin._fused_finalize_gate_sigmoid_mul_add_kernel = Kernel()
+        class Kernel:
+            def __init__(self, name):
+                self.name = name
+
+            def __getitem__(self, grid):
+                def launch(*a, **k):
+                    calls.append("finalize")
+                    launches.append((self.name, grid, k))
+
+                return launch
+
+        fin._fused_finalize_gate_sigmoid_mul_add_kernel = Kernel("rows")
+        fin._fused_finalize_gate_sigmoid_mul_add_chunked_kernel = Kernel("chunked")
         saved = {n: sys.modules.get(n) for n in (runner.__name__, fin.__name__)}
         sys.modules.update({runner.__name__: runner, fin.__name__: fin})
         self.addCleanup(
@@ -246,6 +256,15 @@ class TestStepFallbacks(unittest.TestCase):
         moe.step(ex, layer, torch.zeros(rows, 2560), st)
         self.assertEqual(calls, ["routed", "shared", "finalize"])
         self.assertEqual(st.ran_ops, [("moe", "finalize_permuted")])
+        # the source's decode-size launch: 16 warps, PDL where supported, and up to 64
+        # rows the (row, 1024-column) grid
+        from sglang.kernels.jit.utils import is_arch_support_pdl
+
+        pdl = is_arch_support_pdl()
+        name, grid, kw = launches[0]
+        self.assertEqual((name, grid), ("chunked", (rows, 3)))
+        self.assertEqual((kw["CHUNK"], kw["num_warps"], kw["USE_PDL"]), (1024, 16, pdl))
+        self.assertEqual(kw.get("launch_pdl", False), pdl)
 
     def test_gdn_stock_outside_verify(self):
         from sgl_nvidia_mega.qwen3_8.runtime import gdn

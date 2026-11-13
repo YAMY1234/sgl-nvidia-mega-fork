@@ -757,8 +757,11 @@ class TestExtendStep(_Case):
                 ("finalize", "current", (rows,)),
             ],
         )
-        self.assertEqual((launch["USE_PDL"], launch["num_warps"]), (False, 8))
+        # the source's decode-size launch: its warp rule (16) and PDL; one row a program
+        # above 64 rows
+        self.assertEqual((launch["USE_PDL"], launch["num_warps"]), (self.pdl, 16))
         self.assertNotIn("maxnreg", launch)
+        self.assertNotIn("CHUNK", launch)
         self.assertEqual(self.st.ran_ops, [("moe", "finalize_permuted")])
 
 

@@ -32,6 +32,12 @@ HIDDEN, TOP_K = 2560, 10
 # extend order, and a launch capped at 64 registers (3 -> 4 CTAs per SM, same math).
 EXTEND_MIN_ROWS = 1024
 EXTEND_MAX_REGISTERS = 64
+# Below it, the source's launch (fused_moe_finalize_gate_sigmoid_mul_add): its warp rule
+# max(min(next_pow2(ceil(hidden / 256)), 32), 4) at hidden 2560, PDL, and up to 64 rows the
+# (row, 1024-column) grid of its SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK=1024 recipes.
+FINALIZE_NUM_WARPS = 16
+FINALIZE_COLUMN_CHUNK = 1024
+FINALIZE_COLUMN_CHUNK_MAX_ROWS = 64
 
 SGLANG_READS = {
     "srt/models/qwen2_moe.py": (
@@ -133,7 +139,19 @@ def step(executor, layer, x, st):
     if side is not None:
         shared.record_stream(current)
         current.wait_stream(side)
-    out = _finalize(mlp, x, shared, deferred, USE_PDL=False, num_warps=8)
+    from sglang.kernels.jit.utils import is_arch_support_pdl
+
+    pdl = is_arch_support_pdl()
+    out = _finalize(
+        mlp,
+        x,
+        shared,
+        deferred,
+        chunk=FINALIZE_COLUMN_CHUNK if rows <= FINALIZE_COLUMN_CHUNK_MAX_ROWS else 0,
+        USE_PDL=pdl,
+        num_warps=FINALIZE_NUM_WARPS,
+        **({"launch_pdl": True} if pdl else {}),
+    )
     st.ran("moe", "finalize_permuted")
     return out
 
@@ -185,11 +203,10 @@ def _extend(executor, mlp, x, st):
     return out
 
 
-def _finalize(mlp, x, shared, deferred, **launch):
-    """The finalize kernel on the deferred output, one row a program."""
-    from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise.moe_finalize import (
-        _fused_finalize_gate_sigmoid_mul_add_kernel as kernel,
-    )
+def _finalize(mlp, x, shared, deferred, chunk=0, **launch):
+    """The finalize kernel on the deferred output, one row a program; with ``chunk``,
+    one (row, ``chunk`` columns) a program."""
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise import moe_finalize
 
     rows = x.shape[0]
     top_k = int(deferred.top_k)
@@ -199,7 +216,13 @@ def _finalize(mlp, x, shared, deferred, **launch):
     if top_k != TOP_K or perm.dtype != torch.int32:
         raise RuntimeError(f"moe_finalize: deferred output layout differs (top_k {top_k})")
     out = torch.empty_like(x)
-    kernel[(rows,)](
+    if chunk:
+        kernel = moe_finalize._fused_finalize_gate_sigmoid_mul_add_chunked_kernel
+        grid, launch = (rows, -(-HIDDEN // chunk)), dict(launch, CHUNK=chunk)
+    else:
+        kernel = moe_finalize._fused_finalize_gate_sigmoid_mul_add_kernel
+        grid = (rows,)
+    kernel[grid](
         x.contiguous(),
         mlp.shared_expert_gate.weight.view(-1),
         shared.contiguous(),

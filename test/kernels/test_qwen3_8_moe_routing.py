@@ -263,3 +263,39 @@ def test_prequant_matches_the_stock_call(runner):
         out, ops = _slot(experts, x, logits, options, capture=True)
         assert ops == ["prequant"], m
         _assert_same(out, ref)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="needs an SM10x GPU",
+)
+@pytest.mark.parametrize("rows", [1, 4, 13, 64])
+def test_chunked_finalize_matches_the_row_finalize(rows):
+    """Slot moe_finalize's decode-size launch: the (row, 1024-column) grid writes what one
+    row a program writes, at the same block and warp count (the gate's one reduction)."""
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.elementwise import moe_finalize as fin
+
+    torch.manual_seed(rows)
+    hidden, top_k, dev = 2560, 10, "cuda"
+    x = torch.randn(rows, hidden, device=dev, dtype=torch.bfloat16)
+    gate = torch.randn(hidden, device=dev, dtype=torch.bfloat16)
+    shared = torch.randn(rows, hidden, device=dev, dtype=torch.bfloat16)
+    gemm2 = torch.randn(rows * top_k + 7, hidden + 64, device=dev, dtype=torch.bfloat16)
+    perm = torch.randperm(rows * top_k + 7, device=dev)[: rows * top_k].to(torch.int32)
+    perm[::7] = -1
+    perm = perm.view(rows, top_k).contiguous()
+    weights = torch.rand(rows, top_k, device=dev, dtype=torch.float32)
+    outs = []
+    for chunk in (0, 1024):
+        out = torch.empty_like(x)
+        args = (x, gate, shared, out, gemm2, perm, weights, gemm2.stride(0))
+        kw = dict(hidden_dim=hidden, TOP_K=top_k, BLOCK_SIZE=4096, num_warps=16)
+        if chunk:
+            fin._fused_finalize_gate_sigmoid_mul_add_chunked_kernel[
+                (rows, -(-hidden // chunk))
+            ](*args, CHUNK=chunk, **kw)
+        else:
+            fin._fused_finalize_gate_sigmoid_mul_add_kernel[(rows,)](*args, **kw)
+        outs.append(out)
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0], outs[1])

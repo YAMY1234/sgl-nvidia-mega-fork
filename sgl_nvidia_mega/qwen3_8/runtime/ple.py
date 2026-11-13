@@ -26,7 +26,7 @@ take the built ``Options`` as ``options`` (None: main's function). Engagement op
   self-test passed) or stock (SGLang's chain or its fused verify / decode kernels).
 * ``ple.conv``: on a target verify with SGLang's PLE fusion, ``verify_conv`` (the state
   window, the depthwise conv and the finish in one launch, below the 32-bit index limit);
-  on EXTEND / MIXED outside SGLang's own varlen kernel, ``extend_conv``
+  on EXTEND / MIXED, ahead of SGLang's own varlen kernel, ``extend_conv``
   (``qwen4_ple_fused``: the conv over the token rows, passes stock runs natively, and with
   ``extend_conv_cudnn`` its cuDNN shapes up to 16 sequences of 32,768 tokens) or
   ``chunked`` (``ple_short_conv``: the stock padded conv in chunks of ``conv_chunk_size``
@@ -743,9 +743,9 @@ def forward(options, ple, hidden_states, fb, batch, st):
 
 
 def short_conv(options, ple, x, fb, batch, st):
-    """``Qwen4ExpPLELayer._short_conv``: SGLang's varlen and decode kernels and its
-    target-verify path first, then the source's extend conv over the token rows,
-    then its chunked conv, else SGLang's padded conv."""
+    """``Qwen4ExpPLELayer._short_conv``: SGLang's decode kernel and target-verify path
+    first, then the source's extend conv over the token rows, then SGLang's varlen
+    kernel, then the source's chunked conv, else SGLang's padded conv."""
     from sglang.srt.mem_cache.ple_state_pool import SHORT_CONV_PART
     from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
     from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -761,24 +761,11 @@ def short_conv(options, ple, x, fb, batch, st):
         return x
     part = get_token_to_kv_pool().layer_router.read(ple.layer_id, SHORT_CONV_PART)
     conv_state = part.view.layer_cache(part.view_layer_id)
-    if (
-        batch.use_decode_fast_path
-        or batch.mode.is_target_verify()
-        or _use_qwen4_varlen_prefill(
-            batch.mode,
-            batch.query_start_loc,
-            x,
-            ple.conv1d.weight,
-            conv_state,
-            batch.state_indices,
-            batch.req_indices,
-            batch.token_offsets,
-            ple.short_conv_dilation,
-        )
-    ):
+    if batch.use_decode_fast_path or batch.mode.is_target_verify():
         st.ran("ple.conv", STOCK)
         return ple._short_conv(x, fb, batch)
 
+    # The source's extend conv runs ahead of SGLang's varlen kernel (faster at prefill sizes)
     if options.extend_conv:
         from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba import qwen4_ple_fused as fused
 
@@ -811,6 +798,20 @@ def short_conv(options, ple, x, fb, batch, st):
                 conv_state[track[0]] = states[1].to(dtype=conv_state.dtype)
             st.ran("ple.conv", "extend_conv")
             return F.silu(conv_tokens)
+
+    if _use_qwen4_varlen_prefill(
+        batch.mode,
+        batch.query_start_loc,
+        x,
+        ple.conv1d.weight,
+        conv_state,
+        batch.state_indices,
+        batch.req_indices,
+        batch.token_offsets,
+        ple.short_conv_dilation,
+    ):
+        st.ran("ple.conv", STOCK)
+        return ple._short_conv(x, fb, batch)
 
     conv_chunk_size = options.conv_chunk_size
     conv_lengths = fb.extend_seq_lens_cpu if conv_chunk_size > 0 else None

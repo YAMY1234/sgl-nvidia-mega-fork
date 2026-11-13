@@ -734,6 +734,29 @@ class TestShortConv(unittest.TestCase):
         self.assertTrue(bool((self.cache[[5, 4]] == 2).all()))
         self.assertEqual(ran, [("ple.conv", "extend_conv")])
 
+    def test_extend_conv_ahead_of_the_varlen_kernel(self):
+        _STATE["varlen"] = True
+        try:
+            with (
+                mock.patch.object(qwen4_ple_fused, "conv_engages", lambda *a, **k: True),
+                mock.patch.object(
+                    qwen4_ple_fused,
+                    "fused_short_conv_extend",
+                    lambda x, *a, **k: (x * 2, (torch.ones(2, 32, 9),)),
+                ),
+            ):
+                out, ple, x, ran = self.run_conv(P.DEFAULT, _batch())
+            self.assertEqual(ple.calls, [])
+            self.assertTrue(torch.equal(out, F.silu(x * 2)))
+            self.assertEqual(ran, [("ple.conv", "extend_conv")])
+            out, ple, x, ran = self.run_conv(
+                P.Options(extend_conv=False, extend_conv_cudnn=False), _batch()
+            )
+            self.assertEqual(ple.calls, ["stock_short_conv"])
+            self.assertEqual(ran, [("ple.conv", "stock")])
+        finally:
+            _STATE["varlen"] = False
+
     def test_chunked_conv_matches_the_padded_conv(self):
         torch.manual_seed(0)
         options = P.Options(

@@ -1250,6 +1250,14 @@ class _Routes(_Gemm):
         bindings = self.fake_module("cuda.bindings", driver=driver)
         self.fake_module("cuda", bindings=bindings)
         self.splitk = self.fake_module(SPLITK_MODULE, _SMEM_CAPACITY_BYTES=SMEM_SM100)
+        # ``import sglang.kernels.ops.gemm.<module> as m`` binds through the parents'
+        # attributes: fake the chain down from ``sglang``
+        child = self.splitk
+        for parent in ("sglang.kernels.ops.gemm", "sglang.kernels.ops", "sglang.kernels"):
+            child = self.fake_module(parent, **{child.__name__.rsplit(".", 1)[1]: child})
+        patcher = mock.patch.object(sys.modules["sglang"], "kernels", child, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         unquant = sys.modules["sglang.srt.layers.quantization.unquant"]
         unquant._enable_bf16_splitk_gemm = True
         unquant._cutedsl_bf16_gemm = object()

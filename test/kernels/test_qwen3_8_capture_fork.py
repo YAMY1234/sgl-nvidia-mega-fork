@@ -35,6 +35,8 @@ def test_side_stream_depends_on_the_projection_only():
     main, alt = torch.cuda.Stream(), torch.cuda.Stream()
     with torch.cuda.stream(main):
         assert capture_fork.projection_frontier(main) is None  # not capturing
+        x @ w.T  # cuBLAS initializes its handle outside the capture
+    main.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=main):
         current = torch.cuda.current_stream()

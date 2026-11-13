@@ -85,7 +85,8 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # split-K at 4-16 and 20-32 rows, the shared expert's fused act and TGV down_proj
 # The tuning-pin tables are on when their files are set, as in the source, not by slot:
 # SGLANG_FLASHINFER_TACTIC_PIN_FILE (runtime/flashinfer_tactic_pins.py) and
-# SGLANG_BF16_GEMM_PIN_FILE (runtime/bf16_gemm_pins.py).
+# SGLANG_BF16_GEMM_PIN_FILE (runtime/bf16_gemm_pins.py); likewise the SM107 small-M BF16
+# routes with SGLANG_OPT_SM107_BF16_SMALLM_ROUTES=1 (runtime/sm107_bf16_smallm.py).
 # qsa_draft: the MTP draft's QSA glue (runtime/qsa_draft.py): a draft decode step's
 # lookup of the draft extend's selection inside the K/V pack, and the draft extend's
 # seed capture as one launch
@@ -606,8 +607,13 @@ def _build_moe_finalize(model, decompose) -> bool:
 
 
 def _build_pins(model, executor) -> None:
-    """The tuning-pin tables whose files are set (each agreed on every rank)."""
-    from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins, flashinfer_tactic_pins
+    """The tuning-pin tables whose files are set and the SM107 small-M BF16 routes when
+    their switch is (each agreed on every rank)."""
+    from sgl_nvidia_mega.qwen3_8.runtime import (
+        bf16_gemm_pins,
+        flashinfer_tactic_pins,
+        sm107_bf16_smallm,
+    )
 
     if os.environ.get(flashinfer_tactic_pins.FILE_ENV):
         executor.moe_pins = bool(
@@ -619,6 +625,10 @@ def _build_pins(model, executor) -> None:
         "bf16_gemm_pins", bf16_gemm_pins.build(model, _gemm_call_sites(model)), True
     ):
         bf16_gemm_pins.enable_routes()
+    if sm107_bf16_smallm.requested() and _built_options(
+        "sm107_bf16_smallm", sm107_bf16_smallm.build(_gemm_call_sites(model)), True
+    ):
+        sm107_bf16_smallm.enable()
 
 
 def _gemm_call_sites(model) -> dict:

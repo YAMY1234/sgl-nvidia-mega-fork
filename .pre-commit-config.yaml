@@ -1,4 +1,7 @@
 default_stages: [pre-commit, pre-push, manual]
+# Vendored byte for byte: runtime/sm107_bf16_smallm.py installs its routes only against
+# this file's SHA-256.
+exclude: ^sgl_nvidia_mega/qwen3_8/kernels/ops/gemm/dense_bf16_gemm_sm100_splitk\.py$
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

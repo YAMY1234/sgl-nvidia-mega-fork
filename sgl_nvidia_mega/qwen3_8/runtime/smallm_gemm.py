@@ -7,9 +7,10 @@
 # _prepared, fused_act, precompile) and python/sglang/srt/models/qwen2_moe.py
 # (Qwen2MoeMLP.forward with its TGV down_proj).
 # Changed: the environment switches are ``Options``. The routes serve the executor's
-# own projection calls, not SGLang's BF16 dispatch, so the source's bitwise route
-# table under them is not needed. The split-K runs on this package's copy of the
-# kernel at its own K tile, and the static eligibility checks run once, at build.
+# own projection calls, not SGLang's BF16 dispatch; the source's bitwise route table
+# under them is runtime/sm107_bf16_smallm.py, on its own switch, which this slot does
+# not wait for. The split-K runs on SGLang's epilogue copy of the kernel at its own K
+# tile, and the static eligibility checks run once, at build.
 """Small-M BF16 GEMMs of a covered step on SM107 at TP1 (slot ``smallm_gemm``).
 
 ``out_proj``: the GDN out_proj and the attention o_proj (N 2560, K 6144) at 4-16 and

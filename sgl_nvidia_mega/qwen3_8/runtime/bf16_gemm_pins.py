@@ -12,7 +12,9 @@
 # Changed: the file comes from the environment directly, with an optional SHA-256 check.
 # The source serves the pins inside SGLang's BF16 dispatch, lm_head GEMM and HC mix;
 # here the executor launches those GEMMs itself (``linear``, ``in_proj``, ``mlp``,
-# ``logits_processor``, ``gated_mix``) where SGLang would have run them, at TP1.
+# ``logits_processor``, ``gated_mix``) where SGLang would have run them, at TP1. Where
+# no pin serves a ``linear`` or ``in_proj`` call, runtime/sm107_bf16_smallm.py's route
+# may, as the source's dispatch consults those routes after its pins.
 """Pinned kernels for unquantized BF16 GEMMs at listed (M, N, K) (default off).
 
 ``SGLANG_BF16_GEMM_PIN_FILE`` names a JSON file (``.json.py`` so a source overlay can
@@ -55,7 +57,7 @@ from typing import Callable, Optional
 
 import torch
 
-from sgl_nvidia_mega.qwen3_8.runtime import flashinfer_tactic_pins
+from sgl_nvidia_mega.qwen3_8.runtime import flashinfer_tactic_pins, sm107_bf16_smallm
 
 logger = logging.getLogger(__name__)
 
@@ -396,7 +398,9 @@ def _reaches_dispatch(module, x: torch.Tensor) -> bool:
 
 
 def routed() -> bool:
-    return _routed
+    """Whether the executor's projection calls go through ``linear`` / ``in_proj``: pins
+    or the SM107 small-M routes on."""
+    return _routed or sm107_bf16_smallm.served()
 
 
 def enable_routes() -> None:
@@ -405,12 +409,21 @@ def enable_routes() -> None:
     _routed = True
 
 
+def _dispatch(x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
+    """The source's ``_bf16_gemm_dispatch_impl`` order: a pin, then an SM107 small-M
+    route; None leaves the call to SGLang's dispatch."""
+    out = gemm(x, weight, _stock) if _routed else None
+    if out is None and sm107_bf16_smallm.served():
+        out = sm107_bf16_smallm.gemm(x, weight)
+    return out
+
+
 def linear(module, x: torch.Tensor) -> torch.Tensor:
     """``module(x)[0]`` for an executor's TP1 projection call, its GEMM on the pinned
-    kernel where one serves this (M, N, K) and SGLang's linear method would have run
-    its BF16 dispatch."""
-    if _routed and _reaches_dispatch(module, x):
-        out = gemm(x, module.weight, _stock)
+    kernel or the SM107 small-M route where one serves this (M, N, K) and SGLang's
+    linear method would have run its BF16 dispatch."""
+    if routed() and _reaches_dispatch(module, x):
+        out = _dispatch(x, module.weight)
         if out is not None:
             return out
     return module(x)[0]
@@ -418,14 +431,15 @@ def linear(module, x: torch.Tensor) -> torch.Tensor:
 
 def in_proj(gdn, x: torch.Tensor):
     """``gdn._forward_input_proj(x)``, its packed (qkvz | ba) GEMM on the pinned kernel
-    where one serves (the CUDA branch that runs it through ``bf16_gemm_dispatch``)."""
+    or the SM107 small-M route where one serves (the CUDA branch that runs it through
+    ``bf16_gemm_dispatch``)."""
     if (
-        _routed
+        routed()
         and gdn._fused_in_proj_weight is not None
         and x.dtype == torch.bfloat16
         and x.shape[0] <= _PACKED_IN_PROJ_MAX_ROWS
     ):
-        out = gemm(x, gdn._fused_in_proj_weight, _stock)
+        out = _dispatch(x, gdn._fused_in_proj_weight)
         if out is not None:
             split = gdn._fused_in_proj_qkvz_width
             return out[:, :split], out[:, split:]

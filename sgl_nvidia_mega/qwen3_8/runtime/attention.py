@@ -11,7 +11,8 @@ over the selected blocks (and the request's own uncompressed tail) and the merge
 also applies the sigmoid output gate. With the source's Q38_ATTN_CORE_V1=1, a
 one-request verify (4 rows) in a CUDA graph runs the source's tcgen05 core instead
 (``kernels/ops/attention/qsa_tcgen05_v1.py``): the new K/V store, the 33 fixed 64-token
-tile partials and their merge.
+tile partials and their merge, which applies the output gate where the source hands it
+over (Q38_ATTN_GATE_V2 or SGLANG_ENABLE_QSA_POOL_MERGE_GATE).
 
 Slot ``qsa_pool_fp8``: a TP1 target verify of 56-576 rows (14-144 requests x 4) on an FP8
 E4M3 KV pool runs it as the union kernels (``qsa/pool_union_ws.py``): the new BF16 K/V
@@ -67,6 +68,10 @@ INDEX_QK_SHAPE = (640, 2560)
 # Q38_ATTN_CORE_V1 (qwen_sparse_attn_backend.py, exactly "1"): a one-request verify on a
 # BF16 pool runs the tcgen05 core before the pool kernels (slot qsa_pool)
 ATTN_CORE_V1 = os.environ.get("Q38_ATTN_CORE_V1", "0") == "1"
+# Q38_ATTN_GATE_V2 (a 4-row verify) or SGLANG_ENABLE_QSA_POOL_MERGE_GATE (any verify): the
+# source hands the output gate to the attention, whose tcgen05 core merge applies it
+ATTN_GATE_V2 = _env_bool("Q38_ATTN_GATE_V2")
+POOL_MERGE_GATE = _env_bool("SGLANG_ENABLE_QSA_POOL_MERGE_GATE")
 # Test only: on eager steps, also run SGLang's attention on the same q/k/v and selected
 # indices and log how far the pool kernel's output is from it, per row.
 OPCHECK = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_OPCHECK") == "1"
@@ -649,7 +654,8 @@ def _verify_pool(executor, layer, backend, q, k, v, gate, indices, st):
 def _verify_core(executor, layer, backend, q, k, v, gate, indices, st):
     """The source's tcgen05 core (Q38_ATTN_CORE_V1) on a one-request TP1 verify in a
     CUDA graph on a BF16 pool, under its ``_fused_kv_prefix`` and core gates, or None
-    (nothing launched); SGLang's output gate follows."""
+    (nothing launched). Its merge applies the output gate where the source passes it
+    (``q38_output_gate``), else SGLang's gate follows."""
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
     fb = st.fb
@@ -693,6 +699,7 @@ def _verify_core(executor, layer, backend, q, k, v, gate, indices, st):
     if any(t.stride(1) != HEAD_DIM or t.stride(2) != 1 for t in (new_k, new_v)):
         return None
     query_positions = indexer.decode_logical_positions
+    gated = gate is not None and (ATTN_GATE_V2 or POOL_MERGE_GATE)
     kv = backend.token_to_kv_pool.layer_router.read(layer.attn.layer_id)
     out = executor.qsa_core.run(
         q=q.reshape(rows, QUERY_HEADS, HEAD_DIM),
@@ -707,10 +714,11 @@ def _verify_core(executor, layer, backend, q, k, v, gate, indices, st):
         sequence_lengths=md.sequence_lengths,
         query_positions=query_positions,
         scale=layer.attn.scaling,
+        gate=gate if gated else None,
     )
     out = out.reshape(rows, QUERY_HEADS * HEAD_DIM)
-    impl = "tcgen05_v1"
-    if gate is not None:
+    impl = "tcgen05_gate_v2" if gated else "tcgen05_v1"
+    if gate is not None and not gated:
         out = fused_sigmoid_mul(out, gate, inplace=True)
     if OPCHECK and not torch.cuda.is_current_stream_capturing():
         _opcheck(layer, q, k, v, fb, indices, gate, out, md, query_positions, impl)
@@ -911,19 +919,27 @@ class PoolKernels:
 
 class CoreKernels:
     """The source's TP1 tcgen05 attention of a one-request (4-row) verify on a BF16 pool
-    (Q38_ATTN_CORE_V1): the new K/V store, the tile partials and the merge."""
+    (Q38_ATTN_CORE_V1): the new K/V store, the tile partials and the merge; with a
+    ``gate``, the gate epilogue merge (``qsa_gate_epilogue_v2``) applies it."""
 
     def run(
         self, *, q, key_cache, value_cache, new_k, new_v, locations, slot_map,
-        row_requests, indices, sequence_lengths, query_positions, scale
+        row_requests, indices, sequence_lengths, query_positions, scale, gate=None
     ):
         """[4, QUERY_HEADS, HEAD_DIM] in q's dtype."""
-        from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import qsa_tcgen05_v1
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import (
+            qsa_gate_epilogue_v2,
+            qsa_tcgen05_v1,
+        )
 
-        return qsa_tcgen05_v1.run(
+        args = (
             q, key_cache, value_cache, new_k, new_v, locations, slot_map, row_requests,
-            indices, sequence_lengths, query_positions, scale, width=4,
-            store_new_kv=True,
+            indices, sequence_lengths, query_positions, scale,
+        )
+        if gate is None:
+            return qsa_tcgen05_v1.run(*args, width=4, store_new_kv=True)
+        return qsa_gate_epilogue_v2.run_gated(
+            *args, gate, width=4, store_new_kv=True, wait_primary=False
         )
 
 

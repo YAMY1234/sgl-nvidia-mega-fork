@@ -1220,11 +1220,13 @@ class TestQsaCore(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     def run_core(self, rows=4, *, core=True, topk=1, draft=4, mode=_Mode.TARGET_VERIFY,
-                 loc=None, blocks=512, k=None, v=None, backend=None):
+                 loc=None, blocks=512, k=None, v=None, backend=None, gate_v2=False,
+                 merge_gate=False):
         from sgl_nvidia_mega.qwen3_8.runtime import attention
 
         calls = []
         qkv = torch.zeros(rows, 13312, dtype=torch.bfloat16)
+        self.gate = torch.zeros(rows, 24 * 256)
         layer = SimpleNamespace(
             is_qsa=True,
             alt_stream=None,
@@ -1233,7 +1235,7 @@ class TestQsaCore(unittest.TestCase):
                 torch.zeros(rows, 24 * 256, dtype=torch.bfloat16),
                 torch.zeros(rows, 2 * 256, dtype=torch.bfloat16) if k is None else k,
                 qkv[:, -512:] if v is None else v,  # the QKV's strided V view
-                torch.zeros(rows, 24 * 256),
+                self.gate,
             ),
             _compute_qsa_topk_indices=lambda x, positions, fb: torch.zeros(
                 rows, blocks, dtype=torch.int64
@@ -1255,7 +1257,11 @@ class TestQsaCore(unittest.TestCase):
         st.fb.req_pool_indices = torch.zeros(rows // 4)
         st.fb.out_cache_loc = torch.arange(rows) + 1 if loc is None else loc
         backend = backend or _core_backend(rows)
-        with mock.patch.object(attention, "sparse_backend", lambda: backend):
+        with (
+            mock.patch.object(attention, "sparse_backend", lambda: backend),
+            mock.patch.object(attention, "ATTN_GATE_V2", gate_v2),
+            mock.patch.object(attention, "POOL_MERGE_GATE", merge_gate),
+        ):
             out = attention.step(ex, layer, torch.zeros(rows, 8), st)
         impl = [i for op, i in st.ran_ops if op == "qsa"]
         return impl, out, ex, calls, backend, st
@@ -1281,7 +1287,7 @@ class TestQsaCore(unittest.TestCase):
             kw["query_positions"], backend.md.indexer_metadata.decode_logical_positions
         )
         self.assertEqual((kw["slot_map"], kw["scale"]), ("req_to_token", 0.0625))
-        self.assertNotIn("gate", kw)
+        self.assertIsNone(kw["gate"])
         # SGLang's gate on the core's output, then o_proj on the gated rows
         self.assertEqual(self.gated, [9.0])
         self.assertTrue(torch.equal(out, torch.full((4, 24 * 256), 10.0)))
@@ -1289,6 +1295,20 @@ class TestQsaCore(unittest.TestCase):
         # request, which a 4-row verify does not match: nothing launched
         impl, _, ex, _, _, _ = self.run_core(backend=_core_backend(requests=False))
         self.assertEqual((impl, ex.qsa_core.seen), (["stock"], []))
+
+    def test_gate_in_the_merge(self):
+        """Q38_ATTN_GATE_V2, or SGLANG_ENABLE_QSA_POOL_MERGE_GATE, hands the gate to the
+        core: its epilogue merge applies it and nothing gates after it."""
+        for kw in (dict(gate_v2=True), dict(merge_gate=True), dict(gate_v2=True, merge_gate=True)):
+            self.gated.clear()
+            impl, out, ex, _, _, _ = self.run_core(**kw)
+            self.assertEqual(impl, ["tcgen05_gate_v2"], kw)
+            self.assertIs(ex.qsa_core.seen[0]["gate"], self.gate)
+            self.assertEqual(self.gated, [], kw)
+            self.assertTrue(torch.equal(out, torch.full((4, 24 * 256), 9.0)))
+        # the pool kernels keep their own merge gate
+        impl, _, ex, _, _, _ = self.run_core(rows=8, gate_v2=True)
+        self.assertEqual((impl, len(ex.qsa_pool.seen)), (["pool_splitk"], 1))
 
     def test_other_steps_keep_the_pool_kernels(self):
         strided_k = torch.zeros(4, 2, 512, dtype=torch.bfloat16)[:, :, :256]
@@ -1320,10 +1340,16 @@ class TestQsaCore(unittest.TestCase):
         names = ("q", "key_cache", "value_cache", "new_k", "new_v", "locations",
                  "slot_map", "row_requests", "indices", "sequence_lengths",
                  "query_positions", "scale")
-        with mock.patch.object(qsa_tcgen05_v1, "run", lambda *a, **kw: (a, kw)) as _:
+        with mock.patch.object(qsa_tcgen05_v1, "run", lambda *a, **kw: (a, kw)):
             args, kw = attention.CoreKernels().run(**{n: n for n in names})
         self.assertEqual(args, names)
         self.assertEqual(kw, dict(width=4, store_new_kv=True))
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import qsa_gate_epilogue_v2
+
+        with mock.patch.object(qsa_gate_epilogue_v2, "run_gated", lambda *a, **kw: (a, kw)):
+            args, kw = attention.CoreKernels().run(**{n: n for n in names}, gate="gate")
+        self.assertEqual(args, names + ("gate",))
+        self.assertEqual(kw, dict(width=4, store_new_kv=True, wait_primary=False))
 
     def test_build(self):
         from sgl_nvidia_mega.qwen3_8.runtime import attention

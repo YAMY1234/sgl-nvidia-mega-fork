@@ -96,3 +96,20 @@ def test_core_tolerance_and_store(seed, record_property):
     )
     torch.cuda.synchronize()
     _check(pool.float() * 2, ref, record_property, "pool")  # gate 0: sigmoid 1/2
+
+
+@pytest.mark.parametrize("seed", [1, 2])
+def test_gate_epilogue_gates_the_bf16_core_output(seed):
+    """Q38_ATTN_GATE_V2's merge: the core's BF16 output times sigmoid(gate) in FP32,
+    within one BF16 rounding of torch's (the sigmoid is Triton's)."""
+    q, k, v, nk, nv, table, req, positions, loc, idx = _case(seed)
+    g = torch.Generator(device="cuda").manual_seed(seed + 10)
+    gate = torch.randn(4, 24 * 256, generator=g, device="cuda").bfloat16()
+    case = (q, nk, nv, table, req, positions, loc, idx)
+    run = lambda **kw: CoreKernels().run(
+        **_args(case[0], k.clone(), v.clone(), *case[1:]), **kw
+    )
+    plain, gated = run(), run(gate=gate)
+    torch.cuda.synchronize()
+    want = plain.float() * torch.sigmoid(gate.view(4, 24, 256).float())
+    torch.testing.assert_close(gated, want.bfloat16())  # BF16 tolerances

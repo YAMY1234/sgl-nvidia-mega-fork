@@ -235,6 +235,34 @@ class TestOptions(unittest.TestCase):
         self.assertEqual({tactics[m] for m in range(9, 17)}, {(64, 16, 4, 10)})
         self.assertEqual({tactics[m] for m in MID}, {(64, 32, 4, 8)})
 
+    def test_recipe_switches_with_the_source_gating(self):
+        envs = {
+            "SGLANG_OPT_SM107_BF16_SMALLM_ROUTES": "1",
+            sg.NONBITWISE_LOWM_ENV: "1",
+            sg.NONBITWISE_ENV: "1",
+            sg.FUSED_ACT_ENV: "1",
+            sg.DOWN_TGV_ENV: "1",
+        }
+        with mock.patch.dict("os.environ", envs, clear=False):
+            self.assertEqual(sg.recipe_options(), sg.DEFAULT)
+        # the source's defaults: everything off
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(
+                sg.recipe_options(),
+                sg.Options(
+                    out_proj_low_m=(),
+                    out_proj_mid_m=(),
+                    shared_fused_act=False,
+                    shared_down_tgv_rows=(),
+                ),
+            )
+        # the non-bitwise routes and the fused act need the bitwise routes on
+        off = dict(envs, SGLANG_OPT_SM107_BF16_SMALLM_ROUTES="0")
+        with mock.patch.dict("os.environ", off, clear=True):
+            o = sg.recipe_options()
+        self.assertEqual((o.out_proj_low_m, o.out_proj_mid_m, o.shared_fused_act), ((), (), False))
+        self.assertEqual(o.shared_down_tgv_rows, (4, 8, 16))
+
     def test_overlapping_ranges_are_refused(self):
         with self.assertRaises(ValueError):
             sg.Options(out_proj_mid_m=(((16, 32), (64, 32, 4, 8)),))

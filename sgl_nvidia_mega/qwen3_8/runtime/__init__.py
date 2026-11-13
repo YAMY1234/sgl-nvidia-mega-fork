@@ -368,8 +368,9 @@ def build(model, hf_config, ctx):
     if "smallm_gemm" in slots:
         from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
 
+        options = smallm_gemm.recipe_options()
         executor.smallm_gemm = _built_options(
-            "smallm_gemm", smallm_gemm.build(model), smallm_gemm.DEFAULT
+            "smallm_gemm", smallm_gemm.build(model, options), options
         )
     _build_pins(model, executor)
     if not draft and executor.moe_finalize_ready:

@@ -111,16 +111,14 @@ def config_reasons(cfg, hf_config) -> list[str]:
                 f"the GDN u-cache: a verify of {running} requests x "
                 f"{tokens} rows exceeds the executor's {MAX_ROWS} rows"
             )
+    return reasons
+
+
+def prefill_graphs_enabled(cfg) -> bool:
+    """Whether SGLang captures prefill CUDA graphs (then its own forward runs prefill)."""
     graph = getattr(cfg, "cuda_graph_config", None)
     prefill = getattr(getattr(graph, "prefill", None), "backend", None)
-    if prefill is not None and str(prefill) not in ("disabled", "Backend.DISABLED"):
-        # A covered prefill runs eagerly (spec.Step); breakable prefill graphs
-        # would capture it.
-        reasons.append(
-            f"prefill CUDA graphs {str(prefill)!r} are not supported by the "
-            "Qwen3.8 executor; use --cuda-graph-backend-prefill disabled"
-        )
-    return reasons
+    return prefill is not None and str(prefill) not in ("disabled", "Backend.DISABLED")
 
 
 def model_reasons(model, hf_config) -> list[str]:
@@ -170,9 +168,11 @@ def build(model, hf_config, ctx):
         parity=checker,
         decompose=decompose,
     )
-    if not draft:
-        from sglang.srt.runtime_context import get_exec
+    from sglang.srt.runtime_context import get_exec
 
+    # Prefill graphs capture SGLang's forward, so the executor leaves prefill to it.
+    executor.prefill_graphs = prefill_graphs_enabled(get_exec().graph)
+    if not draft:
         mamba = getattr(get_exec(), "mamba", None)
         executor.verify_required = own_ucache
     if own_ucache:

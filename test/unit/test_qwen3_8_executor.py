@@ -123,6 +123,11 @@ class TestPlan(unittest.TestCase):
         self.assertIsNone(self.plan(ex, _Mode.TARGET_VERIFY, 8, unknown=1))
         _STATE["breakable"] = True
         self.assertIsNone(self.plan(ex, _Mode.EXTEND, 64))
+        _STATE["breakable"] = False
+        ex.prefill_graphs = True  # SGLang's prefill graphs run its own forward
+        self.assertIsNone(self.plan(ex, _Mode.EXTEND, 64))
+        self.assertEqual(self.plan(ex, _Mode.TARGET_VERIFY, 8), ("target_verify", 8))
+        ex.prefill_graphs = False
         _STATE.update(breakable=False, cp=True)
         self.assertIsNone(self.plan(ex, _Mode.EXTEND, 64))
 
@@ -241,13 +246,14 @@ class TestStepFallbacks(unittest.TestCase):
 
 
 class TestReasons(unittest.TestCase):
-    def test_prefill_graphs_refused(self):
+    def test_prefill_graphs_allowed(self):
         cfg = SimpleNamespace(
             cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(backend="breakable"))
         )
-        self.assertTrue(runtime.config_reasons(cfg, None))
-        cfg.cuda_graph_config.prefill.backend = "disabled"
         self.assertEqual(runtime.config_reasons(cfg, None), [])
+        self.assertTrue(runtime.prefill_graphs_enabled(cfg))
+        cfg.cuda_graph_config.prefill.backend = "disabled"
+        self.assertFalse(runtime.prefill_graphs_enabled(cfg))
 
     def test_model_reasons(self):
         pp = SimpleNamespace(is_first_rank=True, is_last_rank=False)

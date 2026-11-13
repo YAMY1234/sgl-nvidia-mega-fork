@@ -154,6 +154,8 @@ class Qwen3_8Executor:
         self.moe_routing = None
         # set by build when SGLang cannot run a target verify itself (u-cache pools)
         self.verify_required = False
+        # set by build when SGLang captures prefill graphs: prefill then runs stock
+        self.prefill_graphs = False
         # the u-cache verify (gdn_ucache.UcacheVerify), set by prepare_ucache
         self.gdn_ucache = None
         # the plugin's own u-cache rings (gdn_ucache_state.UcacheState), set by build
@@ -212,7 +214,7 @@ class Qwen3_8Executor:
         elif mode.is_draft_extend_v2():
             name = "draft_extend" if self.draft else None
         elif mode.is_extend_or_draft_extend_or_mixed():
-            if is_in_breakable_cuda_graph():
+            if self.prefill_graphs or is_in_breakable_cuda_graph():
                 return None
             return Step(mode="prefill", rows=rows)
         else:

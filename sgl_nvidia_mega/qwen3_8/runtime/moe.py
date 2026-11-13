@@ -17,7 +17,7 @@ import contextlib
 
 import torch
 
-from sgl_nvidia_mega.qwen3_8.runtime import moe_routing
+from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins, moe_routing
 
 STOCK = "stock"
 MAX_ROWS = 1024
@@ -32,7 +32,13 @@ SGLANG_READS = {
         "supports_deferred_finalize",
         "shared_expert_gate",
         "alt_stream",
+        "TopKOutputChecker",
+        "gate",
+        "topk",
+        "experts",
     ),
+    "srt/layers/moe/topk.py": ("format_is_bypassed",),
+    "srt/layers/moe/fused_moe_triton/layer.py": ("forward_deferred_finalize",),
     "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
     "srt/layers/moe/moe_runner/flashinfer_trtllm.py": (
         "gemm2_out",
@@ -40,6 +46,13 @@ SGLANG_READS = {
         "expert_weights",
         "top_k",
     ),
+}
+
+
+# With BF16 pins on, _router_experts and _shared_experts mirror these
+SGLANG_MIRRORS = {
+    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_router_experts": "251e3d343aec92fe",
+    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_shared_experts": "3b55a78638831ffa",
 }
 
 
@@ -101,11 +114,11 @@ def step(executor, layer, x, st):
     # slot moe_routing: None when it does not take these rows
     deferred = moe_routing.routed(executor, mlp, x, st)
     if deferred is None:
-        deferred = mlp._forward_router_experts(x, defer_finalize=True)
+        deferred = _router_experts(mlp, x)
     with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
         shared = smallm_gemm.shared_expert(executor, mlp.shared_expert, x, st)
         if shared is None:
-            shared = mlp._forward_shared_experts(x, apply_gate=False)
+            shared = _shared_experts(mlp, x)
         shared = shared.contiguous()
     if side is not None:
         shared.record_stream(current)
@@ -134,3 +147,32 @@ def step(executor, layer, x, st):
     )
     st.ran("moe", "finalize_permuted")
     return out
+
+
+def _router_experts(mlp, x):
+    """``mlp._forward_router_experts(x, defer_finalize=True)``; with BF16 pins on, here
+    with the router GEMM through ``bf16_gemm_pins``."""
+    if not bf16_gemm_pins.routed():
+        return mlp._forward_router_experts(x, defer_finalize=True)
+    from sglang.srt.models.qwen2_moe import TopKOutputChecker
+
+    router_logits = bf16_gemm_pins.linear(mlp.gate, x)
+    topk_output = mlp.topk(x, router_logits)
+    if not mlp.supports_deferred_finalize:
+        raise RuntimeError(
+            "Qwen deferred finalize requires a compatible FlashInfer "
+            "TRTLLM MoE producer and a separate shared expert"
+        )
+    if not TopKOutputChecker.format_is_bypassed(topk_output):
+        raise RuntimeError("Qwen deferred finalize requires logits-based bypassed TopK")
+    return mlp.experts.forward_deferred_finalize(x, topk_output)
+
+
+def _shared_experts(mlp, x):
+    """``mlp._forward_shared_experts(x, apply_gate=False)``; with BF16 pins on, the
+    shared expert's projections through ``bf16_gemm_pins``."""
+    if not bf16_gemm_pins.routed():
+        return mlp._forward_shared_experts(x, apply_gate=False)
+    if mlp.shared_expert is None:
+        return None
+    return bf16_gemm_pins.mlp(mlp.shared_expert, x)

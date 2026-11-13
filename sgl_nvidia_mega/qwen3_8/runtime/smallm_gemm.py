@@ -53,6 +53,8 @@ from typing import Callable, Optional
 
 import torch
 
+from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins
+
 logger = logging.getLogger(__name__)
 
 OUT_PROJ = (2560, 6144)  # (N, K): the GDN out_proj and the attention o_proj
@@ -537,7 +539,7 @@ def shared_expert(executor, mlp, x: torch.Tensor, st) -> Optional[torch.Tensor]:
         return None
     impl = []
     if act is None:
-        gate_up, _ = mlp.gate_up_proj(x)
+        gate_up = bf16_gemm_pins.linear(mlp.gate_up_proj, x)
         act = mlp.act_fn(gate_up)
     else:
         impl.append("act_splitk")
@@ -545,6 +547,6 @@ def shared_expert(executor, mlp, x: torch.Tensor, st) -> Optional[torch.Tensor]:
         out = _k.tgv(act, mlp.down_proj.weight)
         impl.append("down_tgv")
     else:
-        out, _ = mlp.down_proj(act)
+        out = bf16_gemm_pins.linear(mlp.down_proj, act)
     st.ran("moe.shared_expert", "+".join(impl))
     return out

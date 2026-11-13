@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import torch
 
+from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins
+
 STOCK = "stock"
 # slot gdn_verify_glue: 2-8 requests of 4 rows; one program per (request, value head)
 GLUE_MAX_ROWS = 32
@@ -48,6 +50,18 @@ SGLANG_READS = {
         "norm",
         "out_proj",
         "attn",
+        "forward",
+        "_gdn_decode_fused_proj_conv",
+        "_is_xpu",
+        "_is_cpu",
+        "_is_cuda",
+        "_GDN_FUSED_QKVZBA_RATIOS",
+        "_fp8_tuple_input",
+        "_layer_norm_fwd",
+        "get_exec",
+        "fix_query_key_value_ordering",
+        "qwen3_5_gdn_prefill_projection_views",
+        "fused_qkvzba_split_reshape_cat_contiguous",
     ),
     "kernels/ops/attention/fla/layernorm_gated.py": (
         "group_size",
@@ -114,6 +128,11 @@ SGLANG_READS = {
         "select_verify_intermediate_state_indices",
         "pp_spec_stable_rows_enabled",
     ),
+}
+
+# forward mirrors GatedDeltaNet.forward when BF16 pins are on
+SGLANG_MIRRORS = {
+    "srt/models/qwen3_5.py:Qwen3_5GatedDeltaNet.forward": "ff40a6653f83b8b6",
 }
 
 
@@ -184,8 +203,138 @@ def step(executor, layer, x, st):
             return out
     if not (executor.gdn_pdl_ready and fb.forward_mode.is_target_verify()):
         st.ran("gdn", STOCK)
+        if bf16_gemm_pins.routed():
+            return forward(layer.linear_attn, x, fb)
         return layer.linear_attn(x, fb)
     return _verify(executor, layer.linear_attn, x, st)
+
+
+def forward(gdn, hidden_states, forward_batch):
+    """``Qwen3_5GatedDeltaNet.forward`` with its input and output projections through
+    ``bf16_gemm_pins`` (the stock GDN step with BF16 pins on)."""
+    import triton
+    from sglang.srt.models.qwen3_5 import (
+        _GDN_FUSED_QKVZBA_RATIOS,
+        _fp8_tuple_input,
+        _gdn_decode_fused_proj_conv,
+        _is_cpu,
+        _is_cuda,
+        _is_xpu,
+        _layer_norm_fwd,
+        fused_qkvzba_split_reshape_cat_contiguous,
+        get_exec,
+        qwen3_5_gdn_prefill_projection_views,
+    )
+
+    projected_states_qkvz, projected_states_ba = bf16_gemm_pins.in_proj(
+        gdn, hidden_states
+    )
+
+    use_strided_prefill_z = False
+    packed_verify = False
+    if forward_batch.forward_mode.is_target_verify():
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        packed_verify = getattr(backend, "supports_packed_verify", False)
+    use_fused_proj_conv = (
+        _gdn_decode_fused_proj_conv
+        and not (
+            _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu"
+        )
+        and (forward_batch.forward_mode.is_decode() or packed_verify)
+        and isinstance(projected_states_qkvz, torch.Tensor)
+        and isinstance(projected_states_ba, torch.Tensor)
+    )
+    use_fused_contiguous_unpack = (
+        gdn.num_v_heads // gdn.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
+    )
+    if use_fused_proj_conv:
+        mixed_qkv = (projected_states_qkvz, projected_states_ba)
+        z = None
+        b = projected_states_ba
+        a = projected_states_ba
+    elif use_fused_contiguous_unpack:
+        if _is_cpu:
+            num_k_heads_tp = gdn.num_k_heads // gdn.attn_tp_size
+            num_v_heads_tp = gdn.num_v_heads // gdn.attn_tp_size
+        else:
+            num_k_heads_tp = triton.cdiv(gdn.num_k_heads, gdn.attn_tp_size)
+            num_v_heads_tp = triton.cdiv(gdn.num_v_heads, gdn.attn_tp_size)
+        use_strided_prefill_z = (
+            _is_cuda
+            and forward_batch.logical_forward_mode.is_extend_without_speculative()
+        )
+        split_fn = (
+            qwen3_5_gdn_prefill_projection_views
+            if use_strided_prefill_z
+            else fused_qkvzba_split_reshape_cat_contiguous
+        )
+        mixed_qkv, z, b, a = split_fn(
+            projected_states_qkvz,
+            projected_states_ba,
+            num_k_heads_tp,
+            num_v_heads_tp,
+            gdn.head_k_dim,
+            gdn.head_v_dim,
+        )
+    else:
+        query, key, value, z, b, a = gdn.fix_query_key_value_ordering(
+            projected_states_qkvz, projected_states_ba
+        )
+        b = b.contiguous()
+        a = a.contiguous()
+        query, key, value = map(
+            lambda x: x.reshape(x.shape[0], -1), (query, key, value)
+        )
+        mixed_qkv = torch.cat((query, key, value), dim=-1)
+
+    attn_result = gdn.attn(forward_batch, mixed_qkv=mixed_qkv, a=a, b=b)
+    if use_fused_proj_conv:
+        if not isinstance(attn_result, tuple) or len(attn_result) != 2:
+            raise RuntimeError(
+                "Fused GDN projection/Conv1D backend must return (core_attn_out, z)"
+            )
+        core_attn_out, z = attn_result
+    else:
+        core_attn_out = attn_result
+    assert z is not None
+
+    z_shape_og = z.shape
+    core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+    if use_strided_prefill_z:
+        z_flat_shape = (z.numel() // z.shape[-1], z.shape[-1])
+    else:
+        z = z.reshape(-1, z.shape[-1])
+        z_flat_shape = z.shape
+
+    if core_attn_out.shape != z_flat_shape:  # DP-attention padding
+        core_attn_out_pad = z.new_zeros(z_flat_shape)
+        core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
+        core_attn_out = core_attn_out_pad
+
+    nv = gdn.num_v_heads // gdn.attn_tp_size
+    if not use_strided_prefill_z and _fp8_tuple_input(gdn.out_proj, len(z) // nv):
+        fp8, _, _ = _layer_norm_fwd(
+            core_attn_out,
+            gdn.norm.weight,
+            None,
+            gdn.norm.eps,
+            z=z,
+            is_rms_norm=True,
+            activation=gdn.norm.activation,
+            quant_heads=nv,
+        )
+        return gdn.out_proj(fp8)[0]
+
+    core_attn_out = gdn.norm(core_attn_out, z)
+    core_attn_out = core_attn_out.reshape(z_shape_og)
+    core_attn_out = core_attn_out.reshape(
+        *core_attn_out.shape[:-2],
+        core_attn_out.shape[-2] * core_attn_out.shape[-1],
+    )
+    return bf16_gemm_pins.linear(gdn.out_proj, core_attn_out)
 
 
 def glue_reasons(model) -> str:
@@ -366,7 +515,7 @@ def _verify_front(executor, gdn, x, st):
     core = normalized.view(rows, -1)
     out = smallm_gemm.out_proj(executor, gdn.out_proj, core, st, "gdn.out_proj")
     if out is None:
-        out, _ = gdn.out_proj(core)
+        out = bf16_gemm_pins.linear(gdn.out_proj, core)
     return out
 
 
@@ -398,7 +547,7 @@ def _verify_glue(executor, gdn, x, st):
     ):
         return None  # tree verify: the conv walks parent links
     layer = gdn.attn
-    qkvz, ba = gdn._forward_input_proj(x)
+    qkvz, ba = bf16_gemm_pins.in_proj(gdn, x)
     cache = backend.state_layer_cache(layer.layer_id)
     pool = backend.state_pool
     cache_indices = md.mamba_cache_indices
@@ -446,7 +595,7 @@ def _verify_glue(executor, gdn, x, st):
     st.ran("gdn", "verify_glue")
     out = smallm_gemm.out_proj(executor, gdn.out_proj, core, st, "gdn.out_proj")
     if out is None:
-        out, _ = gdn.out_proj(core)
+        out = bf16_gemm_pins.linear(gdn.out_proj, core)
     return out
 
 
@@ -460,7 +609,7 @@ def _verify(executor, gdn, x, st):
     from sgl_nvidia_mega.qwen3_8.runtime import smallm_gemm
 
     fb = st.fb
-    qkvz, ba = gdn._forward_input_proj(x)
+    qkvz, ba = bf16_gemm_pins.in_proj(gdn, x)
     nk = triton.cdiv(gdn.num_k_heads, gdn.attn_tp_size)
     nv = triton.cdiv(gdn.num_v_heads, gdn.attn_tp_size)
     mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
@@ -480,7 +629,7 @@ def _verify(executor, gdn, x, st):
     core = core.reshape(*core.shape[:-2], core.shape[-2] * core.shape[-1])
     out = smallm_gemm.out_proj(executor, gdn.out_proj, core, st, "gdn.out_proj")
     if out is None:
-        out, _ = gdn.out_proj(core)
+        out = bf16_gemm_pins.linear(gdn.out_proj, core)
     return out
 
 

@@ -17,7 +17,8 @@ warp-specialized attention over it (launched with PDL) and the split merge; SGLa
 output gate follows. It replaces SGLang's K/V pack and TRT-LLM decode.
 
 The QKV / gate projection with its norms and RoPE, the indexer (selection) and o_proj
-stay SGLang's. Every other step runs SGLang's ``self_attention``. Numerics: both
+stay SGLang's (with BF16 GEMM pins on, the projection's CUDA branch runs here so
+``qkv_proj`` and ``o_proj`` can take a pin: ``bf16_gemm_pins``). Every other step runs SGLang's ``self_attention``. Numerics: both
 reorder the FP32 softmax reduction against TRT-LLM's sparse decode (the union kernel
 also rescales lazily), tolerance slots; the E4M3 pool bytes are torch's cast.
 
@@ -30,6 +31,8 @@ import logging
 import os
 
 import torch
+
+from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +58,32 @@ SGLANG_READS = {
         "_compute_qsa_topk_indices",
         "self_attention",
         "is_qsa",
+        "_QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD",
+        "_shards_rows_over_cp",
+        "fused_sigmoid_mul",
+        "get_attn_backend",
+        "get_is_capture_mode",
+        "is_in_breakable_cuda_graph",
     ),
-    "srt/models/qwen3_5.py": ("_prepare_qkv_gate", "o_proj"),
+    "srt/models/qwen3_5.py": (
+        "_prepare_qkv_gate",
+        "o_proj",
+        "attn_output_gate",
+        "qkv_proj",
+        "q_size",
+        "kv_size",
+        "q_norm",
+        "k_norm",
+        "rotary_emb",
+        "num_heads",
+        "num_kv_heads",
+        "head_dim",
+        "alt_stream",
+        "attn",
+    ),
+    "kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py": (
+        "fused_qk_gemma_rmsnorm_rope_gate",
+    ),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "kernels/ops/elementwise/elementwise.py": ("fused_sigmoid_mul",),
     "srt/layers/attention/qsa/glue.py": ("resolve_qsa_sparse_backend",),
@@ -70,8 +97,17 @@ SGLANG_READS = {
         "decode_logical_positions",
         "req_to_token_pool",
         "token_to_kv_pool",
+        "prefetch_cp_kv",
     ),
     "srt/mem_cache/kv/router.py": ("layer", "read", "key", "value"),
+}
+
+# With BF16 pins on, _self_attention mirrors self_attention and _qkv_gate this branch
+# of _prepare_qkv_gate
+SGLANG_MIRRORS = {
+    "srt/models/qwen4_exp.py:Qwen4ExpAttentionDecoderLayer.self_attention": "e88bd51bae6665bc",
+    "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer._prepare_qkv_gate": "1af0524597d94935",
+    "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer.forward_prepare_cuda_fused": "d10e23f5651990d0",
 }
 
 
@@ -180,7 +216,97 @@ def step(executor, layer, x, st):
         if out is not None:
             return out
     st.ran("qsa", STOCK)
+    if bf16_gemm_pins.routed():
+        return _self_attention(layer, x, st.positions, fb)
     return layer.self_attention(positions=st.positions, hidden_states=x, forward_batch=fb)
+
+
+def _self_attention(layer, hidden_states, positions, forward_batch):
+    """``layer.self_attention`` with ``qkv_proj`` and ``o_proj`` through
+    ``bf16_gemm_pins`` (the stock QSA step with BF16 pins on)."""
+    from sglang.srt.models.qwen4_exp import (
+        _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD,
+        _shards_rows_over_cp,
+        fused_sigmoid_mul,
+        get_attn_backend,
+        get_is_capture_mode,
+        is_in_breakable_cuda_graph,
+    )
+
+    overlap_indexer = (
+        layer.is_qsa
+        and layer.alt_stream is not None
+        and get_is_capture_mode()
+        and not is_in_breakable_cuda_graph()
+        and hidden_states.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
+    )
+    attention_kwargs = {}
+    if overlap_indexer:
+        current_stream = torch.cuda.current_stream()
+        layer.alt_stream.wait_stream(current_stream)
+
+    q, k, v, gate = _qkv_gate(layer, hidden_states, positions, forward_batch)
+
+    if overlap_indexer:
+        with torch.cuda.stream(layer.alt_stream):
+            topk_indices = layer._compute_qsa_topk_indices(
+                hidden_states, positions, forward_batch
+            )
+        current_stream.wait_stream(layer.alt_stream)
+        topk_indices.record_stream(current_stream)
+        attention_kwargs["topk_indices"] = topk_indices
+    elif layer.is_qsa:
+        if _shards_rows_over_cp(forward_batch) and not get_is_capture_mode():
+            from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
+
+            resolve_qsa_sparse_backend(get_attn_backend()).prefetch_cp_kv(
+                layer.attn, k, v, forward_batch
+            )
+        attention_kwargs["topk_indices"] = layer._compute_qsa_topk_indices(
+            hidden_states, positions, forward_batch
+        )
+
+    attn_output = layer.attn(q, k, v, forward_batch, **attention_kwargs)
+    if gate is not None:
+        if attn_output.is_cuda:
+            attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+        else:
+            gate = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+            attn_output = attn_output * torch.sigmoid(gate)
+    return bf16_gemm_pins.linear(layer.o_proj, attn_output)
+
+
+def _qkv_gate(layer, x, positions, fb):
+    """``layer._prepare_qkv_gate``; with BF16 pins on, its CUDA gated branch
+    (``forward_prepare_cuda_fused``) here, so ``qkv_proj`` can take a pin."""
+    if not (bf16_gemm_pins.routed() and x.is_cuda and layer.attn_output_gate):
+        return layer._prepare_qkv_gate(
+            positions=positions, hidden_states=x, forward_batch=fb
+        )
+    from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+        fused_qk_gemma_rmsnorm_rope_gate,
+    )
+
+    qkv = bf16_gemm_pins.linear(layer.qkv_proj, x)
+    q_gate, k, v = qkv.split([layer.q_size * 2, layer.kv_size, layer.kv_size], dim=-1)
+    rope = layer.rotary_emb
+    q_out, k_out, gate_out = fused_qk_gemma_rmsnorm_rope_gate(
+        q_gate,
+        k,
+        layer.q_norm.weight.data,
+        layer.k_norm.weight.data,
+        rope.cos_sin_cache,
+        positions,
+        layer.q_norm.variance_epsilon,
+        layer.num_heads,
+        layer.num_kv_heads,
+        layer.head_dim,
+        rope.rotary_dim,
+        has_gate=True,
+        mrope_axis_map=(rope.axis_map if positions.dim() == 2 else None),
+    )
+    rows = x.shape[0]
+    return q_out.view(rows, -1), k_out.view(rows, -1), v, gate_out.view(rows, -1)
 
 
 def _pool_eligible(executor, fb, rows) -> bool:
@@ -209,9 +335,7 @@ def _decomposed(executor, layer, x, st):
     from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
 
     fb, positions = st.fb, st.positions
-    q, k, v, gate = layer._prepare_qkv_gate(
-        positions=positions, hidden_states=x, forward_batch=fb
-    )
+    q, k, v, gate = _qkv_gate(layer, x, positions, fb)
     if executor.qsa_indexer is not None:
         indices = qsa_indexer.select(executor, layer, x, positions, st)
     else:
@@ -357,7 +481,7 @@ def _finish(executor, layer, attn_out, gate, st, impl):
     st.ran("qsa", impl)
     output = smallm_gemm.out_proj(executor, layer.o_proj, attn_out, st, "qsa.o_proj")
     if output is None:
-        output, _ = layer.o_proj(attn_out)
+        output = bf16_gemm_pins.linear(layer.o_proj, attn_out)
     return output
 
 

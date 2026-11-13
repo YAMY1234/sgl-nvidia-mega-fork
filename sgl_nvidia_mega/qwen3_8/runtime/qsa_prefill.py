@@ -66,6 +66,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins
+
 logger = logging.getLogger(__name__)
 
 STOCK = "stock"
@@ -429,7 +431,7 @@ def qkv_gate(options, layer, x, positions, st):
         fused_qk_rmsnorm_rope_gate_rows as rows,
     )
 
-    qkv, _ = layer.qkv_proj(x)
+    qkv = bf16_gemm_pins.linear(layer.qkv_proj, x)
     q_gate, k, v = qkv.split([layer.q_size * 2, layer.kv_size, layer.kv_size], dim=-1)
     rope = layer.rotary_emb
     mrope = positions.dim() == 2
@@ -1336,5 +1338,4 @@ def finish(layer, attn_output, gate):
 
     if gate is not None:
         attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
-    output, _ = layer.o_proj(attn_output)
-    return output
+    return bf16_gemm_pins.linear(layer.o_proj, attn_output)

@@ -44,6 +44,8 @@ from typing import Optional
 
 import torch
 
+from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins
+
 logger = logging.getLogger(__name__)
 
 SGLANG_READS = {
@@ -928,7 +930,7 @@ def verify(executor, gdn, x, st, view, buffers=None):
         buffers = executor.ucache_state.buffers
     li = pools.layer_ids.index(attn.layer_id)
     tokens = int(fb.spec_info.draft_token_num)
-    qkvz, ba = gdn._forward_input_proj(x)
+    qkvz, ba = bf16_gemm_pins.in_proj(gdn, x)
     nk = triton.cdiv(gdn.num_k_heads, gdn.attn_tp_size)
     nv = triton.cdiv(gdn.num_v_heads, gdn.attn_tp_size)
     # The strided views: no split kernel; the conv reads q|k|v in place.
@@ -1006,7 +1008,7 @@ def verify(executor, gdn, x, st, view, buffers=None):
         # [rows, HV, V], gated and normalized
         core = core.reshape(x.shape[0], -1)
         out = smallm_gemm.out_proj(executor, gdn.out_proj, core, st, "gdn.out_proj")
-        return gdn.out_proj(core)[0] if out is None else out
+        return bf16_gemm_pins.linear(gdn.out_proj, core) if out is None else out
     z_shape = z.shape
     core = core.reshape(-1, core.shape[-1])
     z_flat_shape = (z.numel() // z.shape[-1], z.shape[-1])
@@ -1019,7 +1021,7 @@ def verify(executor, gdn, x, st, view, buffers=None):
     core = core.reshape(*core.shape[:-2], core.shape[-2] * core.shape[-1])
     out = smallm_gemm.out_proj(executor, gdn.out_proj, core, st, "gdn.out_proj")
     if out is None:
-        out, _ = gdn.out_proj(core)
+        out = bf16_gemm_pins.linear(gdn.out_proj, core)
     return out
 
 

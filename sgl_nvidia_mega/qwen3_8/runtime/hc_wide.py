@@ -57,6 +57,8 @@ from typing import Optional
 
 import torch
 
+from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins
+
 STOCK = "stock"
 # The first row count above runtime/hc.py's kernels
 FLOOR_ROWS = 33
@@ -363,7 +365,7 @@ def mix(
     33..``fused_combine_max_rows`` rows the write-back's gate partials are computed
     here on the side stream (``write`` joins it)."""
     if not _per_branch(hc):
-        mixed, (_, normed, own) = hc.mix(streams, normalized_input=normalized)
+        mixed, (_, normed, own) = bf16_gemm_pins.gated_mix(hc, streams, normalized)
         return mixed, normed, partials if partials is not None else own
     normed = normalized if normalized is not None else hc.hc_norm(streams)
     if _gates_beside(hc, normed, partials, limits):
@@ -384,7 +386,7 @@ def mix(
             hc.hidden_size,
         ).to(hc.params_dtype)
         return mixed, normed, partials
-    mixed, (_, _, own) = hc.mix(streams, normalized_input=normed)
+    mixed, (_, _, own) = bf16_gemm_pins.gated_mix(hc, streams, normed)
     # SGLang's mix makes partials (on its own side stream) only for one row
     return mixed, normed, partials if partials is not None else own
 

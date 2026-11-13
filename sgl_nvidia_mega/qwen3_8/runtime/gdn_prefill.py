@@ -60,6 +60,8 @@ from typing import Optional
 
 import torch
 
+from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins
+
 logger = logging.getLogger(__name__)
 
 OP = "gdn"
@@ -390,7 +392,7 @@ def _forward(options, step, gdn, x, fb):
         _layer_norm_fwd,
     )
 
-    qkvz, ba = gdn._forward_input_proj(x)
+    qkvz, ba = bf16_gemm_pins.in_proj(gdn, x)
     mixed_qkv, z, b, a = qwen3_5_gdn_prefill_projection_views(
         qkvz,
         ba,
@@ -420,8 +422,7 @@ def _forward(options, step, gdn, x, fb):
     )
     core = core.reshape(z_shape)
     core = core.reshape(*core.shape[:-2], core.shape[-2] * core.shape[-1])
-    out, _ = gdn.out_proj(core)
-    return out, impl
+    return bf16_gemm_pins.linear(gdn.out_proj, core), impl
 
 
 def _extend_core(options, step, layer, fb, mixed_qkv, a, b):

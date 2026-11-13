@@ -17,7 +17,32 @@ logger = logging.getLogger(__name__)
 SGLANG_READS = {
     "srt/runtime_context.py": ("get_exec", "get_parallel"),
     "srt/kernel_plugins/nvidia/binding.py": ("megakernel_agree",),
-    "srt/models/qwen4_exp.py": ("Qwen4ExpAttentionDecoderLayer",),
+    "srt/models/qwen4_exp.py": (
+        "Qwen4ExpAttentionDecoderLayer",
+        "Qwen4ExpLinearDecoderLayer",
+        "is_qsa",
+        "indexer",
+        "attn_hyper_connection",
+        "mlp_hyper_connection",
+        "hyper_connection_mixer",
+    ),
+    "srt/models/qwen3_vl.py": ("lm_head",),
+    "srt/models/qwen2_moe.py": (
+        "Qwen2MoeSparseMoeBlock",
+        "gate",
+        "shared_expert",
+        "gate_up_proj",
+        "down_proj",
+    ),
+    "srt/layers/hyperconnection.py": ("input_mix_weight_down", "input_mix_weight_up"),
+    "srt/models/qwen3_5.py": (
+        "linear_attn",
+        "_fused_in_proj_weight",
+        "out_proj",
+        "qkv_proj",
+        "o_proj",
+    ),
+    "srt/layers/attention/qsa/qsa_indexer.py": ("index_qk_proj",),
 }
 
 # Comma-separated kernel slots; unset or "" runs every op on its stock step
@@ -48,6 +73,9 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # embedding add needs the S1 layers
 # smallm_gemm: SM107 small-M BF16 GEMMs (runtime/smallm_gemm.py): out_proj / o_proj
 # split-K at 4-16 and 20-32 rows, the shared expert's fused act and TGV down_proj
+# The tuning-pin tables are on when their files are set, as in the source, not by slot:
+# SGLANG_FLASHINFER_TACTIC_PIN_FILE (runtime/flashinfer_tactic_pins.py) and
+# SGLANG_BF16_GEMM_PIN_FILE (runtime/bf16_gemm_pins.py).
 KNOWN_SLOTS: tuple[str, ...] = (
     "hc",
     "hc_wide",
@@ -245,6 +273,7 @@ def build(model, hf_config, ctx):
         executor.smallm_gemm = _built_options(
             "smallm_gemm", smallm_gemm.build(model), smallm_gemm.DEFAULT
         )
+    _build_pins(model, executor)
     logger.info(
         "NVIDIA megakernel: Qwen3.8 %s executor: %s; slots %s; every other op stock",
         "draft" if draft else ("target (own GDN u-cache)" if own_ucache else "target"),
@@ -431,6 +460,60 @@ def _build_moe_finalize(model, decompose) -> bool:
     if reason:
         unavailable("moe_finalize", reason)
     return not reason
+
+
+def _build_pins(model, executor) -> None:
+    """The tuning-pin tables whose files are set (each agreed on every rank)."""
+    from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins, flashinfer_tactic_pins
+
+    if os.environ.get(flashinfer_tactic_pins.FILE_ENV):
+        executor.moe_pins = bool(
+            _built_options(
+                "moe_tactic_pins", flashinfer_tactic_pins.build(model), True
+            )
+        )
+    if os.environ.get(bf16_gemm_pins.FILE_ENV) and _built_options(
+        "bf16_gemm_pins", bf16_gemm_pins.build(model, _gemm_call_sites(model)), True
+    ):
+        bf16_gemm_pins.enable_routes()
+
+
+def _gemm_call_sites(model) -> dict:
+    """(N, K) -> the executor's projection calls of this model with that weight."""
+    from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+    from sglang.srt.models.qwen4_exp import Qwen4ExpLinearDecoderLayer
+
+    sites = {}
+
+    def add(weight, name):
+        if weight is not None:
+            sites.setdefault(tuple(weight.shape), set()).add(name)
+
+    def add_mix(hc):
+        add(hc.input_mix_weight_down.weight, "hc.mix_down")
+        add(hc.input_mix_weight_up.weight, "hc.mix_up")
+
+    m = model.model
+    for i in range(m.start_layer, m.end_layer):
+        layer = m.layers[i]
+        if isinstance(layer, Qwen4ExpLinearDecoderLayer):
+            add(layer.linear_attn._fused_in_proj_weight, "gdn.in_proj")
+            add(layer.linear_attn.out_proj.weight, "gdn.out_proj")
+        else:
+            add(layer.qkv_proj.weight, "qsa.qkv_proj")
+            add(layer.o_proj.weight, "qsa.o_proj")
+            if layer.is_qsa:
+                add(layer.indexer.index_qk_proj.weight, "qsa.index_qk_proj")
+        if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+            add(layer.mlp.gate.weight, "moe.gate")
+            if layer.mlp.shared_expert is not None:
+                add(layer.mlp.shared_expert.gate_up_proj.weight, "moe.shared_gate_up")
+                add(layer.mlp.shared_expert.down_proj.weight, "moe.shared_down")
+        add_mix(layer.attn_hyper_connection)
+        add_mix(layer.mlp_hyper_connection)
+    add_mix(m.hyper_connection_mixer)
+    add(model.lm_head.weight, "lm_head")
+    return {shape: "/".join(sorted(names)) for shape, names in sites.items()}
 
 
 def _built_options(slot: str, reason: str, options):

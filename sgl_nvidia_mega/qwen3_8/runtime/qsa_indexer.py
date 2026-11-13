@@ -55,6 +55,8 @@ from typing import Optional
 
 import torch
 
+from sgl_nvidia_mega.qwen3_8.runtime import bf16_gemm_pins
+
 logger = logging.getLogger(__name__)
 
 STOCK = "stock"
@@ -106,6 +108,10 @@ SGLANG_READS = {
         "get_decode_mqa_inputs",
     ),
     "srt/layers/attention/qsa/qsa_indexer.py": (
+        "_use_fused_prep",
+        "_rope_axis_map",
+        "apply_rope",
+        "index_kv_heads",
         "layer_id",
         "index_n_heads",
         "index_kv_heads",
@@ -161,6 +167,12 @@ SGLANG_READS = {
     "srt/runtime_context.py": ("get_parallel",),
     "kernels/ops/attention/fast_topk.py": ("fast_topk",),
     "kernels/jit/utils/compile/paths.py": ("KERNEL_PATH",),
+    "kernels/ops/attention/qsa_indexer.py": ("qsa_index_q_norm_rope_store",),
+}
+
+# _project_qk mirrors project_qk when BF16 pins are on
+SGLANG_MIRRORS = {
+    "srt/layers/attention/qsa/qsa_indexer.py:QSAIndexer.project_qk": "0df8761ad501b30a",
 }
 
 
@@ -523,7 +535,8 @@ class IndexerKernels:
         if step.fold:
             q = self._fold(indexer, md, hidden, positions, slots[:n])
         else:
-            q, token_k, stored = indexer.project_qk(
+            q, token_k, stored = _project_qk(
+                indexer,
                 hidden,
                 positions,
                 pool=md.token_to_kv_pool,
@@ -560,7 +573,7 @@ class IndexerKernels:
         k_compress in one launch; returns the index Q [rows, padded heads, dim]."""
         pool = md.token_to_kv_pool
         rope = indexer.rotary_emb
-        qk, _ = indexer.index_qk_proj(hidden)
+        qk = bf16_gemm_pins.linear(indexer.index_qk_proj, hidden)
         out_dtype = pool.qsa_compressed_dtype
         module = self._fold_module(self._fold_key(indexer, qk.dtype, out_dtype))
         positions = positions.long()
@@ -763,6 +776,59 @@ class IndexerKernels:
                 width = compressed_capacity(context_len)
                 for rows in range(1, SPLIT_ROWS + 1):
                     self._split_module(*split_config(rows, width), True)
+
+
+def _project_qk(
+    indexer, hidden_states, positions, pool=None, cache_loc=None, q_heads_padded=None
+):
+    """``indexer.project_qk(...)``; with BF16 pins on, here with ``index_qk_proj``
+    through ``bf16_gemm_pins``."""
+    if not bf16_gemm_pins.routed():
+        return indexer.project_qk(
+            hidden_states,
+            positions,
+            pool=pool,
+            cache_loc=cache_loc,
+            q_heads_padded=q_heads_padded,
+        )
+    qk = bf16_gemm_pins.linear(indexer.index_qk_proj, hidden_states)
+    token_k = qk[:, indexer.index_n_heads * indexer.index_head_dim :].reshape(
+        -1, indexer.index_kv_heads, indexer.index_head_dim
+    )
+    if (
+        pool is not None
+        and cache_loc is not None
+        and qk.shape[0] > 0
+        and indexer._use_fused_prep(qk)
+    ):
+        from sglang.kernels.ops.attention.qsa_indexer import qsa_index_q_norm_rope_store
+
+        key_state_buffer = pool.get_qsa_key_state_buffer(indexer.layer_id)
+        q = qsa_index_q_norm_rope_store(
+            qk,
+            positions.long(),
+            indexer.rotary_emb.cos_sin_cache,
+            indexer._rope_axis_map(qk.device),
+            indexer.q_layernorm.weight.data,
+            cache_loc[: qk.shape[0]].long(),
+            key_state_buffer.view(key_state_buffer.shape[0], -1),
+            pool.qsa_rope_position_buffer,
+            indexer.index_n_heads,
+            indexer.rotary_emb.rotary_dim,
+            indexer.q_layernorm.variance_epsilon,
+            indexer.rotary_emb.is_neox_style,
+            q_heads_padded=q_heads_padded,
+            out_dtype=pool.qsa_compressed_dtype,
+        )
+        return q, token_k, True
+    q_raw = qk[:, : indexer.index_n_heads * indexer.index_head_dim]
+    q = indexer.q_layernorm(q_raw.reshape(-1, indexer.index_head_dim)).reshape(
+        -1, indexer.index_n_heads, indexer.index_head_dim
+    )
+    q = indexer.apply_rope(positions, q)
+    if pool is not None:
+        q = q.to(pool.qsa_compressed_dtype)
+    return q, token_k, False
 
 
 def _score_factory(key):

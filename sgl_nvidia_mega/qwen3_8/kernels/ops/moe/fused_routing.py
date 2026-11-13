@@ -11,7 +11,7 @@ router logits, a 2560-wide BF16 activation row quantized to NVFP4 (16-element E4
 scales in linear layout, one per-tensor global scale), 1-512 rows (one CTA routes 1-32
 rows, a CTA cluster 33-512). Ids, weights, quantized activations and every metadata
 field but the row order inside an expert are bit-identical to FlashInfer's routing
-kernels and CuTe-DSL fp4_quantize (both unchanged from 0.7.2 to 0.7.3); see the kernel
+kernels and CuTe-DSL fp4_quantize (both unchanged from 0.7.2 to 0.7.4); see the kernel
 header. Adapted from the Kimi-K3 fused routing (sgl-project/sglang #48586).
 """
 

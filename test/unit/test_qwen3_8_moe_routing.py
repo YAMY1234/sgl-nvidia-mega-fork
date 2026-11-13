@@ -672,9 +672,24 @@ class TestBuild(unittest.TestCase):
         self.assertFalse(mr._fused_built)
         self.assertIn(part, logs.output[0])
 
+    def test_builds_on_each_mirrored_flashinfer(self):
+        self.assertEqual(mr.FLASHINFER_VERSIONS, ("0.7.3", "0.7.4"))
+        for version in mr.FLASHINFER_VERSIONS:
+            with (
+                self.subTest(version),
+                mock.patch.object(sys.modules["flashinfer"], "__version__", version),
+            ):
+                mr._fused_built = False
+                self.assertEqual(self.build(), "")
+                self.assertTrue(mr._fused_built)
+
     def test_other_flashinfer_keeps_the_slot_without_fused_routing(self):
-        with mock.patch.object(sys.modules["flashinfer"], "__version__", "0.7.4"):
-            self.assert_without_fused("FlashInfer 0.7.4")
+        for version in ("0.7.2", "0.7.5rc1"):
+            with (
+                self.subTest(version),
+                mock.patch.object(sys.modules["flashinfer"], "__version__", version),
+            ):
+                self.assert_without_fused(f"FlashInfer {version}")
 
     def test_other_quant_recipe_keeps_the_slot_without_fused_routing(self):
         fp4_utils = sys.modules["sglang.srt.layers.quantization.fp4_utils"]

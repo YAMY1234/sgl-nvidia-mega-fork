@@ -3,7 +3,7 @@
 call, ``fused_experts_none_to_flashinfer_trtllm_fp4`` on a logits-bypassed top-10
 (FlashInfer's own routing kernel and CuTe-DSL ``fp4_quantize``), at Qwen3.8's TP1 MoE
 geometry (512 experts, hidden 2560) with random NVFP4 weights, on an SM10x GPU with
-FlashInfer 0.7.3.
+FlashInfer 0.7.3 or 0.7.4.
 
 Bitwise, as the source claims: the fused kernel's NVFP4 activations and block scales
 against the stock quant; the routing weights, and every routed GEMM2 row read through
@@ -36,11 +36,11 @@ def _available() -> bool:
         import flashinfer
     except ImportError:
         return False
-    return flashinfer.__version__ == "0.7.3"
+    return flashinfer.__version__ in moe_routing.FLASHINFER_VERSIONS
 
 
 pytestmark = pytest.mark.skipif(
-    not _available(), reason="the fused routing needs SM10x and FlashInfer 0.7.3"
+    not _available(), reason="the fused routing needs SM10x and FlashInfer 0.7.3/0.7.4"
 )
 
 HIDDEN, EXPERTS, TOP_K, INTER = 2560, 512, 10, 512

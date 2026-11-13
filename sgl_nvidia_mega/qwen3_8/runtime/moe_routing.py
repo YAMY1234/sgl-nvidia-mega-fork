@@ -34,10 +34,11 @@ arguments (``_call_kwargs`` mirrors them) and (2) uses the pre-quantized input t
 runner takes from an NVFP4 dispatch.
 
 Numerics: (2) gives the stock call's bits (the same quant function on the same input).
-(1) matches FlashInfer 0.7.3's routing kernels and CuTe-DSL ``fp4_quantize`` by
-construction: ids, weights, NVFP4 activations and every metadata field but the row order
-inside an expert; each permuted row's GEMMs are unchanged and the finalize reads rows
-through the returned permutation (``test/kernels/test_qwen3_8_moe_routing.py``).
+(1) matches FlashInfer 0.7.3's and 0.7.4's routing kernels and CuTe-DSL ``fp4_quantize``
+(unchanged between them) by construction: ids, weights, NVFP4 activations and every
+metadata field but the row order inside an expert; each permuted row's GEMMs are
+unchanged and the finalize reads rows through the returned permutation
+(``test/kernels/test_qwen3_8_moe_routing.py``).
 """
 
 from __future__ import annotations
@@ -134,7 +135,11 @@ SGLANG_MIRRORS = {
     "srt/layers/quantization/modelopt_quant.py:ModelOptNvFp4FusedMoEMethod.apply": "1dc4978c61c40ba6",
 }
 
-# The FlashInfer 0.7.3 internals the fused path mirrors (trtllm_fp4_block_scale_moe_op)
+# The FlashInfer releases whose sources the tuner-key mirror, default tile and PDL default
+# follow: 0.7.4 leaves every file below, the launcher and the routing kernels as in 0.7.3.
+FLASHINFER_VERSIONS = ("0.7.3", "0.7.4")
+
+# The FlashInfer internals the fused path mirrors (trtllm_fp4_block_scale_moe_op)
 FLASHINFER_READS = {
     "flashinfer/fused_moe/backends/trtllm/sm100_runner.py": (
         "MoERunner",
@@ -171,8 +176,8 @@ class Options:
 
 DEFAULT = Options()
 
-# Set by build once the fused path can run in this process (FlashInfer 0.7.3, the
-# CuTe-DSL quant recipe, the kernel compiled)
+# Set by build once the fused path can run in this process (a FLASHINFER_VERSIONS
+# release, the CuTe-DSL quant recipe, the kernel compiled)
 _fused_built = False
 
 
@@ -220,9 +225,11 @@ def fused_reasons() -> str:
 
     from sgl_nvidia_mega.qwen3_8.kernels.ops.moe import fused_routing as op
 
-    # The tuner-key mirror, the default tile and the PDL default follow 0.7.3's sources.
-    if flashinfer.__version__ != "0.7.3":
-        return f"FlashInfer {flashinfer.__version__}, the fused path follows 0.7.3"
+    if flashinfer.__version__ not in FLASHINFER_VERSIONS:
+        return (
+            f"FlashInfer {flashinfer.__version__}, the fused path follows "
+            + " and ".join(FLASHINFER_VERSIONS)
+        )
     # The fused quant reproduces the CuTe-DSL fp4_quantize standard recipe only.
     flags = ("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "FLASHINFER_NVFP4_4OVER6")
     if _flashinfer_fp4_quantize_backend != "cute-dsl" or any(
@@ -499,8 +506,8 @@ def _fused(experts, x, topk_output):
 
 
 def _default_tile_n(num_tokens: int, num_local_experts: int) -> int:
-    # FlashInfer 0.7.3 selectDefaultTileN over FP4BlockScaleLauncher::getSupportedTileNums
-    # (E2m1 x E2m1; 0.7.3 offers the 192 tile on every build, Rubin included).
+    # FlashInfer 0.7.3/0.7.4 selectDefaultTileN over FP4BlockScaleLauncher::
+    # getSupportedTileNums (E2m1 x E2m1; the 192 tile on every build, Rubin included).
     tiles = (8, 16, 32, 64, 128, 192, 256)
     average = num_tokens * 10 / num_local_experts
     i = next((i for i, t in enumerate(tiles) if t >= average), len(tiles) - 1)
@@ -509,7 +516,7 @@ def _default_tile_n(num_tokens: int, num_local_experts: int) -> int:
 
 def _stock_runner(moe_kwargs: dict, inputs):
     """The MoERunner, tuning config and runner kwargs trtllm_fp4_block_scale_moe_op
-    builds for this call (FlashInfer 0.7.3 core.py), so the tuner key is the same."""
+    builds for this call (FlashInfer 0.7.3/0.7.4 core.py), so the tuner key is the same."""
     from flashinfer.fused_moe.backends.trtllm import MoERunner
     from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
     from flashinfer.tllm_enums import (

@@ -67,7 +67,8 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # qsa_pool: the TP1 QSA verify's sparse attention as split-K pool kernels (<= 64 rows)
 # on a BF16 KV pool
 # qsa_pool_fp8: the TP1 QSA verify's sparse attention on an FP8 E4M3 KV pool as the
-# union kernels, warp-specialized (33-576 rows; runtime/attention.py)
+# union kernels, warp-specialized (56-576 rows; runtime/attention.py), and the MTP
+# draft extend's (four rows a request) the same way
 # moe_finalize: the TP1 MoE's finalize + gated shared expert as one ordered kernel; from
 # 1024 rows the source's extend-size MoE, and on the target a FlashInfer tuning pass of
 # its routed experts at prefill sizes (runtime/moe.py, runtime/moe_prefill_autotune.py)
@@ -312,7 +313,7 @@ def build(model, hf_config, ctx):
             from sgl_nvidia_mega.qwen3_8.runtime.attention import PoolKernels
 
             executor.qsa_pool = PoolKernels()
-    if "qsa_pool_fp8" in slots and not draft:
+    if "qsa_pool_fp8" in slots:
         executor.qsa_union = _build_qsa_union(model)
     if "moe_finalize" in slots:
         executor.moe_finalize_ready = _build_moe_finalize(model, decompose)
@@ -543,7 +544,8 @@ def _build_qsa_pool(model) -> bool:
 
 def _build_qsa_union(model):
     """The union kernels (attention.UnionKernels), or None (stock); the pool is checked
-    at the first verify (Qwen3_8Executor._check_pools)."""
+    at the first verify, the draft's at its first draft extend
+    (Qwen3_8Executor._check_pools)."""
     from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
 
     from sgl_nvidia_mega.qwen3_8.runtime import attention

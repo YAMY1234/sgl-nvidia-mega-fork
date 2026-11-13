@@ -170,6 +170,9 @@ class Qwen3_8Executor:
         # slot qsa_pool: set by build with its kernels (attention.PoolKernels)
         self.qsa_pool_ready = False
         self.qsa_pool = None
+        # slot qsa_pool with SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1=1:
+        # attention.CoreKernels, set by build
+        self.qsa_core = None
         # slot qsa_pool_fp8: attention.UnionKernels, set by build; the pool is checked
         # at the first verify (the draft's first draft extend)
         self.qsa_union = None

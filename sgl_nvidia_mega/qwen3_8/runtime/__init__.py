@@ -65,7 +65,8 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # (runtime/gdn.py)
 # qsa_indexer: the QSA indexer's fold, scorer and select (runtime/qsa_indexer.py)
 # qsa_pool: the TP1 QSA verify's sparse attention as split-K pool kernels (<= 64 rows)
-# on a BF16 KV pool
+# on a BF16 KV pool; with SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1=1 (the source
+# branch's tcgen05-core switch), a one-request verify on its tcgen05 core
 # qsa_pool_fp8: the TP1 QSA verify's sparse attention on an FP8 E4M3 KV pool as the
 # union kernels, warp-specialized (56-576 rows; runtime/attention.py), and the MTP
 # draft extend's (four rows a request) the same way
@@ -314,6 +315,7 @@ def build(model, hf_config, ctx):
             from sgl_nvidia_mega.qwen3_8.runtime.attention import PoolKernels
 
             executor.qsa_pool = PoolKernels()
+            executor.qsa_core = _build_qsa_core()
     if "qsa_pool_fp8" in slots:
         executor.qsa_union = _build_qsa_union(model)
     if "moe_finalize" in slots:
@@ -547,6 +549,29 @@ def _build_qsa_pool(model) -> bool:
     if reason:
         unavailable("qsa_pool", reason)
     return not reason
+
+
+def _build_qsa_core():
+    """Slot qsa_pool's tcgen05 core (attention.CoreKernels) where
+    SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1=1 asks for it and it builds on every
+    rank, else None."""
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+
+    from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+    if not attention.ATTN_CORE_V1:
+        return None
+    reason = attention.core_build()
+    megakernel_agree(reason, what="Qwen3.8 slot qsa_pool tcgen05 core")
+    if reason:
+        logger.info(
+            "NVIDIA megakernel: Qwen3.8 slot qsa_pool: "
+            "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1 is set but the tcgen05 core "
+            "does not run (%s); the pool kernels serve",
+            reason,
+        )
+        return None
+    return attention.CoreKernels()
 
 
 def _build_qsa_union(model):

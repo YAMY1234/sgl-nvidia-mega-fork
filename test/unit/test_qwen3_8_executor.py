@@ -814,6 +814,7 @@ class TestQsaPoolFp8(unittest.TestCase):
         ex = SimpleNamespace(
             qsa_pool_ready=split_k,
             qsa_pool=_Kernels(3.0),
+            qsa_core=None,
             qsa_union=_Kernels(1.0, "union_ws_fp8") if union else None,
             qsa_indexer=None,
             qsa_draft=None,
@@ -1083,6 +1084,7 @@ class TestQsaPoolFp8(unittest.TestCase):
         ex = SimpleNamespace(
             qsa_pool_ready=False,
             qsa_pool=None,
+            qsa_core=None,
             qsa_union=_Kernels(1.0, "union_ws_fp8") if union else None,
             qsa_indexer="kernels" if indexer else None,
             qsa_draft="glue" if glue else None,
@@ -1176,6 +1178,207 @@ class TestQsaPoolFp8(unittest.TestCase):
             impl, _, ex, calls, _ = self.draft_extend(rows, **kw)
             self.assertEqual((impl, calls), (["stock"], ["stock"]), kw)
             self.assertEqual(ex.qsa_union.seen, [], kw)
+
+
+def _core_backend(rows=4, *, graph=True, lengths=None, positions="qpos", requests=True,
+                  dtype=torch.bfloat16, **kw):
+    """The verify's QSA backend as the tcgen05 core's gates read it."""
+    md = SimpleNamespace(
+        is_cuda_graph=graph,
+        sequence_lengths=torch.arange(rows) + 100 if lengths is None else lengths,
+        indexer_metadata=SimpleNamespace(
+            decode_logical_positions=None if positions is None else torch.arange(rows) + 99
+        ),
+        row_req_pool_indices=torch.zeros(rows, dtype=torch.int32) if requests else None,
+    )
+    backend = SimpleNamespace(
+        token_to_kv_pool=SimpleNamespace(layer_router=_KvRouter(dtype)),
+        req_to_token_pool=SimpleNamespace(req_to_token="req_to_token"),
+        _resolve_metadata=lambda fb: md,
+        _uses_block_indices=lambda indices: indices.shape[1] == 512,
+        _fused_kv_pool_eligible=True,
+        compress_ratio=4,
+        md=md,
+    )
+    backend.__dict__.update(kw)
+    return backend
+
+
+class TestQsaCore(unittest.TestCase):
+    """Slot qsa_pool with SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1=1: a one-request
+    verify in a CUDA graph on a BF16 pool runs the tcgen05 core under the source's gates,
+    before the split-K pool kernels; anything else keeps the pool kernels (or SGLang's
+    attention)."""
+
+    def setUp(self):
+        elementwise = types.ModuleType("sglang.kernels.ops.elementwise.elementwise")
+        self.gated = []
+        elementwise.fused_sigmoid_mul = (
+            lambda x, gate, inplace: self.gated.append(float(x[0, 0])) or x + 1
+        )
+        patch = mock.patch.dict(sys.modules, {elementwise.__name__: elementwise})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def run_core(self, rows=4, *, core=True, topk=1, draft=4, mode=_Mode.TARGET_VERIFY,
+                 loc=None, blocks=512, k=None, v=None, backend=None, gate_v2=False,
+                 merge_gate=False):
+        from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+        calls = []
+        qkv = torch.zeros(rows, 13312, dtype=torch.bfloat16)
+        self.gate = torch.zeros(rows, 24 * 256)
+        layer = SimpleNamespace(
+            is_qsa=True,
+            alt_stream=None,
+            attn=_QsaAttn(calls),
+            _prepare_qkv_gate=lambda positions, hidden_states, forward_batch: (
+                torch.zeros(rows, 24 * 256, dtype=torch.bfloat16),
+                torch.zeros(rows, 2 * 256, dtype=torch.bfloat16) if k is None else k,
+                qkv[:, -512:] if v is None else v,  # the QKV's strided V view
+                self.gate,
+            ),
+            _compute_qsa_topk_indices=lambda x, positions, fb: torch.zeros(
+                rows, blocks, dtype=torch.int64
+            ),
+            o_proj=lambda x: (x, None),
+        )
+        ex = SimpleNamespace(
+            qsa_pool_ready=True,
+            qsa_pool=_Kernels(3.0),
+            qsa_core=_Kernels(9.0) if core else None,
+            qsa_union=None,
+            qsa_indexer=None,
+            qsa_draft=None,
+            qsa_prefill=None,
+            smallm_gemm=None,
+        )
+        st = _St(mode, rows)
+        st.fb.spec_info = SimpleNamespace(draft_token_num=draft, topk=topk)
+        st.fb.req_pool_indices = torch.zeros(rows // 4)
+        st.fb.out_cache_loc = torch.arange(rows) + 1 if loc is None else loc
+        backend = backend or _core_backend(rows)
+        with (
+            mock.patch.object(attention, "sparse_backend", lambda: backend),
+            mock.patch.object(attention, "ATTN_GATE_V2", gate_v2),
+            mock.patch.object(attention, "POOL_MERGE_GATE", merge_gate),
+        ):
+            out = attention.step(ex, layer, torch.zeros(rows, 8), st)
+        impl = [i for op, i in st.ran_ops if op == "qsa"]
+        return impl, out, ex, calls, backend, st
+
+    def test_one_request_verify_runs_the_core(self):
+        impl, out, ex, calls, backend, st = self.run_core()
+        self.assertEqual((impl, calls, ex.qsa_pool.seen), (["tcgen05_v1"], [], []))
+        (kw,) = ex.qsa_core.seen
+        self.assertEqual(tuple(kw["q"].shape), (4, 24, 256))
+        for name in ("new_k", "new_v"):
+            self.assertEqual(tuple(kw[name].shape), (4, 2, 256))
+            self.assertEqual(kw[name].stride()[1:], (256, 1))
+        self.assertEqual(kw["new_v"].stride(0), 13312)  # the strided view, no copy
+        router = backend.token_to_kv_pool.layer_router
+        self.assertIs(kw["key_cache"], router.k)
+        self.assertIs(kw["value_cache"], router.v)
+        self.assertEqual(router.reads, [7])
+        self.assertIs(kw["locations"], st.fb.out_cache_loc)
+        self.assertIs(kw["row_requests"], backend.md.row_req_pool_indices)
+        self.assertEqual((kw["indices"].dtype, tuple(kw["indices"].shape)), (torch.int32, (4, 512)))
+        self.assertIs(kw["sequence_lengths"], backend.md.sequence_lengths)
+        self.assertIs(
+            kw["query_positions"], backend.md.indexer_metadata.decode_logical_positions
+        )
+        self.assertEqual((kw["slot_map"], kw["scale"]), ("req_to_token", 0.0625))
+        self.assertIsNone(kw["gate"])
+        # SGLang's gate on the core's output, then o_proj on the gated rows
+        self.assertEqual(self.gated, [9.0])
+        self.assertTrue(torch.equal(out, torch.full((4, 24 * 256), 10.0)))
+        # no row requests in the metadata: the source falls back to the batch's, one a
+        # request, which a 4-row verify does not match: nothing launched
+        impl, _, ex, _, _, _ = self.run_core(backend=_core_backend(requests=False))
+        self.assertEqual((impl, ex.qsa_core.seen), (["stock"], []))
+
+    def test_gate_in_the_merge(self):
+        """SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_GATE_V2, or
+        SGLANG_ENABLE_QSA_POOL_MERGE_GATE, hands the gate to the core: its epilogue merge
+        applies it and nothing gates after it."""
+        for kw in (dict(gate_v2=True), dict(merge_gate=True), dict(gate_v2=True, merge_gate=True)):
+            self.gated.clear()
+            impl, out, ex, _, _, _ = self.run_core(**kw)
+            self.assertEqual(impl, ["tcgen05_gate_v2"], kw)
+            self.assertIs(ex.qsa_core.seen[0]["gate"], self.gate)
+            self.assertEqual(self.gated, [], kw)
+            self.assertTrue(torch.equal(out, torch.full((4, 24 * 256), 9.0)))
+        # the pool kernels keep their own merge gate
+        impl, _, ex, _, _, _ = self.run_core(rows=8, gate_v2=True)
+        self.assertEqual((impl, len(ex.qsa_pool.seen)), (["pool_splitk"], 1))
+
+    def test_other_steps_keep_the_pool_kernels(self):
+        strided_k = torch.zeros(4, 2, 512, dtype=torch.bfloat16)[:, :, :256]
+        for name, kw, want in (
+            ("off", dict(core=False), "pool_splitk"),
+            ("two requests", dict(rows=8), "pool_splitk"),
+            ("topk 2", dict(topk=2), "pool_splitk"),
+            ("eager metadata", dict(backend=_core_backend(graph=False)), "pool_splitk"),
+            ("lengths", dict(backend=_core_backend(lengths=torch.zeros(3))), "pool_splitk"),
+            ("not the plain pool", dict(backend=_core_backend(_fused_kv_pool_eligible=False)),
+             "pool_splitk"),
+            ("ratio 8", dict(backend=_core_backend(compress_ratio=8)), "pool_splitk"),
+            ("strided loc", dict(loc=torch.arange(8)[::2]), "pool_splitk"),
+            ("strided k", dict(k=strided_k.reshape(4, 2, 256)), "pool_splitk"),
+            ("three draft tokens", dict(draft=3), "stock"),
+            ("no positions", dict(backend=_core_backend(positions=None)), "stock"),
+            ("token indices", dict(blocks=2051), "stock"),
+            ("FP8 pool", dict(backend=_core_backend(dtype=torch.float8_e4m3fn)), "stock"),
+        ):
+            impl, _, ex, calls, _, _ = self.run_core(**kw)
+            self.assertEqual(impl, [want], name)
+            if ex.qsa_core is not None:
+                self.assertEqual(ex.qsa_core.seen, [], name)
+
+    def test_core_kernels_launch(self):
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import qsa_tcgen05_v1
+        from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+        names = ("q", "key_cache", "value_cache", "new_k", "new_v", "locations",
+                 "slot_map", "row_requests", "indices", "sequence_lengths",
+                 "query_positions", "scale")
+        with mock.patch.object(qsa_tcgen05_v1, "run", lambda *a, **kw: (a, kw)):
+            args, kw = attention.CoreKernels().run(**{n: n for n in names})
+        self.assertEqual(args, names)
+        self.assertEqual(kw, dict(width=4, store_new_kv=True))
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import qsa_gate_epilogue_v2
+
+        for fix in (False, True):  # the QSA PDL fix: the merge waits for the partials
+            with (
+                mock.patch.object(qsa_gate_epilogue_v2, "run_gated", lambda *a, **kw: (a, kw)),
+                mock.patch.object(attention, "QSA_PDL_FIX", fix),
+            ):
+                args, kw = attention.CoreKernels().run(**{n: n for n in names}, gate="gate")
+            self.assertEqual(args, names + ("gate",))
+            self.assertEqual(kw, dict(width=4, store_new_kv=True, wait_primary=fix))
+
+    def test_build(self):
+        from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+        binding = types.ModuleType("sglang.srt.kernel_plugins.nvidia.binding")
+        agreed = []
+        binding.megakernel_agree = lambda reason, what: agreed.append((reason, what))
+        with mock.patch.dict(sys.modules, {binding.__name__: binding}):
+            with mock.patch.object(attention, "ATTN_CORE_V1", False):
+                self.assertIsNone(runtime._build_qsa_core())
+            self.assertEqual(agreed, [])
+            with mock.patch.object(attention, "ATTN_CORE_V1", True):
+                with mock.patch.object(attention, "core_build", return_value=""):
+                    self.assertIsInstance(runtime._build_qsa_core(), attention.CoreKernels)
+                with mock.patch.object(attention, "core_build", return_value="no SM10x"):
+                    self.assertIsNone(runtime._build_qsa_core())
+        self.assertEqual(
+            agreed,
+            [("", "Qwen3.8 slot qsa_pool tcgen05 core"),
+             ("no SM10x", "Qwen3.8 slot qsa_pool tcgen05 core")],
+        )
+        with mock.patch.object(torch.cuda, "is_available", lambda: False):
+            self.assertIn("SM10x", attention.core_build())
 
 
 def _expanded(rows):
@@ -2262,7 +2465,8 @@ class TestQsaDraft(unittest.TestCase):
             decode=lambda *a: order.append("lookup_pack") or glue_out
         )
         ex = SimpleNamespace(
-            qsa_pool_ready=False, qsa_union=None, qsa_indexer=None, qsa_draft=glue,
+            qsa_pool_ready=False, qsa_core=None, qsa_union=None, qsa_indexer=None,
+            qsa_draft=glue,
             qsa_prefill=None, smallm_gemm=None,
         )
         runner = types.ModuleType("sglang.srt.model_executor.runner")
@@ -2663,6 +2867,55 @@ class TestQsaIndexerStreams(unittest.TestCase):
         log, ran = self.run_step(_Mode.DECODE, glue=glue)
         self.assertEqual(log, ["qkv", SEL, "attn"])
         self.assertNotIn("qsa.index_stream", dict(ran))
+
+
+_SWITCHES = r"""
+import importlib
+import json
+import os
+
+from sgl_nvidia_mega.qwen3_8.runtime import attention
+
+names = {
+    "QSA_EARLY_INDEXER": "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_EARLY_INDEXER",
+    "QSA_PDL_INDEX": "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_INDEX",
+    "ATTN_CORE_V1": "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1",
+    "ATTN_GATE_V2": "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_GATE_V2",
+    "POOL_MERGE_GATE": "SGLANG_ENABLE_QSA_POOL_MERGE_GATE",
+    "QSA_PDL_FIX": "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_FIX",
+}
+out = {}
+for value in (None, "1", "true", "True", "0", "yes"):
+    for name in names.values():
+        os.environ.pop(name, None)
+        if value is not None:
+            os.environ[name] = value
+    importlib.reload(attention)
+    out[str(value)] = {attr: getattr(attention, attr) for attr in names}
+print(json.dumps(out))
+"""
+
+
+class TestSourceSwitches(unittest.TestCase):
+    def test_read_as_the_source_reads_them(self):
+        """get_bool_env_var's parsing (default off) for the self_attention switches and
+        the gate's, an exact "1" for the tcgen05-core and QSA PDL-fix switches."""
+        import json
+        import os
+        import subprocess
+
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        done = subprocess.run(
+            [sys.executable, "-c", _SWITCHES], env=env, capture_output=True, text=True,
+            timeout=300,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        got = json.loads(done.stdout.strip().splitlines()[-1])
+        boolean = ("QSA_EARLY_INDEXER", "QSA_PDL_INDEX", "ATTN_GATE_V2", "POOL_MERGE_GATE")
+        for value, on in (("None", ()), ("1", "all"), ("true", boolean),
+                          ("True", boolean), ("0", ()), ("yes", ())):
+            want = {a: on == "all" or a in on for a in got[value]}
+            self.assertEqual(got[value], want, value)
 
 
 _INTERPRETED_DRAFT = r"""

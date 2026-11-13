@@ -8,7 +8,12 @@ Slot ``qsa_pool``: a TP1 target verify of up to 64 rows (16 requests x 4) on a B
 pool runs the sparse attention as the plugin's split-K pool kernels
 (``qsa/pool_decode.py``): the new K/V write at the step's slots, the split-K partials
 over the selected blocks (and the request's own uncompressed tail) and the merge, which
-also applies the sigmoid output gate.
+also applies the sigmoid output gate. With SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1=1
+(the source branch's tcgen05-core switch), a one-request verify (4 rows) in a CUDA graph
+runs the source's tcgen05 core instead (``kernels/ops/attention/qsa_tcgen05_v1.py``): the
+new K/V store, the 33 fixed 64-token tile partials and their merge, which applies the
+output gate where the source hands it over
+(SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_GATE_V2 or SGLANG_ENABLE_QSA_POOL_MERGE_GATE).
 
 Slot ``qsa_pool_fp8``: a TP1 target verify of 56-576 rows (14-144 requests x 4) on an FP8
 E4M3 KV pool runs it as the union kernels (``qsa/pool_union_ws.py``): the new BF16 K/V
@@ -22,7 +27,9 @@ and TRT-LLM decode there.
 
 The QKV / gate projection with its norms and RoPE, the indexer (selection) and o_proj
 stay SGLang's (with BF16 GEMM pins on, the projection's CUDA branch runs here so
-``qkv_proj`` and ``o_proj`` can take a pin: ``bf16_gemm_pins``). As in the source's
+``qkv_proj`` and ``o_proj`` can take a pin: ``bf16_gemm_pins``; with
+SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_FIX=1, the source branch's QSA PDL-fix switch, a
+4-row step's QK norm is the source's PDL launch). As in the source's
 ``self_attention``, under CUDA graph capture (not a breakable graph) below 1024 rows the
 indexer runs on the layer's side stream beside the QKV / gate projection, joined before
 the attention. Every other step runs SGLang's ``self_attention``. Numerics: both
@@ -64,6 +71,19 @@ QSA_EARLY_INDEXER = _env_bool("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_EARLY_INDEXE
 QSA_PDL_INDEX = _env_bool("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_INDEX")
 # The index projection's (N, K) the source's PDL_INDEX branch takes
 INDEX_QK_SHAPE = (640, 2560)
+# SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1 (qwen_sparse_attn_backend.py, exactly
+# "1"): a one-request verify on a BF16 pool runs the tcgen05 core before the pool kernels
+# (slot qsa_pool)
+ATTN_CORE_V1 = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1", "0") == "1"
+# SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_GATE_V2 (a 4-row verify) or
+# SGLANG_ENABLE_QSA_POOL_MERGE_GATE (any verify): the source hands the output gate to the
+# attention, whose tcgen05 core merge applies it
+ATTN_GATE_V2 = _env_bool("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_GATE_V2")
+POOL_MERGE_GATE = _env_bool("SGLANG_ENABLE_QSA_POOL_MERGE_GATE")
+# SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_FIX (exactly "1"): a 4-row QK norm of 24 / 2
+# heads launches with PDL and waits for the QKV in-kernel; the core's gate epilogue waits
+# for its partials
+QSA_PDL_FIX = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_FIX", "0") == "1"
 # Test only: on eager steps, also run SGLang's attention on the same q/k/v and selected
 # indices and log how far the pool kernel's output is from it, per row.
 OPCHECK = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_OPCHECK") == "1"
@@ -141,6 +161,7 @@ SGLANG_READS = {
         "use_bf16_splitk_gemm",
     ),
     "srt/layers/linear.py": ("quant_method", "weight"),
+    "srt/speculative/eagle_info.py": ("topk",),
     "srt/layers/attention/qsa/metadata.py": ("is_cuda_graph",),
     "srt/mem_cache/kv/router.py": ("layer", "read", "key", "value"),
 }
@@ -177,6 +198,17 @@ def build() -> str:
         from sgl_nvidia_mega.qwen3_8.qsa import pool_decode  # noqa: F401
     except Exception as e:
         return f"pool kernels do not import: {type(e).__name__}: {e}"
+    return ""
+
+
+def core_build() -> str:
+    """The tcgen05 core's build reason ('' when it can run here)."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        return "the tcgen05 core needs an SM10x GPU"
+    try:
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import qsa_tcgen05_v1  # noqa: F401
+    except Exception as e:
+        return f"the tcgen05 core does not import: {type(e).__name__}: {e}"
     return ""
 
 
@@ -325,15 +357,32 @@ def _self_attention(layer, hidden_states, positions, forward_batch):
 
 
 def _qkv_gate(layer, x, positions, fb):
-    """``layer._prepare_qkv_gate``; with BF16 pins on, its CUDA gated branch
-    (``forward_prepare_cuda_fused``) here, so ``qkv_proj`` can take a pin."""
-    if not (bf16_gemm_pins.routed() and x.is_cuda and layer.attn_output_gate):
+    """``layer._prepare_qkv_gate``; with BF16 pins on, or where
+    SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_FIX changes the QK norm's launch, its CUDA
+    gated branch (``forward_prepare_cuda_fused``) here, so ``qkv_proj`` can take a pin and
+    the QK norm is the source's launch."""
+    pdl_fix = (
+        QSA_PDL_FIX
+        and x.shape[0] == 4
+        and (layer.num_heads, layer.num_kv_heads) == (QUERY_HEADS, KV_HEADS)
+    )
+    if not (
+        (bf16_gemm_pins.routed() or pdl_fix) and x.is_cuda and layer.attn_output_gate
+    ):
         return layer._prepare_qkv_gate(
             positions=positions, hidden_states=x, forward_batch=fb
         )
-    from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
-        fused_qk_gemma_rmsnorm_rope_gate,
-    )
+    kwargs = {}
+    if pdl_fix:  # SGLang's launcher has no PDL wait
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+            fused_qk_gemma_rmsnorm_rope_gate,
+        )
+
+        kwargs["qsa_pdl_fix"] = True
+    else:
+        from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+            fused_qk_gemma_rmsnorm_rope_gate,
+        )
 
     qkv = bf16_gemm_pins.linear(layer.qkv_proj, x)
     q_gate, k, v = qkv.split([layer.q_size * 2, layer.kv_size, layer.kv_size], dim=-1)
@@ -352,9 +401,20 @@ def _qkv_gate(layer, x, positions, fb):
         rope.rotary_dim,
         has_gate=True,
         mrope_axis_map=(rope.axis_map if positions.dim() == 2 else None),
+        **kwargs,
     )
     rows = x.shape[0]
     return q_out.view(rows, -1), k_out.view(rows, -1), v, gate_out.view(rows, -1)
+
+
+def _core_eligible(executor, fb, rows) -> bool:
+    return (
+        executor.qsa_core is not None
+        and fb.forward_mode.is_target_verify()
+        and rows == 4
+        and int(fb.spec_info.draft_token_num) == 4
+        and int(getattr(fb.spec_info, "topk", 1) or 1) == 1
+    )
 
 
 def _pool_eligible(executor, fb, rows) -> bool:
@@ -535,7 +595,9 @@ def _decomposed(executor, layer, x, st):
         )
     rows = q.shape[0]
     out = None
-    if _pool_eligible(executor, fb, rows):
+    if _core_eligible(executor, fb, rows):
+        out = _verify_core(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
+    if out is None and _pool_eligible(executor, fb, rows):
         out = _verify_pool(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
     if out is None and _union_eligible(executor, fb, rows):
         out = _verify_union(executor, layer, sparse_backend(), q, k, v, gate, indices, st)
@@ -618,6 +680,81 @@ def _verify_pool(executor, layer, backend, q, k, v, gate, indices, st):
             layer, q, k, v, fb, indices, gate, out, md, query_positions, "pool_splitk"
         )
     return _finish(executor, layer, out, None, st, "pool_splitk")
+
+
+def _verify_core(executor, layer, backend, q, k, v, gate, indices, st):
+    """The source's tcgen05 core (SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1) on a
+    one-request TP1 verify in a CUDA graph on a BF16 pool, under its ``_fused_kv_prefix``
+    and core gates, or None (nothing launched). Its merge applies the output gate where
+    the source passes it (to the source's output-gate function), else SGLang's gate
+    follows."""
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    fb = st.fb
+    rows = q.shape[0]
+    loc = fb.out_cache_loc
+    kv = backend.token_to_kv_pool.layer_router.layer(layer.attn.layer_id)
+    kc, vc = kv.key(), kv.value()
+    md = backend._resolve_metadata(fb)
+    indexer = md.indexer_metadata
+    row_requests = md.row_req_pool_indices
+    if row_requests is None:
+        row_requests = fb.req_pool_indices
+    if not (
+        backend._fused_kv_pool_eligible
+        and backend.compress_ratio == RATIO
+        and rows == fb.req_pool_indices.numel() * 4
+        and isinstance(loc, torch.Tensor)
+        and loc.ndim == 1
+        and loc.numel() == rows
+        and loc.is_contiguous()
+        and k.shape[0] == rows
+        and v.shape[0] == rows
+        and q.dtype == torch.bfloat16
+        and kc.ndim == 3
+        and vc.shape == kc.shape
+        and kc.is_contiguous()
+        and vc.is_contiguous()
+        and tuple(kc.shape[1:]) == (KV_HEADS, HEAD_DIM)
+        and kc.dtype == vc.dtype == torch.bfloat16
+        and md.is_cuda_graph
+        and md.sequence_lengths.numel() == rows
+        and backend._uses_block_indices(indices)
+        and tuple(indices.shape) == (rows, BLOCKS)
+        and indexer is not None
+        and indexer.decode_logical_positions is not None
+        and row_requests.numel() == rows
+    ):
+        return None
+    new_k = k.reshape(rows, KV_HEADS, HEAD_DIM)
+    new_v = v.reshape(rows, KV_HEADS, HEAD_DIM)
+    if any(t.stride(1) != HEAD_DIM or t.stride(2) != 1 for t in (new_k, new_v)):
+        return None
+    query_positions = indexer.decode_logical_positions
+    gated = gate is not None and (ATTN_GATE_V2 or POOL_MERGE_GATE)
+    kv = backend.token_to_kv_pool.layer_router.read(layer.attn.layer_id)
+    out = executor.qsa_core.run(
+        q=q.reshape(rows, QUERY_HEADS, HEAD_DIM),
+        key_cache=kv.key(),
+        value_cache=kv.value(),
+        new_k=new_k,
+        new_v=new_v,
+        locations=loc,
+        slot_map=backend.req_to_token_pool.req_to_token,
+        row_requests=row_requests,
+        indices=indices.to(torch.int32).contiguous(),
+        sequence_lengths=md.sequence_lengths,
+        query_positions=query_positions,
+        scale=layer.attn.scaling,
+        gate=gate if gated else None,
+    )
+    out = out.reshape(rows, QUERY_HEADS * HEAD_DIM)
+    impl = "tcgen05_gate_v2" if gated else "tcgen05_v1"
+    if gate is not None and not gated:
+        out = fused_sigmoid_mul(out, gate, inplace=True)
+    if OPCHECK and not torch.cuda.is_current_stream_capturing():
+        _opcheck(layer, q, k, v, fb, indices, gate, out, md, query_positions, impl)
+    return _finish(executor, layer, out, None, st, impl)
 
 
 def _verify_union(executor, layer, backend, q, k, v, gate, indices, st):
@@ -810,6 +947,33 @@ class PoolKernels:
             HAS_GATE=True, launch_pdl=True,
         )
         return out
+
+
+class CoreKernels:
+    """The source's TP1 tcgen05 attention of a one-request (4-row) verify on a BF16 pool
+    (SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1): the new K/V store, the tile partials
+    and the merge; with a ``gate``, the gate epilogue merge (``qsa_gate_epilogue_v2``)
+    applies it."""
+
+    def run(
+        self, *, q, key_cache, value_cache, new_k, new_v, locations, slot_map,
+        row_requests, indices, sequence_lengths, query_positions, scale, gate=None
+    ):
+        """[4, QUERY_HEADS, HEAD_DIM] in q's dtype."""
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.attention import (
+            qsa_gate_epilogue_v2,
+            qsa_tcgen05_v1,
+        )
+
+        args = (
+            q, key_cache, value_cache, new_k, new_v, locations, slot_map, row_requests,
+            indices, sequence_lengths, query_positions, scale,
+        )
+        if gate is None:
+            return qsa_tcgen05_v1.run(*args, width=4, store_new_kv=True)
+        return qsa_gate_epilogue_v2.run_gated(
+            *args, gate, width=4, store_new_kv=True, wait_primary=QSA_PDL_FIX
+        )
 
 
 class UnionKernels:

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import torch
 
+from sgl_nvidia_mega.qwen3_8.runtime import moe_routing
+
 STOCK = "stock"
 MAX_ROWS = 1024
 HIDDEN, TOP_K = 2560, 10
@@ -77,7 +79,10 @@ def step(executor, layer, x, st):
     )
 
     shared = mlp._forward_shared_experts(x, apply_gate=False).contiguous()
-    deferred = mlp._forward_router_experts(x, defer_finalize=True)
+    # slot moe_routing: None when it does not take these rows
+    deferred = moe_routing.routed(executor, mlp, x, st)
+    if deferred is None:
+        deferred = mlp._forward_router_experts(x, defer_finalize=True)
     top_k = int(deferred.top_k)
     gemm2 = deferred.gemm2_out.view(-1, deferred.gemm2_out.shape[-1])
     perm = deferred.expanded_idx_to_permuted_idx.view(-1, top_k)[:rows].contiguous()

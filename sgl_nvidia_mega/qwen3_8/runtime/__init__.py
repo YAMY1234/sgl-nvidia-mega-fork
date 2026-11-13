@@ -18,6 +18,12 @@ SGLANG_READS = {
     "srt/runtime_context.py": ("get_exec", "get_parallel"),
     "srt/kernel_plugins/nvidia/binding.py": ("megakernel_agree",),
     "srt/models/qwen4_exp.py": ("Qwen4ExpAttentionDecoderLayer",),
+    "kernels/plugin_kernels/nvidia/spec.py": ("MegakernelSpec",),
+    "srt/environ.py": (
+        "envs",
+        "SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND",
+        "SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER",
+    ),
 }
 
 # Comma-separated kernel slots; unset or "" runs every op on its stock step
@@ -96,6 +102,32 @@ def requested_slots() -> frozenset:
     return frozenset(name.strip() for name in raw.split(",")) - {""}
 
 
+def prefill_graph_supported() -> bool:
+    """Whether SGLang hands a spec's build the prefill body breakable prefill graphs
+    capture (``MegakernelSpec.prefill_graph``)."""
+    from sglang.kernels.plugin_kernels.nvidia.spec import MegakernelSpec
+
+    return "prefill_graph" in getattr(MegakernelSpec, "__struct_fields__", ())
+
+
+def _prefill_backend(graph_config) -> str:
+    """The prefill CUDA graph backend of SGLang's cuda_graph_config ('disabled' when
+    none is configured)."""
+    backend = getattr(getattr(graph_config, "prefill", None), "backend", None)
+    return "disabled" if backend is None else str(backend).split(".")[-1].lower()
+
+
+def gdn_graph_tables() -> bool:
+    """Whether breakable prefill graphs hand an external prefill body FlashInfer's GDN
+    tables; SGLang then captures no GDN extend of its own, slot gdn_prefill must."""
+    from sglang.srt.environ import envs
+
+    return bool(
+        envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
+        and envs.SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER.get()
+    )
+
+
 def config_reasons(cfg, hf_config) -> list[str]:
     """Settings the executor cannot serve, checked before the weights load."""
     reasons = [
@@ -118,16 +150,35 @@ def config_reasons(cfg, hf_config) -> list[str]:
                 f"the GDN u-cache: a verify of {running} requests x "
                 f"{tokens} rows exceeds the executor's {MAX_ROWS} rows"
             )
-    graph = getattr(cfg, "cuda_graph_config", None)
-    prefill = getattr(getattr(graph, "prefill", None), "backend", None)
-    if prefill is not None and str(prefill) not in ("disabled", "Backend.DISABLED"):
-        # A covered prefill runs eagerly (spec.Step); breakable prefill graphs
-        # would capture it.
+    prefill = _prefill_backend(getattr(cfg, "cuda_graph_config", None))
+    if prefill == "breakable" and prefill_graph_supported():
+        # the executor's prefill body is captured (Qwen3_8Executor.plan_body)
+        if gdn_graph_tables() and "gdn_prefill" not in requested_slots():
+            reasons.append(
+                "breakable prefill graphs with FlashInfer's GDN tables "
+                "(SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER) need slot gdn_prefill, "
+                "which runs the GDN core in the graph"
+            )
+    elif prefill != "disabled":
+        # A covered prefill step runs eagerly; only SGLang's prefill body routing
+        # (MegakernelSpec.prefill_graph) lets a breakable prefill graph capture it.
         reasons.append(
-            f"prefill CUDA graphs {str(prefill)!r} are not supported by the "
-            "Qwen3.8 executor; use --cuda-graph-backend-prefill disabled"
+            f"prefill CUDA graphs {prefill!r} are not supported by the Qwen3.8 "
+            "executor; use --cuda-graph-backend-prefill breakable (with an SGLang "
+            "whose megakernel spec has prefill_graph) or disabled"
         )
     return reasons
+
+
+def prefill_graphs_on() -> bool:
+    """Whether this server captures the target's prefill body in breakable prefill
+    graphs (config_reasons refused every other prefill graph)."""
+    from sglang.srt.runtime_context import get_exec
+
+    return (
+        prefill_graph_supported()
+        and _prefill_backend(get_exec().graph.cuda_graph_config) == "breakable"
+    )
 
 
 def model_reasons(model, hf_config) -> list[str]:
@@ -138,6 +189,16 @@ def model_reasons(model, hf_config) -> list[str]:
     pp = getattr(model, "pp_group", None)
     if pp is not None and not (pp.is_first_rank and pp.is_last_rank):
         reasons.append("pipeline parallelism is not supported")
+    draft = type(model).__name__.endswith("MTP")
+    if not draft and gdn_graph_tables() and prefill_graphs_on():
+        from sglang.srt.runtime_context import get_parallel
+
+        # plan_body declines CP-sharded rows, which no captured chain then serves
+        if getattr(get_parallel(), "attn_cp_size", 1) > 1:
+            reasons.append(
+                "breakable prefill graphs with FlashInfer's GDN tables under "
+                "attention CP are not supported"
+            )
     return reasons
 
 
@@ -182,6 +243,7 @@ def build(model, hf_config, ctx):
 
         mamba = getattr(get_exec(), "mamba", None)
         executor.verify_required = own_ucache
+        executor.prefill_graph = prefill_graphs_on()
     if own_ucache:
         from sgl_nvidia_mega.qwen3_8.runtime.gdn_ucache_state import UcacheState
 
@@ -223,6 +285,12 @@ def build(model, hf_config, ctx):
         executor.gdn_prefill = _built_options(
             "gdn_prefill", gdn_prefill.build(model), gdn_prefill.DEFAULT
         )
+    if executor.prefill_graph and executor.gdn_prefill is None and gdn_graph_tables():
+        # SGLang's captured GDN extend refuses FlashInfer's tables
+        raise RuntimeError(
+            "Qwen3.8 executor: breakable prefill graphs with FlashInfer's GDN tables "
+            "need slot gdn_prefill, which did not build (see its log line)"
+        )
     if "qsa_prefill" in slots:
         from sgl_nvidia_mega.qwen3_8.runtime import qsa_prefill
 
@@ -240,9 +308,10 @@ def build(model, hf_config, ctx):
             "smallm_gemm", smallm_gemm.build(model), smallm_gemm.DEFAULT
         )
     logger.info(
-        "NVIDIA megakernel: Qwen3.8 %s executor: %s; slots %s; every other op stock",
+        "NVIDIA megakernel: Qwen3.8 %s executor: %s%s; slots %s; every other op stock",
         "draft" if draft else ("target (own GDN u-cache)" if own_ucache else "target"),
         "layers decomposed (S1)" if decompose else "layers through the stage boundaries (S0)",
+        "; prefill body in breakable prefill graphs" if executor.prefill_graph else "",
         sorted(slots) or "none",
     )
     return executor

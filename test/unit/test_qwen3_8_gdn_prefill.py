@@ -25,9 +25,13 @@ from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear import (
 )
 from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba import gdn_prefill_conv as conv_mod
 from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba import (
+    gdn_prefill_cp_tail as tail_mod,
+)
+from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba import (
     gdn_prefill_state_glue as glue_mod,
 )
 from sgl_nvidia_mega.qwen3_8.runtime import gdn_prefill as gp
+from sgl_nvidia_mega.qwen3_8.runtime import prefill_graph as pg
 
 # A small GDN layer of Qwen3.8's shape: 2 key heads, 6 value heads (ratio 3), 128 wide
 H, HV, D = 2, 6, 128
@@ -527,10 +531,15 @@ class TestFallbacks(_Case):
         self.assert_stock("BF16", x=torch.zeros(8, HIDDEN, dtype=torch.float16))
 
     def test_prefill_graphs(self):
-        _STATE["breakable"] = True
+        _STATE["full_graph"] = True
         self.assert_stock("graph")
-        _STATE.update(breakable=False, full_graph=True)
-        self.assert_stock("graph")
+        # a breakable graph's capture takes the graph path (TestPrefillGraph); the
+        # eager step still declines it
+        _STATE.update(breakable=True, full_graph=False)
+        x = torch.zeros(8, HIDDEN, dtype=torch.bfloat16)
+        reason, step = gp.prepare(_gdn(), x, _batch((5, 3)))
+        self.assertIsNone(step)
+        self.assertIn("graph", reason)
 
     def test_cp(self):
         _STATE["cp"] = True
@@ -561,6 +570,274 @@ class TestFallbacks(_Case):
         backend = _Backend(_metadata((5, 3)))
         backend.temporal = torch.zeros(SLOTS, HV, D, 2 * D)[..., :D]
         self.assert_stock("strided", backend=backend)
+
+
+def _graph_meta(track=False, flashinfer=True):
+    """A bucket's static tables (GDNPrefillGraphMetadata), with FlashInfer's."""
+    tables = SimpleNamespace(
+        cp_single=True, pre_track_mode="pre_mode", track_mode="mode", track_h_row="h_row"
+    )
+    return SimpleNamespace(
+        track=track,
+        flashinfer=tables if flashinfer else None,
+        cu_seqlens="cu",
+        cache_indices="slots",
+        has_initial_state="init",
+        conv_block_table="blocks",
+        track_mode="conv_mode",
+        track_conv_start="conv_start",
+        track_dst="dst",
+        num_logical_tokens="tokens",
+    )
+
+
+class TestPrefillGraph(_Case):
+    """Inside a breakable prefill graph's capture the core runs on the bucket's
+    FlashInfer tables in the segment, or without tables as a graph break."""
+
+    def setUp(self):
+        super().setUp()
+        _STATE["breakable"] = True
+        track = types.ModuleType("sglang.kernels.ops.mamba.gdn_prefill_track")
+        track.gdn_track_conv_window = lambda **kw: self.spies.calls.append(
+            ("track_conv_window", kw)
+        )
+        track.gdn_track_ssm_state = lambda **kw: self.spies.calls.append(
+            ("track_ssm", kw)
+        )
+        tables = types.ModuleType("sglang.srt.layers.attention.linear.gdn_prefill_graph")
+        tables.GDN_CHUNK_SIZE = 64
+        patcher = mock.patch.dict(sys.modules, {m.__name__: m for m in (track, tables)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(fi_mod, "extend_in_graph", self.fi_graph)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.ex = SimpleNamespace(gdn_prefill=gp.DEFAULT, gdn_graph_outputs=[])
+
+    def fi_graph(self, kernel, q, k, v, g, beta, **kw):
+        self.spies.calls.append(("extend_in_graph", dict(kw, kernel=kernel, q=q)))
+        kw["output"].fill_(1.0)
+        rows = kw["checkpoint_rows"]
+        return torch.zeros(1, rows, HV, D, D) if rows else None
+
+    def graph_step(self, meta, rows=8, lens=(5,)):
+        self.spies = _Spies(self)
+        self.backend = _Backend(_metadata(lens))
+        _STATE["backend"] = self.backend
+        self.out_proj = []
+        self.gdn = _gdn(out_proj_calls=self.out_proj)
+        self.x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16)
+        # bucket rows past the batch's tokens: the eager step's DP padding decline
+        self.st = _St(_batch(lens, padded=sum(lens)))
+        self.st.view = SimpleNamespace(prefill_graph_metadata=meta)
+        return gp.extend(self.ex, SimpleNamespace(linear_attn=self.gdn), self.x, self.st)
+
+    def test_core_in_the_segment_on_the_tables(self):
+        meta = _graph_meta()
+        out = self.graph_step(meta)
+        s = self.spies
+        self.assertEqual(s.names(), ["split_conv", "gating", "extend_in_graph", "norm"])
+        conv = s.kwargs("split_conv")
+        self.assertEqual(tuple(conv["x"].shape), (QKV, 8))
+        self.assertEqual(
+            (conv["query_start_loc"], conv["cache_indices"], conv["block_table"]),
+            ("cu", "slots", "blocks"),
+        )
+        self.assertEqual(conv["has_initial_state"], "init")
+        self.assertIsNone(conv["seq_lens_cpu"])  # no host lengths in the segment
+        self.assertNotIn("strip_cfg", conv)
+        core = s.kwargs("extend_in_graph")
+        self.assertIs(core["tables"], meta.flashinfer)
+        self.assertIs(core["ssm_states"], self.backend.temporal)
+        self.assertIsInstance(core["kernel"], _FlashInferKernel)
+        self.assertEqual(
+            (core["checkpoint_rows"], core["checkpoint_every_n_tokens"]), (0, 64)
+        )
+        self.assertEqual((core["l2norm_retile"], core["qk_one_launch"]), (True, True))
+        # the shared output outside the graph pool, every bucket row
+        (shared,) = self.ex.gdn_graph_outputs
+        self.assertEqual(tuple(shared.shape), (8, HV, D))
+        self.assertEqual(core["output"].data_ptr(), shared.data_ptr())
+        self.assertTrue(torch.equal(s.kwargs("norm")["x"], torch.ones(8 * HV, D)))
+        self.assertEqual(self.st.ran_ops, [("gdn", "graph+conv_split+fi")])
+        self.assertEqual(tuple(out.shape), (8, 1))
+
+    def test_graph_outputs_grow_and_keep_the_smaller_ones(self):
+        self.graph_step(_graph_meta(), rows=8)
+        first = self.ex.gdn_graph_outputs[0]
+        self.graph_step(_graph_meta(), rows=4, lens=(3,))
+        self.assertEqual(self.ex.gdn_graph_outputs, [first])
+        self.graph_step(_graph_meta(), rows=16, lens=(9,))
+        self.assertEqual(len(self.ex.gdn_graph_outputs), 2)
+        self.assertEqual(self.ex.gdn_graph_outputs[0].shape[0], 16)
+        self.assertIs(self.ex.gdn_graph_outputs[1], first)
+
+    def test_track_snapshots_from_the_tables(self):
+        meta = _graph_meta(track=True)
+        self.graph_step(meta, rows=128, lens=(100,))
+        s = self.spies
+        self.assertEqual(
+            s.names(),
+            [
+                "track_conv_window",
+                "split_conv",
+                "gating",
+                "track_ssm",
+                "extend_in_graph",
+                "track_ssm",
+                "norm",
+            ],
+        )
+        window = s.kwargs("track_conv_window")
+        self.assertEqual(
+            (window["track_mode"], window["track_dst"], window["num_tokens"]),
+            ("conv_mode", "dst", "tokens"),
+        )
+        pre, post = [c[1] for c in s.calls if c[0] == "track_ssm"]
+        # before the kernel: chunk-0 rows snapshot the initial state
+        self.assertEqual(pre["track_mode"], "pre_mode")
+        self.assertEqual(tuple(pre["h"].shape), (1, *self.backend.temporal.shape))
+        # after: the 64-token checkpoints of the 128-row bucket
+        self.assertEqual(s.kwargs("extend_in_graph")["checkpoint_rows"], 2)
+        self.assertEqual((post["track_mode"], post["track_h_row"]), ("mode", "h_row"))
+        self.assertEqual(tuple(post["h"].shape), (1, 2, HV, D, D))
+        self.assertEqual(self.st.ran_ops, [("gdn", "graph+conv_split+fi+track")])
+
+    def test_no_tables_runs_the_core_as_a_break(self):
+        seen = []
+
+        def core(executor, gdn, step, qkv, a, b):
+            seen.append((executor, gdn, step.kernel, tuple(qkv.shape), a.shape[0]))
+            return torch.full((1, qkv.shape[0], HV, D), 3.0), "break"
+
+        with mock.patch.object(pg, "gdn_core", core):
+            out = self.graph_step(None)
+        ((executor, gdn, kernel, qkv, a_rows),) = seen
+        self.assertEqual((executor, gdn), (self.ex, self.gdn))
+        self.assertIsInstance(kernel, _FlashInferKernel)
+        self.assertEqual((qkv, a_rows), ((8, QKV), 8))
+        # the projections and the norm stay in the segment
+        self.assertEqual(self.spies.names(), ["norm"])
+        norm = self.spies.kwargs("norm")["x"]
+        self.assertTrue(torch.equal(norm, torch.full((8 * HV, D), 3.0)))
+        self.assertEqual(self.st.ran_ops, [("gdn", "break")])
+        self.assertEqual(tuple(out.shape), (8, 1))
+
+    def test_triton_tables_keep_sglang_chain(self):
+        self.assertIsNone(self.graph_step(_graph_meta(flashinfer=False)))
+        self.assertEqual(self.spies.calls, [])
+        self.assertEqual(self.st.ran_ops, [])
+
+    def test_break_body_runs_the_eager_core_on_the_real_rows(self):
+        live = _St(_batch((5,), padded=5))
+        seen = {}
+
+        def core_rows(options, step, gdn, fb, qkv, a, b, output):
+            seen.update(fb=fb, rows=(qkv.shape[0], a.shape[0], b.shape[0]))
+            seen["output"] = tuple(output.shape)
+            output.fill_(1.0)
+            return "conv_split+fi+rows_fused"
+
+        output = torch.full((1, 8, HV, D), 7.0)
+        args = (torch.zeros(8, QKV), torch.zeros(8, HV), torch.zeros(8, HV), output)
+        with (
+            mock.patch.object(pg, "_live", lambda executor: live),
+            mock.patch.object(gp, "core_rows", core_rows),
+        ):
+            pg._gdn_core(self.ex, "gdn", "step", *args)
+        self.assertIs(seen["fb"], live.fb)
+        self.assertEqual((seen["rows"], seen["output"]), ((5, 5, 5), (1, 5, HV, D)))
+        self.assertTrue(torch.equal(output[:, :5], torch.ones(1, 5, HV, D)))
+        self.assertTrue(torch.equal(output[:, 5:], torch.zeros(1, 3, HV, D)))
+        self.assertEqual(live.ran_ops, [("gdn.core", "conv_split+fi+rows_fused")])
+
+    def test_core_rows_writes_the_output(self):
+        _STATE["breakable"] = False
+        lens = (5,)
+        self.spies = _Spies(self)
+        backend = _Backend(_metadata(lens))
+        _STATE["backend"] = backend
+        gdn = _gdn()
+        fb = _batch(lens)
+        _, step = gp.prepare(gdn, torch.zeros(5, HIDDEN, dtype=torch.bfloat16), fb)
+        output = torch.zeros(1, 5, HV, D)
+        qkvz, ba = gdn._forward_input_proj(torch.zeros(5, HIDDEN))
+        qkv = qkvz[:, :QKV]
+        impl = gp.core_rows(gp.DEFAULT, step, gdn, fb, qkv, ba[:, :HV], ba[:, HV:], output)
+        self.assertEqual(impl, "conv_split+fi+rows_fused")
+        self.assertIs(self.spies.kwargs("flashinfer")["output"], output)
+        # an MIS batch keeps SGLang's extend
+        backend.mis_metadata = object()
+        backend.forward_extend = lambda layer, fb_, *a: torch.ones(1, 5, HV, D)
+        impl = gp.core_rows(gp.DEFAULT, step, gdn, fb, qkv, ba[:, :HV], ba[:, HV:], output)
+        self.assertEqual(impl, "mis_stock")
+        self.assertTrue(torch.equal(output, torch.ones(1, 5, HV, D)))
+
+
+class TestExtendInGraph(unittest.TestCase):
+    """FlashInfer's calls on a bucket's static tables."""
+
+    def run_core(self, cp_single, checkpoint_rows=0):
+        calls, tails = [], []
+        kernel = SimpleNamespace(_prefill_fn=lambda **kw: calls.append(kw))
+        tables = SimpleNamespace(
+            cp_single=cp_single,
+            cp_cu_seqlens=torch.tensor([0, 5]),
+            ncp_cu_seqlens=torch.tensor([0, 0, 0]),
+            cp_state_indices="cp_slots",
+            ncp_state_indices="ncp_slots",
+            cp_checkpoint_cu="cp_ck",
+            ncp_checkpoint_cu="ncp_ck",
+        )
+        prep = lambda q, k, v, retile, qk_one_launch: (q, k, v)
+        q, v = torch.zeros(1, 8, H, D), torch.zeros(1, 8, HV, D)
+        g, beta = torch.zeros(1, 8, HV), torch.ones(1, 8, HV)
+        self.ssm, self.output = torch.zeros(SLOTS, HV, D, D), torch.zeros(8, HV, D)
+        with (
+            mock.patch.object(fi_mod, "gdn_prefill_qkv_prepare_fwd", prep),
+            mock.patch.object(
+                tail_mod, "gdn_cp_tail_neutralize", lambda *a: tails.append(a[-1])
+            ),
+        ):
+            out = fi_mod.extend_in_graph(
+                kernel, q, q, v, g, beta, ssm_states=self.ssm, tables=tables,
+                output=self.output, checkpoint_rows=checkpoint_rows,
+                checkpoint_every_n_tokens=64,
+            )
+        return calls, tails, tables, out
+
+    def test_one_sequence_on_the_cp_kernel(self):
+        calls, tails, tables, out = self.run_core(cp_single=True)
+        self.assertIsNone(out)
+        cp, ncp = calls
+        self.assertEqual((cp["use_cp"], cp["max_seqlen"]), (True, 8))
+        self.assertIs(cp["cu_seqlens"], tables.cp_cu_seqlens)
+        slots = (cp["state_indices"], ncp["state_indices"])
+        self.assertEqual(slots, ("cp_slots", "ncp_slots"))
+        self.assertIs(ncp["cu_seqlens"], tables.ncp_cu_seqlens)
+        self.assertEqual(ncp["use_cp"], False)
+        self.assertNotIn("max_seqlen", ncp)
+        for call in calls:  # in place by slot, FlashInfer's own l2norm off
+            self.assertIs(call["initial_state"], self.ssm)
+            self.assertIs(call["output_state"], self.ssm)
+            self.assertIs(call["output"], self.output)
+            self.assertFalse(call["use_qk_l2norm_in_kernel"])
+            self.assertTrue(torch.equal(call["g"], torch.ones(8, HV)))
+            self.assertNotIn("state_checkpoints", call)
+        # the rows past each call's batch neutralized: CP [0, T], non-CP its last pair
+        self.assertIs(tails[0], tables.cp_cu_seqlens)
+        self.assertEqual(tails[1].tolist(), [0, 0])
+
+    def test_other_batches_on_the_non_cp_kernel_with_checkpoints(self):
+        calls, tails, tables, out = self.run_core(cp_single=False, checkpoint_rows=2)
+        (ncp,) = calls
+        self.assertEqual(ncp["use_cp"], False)
+        self.assertEqual(len(tails), 1)
+        self.assertEqual(tuple(ncp["state_checkpoints"].shape), (2, HV, D, D))
+        self.assertEqual(ncp["checkpoint_cu_starts"], "ncp_ck")
+        self.assertEqual(ncp["checkpoint_every_n_tokens"], 64)
+        self.assertEqual(tuple(out.shape), (1, 2, HV, D, D))
 
 
 class TestOptions(unittest.TestCase):

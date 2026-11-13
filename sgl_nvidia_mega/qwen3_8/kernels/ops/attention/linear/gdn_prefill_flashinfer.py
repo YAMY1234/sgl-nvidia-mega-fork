@@ -13,6 +13,11 @@ environment reads are arguments (SGLANG_OPT_GDN_PREFILL_FUSED_STATE_COPY is
 switches are ``l2norm_retile`` and ``qk_one_launch``), and the q / k / v preparation is
 this package's copy. FlashInfer's prefill function is the stock kernel's, so
 ``gdn_prefill_tmem_dealloc.install()`` (FlashInfer #8854) reaches it too.
+
+``extend_in_graph`` is the source's ``FlashInferGDNKernel.extend_in_graph`` (the core of
+a GDN extend captured in a breakable prefill CUDA graph, on the bucket's static
+``GDNFlashInferGraphTables``), with this package's q / k / v preparation and the
+bucket rows past the batch neutralized before the non-CP call as well.
 """
 
 from typing import Optional
@@ -40,6 +45,15 @@ SGLANG_READS = {
         "_prefill_fn",
         "use_state_pool",
         "_prefill_needs_fp32_state",
+    ),
+    "srt/layers/attention/linear/gdn_prefill_graph.py": (
+        "cp_single",
+        "cp_cu_seqlens",
+        "cp_state_indices",
+        "cp_checkpoint_cu",
+        "ncp_cu_seqlens",
+        "ncp_state_indices",
+        "ncp_checkpoint_cu",
     ),
 }
 
@@ -150,3 +164,85 @@ def extend(
     # Match Triton's [1, checkpoints, H, V, K] intermediate-state layout.
     h = state_checkpoints.unsqueeze(0) if state_checkpoints is not None else None
     return core_attn_out, None, h
+
+
+def extend_in_graph(
+    kernel,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    ssm_states: torch.Tensor,
+    tables,
+    output: torch.Tensor,
+    checkpoint_rows: int,
+    checkpoint_every_n_tokens: int,
+    l2norm_retile: bool = False,
+    qk_one_launch: bool = False,
+) -> Optional[torch.Tensor]:
+    """The prefill core of a captured GDN extend on the bucket's static tables
+    (``GDNFlashInferGraphTables``): the CP kernel takes a one-sequence batch (if
+    ``tables.cp_single``), the non-CP kernel any other, and both update the pool in
+    place by slot. ``output`` is [tokens, HV, V]; returns the [1, checkpoint_rows, HV,
+    V, K] state checkpoints, if any."""
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba.gdn_prefill_cp_tail import (
+        gdn_cp_tail_neutralize,
+    )
+
+    q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(
+        q[0], k[0], v[0], retile=l2norm_retile, qk_one_launch=qk_one_launch
+    )
+    alpha = torch.exp(g[0].to(torch.float32))
+    beta_fi = beta[0].to(torch.float32)
+    common = dict(
+        q=q_fi,
+        k=k_fi,
+        v=v_fi,
+        g=alpha,
+        beta=beta_fi,
+        scale=None,
+        initial_state=ssm_states,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=False,
+        output=output,
+        output_state=ssm_states,
+    )
+    checkpoints = (
+        ssm_states.new_empty((checkpoint_rows, *ssm_states.shape[1:]))
+        if checkpoint_rows > 0
+        else None
+    )
+
+    def checkpoint_args(cu: torch.Tensor) -> dict:
+        if checkpoints is None:
+            return {}
+        return dict(
+            state_checkpoints=checkpoints,
+            checkpoint_cu_starts=cu,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        )
+
+    if tables.cp_single:
+        # Rows past T are bucket padding (stale graph-pool memory, possibly not finite).
+        gdn_cp_tail_neutralize(q_fi, k_fi, v_fi, alpha, beta_fi, tables.cp_cu_seqlens)
+        # max_seqlen bounds the CP launch grid; the bucket bounds any sequence.
+        kernel._prefill_fn(
+            **common,
+            cu_seqlens=tables.cp_cu_seqlens,
+            state_indices=tables.cp_state_indices,
+            use_cp=True,
+            max_seqlen=q_fi.shape[0],
+            **checkpoint_args(tables.cp_checkpoint_cu),
+        )
+    # The non-CP table's last entry is the batch's T (0 when the CP call took it).
+    gdn_cp_tail_neutralize(q_fi, k_fi, v_fi, alpha, beta_fi, tables.ncp_cu_seqlens[-2:])
+    kernel._prefill_fn(
+        **common,
+        cu_seqlens=tables.ncp_cu_seqlens,
+        state_indices=tables.ncp_state_indices,
+        use_cp=False,
+        **checkpoint_args(tables.ncp_checkpoint_cu),
+    )
+    return checkpoints.unsqueeze(0) if checkpoints is not None else None

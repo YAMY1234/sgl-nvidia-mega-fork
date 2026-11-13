@@ -322,6 +322,8 @@ def gemm(
     state = _load()
     if not state or x.ndim != 2 or weight.ndim != 2:
         return None
+    # CuTe's DLPack import refuses tensors that require grad (e.g. the HC mix weights)
+    x, weight = x.detach(), weight.detach()
     n, k = weight.shape
     if (n, k) not in state["shapes"]:
         return None

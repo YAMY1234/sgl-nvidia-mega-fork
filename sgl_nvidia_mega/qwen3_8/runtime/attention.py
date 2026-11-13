@@ -10,7 +10,7 @@ pool runs the sparse attention as the plugin's split-K pool kernels
 over the selected blocks (and the request's own uncompressed tail) and the merge, which
 also applies the sigmoid output gate.
 
-Slot ``qsa_pool_fp8``: a TP1 target verify of 33-576 rows (9-144 requests x 4) on an FP8
+Slot ``qsa_pool_fp8``: a TP1 target verify of 56-576 rows (14-144 requests x 4) on an FP8
 E4M3 KV pool runs it as the union kernels (``qsa/pool_union_ws.py``): the new BF16 K/V
 cast to E4M3 in the pool write, each request's union of selected tokens, the
 warp-specialized attention over it (launched with PDL) and the split merge; SGLang's
@@ -39,9 +39,10 @@ STOCK = "stock"
 OPCHECK = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_OPCHECK") == "1"
 MAX_ROWS = 64
 QUERY_HEADS, KV_HEADS, HEAD_DIM, BLOCKS, RATIO = 24, 2, 256, 512, 4
-# Slot qsa_pool_fp8's verify rows; other widths run SGLang's pack + TRT-LLM decode
+# Slot qsa_pool_fp8's verify rows; other widths run SGLang's pack + TRT-LLM decode. On SM107 the union
+# beat it at 56-64 rows at every context and selection overlap measured, not reliably below
 UNION_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_UNION_MIN_ROWS"
-UNION_MIN_ROWS = int(os.environ.get(UNION_MIN_ROWS_ENV) or 33)
+UNION_MIN_ROWS = int(os.environ.get(UNION_MIN_ROWS_ENV) or 56)
 UNION_MAX_ROWS = 576
 # Splits of a request's token list in the union attention (1-16)
 UNION_SPLITS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_UNION_SPLITS"

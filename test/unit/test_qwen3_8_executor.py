@@ -777,7 +777,8 @@ class TestQsaPoolFp8(unittest.TestCase):
             (bf16, 128, False, "stock"),  # the pool check turned the union off
             (fp8, 8, True, "stock"),
             (fp8, 32, True, "stock"),
-            (fp8, 36, True, "union_ws_fp8"),
+            (fp8, 52, True, "stock"),  # below the measured bound (56)
+            (fp8, 56, True, "union_ws_fp8"),
             (fp8, 64, True, "union_ws_fp8"),  # the split-K kernels read BF16 only
             (fp8, 288, True, "union_ws_fp8"),
             (fp8, 512, True, "union_ws_fp8"),

@@ -24,8 +24,8 @@ SGLANG_READS = {"kernels/ops/attention/fla/utils.py": ("is_tf32_supported",)}
 
 
 SGLANG_MIRRORS = {
-    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:gdn_replayssm_spec_circular_kernel": "24661e2e09baefb2",
-    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:_launch_gdn_spec": "8bf89daf973334cc",
+    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:gdn_replayssm_spec_circular_kernel": "2957b47bcee2fd5b",
+    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:_launch_gdn_spec": "8acb385876f4caf8",
     "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:gdn_replayssm_spec_decode": "c3fcd760148facd7",
 }
 
@@ -90,6 +90,11 @@ def gdn_replayssm_spec_circular_kernel(
     IS_FLUSH: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    # Element strides between the replay rows of each cursor: 1 when the
+    # cursors are their own arrays, a whole entry when they sit in one.
+    STRIDE_WP: tl.constexpr = 1,
+    STRIDE_CB: tl.constexpr = 1,
+    STRIDE_FL: tl.constexpr = 1,
     USE_GDC: tl.constexpr = False,
     WAIT_FOR_GATE_PRODUCER: tl.constexpr = False,
     PREFETCH_CHECKPOINT: tl.constexpr = False,
@@ -123,7 +128,7 @@ def gdn_replayssm_spec_circular_kernel(
             if USE_GDC:
                 tl.extra.cuda.gdc_wait()
             return
-        b_is_flush = tl.load(is_flush_flags + replay_idx) != 0
+        b_is_flush = tl.load(is_flush_flags + replay_idx * STRIDE_FL) != 0
         if not b_is_flush:
             if USE_GDC:
                 tl.extra.cuda.gdc_wait()
@@ -139,14 +144,14 @@ def gdn_replayssm_spec_circular_kernel(
                 mask=full_mask,
             )
             return
-        b_is_flush = tl.load(is_flush_flags + replay_idx) != 0
+        b_is_flush = tl.load(is_flush_flags + replay_idx * STRIDE_FL) != 0
         if b_is_flush:
             if USE_GDC:
                 tl.extra.cuda.gdc_wait()
             return
 
-    b_write_pos = tl.load(write_pos + replay_idx).to(tl.int64)
-    b_cache_base = tl.load(cache_base + replay_idx).to(tl.int32)
+    b_write_pos = tl.load(write_pos + replay_idx * STRIDE_WP).to(tl.int64)
+    b_cache_base = tl.load(cache_base + replay_idx * STRIDE_CB).to(tl.int32)
 
     out_mask = mask_s[:, None] & mask_v[None, :]
 
@@ -591,6 +596,9 @@ def verify(
         IS_FLUSH=False,
         NULL_BLOCK_ID=null_block_id,
         DOT_PRECISION="tf32" if is_tf32_supported else "ieee",
+        STRIDE_WP=write_pos.stride(0),
+        STRIDE_CB=cache_base.stride(0),
+        STRIDE_FL=is_flush.stride(0),
         num_warps=num_warps,
         num_stages=num_stages,
         **pdl_kwargs,
@@ -611,7 +619,11 @@ SGLANG_READS = {"kernels/ops/attention/fla/utils.py": ("is_tf32_supported",)}
 # contract test skips each, naming the change, only where the installed SGLang lacks it.
 SGLANG_REQUIRES = {
     "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:gdn_replayssm_spec_circular_kernel": (
-        "sglang#46185",
-        ("9ad1193ce666552d",),
+        "sglang#49719",
+        ("9ad1193ce666552d", "24661e2e09baefb2"),
+    ),
+    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:_launch_gdn_spec": (
+        "sglang#49719",
+        ("8bf89daf973334cc",),
     ),
 }

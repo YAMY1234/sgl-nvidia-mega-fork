@@ -50,7 +50,7 @@ class _FusedMoE:
         self.intermediate_size_per_partition = INTER
         self.routing_method_type = _Routing.RenormalizeNaive
         self.moe_runner_config = SimpleNamespace(
-            activation="silu", is_gated=True, routed_scaling_factor=None
+            activation="silu", is_gated=True, routed_scaling_factor=None, inplace=False
         )
         self.w13_weight = torch.zeros(
             EXPERTS, 2 * INTER, HIDDEN // 2, dtype=torch.uint8
@@ -612,7 +612,7 @@ class _Block(_Mlp):
         return self.out
 
     def _forward_shared_experts(self, x, apply_gate):
-        self.log.append(("shared", _STATE["on"].name, apply_gate))
+        self.log.append(("shared", _STATE["on"].name, apply_gate, x))
         return torch.zeros_like(x)
 
 
@@ -658,9 +658,10 @@ class TestExtendStep(_Case):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def run_moe(self, rows=moe.EXTEND_MIN_ROWS, options=mr.DEFAULT):
+    def run_moe(self, rows=moe.EXTEND_MIN_ROWS, options=mr.DEFAULT, inplace=False):
         self.mlp = _Block(_STATE["log"], rows)
-        self.x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16)
+        self.mlp.experts.moe_runner_config.inplace = inplace
+        self.x = torch.randn(rows, HIDDEN).to(torch.bfloat16)
         self.st = _St()
         executor = SimpleNamespace(
             moe_finalize_ready=True, moe_routing=options, smallm_gemm=None
@@ -751,24 +752,101 @@ class TestExtendStep(_Case):
         rows = moe.EXTEND_MIN_ROWS - 1
         with mock.patch.object(mr, "_takes_fused", lambda *a: False):
             order, launch = self.run_moe(rows=rows)
-        # the shared expert waits for the router GEMM (the source's executed order)
+        # nothing orders the shared expert after the router GEMM
         self.assertEqual(
-            order[:10],
+            order[:8],
             [
                 ("wait", "alt", "current"),
                 ("quant", "current"),
                 ("record_event", "current"),
-                ("gate", "alt"),
-                ("record_event", "alt"),
-                ("wait_event", "current", "alt"),
                 ("shared", "current", False),
+                ("gate", "alt"),
                 ("topk",),
                 ("wait_event", "alt", "current"),
                 ("run_moe_core",),
             ],
         )
         self.assertEqual(order[-1], ("finalize", "current", (rows,)))
-        self.assertEqual(self.st.ran_ops[0], (mr.OP, "prequant"))
+        self.assertEqual(
+            self.st.ran_ops[:2], [("moe.shared_input", "stock"), (mr.OP, "prequant")]
+        )
+
+    def run_fused(self, rows, no_clone, inplace=False):
+        """The decode-size step on rows the fused routing takes (its routed half a spy)."""
+
+        def fused_from_logits(mlp, x, logits, st):
+            _STATE["log"].append(("fused_from_logits", _STATE["on"].name))
+            st.ran(mr.OP, "fused_routing")
+            return mlp.out
+
+        with (
+            mock.patch.object(mr, "_takes_fused", lambda *a: True),
+            mock.patch.object(mr, "fused_from_logits", fused_from_logits),
+            mock.patch.object(moe, "SHARED_NO_CLONE", no_clone),
+        ):
+            return self.run_moe(rows=rows, inplace=inplace)
+
+    def test_fused_rows_shared_expert_beside_the_router_gemm(self):
+        # the source's forward_normal_dual_stream with its fused routing: the shared expert
+        # first on the current stream, without waiting for the router GEMM; the router
+        # GEMM, the routing and the routed GEMMs on the side stream; the finalize after
+        # the join
+        for rows in (4, 16, 64, 176, 256, 320):
+            for no_clone in (True, False):
+                with self.subTest(rows=rows, no_clone=no_clone):
+                    _STATE["log"].clear()
+                    order, _ = self.run_fused(rows, no_clone)
+                    self.assertEqual(
+                        order,
+                        [
+                            ("wait", "alt", "current"),
+                            ("shared", "current", False),
+                            ("gate", "alt"),
+                            ("fused_from_logits",),
+                            ("wait", "current", "alt"),
+                            ("record_stream", (rows * TOP_K, HIDDEN), "current"),
+                            ("record_stream", (rows, TOP_K), "current"),
+                            ("record_stream", (rows * TOP_K,), "current"),
+                            ("finalize", "current", (rows,)),
+                        ],
+                    )
+                    log = _STATE["log"]
+                    self.assertEqual(log[3], ("fused_from_logits", "alt"))
+                    # the shared expert reads the input itself, or SGLang's clone of it
+                    self.assertIs(log[1][3] is self.x, no_clone)
+                    self.assertTrue(torch.equal(log[1][3], self.x))
+                    impl = "no_clone" if no_clone else "stock"
+                    self.assertEqual(
+                        self.st.ran_ops,
+                        [
+                            ("moe.shared_input", impl),
+                            (mr.OP, "fused_routing"),
+                            ("moe", "finalize_permuted"),
+                        ],
+                    )
+
+    def test_inplace_runner_keeps_the_clone(self):
+        # the source's condition: no clone only for a routed runner that does not write
+        # its input in place
+        self.run_fused(256, no_clone=True, inplace=True)
+        self.assertIsNot(_STATE["log"][1][3], self.x)
+        self.assertEqual(self.st.ran_ops[0], ("moe.shared_input", "stock"))
+
+    def test_eager_has_no_clone(self):
+        # the source's eager branch: the shared expert on the input, then the routed half
+        _STATE["capture"] = False
+        with mock.patch.object(moe, "SHARED_NO_CLONE", False):
+            order, _ = self.run_moe(rows=8, options=None)
+        self.assertEqual(
+            order,
+            [
+                ("shared", "current", False),
+                ("routed", "current", True),
+                ("finalize", "current", (8,)),
+            ],
+        )
+        self.assertIs(_STATE["log"][0][3], self.x)
+        self.assertEqual(self.st.ran_ops, [("moe", "finalize_permuted")])
 
     def test_fewer_rows_take_the_source_dual_stream(self):
         # the source's forward_normal_dual_stream at decode sizes: the shared expert on the
@@ -793,7 +871,62 @@ class TestExtendStep(_Case):
         self.assertEqual((launch["USE_PDL"], launch["num_warps"]), (self.pdl, 16))
         self.assertNotIn("maxnreg", launch)
         self.assertNotIn("CHUNK", launch)
-        self.assertEqual(self.st.ran_ops, [("moe", "finalize_permuted")])
+        self.assertEqual(
+            self.st.ran_ops,
+            [("moe.shared_input", "stock"), ("moe", "finalize_permuted")],
+        )
+
+
+_NO_CLONE_SWITCH = r"""
+import importlib
+import json
+import os
+
+from sgl_nvidia_mega.qwen3_8.runtime import moe
+
+out = {}
+for value in (None, "1", "true", "True", "0", "false", "yes"):
+    os.environ.pop(moe.SHARED_NO_CLONE_ENV, None)
+    if value is not None:
+        os.environ[moe.SHARED_NO_CLONE_ENV] = value
+    importlib.reload(moe)
+    out[str(value)] = moe.SHARED_NO_CLONE
+print(json.dumps(out))
+"""
+
+
+class TestSharedNoCloneSwitch(unittest.TestCase):
+    def test_read_as_the_source_reads_its_switch(self):
+        """get_bool_env_var's parsing, default off, under the recipes' name for the
+        source's SGLANG_QWEN_MOE_SHARED_NO_CLONE."""
+        import json
+        import subprocess
+
+        self.assertEqual(
+            moe.SHARED_NO_CLONE_ENV, "SGLANG_OPT_MOE_SHARED_EXPERT_NO_CLONE"
+        )
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        done = subprocess.run(
+            [sys.executable, "-c", _NO_CLONE_SWITCH],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        got = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(
+            got,
+            {
+                "None": False,
+                "1": True,
+                "true": True,
+                "True": True,
+                "0": False,
+                "false": False,
+                "yes": False,
+            },
+        )
 
 
 class TestOptions(unittest.TestCase):

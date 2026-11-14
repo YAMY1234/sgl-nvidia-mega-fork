@@ -8,9 +8,10 @@ recurrence that advances each slot by exactly its accepted tokens (the bounds ar
 source test's). Then, on SM107, the claims the port rests on: the flush options
 change no bit, the fused conv is the separate conv's bits (SGLang's and the hoisted
 copy, which agree bit for bit), the fused norm is within a bf16 rounding of SGLang's
-gated norm, and a captured graph replays the eager bits. On any of them, the separate
-norm's verify launch (16 rows x 8 warps a program) is SGLang's gated norm bit for bit at
-Qwen3.8's verify shapes.
+gated norm, and a captured graph replays the eager bits. On any of them, at Qwen3.8's
+verify shapes, the separate norm's verify launch (16 rows x 8 warps a program) is SGLang's
+gated norm bit for bit, and the source's retiled verify conv is the hoisted conv's and
+SGLang's conv's bits.
 """
 
 import os
@@ -351,6 +352,97 @@ def test_hoisted_conv_is_sglang_conv():
         _same(y0.view(batch, T, -1)[live], y1.view(batch, T, -1)[live], "conv output")
         _same(s0, s1, "conv state")
         _same(w0[live], w1[live], "conv windows")
+
+
+# Verify requests (x 4 draft rows: 4 to 320 rows)
+VERIFY_BATCHES = (1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 32, 44, 48, 52, 56, 60, 64)
+VERIFY_BATCHES += (68, 72, 80)
+
+
+@pytest.mark.parametrize("batch", VERIFY_BATCHES)
+def test_retiled_conv_is_the_hoisted_and_sglang_conv(batch, monkeypatch):
+    """SGLANG_ENABLE_GDN_VERIFY_CONV_RETILE at Qwen3.8's shapes (16 key heads, 48 value
+    heads): the source's retiled kernel writes the bits of the hoisted conv (the separate
+    conv before it) and of SGLang's causal_conv1d_update: the outputs, the conv states
+    and the deduplicated step windows, with padded rows."""
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.gdn_front import conv as front
+
+    h, hv, T = 16, 48, NUM_DRAFT_TOKENS
+    retiled = []
+    launch = front.launch_retiled
+
+    def spy(**kw):
+        retiled.append(kw["config"])
+        return launch(**kw)
+
+    monkeypatch.setattr(front, "launch_retiled", spy)
+    # one state slot a row (two rows on one slot would race); every 5th row is padding
+    slots = torch.arange(1, batch + 1, dtype=torch.int32, device=DEVICE)
+    slots[3::5] = -1
+    rows = torch.arange(batch, dtype=torch.int32, device=DEVICE)
+    live = [r for r, s in enumerate(slots.tolist()) if s >= 0]
+
+    def run(retile, hoisted, perturb=False):
+        proj, mixed, weight, conv_state, phys, window = _conv_inputs(
+            batch, T, h, hv, batch
+        )
+        if perturb:
+            mixed[live[-1] * T + 1, 7] += 4
+        y = U._conv(
+            _attn(weight, h, hv),
+            mixed,
+            conv_state,
+            window,
+            slots,
+            rows,
+            batch,
+            T,
+            hoisted,
+            retile=retile,
+        )
+        torch.cuda.synchronize()
+        return y.view(batch, T, -1)[live], conv_state, phys[live]
+
+    got = run(True, True)
+    assert retiled == [front.RETILE_DEFAULT]
+    for name, ref in (("hoisted", run(False, True)), ("SGLang's", run(False, False))):
+        for what, a, b in zip(("output", "conv state", "windows"), got, ref):
+            _same(a, b, f"retiled vs {name} conv at batch {batch}: {what}")
+    # the comparison sees the rows: one changed x element changes its own request only
+    moved = run(True, True, perturb=True)
+    assert not torch.equal(moved[0][-1], got[0][-1]), "a perturbed row must change"
+    _same(moved[0][:-1], got[0][:-1], "the other requests' outputs")
+
+
+def test_retiled_conv_on_the_dense_window_is_sglang_conv():
+    """The per-step window layout (no deduplication) takes the retiled kernel's
+    per-step stores: SGLang's bits."""
+    h, hv, T, batch = 16, 48, NUM_DRAFT_TOKENS, 6
+    slots = torch.tensor([3, 0, 5, -1, 1, 6], dtype=torch.int32, device=DEVICE)
+    rows = torch.arange(batch, dtype=torch.int32, device=DEVICE)
+    live = [r for r, s in enumerate(slots.tolist()) if s >= 0]
+    results = []
+    for retile in (False, True):
+        proj, mixed, weight, conv_state, _, _ = _conv_inputs(batch, T, h, hv, 11)
+        window = torch.zeros(
+            batch, T, mixed.shape[1], 3, dtype=torch.bfloat16, device=DEVICE
+        )
+        y = U._conv(
+            _attn(weight, h, hv),
+            mixed,
+            conv_state,
+            window,
+            slots,
+            rows,
+            batch,
+            T,
+            False,
+            retile=retile,
+        )
+        torch.cuda.synchronize()
+        results.append((y.view(batch, T, -1)[live], conv_state, window[live]))
+    for what, a, b in zip(("output", "conv state", "windows"), *results):
+        _same(a, b, f"retiled vs SGLang's conv, per-step windows: {what}")
 
 
 def _flush_batch(h, hv, T):

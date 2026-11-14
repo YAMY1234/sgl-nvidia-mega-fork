@@ -10,6 +10,7 @@ so no GPU is needed."""
 
 import functools
 import hashlib
+import importlib
 import json
 import os
 import sys
@@ -1277,7 +1278,7 @@ class _Routes(_Gemm):
                 parent, **{child.__name__.rsplit(".", 1)[1]: child}
             )
         patcher = mock.patch.object(
-            sys.modules["sglang"], "kernels", child, create=True
+            importlib.import_module("sglang"), "kernels", child, create=True
         )
         patcher.start()
         self.addCleanup(patcher.stop)

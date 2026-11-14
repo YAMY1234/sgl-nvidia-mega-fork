@@ -219,6 +219,11 @@ def _install(test):
         "sglang.srt.runtime_context": dict(
             get_parallel=lambda: SimpleNamespace(tp_size=_STATE["tp"])
         ),
+        # moe.step reads only this; the real package imports SGLang's distributed
+        # stack, which needs the real runtime_context the fake above replaces
+        "sglang.srt.batch_invariant_ops": dict(
+            is_batch_invariant_mode_enabled=lambda: False
+        ),
         "sglang.srt.model_executor.runner": dict(
             get_is_capture_mode=lambda: _STATE["capture"]
         ),

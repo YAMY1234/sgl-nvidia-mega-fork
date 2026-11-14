@@ -606,3 +606,12 @@ def gdn_replayssm_spec_decode(**kwargs):
 
 
 SGLANG_READS = {"kernels/ops/attention/fla/utils.py": ("is_tf32_supported",)}
+
+# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
+# contract test skips each, naming the change, only where the installed SGLang lacks it.
+SGLANG_REQUIRES = {
+    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:gdn_replayssm_spec_circular_kernel": (
+        "sglang#46185",
+        ("9ad1193ce666552d",),
+    ),
+}

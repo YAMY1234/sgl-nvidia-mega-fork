@@ -89,6 +89,15 @@ SGLANG_MIRRORS = {
     "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_shared_experts": "3b55a78638831ffa",
 }
 
+# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
+# contract test skips each, naming the change, only where the installed SGLang lacks it.
+SGLANG_REQUIRES = {
+    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_router_experts": (
+        "sglang#48366",
+        ("32d09f01b77d76b5",),
+    ),
+}
+
 
 def layer_reasons(layer) -> str:
     from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock

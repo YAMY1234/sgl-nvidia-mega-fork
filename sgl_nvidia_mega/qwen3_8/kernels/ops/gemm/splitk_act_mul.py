@@ -50,6 +50,17 @@ SGLANG_MIRRORS = {
     "kernels/ops/gemm/dense_bf16_gemm_sm100_splitk_epilogue.py:SplitKDenseGemmKernel.epilog_warp": "d317579e743e7dd2",
 }
 
+# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
+# contract test skips each, naming the change, only where the installed SGLang lacks it.
+SGLANG_REQUIRES = {
+    "kernels/ops/gemm/dense_bf16_gemm_sm100_splitk_epilogue.py:_mbarrier_wait_acquire_cluster": "sglang#50194",
+    "kernels/ops/gemm/dense_bf16_gemm_sm100_splitk_epilogue.py:_tcgen05_fence": "sglang#48616",
+    "kernels/ops/gemm/dense_bf16_gemm_sm100_splitk_epilogue.py:SplitKDenseGemmKernel.epilog_warp": (
+        "sglang#50194",
+        ("e6f914864abef611", "070a3e085d4ddd5d"),
+    ),
+}
+
 # (mma_m, mma_n, split_k, ab_stages): the source's gate_up route at 1-16 rows
 TACTIC = (64, 8, 4, 5)
 _TILE_M = 64

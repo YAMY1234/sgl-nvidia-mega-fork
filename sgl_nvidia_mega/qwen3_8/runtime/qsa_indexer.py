@@ -176,6 +176,15 @@ SGLANG_MIRRORS = {
     "srt/layers/attention/qsa/qsa_indexer.py:QSAIndexer.project_qk": "0df8761ad501b30a",
 }
 
+# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
+# contract test skips each, naming the change, only where the installed SGLang lacks it.
+SGLANG_REQUIRES = {
+    "srt/layers/attention/qsa/qsa_indexer.py:QSAIndexer.project_qk": (
+        "sglang#48271",
+        ("4931b511637d8755",),
+    ),
+}
+
 
 @dataclass(frozen=True)
 class Options:

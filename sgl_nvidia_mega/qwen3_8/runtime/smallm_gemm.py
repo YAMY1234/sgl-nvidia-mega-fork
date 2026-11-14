@@ -106,6 +106,12 @@ SGLANG_MIRRORS = {
     "srt/models/qwen2_moe.py:Qwen2MoeMLP.forward": "60b6d1e897d94ed9",
 }
 
+# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
+# contract test skips each, naming the change, only where the installed SGLang lacks it.
+SGLANG_REQUIRES = {
+    "kernels/ops/gemm/dense_bf16_gemm_sm100_splitk_epilogue.py:_mbarrier_wait_acquire_cluster": "sglang#50194",
+}
+
 
 @dataclass(frozen=True)
 class Options:

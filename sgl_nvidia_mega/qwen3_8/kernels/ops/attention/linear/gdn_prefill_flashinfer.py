@@ -57,6 +57,18 @@ SGLANG_READS = {
     ),
 }
 
+# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
+# contract test skips each, naming the change, only where the installed SGLang lacks it.
+SGLANG_REQUIRES = {
+    "srt/layers/attention/linear/gdn_prefill_graph.py:cp_checkpoint_cu": "sglang#50157",
+    "srt/layers/attention/linear/gdn_prefill_graph.py:cp_cu_seqlens": "sglang#50157",
+    "srt/layers/attention/linear/gdn_prefill_graph.py:cp_single": "sglang#50157",
+    "srt/layers/attention/linear/gdn_prefill_graph.py:cp_state_indices": "sglang#50157",
+    "srt/layers/attention/linear/gdn_prefill_graph.py:ncp_checkpoint_cu": "sglang#50157",
+    "srt/layers/attention/linear/gdn_prefill_graph.py:ncp_cu_seqlens": "sglang#50157",
+    "srt/layers/attention/linear/gdn_prefill_graph.py:ncp_state_indices": "sglang#50157",
+}
+
 
 def extend(
     kernel,

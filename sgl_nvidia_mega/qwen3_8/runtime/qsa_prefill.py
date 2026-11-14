@@ -213,6 +213,19 @@ SGLANG_MIRRORS = {
     "srt/layers/attention/qwen_sparse_attn_backend.py:QwenSparseAttnBackend.capture_mtp_sparse_indices": "bc39db1cc9b58976",
 }
 
+# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
+# contract test skips each, naming the change, only where the installed SGLang lacks it.
+SGLANG_REQUIRES = {
+    "kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py:fused_qk_gemma_rmsnorm_rope_gate": (
+        "sglang#48366",
+        ("618c8b9510090454",),
+    ),
+    "srt/layers/radix_attention.py:RadixAttention.forward": (
+        "sglang#48980",
+        ("79fcc925a1bdb5ee",),
+    ),
+}
+
 
 @dataclasses.dataclass(frozen=True)
 class Options:

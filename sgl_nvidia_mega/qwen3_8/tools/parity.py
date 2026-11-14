@@ -41,6 +41,12 @@ SGLANG_READS = {
     "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
 }
 
+# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
+# contract test skips each, naming the change, only where the installed SGLang lacks it.
+SGLANG_REQUIRES = {
+    "srt/mem_cache/kv/decl.py:STATE_PART": "sglang#48007",
+}
+
 MODE = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_PARITY", "0")
 ENABLED = MODE in ("1", "layer", "control")
 

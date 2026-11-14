@@ -51,6 +51,12 @@ SGLANG_READS = {
     ),
 }
 
+# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
+# contract test skips each, naming the change, only where the installed SGLang lacks it.
+SGLANG_REQUIRES = {
+    "srt/environ.py:SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER": "sglang#50157",
+}
+
 # Comma-separated kernel slots; unset or "" runs every op on its stock step
 # function. No slot ships on by default yet.
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"

@@ -191,6 +191,14 @@ SGLANG_READS = {
     "srt/model_executor/runner_utils/prefill_graph.py": ("is_in_full_prefill_graph",),
 }
 
+# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
+# contract test skips each, naming the change, only where the installed SGLang lacks it.
+SGLANG_REQUIRES = {
+    "srt/kernel_plugins/nvidia/eagle_binding.py:prefill_graph_metadata": "sglang#50157",
+    "srt/layers/attention/linear/gdn_prefill_graph.py:flashinfer": "sglang#50157",
+    "srt/layers/attention/linear/gdn_prefill_graph.py:pre_track_mode": "sglang#50157",
+}
+
 
 @dataclass(frozen=True)
 class Options:

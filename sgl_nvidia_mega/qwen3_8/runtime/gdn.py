@@ -138,6 +138,15 @@ SGLANG_MIRRORS = {
     "srt/models/qwen3_5.py:Qwen3_5GatedDeltaNet.forward": "ff40a6653f83b8b6",
 }
 
+# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
+# contract test skips each, naming the change, only where the installed SGLang lacks it.
+SGLANG_REQUIRES = {
+    "srt/models/qwen3_5.py:Qwen3_5GatedDeltaNet.forward": (
+        "sglang#44017",
+        ("a5e9e3bd054ff18f",),
+    ),
+}
+
 
 def linear_backend():
     from sglang.srt.model_executor.forward_context import get_attn_backend

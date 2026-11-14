@@ -190,6 +190,20 @@ SGLANG_MIRRORS = {
     "kernels/ops/mamba/qwen4_short_conv.py:fused_qwen4_verify_conv": "4b2ed8834a5a5d0d",
 }
 
+# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
+# contract test skips each, naming the change, only where the installed SGLang lacks it.
+SGLANG_REQUIRES = {
+    "srt/models/qwen4_exp.py:_use_qwen4_varlen_prefill": "sglang#43032",
+    "srt/models/qwen4_exp.py:_prepare_ple_batch": (
+        "sglang#49309",
+        ("96091d8d8cb398c7", "22f0ccb94876ccb6"),
+    ),
+    "srt/models/qwen4_exp.py:Qwen4ExpPLELayer._short_conv": (
+        "sglang#43032",
+        ("463d39a6efea82fc",),
+    ),
+}
+
 
 @dataclasses.dataclass(frozen=True)
 class Options:

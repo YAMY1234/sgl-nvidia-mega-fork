@@ -142,6 +142,19 @@ SGLANG_MIRRORS = {
     "srt/layers/quantization/modelopt_quant.py:ModelOptNvFp4FusedMoEMethod.apply": "1dc4978c61c40ba6",
 }
 
+# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
+# contract test skips each, naming the change, only where the installed SGLang lacks it.
+SGLANG_REQUIRES = {
+    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_router_experts": (
+        "sglang#48366",
+        ("32d09f01b77d76b5",),
+    ),
+    "srt/layers/moe/moe_runner/flashinfer_trtllm.py:fused_experts_none_to_flashinfer_trtllm_fp4": (
+        "sglang#48468",
+        ("339d95256df67c5a",),
+    ),
+}
+
 # The FlashInfer releases whose sources the tuner-key mirror, default tile and PDL default
 # follow: 0.7.4 leaves every file below, the launcher and the routing kernels as in 0.7.3.
 FLASHINFER_VERSIONS = ("0.7.3", "0.7.4")

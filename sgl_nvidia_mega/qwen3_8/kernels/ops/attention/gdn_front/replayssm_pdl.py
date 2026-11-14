@@ -157,6 +157,7 @@ def gdn_replayssm_spec_circular_kernel(
 
     b_wp_i = b_write_pos.to(tl.int32)
     cache_valid = o_c < b_write_pos
+    has_history = b_write_pos > 0
 
     phys_c = (b_cache_base + o_c) & (MAX_CACHE_LEN - 1)
     phys_spec = (b_cache_base + b_wp_i + o_s) & (MAX_CACHE_LEN - 1)
@@ -329,20 +330,21 @@ def gdn_replayssm_spec_circular_kernel(
                 hw_k += tl.dot(sc_tile, k_residual_T)
 
         if not IS_FLUSH:
-            p_k = k_cache + (
-                replay_idx * stride_k_slot
-                + (i_h * MAX_CACHE_LEN + phys_c[:, None]) * K
-                + o_kt[None, :]
-            )
-            khist_tile = tl.load(
-                p_k, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
-            )
-            if STATE_FP32:
-                khist_tile = khist_tile.to(tl.float32)
-            else:
-                khist_tile = khist_tile.to(k_cache.dtype.element_ty)
-            scores_q += tl.dot(khist_tile, qT, input_precision=DOT_PRECISION)
-            scores_k += tl.dot(khist_tile, kT, input_precision=DOT_PRECISION)
+            if has_history:
+                p_k = k_cache + (
+                    replay_idx * stride_k_slot
+                    + (i_h * MAX_CACHE_LEN + phys_c[:, None]) * K
+                    + o_kt[None, :]
+                )
+                khist_tile = tl.load(
+                    p_k, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
+                )
+                if STATE_FP32:
+                    khist_tile = khist_tile.to(tl.float32)
+                else:
+                    khist_tile = khist_tile.to(k_cache.dtype.element_ty)
+                scores_q += tl.dot(khist_tile, qT, input_precision=DOT_PRECISION)
+                scores_k += tl.dot(khist_tile, kT, input_precision=DOT_PRECISION)
 
         if write_k:
             spec_kt_mask = (
@@ -377,12 +379,17 @@ def gdn_replayssm_spec_circular_kernel(
             )
 
     if not IS_FLUSH:
-        hw_q = b_total_decay * hw_q + tl.dot(
-            b_d_scaled, scores_q.to(b_d_scaled.dtype), input_precision=DOT_PRECISION
-        )
-        hw_k = b_total_decay * hw_k + tl.dot(
-            b_d_scaled, scores_k.to(b_d_scaled.dtype), input_precision=DOT_PRECISION
-        )
+        if has_history:
+            hw_q = b_total_decay * hw_q + tl.dot(
+                b_d_scaled,
+                scores_q.to(b_d_scaled.dtype),
+                input_precision=DOT_PRECISION,
+            )
+            hw_k = b_total_decay * hw_k + tl.dot(
+                b_d_scaled,
+                scores_k.to(b_d_scaled.dtype),
+                input_precision=DOT_PRECISION,
+            )
 
     lower = (o_s[:, None] > o_s[None, :]) & mask_s[:, None] & mask_s[None, :]
     diff_ij = G_s[:, None] - G_s[None, :]
@@ -392,7 +399,9 @@ def gdn_replayssm_spec_circular_kernel(
     for ii in range(2, BS):
         row = tl.sum(tl.where((o_s == ii)[:, None], -A_mat, 0.0), axis=0)
         row = tl.where(o_s < ii, row, 0.0)
-        row = row + tl.sum(row[:, None] * b_Ai, axis=0)
+        row = row + tl.sum(
+            row[:, None] * tl.where((o_s < ii)[:, None], b_Ai, 0.0), axis=0
+        )
         b_Ai = tl.where((o_s == ii)[:, None], row, b_Ai)
     T_mat = b_Ai + (o_s[:, None] == o_s[None, :]).to(tl.float32)
 
@@ -405,7 +414,9 @@ def gdn_replayssm_spec_circular_kernel(
     for j in tl.static_range(BS):
         Rj = tl.sum(tl.where((o_s == j)[None, :], R_mat, 0.0), axis=1)
         Tj = tl.sum(tl.where((o_s == j)[None, :], T_mat, 0.0), axis=1)
-        D_spec += Rj[:, None] * Tj[None, :]
+        D_spec = tl.where(
+            (o_s >= j)[None, :], tl.fma(Rj[:, None], Tj[None, :], D_spec), D_spec
+        )
 
     causalF = (o_s[:, None] <= o_s[None, :]) & mask_s[:, None] & mask_s[None, :]
     diff_ji = G_s[None, :] - G_s[:, None]
@@ -414,7 +425,7 @@ def gdn_replayssm_spec_circular_kernel(
     for j in tl.static_range(BS):
         Dj = tl.sum(tl.where((o_s == j)[None, :], D_spec, 0.0), axis=1)
         Fj = tl.sum(tl.where((o_s == j)[:, None], F_mat, 0.0), axis=0)
-        DF += Dj[:, None] * Fj[None, :]
+        DF = tl.where((o_s >= j)[None, :], tl.fma(Dj[:, None], Fj[None, :], DF), DF)
     O_tile = expG_s[None, :] * hw_q + DF
 
     tl.store(p_o, tl.trans(O_tile).to(p_o.dtype.element_ty), mask=out_mask)

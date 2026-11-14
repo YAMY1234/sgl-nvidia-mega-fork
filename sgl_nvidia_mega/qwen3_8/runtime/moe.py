@@ -45,6 +45,10 @@ if FINALIZE_COLUMN_CHUNK not in (0, 128, 256, 512, 1024):
         f"got {FINALIZE_COLUMN_CHUNK}"
     )
 FINALIZE_COLUMN_CHUNK_MAX_ROWS = 64
+# The source's SGLANG_QWEN_MOE_SHARED_NO_CLONE under its recipes' name here: the captured
+# dual stream's shared expert reads the block input itself instead of SGLang's clone of it.
+SHARED_NO_CLONE_ENV = "SGLANG_OPT_MOE_SHARED_EXPERT_NO_CLONE"
+SHARED_NO_CLONE = os.environ.get(SHARED_NO_CLONE_ENV, "false").lower() in ("true", "1")
 
 SGLANG_READS = {
     "srt/models/qwen2_moe.py": (
@@ -61,7 +65,12 @@ SGLANG_READS = {
         "experts",
     ),
     "srt/layers/moe/topk.py": ("format_is_bypassed",),
-    "srt/layers/moe/fused_moe_triton/layer.py": ("forward_deferred_finalize",),
+    "srt/layers/moe/fused_moe_triton/layer.py": (
+        "forward_deferred_finalize",
+        "FusedMoE",
+        "moe_runner_config",
+        "inplace",
+    ),
     "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
     "srt/layers/moe/moe_runner/flashinfer_trtllm.py": (
         "gemm2_out",
@@ -139,33 +148,25 @@ def step(executor, layer, x, st):
         if deferred is None:
             deferred = _router_experts(mlp, x)
     else:
-        # The source's forward_normal_dual_stream: on the current stream the routed input's
-        # quant (when the fused routing does not quantize it) and the shared expert; on the
-        # block's side stream the router and the routed experts; then the finalize. Under
-        # slot moe_routing the shared expert waits for the router GEMM, as in the source's
-        # executed graph, so it overlaps the routing and routed GEMMs and the router GEMM is
-        # not delayed by it.
+        # The source's forward_normal_dual_stream: the quant (when the fused routing does not
+        # quantize) and the shared expert on the current stream, the router GEMM, routing and
+        # routed experts on the side stream, no wait between the two before the finalize.
         current = torch.cuda.current_stream()
         side.wait_stream(current)
         fused = options is not None and moe_routing._takes_fused(options, mlp, x)
         quant = None
         if options is not None and not fused and options.prequant_overlap:
             quant = moe_routing.quantize(mlp, x)
-        if fused or quant is not None:
-            with torch.cuda.stream(side):
+        shared = _shared(executor, mlp, _shared_input(mlp, x, st), st)
+        with torch.cuda.stream(side):
+            if fused or quant is not None:
                 logits = bf16_gemm_pins.linear(mlp.gate, x)
-                router_done = side.record_event()
-            current.wait_event(router_done)
-            shared = _shared(executor, mlp, x, st)
-            with torch.cuda.stream(side):
                 if fused:
                     deferred = moe_routing.fused_from_logits(mlp, x, logits, st)
                 else:
                     deferred = moe_routing.deferred(mlp, x, logits, quant)
                     st.ran(moe_routing.OP, "prequant")
-        else:
-            shared = _shared(executor, mlp, x, st)
-            with torch.cuda.stream(side):
+            else:
                 deferred = _router_experts(mlp, x)
         current.wait_stream(side)
         for t in (
@@ -238,6 +239,23 @@ def _extend(executor, mlp, x, st):
     )
     st.ran("moe", "extend_finalize")
     return out
+
+
+def _shared_input(mlp, x, st):
+    """The source's _shared_expert_input: ``x`` itself with SHARED_NO_CLONE when the
+    routed runner never writes its input in place, else SGLang's clone. The clone's copy
+    node starts the shared expert after the router GEMM; without it they start together."""
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    if (
+        SHARED_NO_CLONE
+        and isinstance(mlp.experts, FusedMoE)
+        and not mlp.experts.moe_runner_config.inplace
+    ):
+        st.ran("moe.shared_input", "no_clone")
+        return x
+    st.ran("moe.shared_input", STOCK)
+    return x.clone()
 
 
 def _shared(executor, mlp, x, st):

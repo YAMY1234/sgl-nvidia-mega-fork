@@ -8,7 +8,9 @@ recurrence that advances each slot by exactly its accepted tokens (the bounds ar
 source test's). Then, on SM107, the claims the port rests on: the flush options
 change no bit, the fused conv is the separate conv's bits (SGLang's and the hoisted
 copy, which agree bit for bit), the fused norm is within a bf16 rounding of SGLang's
-gated norm, and a captured graph replays the eager bits.
+gated norm, and a captured graph replays the eager bits. On any of them, the separate
+norm's verify launch (16 rows x 8 warps a program) is SGLang's gated norm bit for bit at
+Qwen3.8's verify shapes.
 """
 
 import os
@@ -514,6 +516,90 @@ def test_fused_norm_against_sglang_gated_norm(batch):
         f"{diff.numel()} elements differ, max {diff.max().item():.3e}"
     )
     torch.testing.assert_close(b, a, atol=1.6e-2, rtol=1e-2)
+
+
+# Verify rows (requests x 4 draft rows): the small verifies of the low-concurrency
+# points and the high-concurrency ones (to 80 requests)
+VERIFY_ROWS = (4, 8, 12, 16, 24, 32, 48, 64, 80, 96, 128, 160, 176, 192, 208, 224, 240)
+VERIFY_ROWS += (256, 272, 288, 304, 320)
+
+
+class _GatedNorm:
+    """The layer's RMSNormGated (norm before a sigmoid gate, no groups, no bias);
+    calling it is RMSNormGated.forward_cuda's call."""
+
+    def __init__(self, weight):
+        self.weight, self.eps, self.bias, self.group_size = weight, 1e-6, None, None
+        self.norm_before_gate, self.activation = True, "sigmoid"
+
+    def __call__(self, x, z):
+        from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
+
+        return layernorm_fn(
+            x,
+            self.weight,
+            self.bias,
+            z=z,
+            eps=self.eps,
+            group_size=self.group_size,
+            norm_before_gate=self.norm_before_gate,
+            is_rms_norm=True,
+            activation=self.activation,
+        )
+
+
+def _verify_norm_inputs(rows, seed, h=16, hv=48):
+    """The flush output [rows * HV, V], the strided gate view z [rows, HV, V] of the
+    projection rows (q | k | v | z) and the layer's norm."""
+    gen = torch.Generator(device=DEVICE).manual_seed(seed)
+    D = (2 * h + hv) * K
+    proj = torch.randn(rows, D + hv * V, generator=gen, device=DEVICE).to(
+        torch.bfloat16
+    )
+    core = torch.randn(rows * hv, V, generator=gen, device=DEVICE).to(torch.bfloat16)
+    weight = (torch.rand(V, generator=gen, device=DEVICE) + 0.5).to(torch.bfloat16)
+    return core, proj[:, D:].view(rows, hv, V), _GatedNorm(weight)
+
+
+@pytest.mark.parametrize("rows", VERIFY_ROWS)
+def test_verify_norm_launch_is_sglang_gated_norm(rows, monkeypatch):
+    """SGLANG_ENABLE_GDN_VERIFY_NORM_RETILE: wherever SGLang's launch holds >= 2 rows a
+    program, the verify norm runs on 16 rows x 8 warps a program, each 128-wide row on one
+    warp's 16 lanes x 8 elements as SGLang's launch: SGLang's bits. Elsewhere SGLang's own
+    launch runs."""
+    from sglang.kernels.ops.attention.fla.layernorm_gated import calc_rows_per_block
+
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear import (
+        gdn_prefill_norm as norm_mod,
+    )
+
+    launches = []
+    launch = norm_mod._layer_norm_fwd
+
+    def spy(*args, **kw):
+        launches.append(kw.get("launch_cfg"))
+        return launch(*args, **kw)
+
+    monkeypatch.setattr(norm_mod, "_layer_norm_fwd", spy)
+    hv = 48
+    core, z, norm = _verify_norm_inputs(rows, seed=rows)
+    stock_rows = calc_rows_per_block(rows * hv, DEVICE)
+    got = U._gated_norm(U.DEFAULT, norm, core, z)
+    want = norm(core, z)
+    torch.cuda.synchronize()
+    assert launches == ([(16, 8)] if stock_rows >= 2 else []), (rows, stock_rows)
+    if rows >= 176:  # every high-concurrency verify takes it
+        assert launches == [(16, 8)]
+    _same(got, want, f"verify norm, {rows} rows ({stock_rows} rows a stock program)")
+    # the comparison sees every row: a changed element changes its row only
+    r = rows * hv // 2 + 1
+    perturbed = core.clone()
+    perturbed[r, 5] += 4
+    moved = U._gated_norm(U.DEFAULT, norm, perturbed, z)
+    torch.cuda.synchronize()
+    assert not torch.equal(moved[r], got[r]), "a perturbed row must change"
+    _same(moved[:r], got[:r], "rows before the perturbed one")
+    _same(moved[r + 1 :], got[r + 1 :], "rows after the perturbed one")
 
 
 @needs_sm107

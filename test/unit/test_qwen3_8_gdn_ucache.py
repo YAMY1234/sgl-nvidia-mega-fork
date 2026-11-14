@@ -5,6 +5,7 @@ order, the flush launch's arguments under each option, the conv / norm dispatch 
 Triton launchers are spies or CPU references; the ported Triton kernels themselves run
 once under Triton's interpreter, in a subprocess."""
 
+import dataclasses
 import json
 import os
 import subprocess
@@ -18,6 +19,9 @@ from unittest import mock
 import torch
 
 from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.gdn_front import conv as front_conv
+from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear import (
+    gdn_prefill_norm as norm_mod,
+)
 from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear import gdn_ucache_verify as K
 from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache as U
 
@@ -170,6 +174,10 @@ class _Env:
         for m in (proj, conv, norm, backend, qwen4):
             modules[m.__name__] = m
 
+        def verify_norm(x, weight, bias, eps, **kw):
+            calls.append(("verify_norm", x, weight, bias, eps, kw))
+            return x, None, None
+
         def hoisted(x, conv_state, weight, bias, activation, slots, window, rows, **kw):
             calls.append(("hoisted_conv", x, conv_state, slots, window, rows, kw))
             out = torch.empty(
@@ -193,6 +201,10 @@ class _Env:
             ),
             mock.patch.object(K, "_split_qkv_kernel", _Launch("split", calls)),
             mock.patch.object(front_conv, "conv_update", hoisted),
+            mock.patch.object(
+                norm_mod, "calc_rows_per_block", lambda rows, device: rows_per_block
+            ),
+            mock.patch.object(norm_mod, "_layer_norm_fwd", verify_norm),
         ]
 
     def __enter__(self):
@@ -252,6 +264,18 @@ def _view(buffers, *, dedup_window=True, batch=len(CACHE_INDICES)):
         intermediate_indices=torch.arange(batch, dtype=torch.int32),
     )
     return SimpleNamespace(gdn=meta, mamba=mamba)
+
+
+def _norm_init(case):
+    """_Norm.__init__ with the case's attributes (``norm``) set after it."""
+    init = _Norm.__init__
+
+    def patched(self, *args, **kw):
+        init(self, *args, **kw)
+        for name, value in case.get("norm", {}).items():
+            setattr(self, name, value)
+
+    return patched
 
 
 class _Norm:
@@ -625,6 +649,7 @@ class TestVerify(unittest.TestCase):
             self.assertEqual(st.ran_ops, [("gdn", "ucache+norm")])
 
     def test_separate_norm_where_the_fused_one_does_not_apply(self):
+        stock = U.Options(verify_norm_retile=False)
         cases = (
             dict(env=dict(rows_per_block=1)),  # B < 3: one row per program
             dict(env=dict(norm_reason="z layout")),
@@ -634,8 +659,12 @@ class TestVerify(unittest.TestCase):
         )
         for case in cases:
             with self.subTest(case=case), _Env(**case.get("env", {})) as env:
-                kw = case.get("kw", {})
+                kw = dict(case.get("kw", {}))
+                kw["options"] = dataclasses.replace(
+                    kw.get("options", stock), verify_norm_retile=False
+                )
                 out, gdn, st, view = self.run_verify(env, **kw)
+                self.assertNotIn("verify_norm", env.names())
                 self.assertNotIn("fused_norm", env.flushes()[0])
                 ((_, x, z),) = [c for c in env.calls if c[0] == "norm"]
                 rows = kw.get("batch", len(CACHE_INDICES)) * T
@@ -644,6 +673,79 @@ class TestVerify(unittest.TestCase):
                 self.assertEqual(z.data_ptr(), gdn.qkvz[:, D:].data_ptr())
                 self.assertEqual(env.calls[-1][1].shape, (rows, HV * VD))
                 self.assertEqual(st.ran_ops, [("gdn", "ucache")])
+
+    def test_verify_norm_launch_where_the_fused_one_does_not_apply(self):
+        """SGLANG_ENABLE_GDN_VERIFY_NORM_RETILE: the separate norm is SGLang's kernel on
+        16 rows x 8 warps a program wherever SGLang's launch holds >= 2 rows a program."""
+        cases = (
+            dict(env=dict(norm_reason="z layout")),
+            dict(kw=dict(batch=49)),  # above fused_norm_max_batch
+            dict(kw=dict(activation="swish")),
+            dict(kw=dict(options=U.Options(fused_norm=False))),
+            dict(env=dict(rows_per_block=4), kw=dict(batch=64)),
+        )
+        for case in cases:
+            with self.subTest(case=case), _Env(**case.get("env", {})) as env:
+                kw = case.get("kw", {})
+                out, gdn, st, view = self.run_verify(env, **kw)
+                self.assertNotIn("fused_norm", env.flushes()[0])
+                self.assertNotIn("norm", env.names())
+                ((_, x, weight, bias, eps, nkw),) = [
+                    c for c in env.calls if c[0] == "verify_norm"
+                ]
+                rows = kw.get("batch", len(CACHE_INDICES)) * T
+                self.assertEqual(x.shape, (rows * HV, VD))
+                self.assertIs(weight, gdn.norm.weight)
+                self.assertIsNone(bias)
+                self.assertEqual(eps, gdn.norm.eps)
+                z = nkw.pop("z")
+                self.assertEqual(z.shape, (rows, HV, VD))  # the strided z view
+                self.assertEqual(z.data_ptr(), gdn.qkvz[:, D:].data_ptr())
+                self.assertEqual(
+                    nkw,
+                    dict(
+                        group_size=None,
+                        norm_before_gate=True,
+                        is_rms_norm=True,
+                        activation=gdn.norm.activation,
+                        launch_cfg=(16, 8),
+                    ),
+                )
+                self.assertEqual(env.calls[-1][1].shape, (rows, HV * VD))
+                self.assertEqual(st.ran_ops, [("gdn", "ucache")])
+
+    def test_stock_norm_where_the_verify_launch_does_not_apply(self):
+        cases = (
+            dict(env=dict(rows_per_block=1)),  # one row a program: 4 x 32 lanes a row
+            dict(norm=dict(bias=torch.zeros(VD, dtype=BF16))),
+            dict(norm=dict(group_size=64)),
+            dict(
+                kw=dict(options=U.Options(verify_norm_retile=False, fused_norm=False))
+            ),
+        )
+        for case in cases:
+            with self.subTest(case=case), _Env(**case.get("env", {})) as env:
+                with mock.patch.object(_Norm, "__init__", _norm_init(case)):
+                    out, gdn, st, view = self.run_verify(env, **case.get("kw", {}))
+                self.assertNotIn("verify_norm", env.names())
+                ((_, x, z),) = [c for c in env.calls if c[0] == "norm"]
+                self.assertEqual(x.shape, (len(CACHE_INDICES) * T * HV, VD))
+
+    def test_verify_norm_applies(self):
+        x = torch.zeros(24, VD, dtype=BF16)
+        for rows_per_block, width, applies in (
+            (2, VD, True),
+            (4, VD, True),
+            (1, VD, False),
+            (4, 64, False),
+        ):
+            with mock.patch.object(
+                norm_mod, "calc_rows_per_block", lambda rows, device: rows_per_block
+            ):
+                self.assertIs(
+                    norm_mod.gdn_verify_norm_retile_applies(x[:, :width]), applies
+                )
+        self.assertEqual(norm_mod.GDN_VERIFY_NORM_DEFAULT, (16, 8))
 
     def test_stock_conv_without_the_hoisted_layout(self):
         for kw in (

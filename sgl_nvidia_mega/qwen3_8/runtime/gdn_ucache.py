@@ -17,7 +17,9 @@ inside the flush launch (``Options.fused_conv``); the flush (``UcacheVerify.core
 launch that outputs every draft position from the checkpoint ``S0`` plus the ring
 window, appends the T new (k, u, g) records, and folds the window into ``S0`` on rows
 whose window holds ``flush_min`` records); the gated RMSNorm, inside the flush's
-epilogue (``Options.fused_norm``) or SGLang's; and ``out_proj``. The flush kernel is the
+epilogue (``Options.fused_norm``), else SGLang's kernel on 16 rows and 8 warps a program
+(``Options.verify_norm_retile``, where SGLang's own launch holds >= 2 rows a program)
+or SGLang's norm; and ``out_proj``. The flush kernel is the
 vendored SM107 build (``kernels/ops/attention/linear/gdn_ucache_rubin``) on SM107 and
 FlashInfer's ``gated_delta_rule_mtp_ucache_flush_umma`` on SM100 / SM103.
 
@@ -32,7 +34,9 @@ conv as SGLang's conv does. Linear draft chains only (SGLang refuses topk > 1).
 Numerics: the source's. Its flush kernel files are byte-identical; the
 flush options do not change a result; the fused conv is SGLang's conv bit for bit
 (source claim); the fused norm reduces a 128-wide row as 16 threads x 8 elements, the
-stock gated norm's order where it applies (B >= 3), not shown bitwise. The hoisted conv
+stock gated norm's order where it applies (B >= 3), not shown bitwise; the verify norm
+launch keeps each 128-wide row on one warp's 16 lanes x 8 elements, SGLang's launch's
+order, bit for bit. The hoisted conv
 is SGLang's conv kernel with every x row loaded first, bit for bit (source claim), as
 the source's retiled verify conv (SGLANG_OPT_GDN_VERIFY_CONV_RETILE) is."""
 
@@ -136,6 +140,9 @@ class Options:
     # SGLANG_OPT_GDN_VERIFY_CONV_RETILE's role: the separate conv on the hoisted copy of
     # SGLang's kernel (gdn_front/conv.py), else SGLang's causal_conv1d_update
     hoisted_conv: bool = True
+    # SGLANG_ENABLE_GDN_VERIFY_NORM_RETILE: the separate gated norm on 16 rows x 8 warps
+    # a program where SGLang's launch holds >= 2 rows a program (gdn_prefill_norm.py)
+    verify_norm_retile: bool = True
 
     def flush_options(self):
         from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear.gdn_ucache_verify import (
@@ -1016,13 +1023,38 @@ def verify(executor, gdn, x, st, view, buffers=None):
         padded = z.new_zeros(z_flat_shape)
         padded[: core.shape[0], :] = core
         core = padded
-    core = gdn.norm(core, z)
+    core = _gated_norm(uv.options, gdn.norm, core, z)
     core = core.reshape(z_shape)
     core = core.reshape(*core.shape[:-2], core.shape[-2] * core.shape[-1])
     out = smallm_gemm.out_proj(executor, gdn.out_proj, core, st, "gdn.out_proj")
     if out is None:
         out = bf16_gemm_pins.linear(gdn.out_proj, core)
     return out
+
+
+def _gated_norm(options, norm, core, z):
+    """``norm(core, z)``: the layer's gated RMSNorm of the flush output [rows * HV, V]
+    with the strided gate view z [rows, HV, V]; on the verify launch where it applies."""
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear import (
+        gdn_prefill_norm,
+    )
+
+    if (
+        options.verify_norm_retile
+        and norm.group_size is None
+        and norm.bias is None
+        and core.stride(-1) == 1
+        and gdn_prefill_norm.gdn_verify_norm_retile_applies(core)
+    ):
+        return gdn_prefill_norm.gdn_verify_norm_retiled(
+            x=core,
+            weight=norm.weight,
+            z=z,
+            eps=norm.eps,
+            norm_before_gate=norm.norm_before_gate,
+            activation=norm.activation,
+        )
+    return norm(core, z)
 
 
 def _conv(

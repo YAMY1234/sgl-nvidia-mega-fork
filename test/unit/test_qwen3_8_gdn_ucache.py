@@ -178,8 +178,8 @@ class _Env:
             calls.append(("verify_norm", x, weight, bias, eps, kw))
             return x, None, None
 
-        def hoisted(x, conv_state, weight, bias, activation, slots, window, rows, **kw):
-            calls.append(("hoisted_conv", x, conv_state, slots, window, rows, kw))
+        def front(x, conv_state, weight, bias, activation, slots, window, rows, **kw):
+            calls.append(("front_conv", x, conv_state, slots, window, rows, kw))
             out = torch.empty(
                 (x.shape[0], x.shape[2], x.shape[1]), dtype=x.dtype
             ).transpose(1, 2)
@@ -200,7 +200,7 @@ class _Env:
                 K, "_refresh_gate_params_kernel", _Launch("refresh", calls)
             ),
             mock.patch.object(K, "_split_qkv_kernel", _Launch("split", calls)),
-            mock.patch.object(front_conv, "conv_update", hoisted),
+            mock.patch.object(front_conv, "conv_update", front),
             mock.patch.object(
                 norm_mod, "calc_rows_per_block", lambda rows, device: rows_per_block
             ),
@@ -595,7 +595,7 @@ class TestVerify(unittest.TestCase):
                 names,
                 [
                     "views",
-                    "hoisted_conv",
+                    "front_conv",
                     "gather",
                     "order",
                     "zero",
@@ -614,13 +614,14 @@ class TestVerify(unittest.TestCase):
             self.assertEqual(slots.tolist(), CACHE_INDICES)
             self.assertEqual(window.shape, (B, T, D, 3))
             self.assertEqual(window_rows.tolist(), list(range(B)))
+            # the source's call: the retiled kernel, else SGLang's on 128-channel tiles
             self.assertEqual(
                 ckw,
                 {
-                    "block_n": 256,
+                    "block_n": 128,
                     "token_major_out": True,
-                    "hoist": True,
-                    "window_mode": 1,
+                    "num_warps": 2,
+                    "retile": front_conv.RETILE_DEFAULT,
                 },
             )
             (kw,) = env.flushes()
@@ -747,14 +748,42 @@ class TestVerify(unittest.TestCase):
                 )
         self.assertEqual(norm_mod.GDN_VERIFY_NORM_DEFAULT, (16, 8))
 
+    def test_retiled_conv_on_either_window_layout(self):
+        for dedup_window in (True, False):
+            with self.subTest(dedup_window=dedup_window), _Env() as env:
+                out, gdn, st, view = self.run_verify(env, dedup_window=dedup_window)
+                ((_, x, conv_state, slots, window, rows, ckw),) = [
+                    c for c in env.calls if c[0] == "front_conv"
+                ]
+                self.assertEqual(x.data_ptr(), gdn.qkvz.data_ptr())
+                self.assertEqual(slots.tolist(), CACHE_INDICES)
+                self.assertEqual(window.shape, (len(CACHE_INDICES), T, D, 3))
+                self.assertIs(ckw["retile"], front_conv.RETILE_DEFAULT)
+                self.assertEqual((ckw["block_n"], ckw["num_warps"]), (128, 2))
+                self.assertNotIn("stock_conv", env.names())
+
+    def test_hoisted_conv_without_the_retile(self):
+        with _Env() as env:
+            self.run_verify(env, options=U.Options(conv_retile=False))
+            ((*_, ckw),) = [c for c in env.calls if c[0] == "front_conv"]
+            self.assertEqual(
+                ckw,
+                {
+                    "block_n": 256,
+                    "token_major_out": True,
+                    "hoist": True,
+                    "window_mode": 1,
+                },
+            )
+
     def test_stock_conv_without_the_hoisted_layout(self):
         for kw in (
-            dict(dedup_window=False),
-            dict(options=U.Options(hoisted_conv=False)),
+            dict(dedup_window=False, options=U.Options(conv_retile=False)),
+            dict(options=U.Options(hoisted_conv=False, conv_retile=False)),
         ):
             with self.subTest(kw=kw), _Env() as env:
                 out, gdn, st, view = self.run_verify(env, **kw)
-                self.assertNotIn("hoisted_conv", env.names())
+                self.assertNotIn("front_conv", env.names())
                 ((_, x, conv_state, ckw),) = [
                     c for c in env.calls if c[0] == "stock_conv"
                 ]
@@ -771,7 +800,7 @@ class TestVerify(unittest.TestCase):
             out, gdn, st, view = self.run_verify(
                 env, options=U.HIGH_CONCURRENCY_FUSED_CONV
             )
-            self.assertNotIn("hoisted_conv", env.names())
+            self.assertNotIn("front_conv", env.names())
             self.assertNotIn("stock_conv", env.names())
             (kw,) = env.flushes()
             fc = kw["fused_conv"]
@@ -796,7 +825,7 @@ class TestVerify(unittest.TestCase):
                 self.run_verify(
                     env, options=U.HIGH_CONCURRENCY_FUSED_CONV, **case.get("kw", {})
                 )
-                self.assertIn("hoisted_conv", env.names())
+                self.assertIn("front_conv", env.names())
                 self.assertNotIn("fused_conv", env.flushes()[0])
 
     def test_request_rows_and_padding(self):
@@ -835,6 +864,158 @@ class TestVerify(unittest.TestCase):
                     _St(),
                     _view(_buffers()),
                 )
+
+
+def _front_conv_inputs(*, tokens=T, dedup_window=True, width=4, dtype=BF16, batch=6):
+    x = torch.zeros(batch * tokens, D + HV * VD, dtype=dtype)[:, :D]
+    x = x.view(batch, tokens, D).transpose(1, 2)
+    if dedup_window:
+        phys = torch.zeros(batch, D, tokens + 2, dtype=dtype)
+        window = phys.as_strided(
+            (batch, tokens, D, 3), ((tokens + 2) * D, 1, tokens + 2, 1)
+        )
+    else:
+        window = torch.zeros(batch, tokens, D, 3, dtype=dtype)
+    return dict(
+        x=x,
+        conv_state=torch.zeros(SLOTS, D, width - 1, dtype=BF16),
+        weight=torch.zeros(D, width, dtype=BF16),
+        bias=None,
+        activation="silu",
+        conv_state_indices=torch.tensor(CACHE_INDICES[:batch], dtype=torch.int32),
+        intermediate_conv_window=window,
+        intermediate_state_indices=torch.arange(batch, dtype=torch.int32),
+    )
+
+
+class TestRetiledConv(unittest.TestCase):
+    """gdn_front/conv.py's conv_update with ``retile``: the source's retiled kernel where
+    retile_unsupported_reason admits the call, else SGLang's kernel at the caller's tile."""
+
+    def launch(self, inputs, pdl=True, **kw):
+        from sglang.kernels.ops.mamba import causal_conv1d_triton as stock
+
+        from sgl_nvidia_mega.qwen3_8 import _jit
+
+        calls = []
+        with (
+            mock.patch.object(front_conv, "_RETILED", [_Launch("retiled", calls)]),
+            mock.patch.object(
+                stock, "_causal_conv1d_update_kernel", _Launch("stock", calls)
+            ),
+            mock.patch.object(_jit, "is_arch_support_pdl", lambda: pdl),
+        ):
+            args = dict(inputs)
+            out = front_conv.conv_update(
+                args.pop("x"),
+                args.pop("conv_state"),
+                args.pop("weight"),
+                args.pop("bias"),
+                args.pop("activation"),
+                args.pop("conv_state_indices"),
+                args.pop("intermediate_conv_window"),
+                args.pop("intermediate_state_indices"),
+                **kw,
+            )
+        return out, calls
+
+    def test_retiled_launch(self):
+        for dedup_window, pdl in ((True, True), (False, True), (True, False)):
+            with self.subTest(dedup_window=dedup_window, pdl=pdl):
+                inputs = _front_conv_inputs(dedup_window=dedup_window)
+                out, calls = self.launch(
+                    inputs,
+                    pdl=pdl,
+                    block_n=128,
+                    token_major_out=True,
+                    num_warps=2,
+                    retile=front_conv.RETILE_DEFAULT,
+                )
+                ((name, grid, args, kw),) = calls
+                self.assertEqual(name, "retiled")
+                # one program per (request, 256 channels)
+                self.assertEqual(grid, (len(CACHE_INDICES), D // 256))
+                self.assertIs(args[0], inputs["x"])
+                self.assertIs(args[7], out)
+                self.assertEqual(out.transpose(1, 2).stride(), (T * D, D, 1))
+                self.assertEqual(args[8:11], (len(CACHE_INDICES), D, T))
+                self.assertEqual(
+                    args[20:24], inputs["intermediate_conv_window"].stride()
+                )
+                self.assertEqual(args[-1], -1)  # PAD_SLOT_ID
+                self.assertEqual(
+                    kw,
+                    dict(
+                        HAS_BIAS=False,
+                        SILU_ACTIVATION=True,
+                        BLOCK_N=256,
+                        ROWS=1,
+                        PREFETCH=2,
+                        WINDOW_TILE=dedup_window,
+                        NP2_WIN=8,
+                        USE_GDC=pdl,
+                        num_warps=4,
+                        **({"launch_pdl": True} if pdl else {}),
+                    ),
+                )
+
+    def test_stock_kernel_where_the_retile_does_not_apply(self):
+        cases = (
+            (dict(tokens=3), "3 verify tokens"),
+            (dict(tokens=9), "9 verify tokens"),
+            (dict(width=3), "conv width 3"),
+            (dict(dtype=torch.float32), "dtypes"),
+        )
+        for case, reason in cases:
+            with self.subTest(case=case):
+                inputs = _front_conv_inputs(**case)
+                got = front_conv.retile_unsupported_reason(
+                    x=inputs["x"],
+                    conv_state=inputs["conv_state"],
+                    weight=inputs["weight"],
+                    intermediate_conv_window=inputs["intermediate_conv_window"],
+                )
+                self.assertIn(reason, got)
+                out, calls = self.launch(
+                    inputs,
+                    block_n=128,
+                    token_major_out=True,
+                    num_warps=2,
+                    retile=front_conv.RETILE_DEFAULT,
+                )
+                ((name, grid, args, kw),) = calls
+                self.assertEqual(name, "stock")
+                self.assertEqual(
+                    (kw["BLOCK_N"], kw["num_warps"], kw["SAVE_INTERMEDIATE"]),
+                    (128, 2, True),
+                )
+        window5 = _front_conv_inputs(dedup_window=False)
+        window5["intermediate_conv_window"] = window5["intermediate_conv_window"][None]
+        self.assertIn(
+            "window of 5 dims",
+            front_conv.retile_unsupported_reason(
+                x=window5["x"],
+                conv_state=window5["conv_state"],
+                weight=window5["weight"],
+                intermediate_conv_window=window5["intermediate_conv_window"],
+            ),
+        )
+
+    def test_no_retile_without_the_config_or_token_major_out(self):
+        inputs = _front_conv_inputs()
+        for kw in (
+            dict(block_n=128, token_major_out=True, num_warps=2),
+            dict(block_n=128, num_warps=2, retile=front_conv.RETILE_DEFAULT),
+        ):
+            with self.subTest(kw=kw):
+                _, calls = self.launch(inputs, **kw)
+                self.assertEqual([c[0] for c in calls], ["stock"])
+
+    def test_default_config(self):
+        self.assertEqual(
+            front_conv.RETILE_DEFAULT,
+            front_conv.RetileConfig(block_n=256, num_warps=4, rows=1, prefetch=2),
+        )
 
 
 class TestReasons(unittest.TestCase):
@@ -940,6 +1121,52 @@ print(json.dumps(out))
 """
 
 
+_INTERPRETED_CONV = r"""
+import json
+import torch
+from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.gdn_front import conv as C
+
+# fp32 (the interpreter's bf16 arithmetic is not the GPU's); slot -1 is padding
+batch, D = 6, 1280
+slots = torch.tensor([3, -1, 5, -1, 1, 6], dtype=torch.int32)
+rows = torch.arange(batch, dtype=torch.int32)
+out = {}
+for T in (4, 6, 8):
+    for dedup in (True, False):
+        g = torch.Generator().manual_seed(T)
+        proj = torch.randn(batch * T, D + 768, generator=g)
+        x = proj[:, :D].view(batch, T, D).transpose(1, 2)
+        w = torch.randn(D, 4, generator=g) * 0.5
+        cs = torch.randn(8 + batch, D, 3, generator=g)
+        if dedup:
+            phys = torch.zeros(batch, D, T + 2)
+            win = phys.as_strided((batch, T, D, 3), ((T + 2) * D, 1, T + 2, 1))
+        else:
+            phys = win = torch.zeros(batch, T, D, 3)
+        cs0 = cs.clone()
+        y = C.conv_update(
+            x, cs, w, None, "silu", slots, win, rows, block_n=128,
+            token_major_out=True, num_warps=2, retile=C.RETILE_DEFAULT,
+        )
+        ok = []
+        for r, s in enumerate(slots.tolist()):
+            if s < 0:
+                ok.append(phys[r].abs().sum().item() == 0)  # padded rows write nothing
+                continue
+            seq = torch.cat([cs0[s], x[r]], dim=1)  # c0 c1 c2 x_0 .. x_{T-1}
+            acc = sum(seq[:, k : k + T] * w[:, k : k + 1] for k in range(4))
+            ok.append(torch.allclose(y[r], acc / (1 + torch.exp(-acc)), rtol=1e-6, atol=1e-6))
+            ok.append(torch.equal(cs[s], x[r][:, T - 3 :]))  # the new conv state
+            want = seq[:, 1:] if dedup else torch.stack([seq[:, t + 1 : t + 4] for t in range(T)])
+            ok.append(torch.equal(phys[r], want))  # the step windows
+        live = [s for s in slots.tolist() if s >= 0]
+        other = [i for i in range(cs.shape[0]) if i not in live]
+        ok.append(torch.equal(cs[other], cs0[other]))
+        out[f"{T} {dedup}"] = all(ok)
+print(json.dumps(out))
+"""
+
+
 class TestInterpretedKernels(unittest.TestCase):
     """The ported Triton kernels (byte-identical to the source) on CPU."""
 
@@ -975,6 +1202,22 @@ class TestInterpretedKernels(unittest.TestCase):
         )
         self.assertEqual(got["split"], [True, True, True])
         self.assertEqual(got["refresh"], [True, True])
+
+    def test_retiled_conv(self):
+        """The ported retiled verify conv against a direct reference: outputs, the new
+        conv state, both window layouts, padded rows, 4 / 6 / 8 verify tokens."""
+        env = dict(os.environ, TRITON_INTERPRET="1", PYTHONDONTWRITEBYTECODE="1")
+        done = subprocess.run(
+            [sys.executable, "-c", _INTERPRETED_CONV],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        got = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(len(got), 6)
+        self.assertTrue(all(got.values()), got)
 
 
 if __name__ == "__main__":

@@ -12,8 +12,9 @@ whose rings the executor allocates, resets and commits (``gdn_ucache_state.py``)
 
 Per layer, ``verify`` runs: the input projection; its strided q/k/v/z/b/a views (no
 split kernel); the causal conv update of the verify rows, either separately (the
-plugin's hoisted copy of SGLang's conv kernel, or SGLang's ``causal_conv1d_update``) or
-inside the flush launch (``Options.fused_conv``); the flush (``UcacheVerify.core``: one
+source's retiled conv kernel, ``Options.conv_retile``; else the plugin's hoisted copy of
+SGLang's conv kernel, or SGLang's ``causal_conv1d_update``) or inside the flush launch
+(``Options.fused_conv``); the flush (``UcacheVerify.core``: one
 launch that outputs every draft position from the checkpoint ``S0`` plus the ring
 window, appends the T new (k, u, g) records, and folds the window into ``S0`` on rows
 whose window holds ``flush_min`` records); the gated RMSNorm, inside the flush's
@@ -36,9 +37,10 @@ flush options do not change a result; the fused conv is SGLang's conv bit for bi
 (source claim); the fused norm reduces a 128-wide row as 16 threads x 8 elements, the
 stock gated norm's order where it applies (B >= 3), not shown bitwise; the verify norm
 launch keeps each 128-wide row on one warp's 16 lanes x 8 elements, SGLang's launch's
-order, bit for bit. The hoisted conv
-is SGLang's conv kernel with every x row loaded first, bit for bit (source claim), as
-the source's retiled verify conv (SGLANG_OPT_GDN_VERIFY_CONV_RETILE) is."""
+order, bit for bit. The retiled conv
+and the hoisted conv are SGLang's conv kernel's values and arithmetic per element (every
+x row loaded first; the retiled one also loads the weights, slot indices and prior conv
+state before its PDL wait), bit for bit (source claim)."""
 
 from __future__ import annotations
 
@@ -137,9 +139,13 @@ class Options:
     fused_norm: bool = True
     # SGLANG_GDN_UCACHE_FUSED_NORM_MAX_BATCH
     fused_norm_max_batch: int = 48
-    # SGLANG_OPT_GDN_VERIFY_CONV_RETILE's role: the separate conv on the hoisted copy of
-    # SGLang's kernel (gdn_front/conv.py), else SGLang's causal_conv1d_update
+    # With conv_retile off: the separate conv on the hoisted copy of SGLang's kernel
+    # (gdn_front/conv.py), else SGLang's causal_conv1d_update
     hoisted_conv: bool = True
+    # SGLANG_ENABLE_GDN_VERIFY_CONV_RETILE: the separate conv on the source's retiled
+    # kernel (gdn_front/conv.py, RETILE_DEFAULT) where it applies, else SGLang's conv
+    # kernel on 128-channel tiles with 2 warps (the source's call); over hoisted_conv
+    conv_retile: bool = True
     # SGLANG_ENABLE_GDN_VERIFY_NORM_RETILE: the separate gated norm on 16 rows x 8 warps
     # a program where SGLang's launch holds >= 2 rows a program (gdn_prefill_norm.py)
     verify_norm_retile: bool = True
@@ -975,6 +981,7 @@ def verify(executor, gdn, x, st, view, buffers=None):
             batch,
             tokens,
             uv.options.hoisted_conv,
+            retile=uv.options.conv_retile,
         )
     query, key, value = _split_qkv(attn, convolved, uv.flush_options.strided_qkv)
     fused_norm = uv.fused_norm(
@@ -1058,12 +1065,44 @@ def _gated_norm(options, norm, core, z):
 
 
 def _conv(
-    attn, mixed_qkv, conv_state, window, slots, window_rows, batch, tokens, hoisted
+    attn,
+    mixed_qkv,
+    conv_state,
+    window,
+    slots,
+    window_rows,
+    batch,
+    tokens,
+    hoisted,
+    retile=False,
 ):
     """The causal conv update of the verify rows (linear chain): [rows, channels],
-    token-major. SGLang's conv kernel, or its hoisted copy where it applies (width 4,
-    4-8 rows a request, the deduplicated window layout): the same bits."""
+    token-major. With ``retile``, the source's call: its retiled kernel where it applies
+    (width 4, 4-8 rows a request, one dtype, a 4-D window), else SGLang's conv kernel on
+    128-channel tiles. Else SGLang's conv kernel, or its hoisted copy where it applies
+    (width 4, 4-8 rows a request, the deduplicated window layout). The same bits."""
     x = mixed_qkv.view(batch, tokens, -1).transpose(1, 2)
+    if retile:
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.gdn_front.conv import (
+            RETILE_DEFAULT,
+            conv_update,
+        )
+
+        y = conv_update(
+            x,
+            conv_state,
+            attn.conv_weights,
+            attn.bias,
+            attn.activation,
+            slots,
+            window,
+            window_rows,
+            block_n=128,
+            token_major_out=True,
+            num_warps=2,
+            retile=RETILE_DEFAULT,
+        )
+        return y.transpose(1, 2).view(batch * tokens, -1)
     st = window.stride()
     if (
         hoisted

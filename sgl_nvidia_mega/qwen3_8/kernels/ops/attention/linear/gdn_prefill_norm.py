@@ -3,11 +3,16 @@
 # Copyright (c) 2024, Tri Dao.
 # From SGLang python/sglang/kernels/ops/attention/fla/layernorm_gated.py.
 """The gated RMSNorm launch (``_layer_norm_fwd``) with the extend-sized tile: 32 rows
-and 4 warps a program for single-group 128-wide inputs (the GDN output norm).
+and 4 warps a program for single-group 128-wide inputs (the GDN output norm); and the
+target-verify launch of that norm: 16 rows and 8 warps a program
+(``gdn_verify_norm_retiled``).
 
-Byte-identical to the source: ``_norm_retile_cfg`` and
-``_layer_norm_fwd``. Changed: SGLANG_OPT_GDN_PREFILL_NORM_RETILE is the ``retile``
-argument of both; the unchanged kernel and row heuristic are SGLang's
+Byte-identical to the source: ``_norm_retile_cfg``, ``_layer_norm_fwd`` and
+``GDN_VERIFY_NORM_DEFAULT``. Changed: SGLANG_OPT_GDN_PREFILL_NORM_RETILE is the
+``retile`` argument of the first two; SGLANG_ENABLE_GDN_VERIFY_NORM_RETILE is checked
+by the caller, so ``gdn_verify_norm_retile_applies`` / ``gdn_verify_norm_retiled`` take
+no switch and launch GDN_VERIFY_NORM_DEFAULT (no SGLANG_GDN_VERIFY_NORM_RETILE_CONFIG
+override). The unchanged kernel and row heuristic are SGLang's
 (``_layer_norm_fwd_1pass_kernel``, ``calc_rows_per_block``)."""
 
 import logging
@@ -68,6 +73,62 @@ def _log_norm_retile_once() -> None:
         NORM_RETILE_CFG,
         NORM_RETILE_MIN_ROWS,
     )
+
+
+# Measured on VR200 at verify rows B x 4 x 48, B 4-104; re-tune when the kernel changes.
+GDN_VERIFY_NORM_DEFAULT = (16, 8)  # (ROWS_PER_BLOCK, num_warps)
+
+_verify_norm_logged = False
+_verify_norm_stock_logged = False
+
+
+def gdn_verify_norm_retile_applies(x) -> bool:
+    """Whether GDN_VERIFY_NORM_DEFAULT keeps the stock row reduction for x [rows, N]: only
+    for N == 128 where the stock launch holds >= 2 rows per program (8 elements x 16 lanes
+    a row); at 1 row per program (M <= 2 x SMs, verify B1/B2) a stock row is 4 elements x
+    32 lanes."""
+    global _verify_norm_stock_logged
+    if x.shape[-1] != 128:
+        return False
+    if calc_rows_per_block(x.shape[0], x.device) >= 2:
+        return True
+    if not _verify_norm_stock_logged:
+        _verify_norm_stock_logged = True
+        logger.info(
+            "SGLANG_ENABLE_GDN_VERIFY_NORM_RETILE: stock launch kept at %d rows (1 row per "
+            "program), as at every verify this small",
+            x.shape[0],
+        )
+    return False
+
+
+def gdn_verify_norm_retiled(*, x, weight, z, eps, norm_before_gate, activation):
+    """``rms_norm_gated`` of a target verify on the strided projection views (x [rows,
+    head_v_dim], z the 3-D strided gate view, no bias, no groups) on
+    GDN_VERIFY_NORM_DEFAULT's launch: the same values per row."""
+    global _verify_norm_logged
+    if not _verify_norm_logged:
+        _verify_norm_logged = True
+        logger.info(
+            "SGLANG_ENABLE_GDN_VERIFY_NORM_RETILE engaged: rows_per_block, num_warps = %s, "
+            "first verify %d rows of %d",
+            GDN_VERIFY_NORM_DEFAULT,
+            x.shape[0],
+            x.shape[1],
+        )
+    y, _, _ = _layer_norm_fwd(
+        x,
+        weight,
+        None,
+        eps,
+        z=z,
+        group_size=None,
+        norm_before_gate=norm_before_gate,
+        is_rms_norm=True,
+        activation=activation,
+        launch_cfg=GDN_VERIFY_NORM_DEFAULT,
+    )
+    return y
 
 
 def _layer_norm_fwd(

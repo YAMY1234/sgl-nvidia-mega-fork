@@ -8,8 +8,14 @@ committed history, and waits for the conv's q / k / v only where it first reads 
 (PTX ``griddepcontrol``). The gates and the history must be ready when it starts:
 they come from launches before the conv. Where the launch before it also writes the
 gates b / a (slot gdn_front's verify front), ``wait_for_gate_producer`` moves the wait
-before the gates' reads, as the kernel on SGLang branch nvidia/qwen35-agentx-gb300 does;
-the arithmetic is the same.
+before the gates' reads, as the kernel on SGLang branch nvidia/qwen35-agentx-gb300 does.
+
+The arithmetic is the reference's, from before sgl-project/sglang#46185: the D
+and DF accumulations are plain multiply-adds (no masked fused multiply-add), the row update
+of the triangular inverse reads every row (no mask), and the history dots run when a row
+has no history. Bit for bit the reference's verify; within 1.5e-5 of SGLang's output at
+Qwen3.8's TP1 shape (its d and raw-v ring entries differ by the same rounding); 0.25-0.70 us
+a launch faster than #46185's at 4-8 requests; GSM-gated with the slot (47365).
 """
 
 from __future__ import annotations
@@ -23,6 +29,8 @@ import triton.language as tl
 SGLANG_READS = {"kernels/ops/attention/fla/utils.py": ("is_tf32_supported",)}
 
 
+# Pinned after sgl-project/sglang#49719 (the cursor strides, ported). #46185's arithmetic is
+# deliberately not taken (see the module docstring); a further upstream change still fails here.
 SGLANG_MIRRORS = {
     "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:gdn_replayssm_spec_circular_kernel": "2957b47bcee2fd5b",
     "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:_launch_gdn_spec": "8acb385876f4caf8",

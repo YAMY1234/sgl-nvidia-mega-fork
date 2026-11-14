@@ -38,6 +38,9 @@ _FEATURES = frozenset(
     }
 )
 # S0 runs SGLang's own ops; kernel slots declare their tolerances as they land.
+# Slot gdn_native_pdl keeps the reference's pre-sgl-project/sglang#46185 ReplaySSM verify
+# arithmetic: bit for bit the reference, within 1.5e-5 of SGLang's verify output
+# (gdn_front/replayssm_pdl.py).
 _NUMERICS = Numerics(kind=NumericsKind.BITWISE)
 # The target's step view: the typed EAGLE hybrid view (QSA step/pool views, GDN pools
 # incl. the u-cache rings, layer readiness) where SGLang offers binding kinds. The

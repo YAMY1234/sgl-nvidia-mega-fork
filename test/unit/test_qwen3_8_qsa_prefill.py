@@ -207,10 +207,16 @@ def _install(test):
             pack_qsa_prefill_kv=pack,
             _get_best_config=lambda rows: _STATE["tile"],
         ),
-        "sglang.srt.utils.device": dict(
-            async_h2d=h2d, is_sm100_supported=lambda: _STATE["sm100"]
-        ),
     }
+    import sglang.srt.utils as sglang_utils  # the real package; the slot imports these from it
+
+    for name, value in (
+        ("async_h2d", h2d),
+        ("is_sm100_supported", lambda: _STATE["sm100"]),
+    ):
+        patcher = mock.patch.object(sglang_utils, name, value)
+        patcher.start()
+        test.addCleanup(patcher.stop)
     for name, attrs in fakes.items():
         module = types.ModuleType(name)
         module.__dict__.update(attrs)

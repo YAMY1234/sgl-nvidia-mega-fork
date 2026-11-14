@@ -65,7 +65,7 @@ SGLANG_READS = {
     "kernels/ops/mamba/mamba_state_scatter_triton.py": (
         "fused_conv_window_scatter_with_mask",
     ),
-    "srt/utils/device.py": ("async_h2d",),
+    "srt/utils/device.py|srt/utils/common.py": ("async_h2d",),
 }
 # Binding v2 (fn-binding-v2-20261112), not on SGLang main yet: what SGLang hands this
 # module. Move them into SGLANG_READS when it lands.
@@ -484,7 +484,7 @@ def _on_device(ids, device, what: str) -> torch.Tensor:
     if ids is None:
         raise RuntimeError(f"GDN u-cache: the reset needs its {what}")
     if not isinstance(ids, torch.Tensor):
-        from sglang.srt.utils.device import async_h2d
+        from sglang.srt.utils import async_h2d
 
         return async_h2d(list(ids), dtype=torch.int64, device=device)
     return ids if ids.device == device else ids.to(device, non_blocking=True)

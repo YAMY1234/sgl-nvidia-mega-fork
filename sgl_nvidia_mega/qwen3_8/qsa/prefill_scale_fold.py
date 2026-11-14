@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.qsa.mqa import (
     _validate_k,
     _validate_q,
 )
-from sglang.srt.utils.device import is_hip
+from sglang.srt.utils import is_hip
 
 if HAS_TILELANG:
     import tilelang
@@ -37,7 +37,7 @@ SGLANG_READS = {
         "_validate_q",
         "_tilelang_qsa_mqa_prefill_relative_kernel",
     ),
-    "srt/utils/device.py": ("is_hip",),
+    "srt/utils/device.py|srt/utils/common.py": ("is_hip",),
 }
 
 # CUDA's div_ by a CPU scalar multiplies by the FP32 reciprocal: for sqrt(128)

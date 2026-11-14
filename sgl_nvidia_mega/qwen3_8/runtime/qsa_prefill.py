@@ -196,7 +196,7 @@ SGLANG_READS = {
     "srt/model_executor/runner_backend_utils/breakable_cuda_graph/__init__.py": (
         "is_in_breakable_cuda_graph",
     ),
-    "srt/utils/device.py": ("async_h2d", "is_sm100_supported"),
+    "srt/utils/device.py|srt/utils/common.py": ("async_h2d", "is_sm100_supported"),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
@@ -924,7 +924,7 @@ def capture_seeds(options, backend, topk_indices, fb, layer_id, md) -> None:
     if rows is None:
         backend.capture_mtp_sparse_indices(topk_indices, fb, layer_id, metadata=md)
         return
-    from sglang.srt.utils.device import async_h2d
+    from sglang.srt.utils import async_h2d
 
     state = backend._mtp_shared_sparse_indices
     row_to_req = md.get_token_to_batch_idx().long()
@@ -1007,7 +1007,7 @@ def attention(options, attn, backend, q, k, v, topk_indices, st):
     # Current-chunk K/V has already been committed to the cache above.
     max_q = None
     if options.host_path:
-        from sglang.srt.utils.device import async_h2d
+        from sglang.srt.utils import async_h2d
 
         # Staged in pinned memory, so the copy does not drain the stream; max_q is
         # the host max of the lens cu_seqlens_q is built from.
@@ -1278,7 +1278,7 @@ def tma_reason(q, k, v, indices, cu_q, cu_k, kv_lens, extend_lens, fb, ratio) ->
     (16, 1, 2) tile (the source's ``_numeric_packed_prefill`` admission) in the
     provider's layout."""
     from sglang.srt.layers.attention.qsa.sparse_attn import _get_best_config
-    from sglang.srt.utils.device import is_sm100_supported
+    from sglang.srt.utils import is_sm100_supported
 
     if not is_sm100_supported():
         return "not SM100 family"

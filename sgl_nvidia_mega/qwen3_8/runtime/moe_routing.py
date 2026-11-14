@@ -130,7 +130,7 @@ SGLANG_READS = {
     "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
     "srt/runtime_context.py": ("get_parallel",),
     "srt/environ.py": ("envs", "SGLANG_EXPERIMENTAL_LORA_OPTI"),
-    "srt/utils/triton_utils.py": ("next_power_of_2",),
+    "srt/utils/triton_utils.py|srt/utils/common.py": ("next_power_of_2",),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
@@ -422,7 +422,7 @@ def _call_kwargs(experts, topk_output, x_fp4, x_sf) -> dict:
         get_activation_type,
         trtllm_moe_enable_pdl,
     )
-    from sglang.srt.utils.triton_utils import next_power_of_2
+    from sglang.srt.utils import next_power_of_2
 
     def data(name):
         t = getattr(experts, name, None)

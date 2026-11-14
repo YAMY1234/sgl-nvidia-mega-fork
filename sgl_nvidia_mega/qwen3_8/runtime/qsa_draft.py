@@ -105,7 +105,7 @@ SGLANG_READS = {
     "srt/model_executor/runner_backend_utils/breakable_cuda_graph/__init__.py": (
         "is_in_breakable_cuda_graph",
     ),
-    "srt/utils/device.py": ("is_sm100_supported",),
+    "srt/utils/device.py|srt/utils/common.py": ("is_sm100_supported",),
     "srt/runtime_context.py": ("get_parallel", "get_spec"),
     "srt/arg_groups/fields/spec.py": (
         "speculative_num_steps",
@@ -254,7 +254,7 @@ class DraftGlue:
         from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
             _TRTLLM_SPARSE_PAGE_SIZE,
         )
-        from sglang.srt.utils.device import is_sm100_supported
+        from sglang.srt.utils import is_sm100_supported
 
         rows, topk = lookup.shape
         page = _TRTLLM_SPARSE_PAGE_SIZE

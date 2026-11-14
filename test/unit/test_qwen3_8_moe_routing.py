@@ -180,6 +180,8 @@ def _quantize(x, scale):
 
 def _install(test):
     """SGLang's and FlashInfer's modules the slot imports, as fakes, restored after."""
+    import sglang.srt.utils as sglang_utils  # real; patched below, before the fakes go in
+
     log = []
     _STATE.update(
         log=log,
@@ -230,9 +232,6 @@ def _install(test):
         "sglang.srt.layers.moe.token_dispatcher.standard": dict(
             StandardDispatchOutput=SimpleNamespace
         ),
-        "sglang.srt.utils.triton_utils": dict(
-            next_power_of_2=lambda n: 1 << (n - 1).bit_length()
-        ),
         "flashinfer": dict(__version__="0.7.3"),
         "flashinfer.autotuner": dict(
             AutoTuner=SimpleNamespace(get=lambda: _STATE["tuner"])
@@ -265,6 +264,7 @@ def _install(test):
         (torch.cuda, "current_stream", lambda: _STATE["on"]),
         (torch.cuda, "stream", _on),
         (mr, "_fused_built", True),
+        (sglang_utils, "next_power_of_2", lambda n: 1 << (n - 1).bit_length()),
     ):
         patcher = mock.patch.object(target, name, value)
         patcher.start()

@@ -2444,14 +2444,14 @@ class TestQsaDraft(unittest.TestCase):
         )
         flashinfer = types.ModuleType("flashinfer.utils")
         flashinfer.get_trtllm_gen_multi_ctas_kv_counter_bytes = lambda b, h, sms: 8
-        device = types.ModuleType("sglang.srt.utils.device")
-        device.is_sm100_supported = lambda: True
         patch = mock.patch.dict(
-            sys.modules,
-            {m.__name__: m for m in (qsab, flashinfer, device)},
+            sys.modules, {m.__name__: m for m in (qsab, flashinfer)}
         )
         patch.start()
         self.addCleanup(patch.stop)
+        sm100 = mock.patch("sglang.srt.utils.is_sm100_supported", lambda: True)
+        sm100.start()
+        self.addCleanup(sm100.stop)
         props = mock.patch.object(
             torch.cuda,
             "get_device_properties",

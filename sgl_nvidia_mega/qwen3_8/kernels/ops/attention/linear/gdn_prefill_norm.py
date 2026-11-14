@@ -40,7 +40,7 @@ SGLANG_READS = {
     ),
     "srt/batch_invariant_ops/__init__.py": ("is_batch_invariant_mode_enabled",),
     "srt/utils/common.py": ("cdiv",),
-    "srt/utils/device.py": ("device_context",),
+    "srt/utils/device.py|srt/utils/common.py": ("device_context",),
 }
 
 # Extend-sized single-group 128-wide inputs (the GDN output norm) take 32 rows / 4

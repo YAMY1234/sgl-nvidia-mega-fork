@@ -896,27 +896,34 @@ def _last_rows_of_runs(*, extend_lens, pool_ids, num_rows: int) -> list:
 def host_anchor_rows(fb, md, num_rows: int):
     """The seed rows of capture_mtp_sparse_indices' eager path from the step's host
     lengths and request-pool ids (the source's ``_mtp_anchor_host_source`` and
-    ``_mtp_anchor_host_rows``), or None when the host lists do not line up."""
+    ``_mtp_anchor_host_rows``), or None when the host lists do not line up.
+
+    The MTP draft's prefill batch has no host pool ids (SGLang copies them for a
+    non-speculative extend only). A batch's requests hold distinct pool rows, so there
+    a row is last exactly where its request's run ends; a batch whose rows exceed its
+    tokens (padding) keeps the device path."""
     batch_size = md.req_pool_indices.shape[0]
     host_lens = fb.extend_seq_lens_cpu
     host_pool = fb.req_pool_indices_cpu
     extend_seq_lens = fb.extend_seq_lens
     if (
         host_lens is None
-        or host_pool is None
         or extend_seq_lens is None
         or len(host_lens) != batch_size
         or extend_seq_lens.dim() != 1
         or extend_seq_lens.shape[0] != batch_size
-        or host_pool.dim() != 1
-        or host_pool.shape[0] < batch_size
     ):
         return None
-    return _last_rows_of_runs(
-        extend_lens=tuple(int(x) for x in host_lens),
-        pool_ids=tuple(int(x) for x in host_pool[:batch_size].tolist()),
-        num_rows=num_rows,
-    )
+    lens = tuple(int(x) for x in host_lens)
+    if host_pool is None:
+        if num_rows > sum(lens):
+            return None
+        pool_ids = tuple(range(batch_size))
+    elif host_pool.dim() != 1 or host_pool.shape[0] < batch_size:
+        return None
+    else:
+        pool_ids = tuple(int(x) for x in host_pool[:batch_size].tolist())
+    return _last_rows_of_runs(extend_lens=lens, pool_ids=pool_ids, num_rows=num_rows)
 
 
 def capture_seeds(options, backend, topk_indices, fb, layer_id, md) -> None:

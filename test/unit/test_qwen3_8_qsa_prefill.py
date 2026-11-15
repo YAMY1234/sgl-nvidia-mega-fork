@@ -745,9 +745,40 @@ class TestHostAnchorRows(unittest.TestCase):
         self.assertEqual(qp.host_anchor_rows(fb, md, 8), [4, 7])
         fb.extend_seq_lens_cpu = [5]
         self.assertIsNone(qp.host_anchor_rows(fb, md, 8))
+
+    def test_without_host_pool_ids_the_run_ends_match_the_device_rule(self):
+        """The MTP draft's prefill batch has no host pool ids: with the batch's
+        requests on distinct pool rows the run ends are the device rule's rows,
+        including zero-length extends, one request and rows cut short; rows past
+        the batch's tokens (a padded batch) keep the device path."""
+        cases = [
+            ((5, 3), 8),  # two requests
+            ((7,), 7),  # one request
+            ((7,), 3),  # one request, rows cut short
+            ((0, 4, 0, 2, 0), 6),  # zero-length extends at the ends and between
+            ((4, 0, 0, 3), 5),  # zero-length extends, rows cut inside the last run
+            ((1, 1, 1), 3),
+        ]
+        gen = torch.Generator().manual_seed(9)
+        for _ in range(200):
+            n = int(torch.randint(1, 7, (1,), generator=gen))
+            lens = tuple(torch.randint(0, 6, (n,), generator=gen).tolist())
+            if sum(lens):
+                rows = int(torch.randint(1, sum(lens) + 1, (1,), generator=gen))
+                cases.append((lens, rows))
+        for lens, rows in cases:
+            fb = _fb(extend=lens, prefix=(0,) * len(lens))
+            fb.req_pool_indices_cpu = None
+            md = SimpleNamespace(req_pool_indices=torch.zeros(len(lens)))
+            ids = torch.randperm(64, generator=gen)[: len(lens)].tolist()  # distinct
+            self.assertEqual(
+                qp.host_anchor_rows(fb, md, rows),
+                self.device_rows(list(lens), ids, rows),
+                (lens, ids, rows),
+            )
         fb = _fb(extend=(5, 3))
         fb.req_pool_indices_cpu = None
-        self.assertIsNone(qp.host_anchor_rows(fb, md, 8))
+        self.assertIsNone(qp.host_anchor_rows(fb, _metadata(8), 9))  # padded rows
 
 
 class TestFastSelect(unittest.TestCase):

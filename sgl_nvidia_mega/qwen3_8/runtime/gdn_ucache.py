@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -170,6 +171,9 @@ PLAIN = Options(
     strided_qkv=False, pdl=False, flush_first=False, fused_conv=False, fused_norm=False
 )
 DEFAULT = HIGH_CONCURRENCY
+# The recipe's switch for HIGH_CONCURRENCY_FUSED_CONV on SM107 (the source reads
+# SGLANG_ENABLE_GDN_UCACHE_FUSED_CONV: 1 in its c128 recipe, 0 in its c176 one)
+FUSED_CONV_ENV = "SGLANG_OPT_GDN_UCACHE_FUSED_CONV"
 
 
 def _kernels():
@@ -187,7 +191,13 @@ def _rubin():
 
 
 def default_options(device) -> Options:
-    return DEFAULT if torch.cuda.get_device_capability(device) == SM107 else PLAIN
+    if torch.cuda.get_device_capability(device) != SM107:
+        return PLAIN
+    return (
+        HIGH_CONCURRENCY_FUSED_CONV
+        if os.environ.get(FUSED_CONV_ENV) == "1"
+        else DEFAULT
+    )
 
 
 class UcacheVerify:

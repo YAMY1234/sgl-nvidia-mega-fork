@@ -425,6 +425,23 @@ class TestOptions(unittest.TestCase):
             uv = _verifier(options=U.Options(pdl=False, fused_conv=True))
             self.assertFalse(uv.fused_conv_enabled or uv.fused_norm_enabled)
 
+    def test_recipe_switch_selects_the_fused_conv(self):
+        for capability, value, want in (
+            ((10, 7), "1", U.HIGH_CONCURRENCY_FUSED_CONV),
+            ((10, 7), "0", U.DEFAULT),
+            ((10, 7), None, U.DEFAULT),
+            ((10, 0), "1", U.PLAIN),
+        ):
+            env = {} if value is None else {U.FUSED_CONV_ENV: value}
+            with _Env(capability), mock.patch.dict(os.environ, env):
+                if value is None:
+                    os.environ.pop(U.FUSED_CONV_ENV, None)
+                uv = _verifier()
+                self.assertIs(uv.options, want, (capability, value))
+                self.assertEqual(
+                    uv.fused_conv_enabled, want is U.HIGH_CONCURRENCY_FUSED_CONV
+                )
+
     def test_sm100_takes_flashinfer_without_options(self):
         for capability in ((10, 0), (10, 3)):
             with _Env(capability) as env:

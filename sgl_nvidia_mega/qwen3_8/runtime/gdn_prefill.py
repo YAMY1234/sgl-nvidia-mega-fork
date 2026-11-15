@@ -63,7 +63,8 @@ SGLang's forward.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Optional
 
@@ -220,6 +221,10 @@ class Options:
     # SGLANG_OPT_GDN_PREFILL_TMEM_DEALLOC=1 (a master pin): FlashInfer #8854 on
     # FlashInfer 0.7.3's prefill kernels, installed by build
     tmem_dealloc: bool = True
+    # SGLANG_OPT_GDN_PREFILL_CP_SPLIT=1 (off by default): in a multi-sequence prefill each
+    # sequence of at least this many tokens takes FlashInfer's CP kernel on a side
+    # stream, the rest the chunked kernel; 0: one call (FlashInfer's routing)
+    cp_split_min_tokens: int = 0
 
     def __post_init__(self):
         # the source's parsers validate the tiles (ValueError)
@@ -289,6 +294,21 @@ def layer_reasons(gdn) -> str:
     if not isinstance(norm, RMSNorm) or norm.bias is not None:
         return "the GDN output norm is not SGLang's gated RMSNorm without bias"
     return ""
+
+
+CP_SPLIT_ENV = "SGLANG_OPT_GDN_PREFILL_CP_SPLIT"
+# The measured crossover on VR200 at 48 value heads with checkpoints (8192 tokens).
+CP_SPLIT_MIN_TOKENS_ENV = "SGLANG_OPT_GDN_PREFILL_CP_SPLIT_MIN_TOKENS"
+
+
+def default_options() -> Options:
+    """DEFAULT, with the CP split where the recipe asks for it."""
+    if os.environ.get(CP_SPLIT_ENV) != "1":
+        return DEFAULT
+    return replace(
+        DEFAULT,
+        cp_split_min_tokens=int(os.environ.get(CP_SPLIT_MIN_TOKENS_ENV, "8192")),
+    )
 
 
 def build(model, options: Options = DEFAULT) -> str:
@@ -575,6 +595,8 @@ def _extend_core(options, step, layer, fb, mixed_qkv, a, b, output=None):
         fused_rows=fused_rows,
         l2norm_retile=options.l2norm_retile,
         qk_one_launch=options.qk_l2norm_one_launch,
+        cp_split_min_tokens=options.cp_split_min_tokens,
+        seq_lens_cpu=fb.extend_seq_lens_cpu,
         output=output,
     )
     if track and not (options.fused_track and _fused_track_states(md, h, ssm_states)):

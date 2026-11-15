@@ -331,7 +331,7 @@ def build(model, hf_config, ctx):
         from sgl_nvidia_mega.qwen3_8.runtime import gdn_prefill
 
         executor.gdn_prefill = _built_options(
-            "gdn_prefill", gdn_prefill.build(model), gdn_prefill.DEFAULT
+            "gdn_prefill", gdn_prefill.build(model), gdn_prefill.default_options()
         )
     if (
         executor.prefill_graph

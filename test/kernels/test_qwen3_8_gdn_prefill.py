@@ -72,12 +72,15 @@ CASES = {
     "ragged": ([700] + [1] * 40, [0] + [11] * 40, {0: 640}),
     # one token: the plain conv on the recipe tile
     "one_token": ([1], [9], {}),
+    # a long sequence between short ones, every one with checkpoints: the CP split
+    "cp_split": ([640, 8256, 1100], [3, 0, 0], {1: 8200, 2: 1024}),
 }
 IMPL = {
     "mixed": "conv_split+fi+rows_fused+track_fused",
     "long": "conv_split+fi+rows_fused+track_fused",
     "ragged": "conv_split+fi+rows_fused+track_fused",
     "one_token": "conv+fi+rows_fused",
+    "cp_split": "conv_split+fi+rows_fused+track_fused",
 }
 
 
@@ -306,6 +309,43 @@ def test_split_conv_without_strip(monkeypatch):
     expected = case.stock(monkeypatch)
     options = dataclasses.replace(gdn_prefill.DEFAULT, conv_strip=None)
     actual, _ = case.plugin(monkeypatch, options)
+    _assert_same(expected, actual)
+
+
+def test_cp_split_matches_one_call_within_bf16_steps(monkeypatch):
+    """The CP split against the one chunked call: the conv states bitwise, the output
+    and the SSM states (live and track slots) within a few BF16 steps of their largest
+    values (CP and the chunked kernel sum in different orders); a batch with no
+    sequence that long runs the one call."""
+    from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.linear import (
+        gdn_prefill_flashinfer as fi_mod,
+    )
+
+    split = dataclasses.replace(gdn_prefill.DEFAULT, cp_split_min_tokens=8192)
+    runs = []
+    real = fi_mod._run_cp_split
+    monkeypatch.setattr(
+        fi_mod, "_run_cp_split", lambda *a: runs.append(a[1]) or real(*a)
+    )
+    case = _Case("cp_split", BF16)
+    (out, conv, ssm), _ = case.plugin(monkeypatch, gdn_prefill.DEFAULT)
+    assert runs == []
+    (out2, conv2, ssm2), ran = case.plugin(monkeypatch, split)
+    assert ran == [("gdn", IMPL["cp_split"])]
+    assert [(c[0], c[1], c[6]) for c in runs[0]] == [
+        (0, 1, False),
+        (1, 2, True),
+        (2, 3, False),
+    ]
+    assert torch.equal(conv2, conv)
+    for a, b in ((out2, out), (ssm2.float(), ssm.float())):
+        assert bool(torch.isfinite(a).all())
+        assert (a.float() - b.float()).abs().max() <= 2**-6 * b.float().abs().max()
+    assert not torch.equal(ssm2, ssm)  # the split did run CP
+    mixed = _Case("mixed", BF16)
+    expected, _ = mixed.plugin(monkeypatch, gdn_prefill.DEFAULT)
+    actual, _ = mixed.plugin(monkeypatch, split)
+    assert len(runs) == 1
     _assert_same(expected, actual)
 
 

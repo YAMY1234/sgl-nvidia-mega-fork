@@ -466,7 +466,7 @@ def _flush_batch(h, hv, T):
     pytest.skip("no batch takes the fused conv")
 
 
-def _verify_once(*, h, hv, batch, T, fused_conv, fused_norm, seed=3):
+def _verify_once(*, h, hv, batch, T, fused_conv, fused_norm, seed=3, retile=False):
     """One first-layer verify on fresh copies: the separate conv + flush (+ SGLang's
     gated norm) or the fused launch. Returns everything it writes."""
     from types import SimpleNamespace
@@ -519,7 +519,7 @@ def _verify_once(*, h, hv, batch, T, fused_conv, fused_norm, seed=3):
         )
     else:
         convolved = U._conv(
-            attn, mixed, conv_state, window, slots, window_rows, batch, T, True
+            attn, mixed, conv_state, window, slots, window_rows, batch, T, True, retile
         )
     q, k, v = U._split_qkv(attn, convolved, True)
     fn = uv.fused_norm(
@@ -576,11 +576,14 @@ def _verify_once(*, h, hv, batch, T, fused_conv, fused_norm, seed=3):
 
 
 @needs_sm107
-def test_fused_conv_is_the_separate_conv():
+@pytest.mark.parametrize("batch", [None, 24, 32, 40, 48, 56])
+@pytest.mark.parametrize("retile", [False, True])
+def test_fused_conv_is_the_separate_conv(batch, retile):
+    # None: the smallest fused batch; 24-56 requests: the c128 recipe's verifies
     h, hv, T = 16, 48, NUM_DRAFT_TOKENS
-    batch = _flush_batch(h, hv, T)
+    batch = batch or _flush_batch(h, hv, T)
     separate = _verify_once(
-        h=h, hv=hv, batch=batch, T=T, fused_conv=False, fused_norm=False
+        h=h, hv=hv, batch=batch, T=T, fused_conv=False, fused_norm=False, retile=retile
     )
     fused = _verify_once(
         h=h, hv=hv, batch=batch, T=T, fused_conv=True, fused_norm=False

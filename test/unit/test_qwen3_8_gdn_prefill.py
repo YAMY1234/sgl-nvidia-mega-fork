@@ -27,6 +27,7 @@ from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba import gdn_prefill_conv as conv_m
 from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba import gdn_prefill_cp_tail as tail_mod
 from sgl_nvidia_mega.qwen3_8.kernels.ops.mamba import gdn_prefill_state_glue as glue_mod
 from sgl_nvidia_mega.qwen3_8.runtime import gdn_prefill as gp
+from sgl_nvidia_mega.qwen3_8.runtime import gdn_prefill_tables as tab
 from sgl_nvidia_mega.qwen3_8.runtime import prefill_graph as pg
 
 # A small GDN layer of Qwen3.8's shape: 2 key heads, 6 value heads (ratio 3), 128 wide
@@ -569,7 +570,8 @@ class TestFallbacks(_Case):
 
 
 def _graph_meta(track=False, flashinfer=True):
-    """A bucket's static tables (GDNPrefillGraphMetadata), with FlashInfer's."""
+    """A bucket's static tables (GDNPrefillGraphMetadata), and FlashInfer's (``fi``,
+    the executor's gdn_prefill_tables entry for it)."""
     tables = SimpleNamespace(
         cp_single=True,
         pre_track_mode="pre_mode",
@@ -578,7 +580,7 @@ def _graph_meta(track=False, flashinfer=True):
     )
     return SimpleNamespace(
         track=track,
-        flashinfer=tables if flashinfer else None,
+        fi=tables if flashinfer else None,
         cu_seqlens="cu",
         cache_indices="slots",
         has_initial_state="init",
@@ -614,7 +616,11 @@ class TestPrefillGraph(_Case):
         patcher = mock.patch.object(fi_mod, "extend_in_graph", self.fi_graph)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.ex = SimpleNamespace(gdn_prefill=gp.DEFAULT, gdn_graph_outputs=[])
+        self.ex = SimpleNamespace(
+            gdn_prefill=gp.DEFAULT,
+            gdn_graph_outputs=[],
+            gdn_tables=SimpleNamespace(get=lambda meta: meta.fi),
+        )
 
     def fi_graph(self, kernel, q, k, v, g, beta, **kw):
         self.spies.calls.append(("extend_in_graph", dict(kw, kernel=kernel, q=q)))
@@ -651,7 +657,7 @@ class TestPrefillGraph(_Case):
         self.assertIsNone(conv["seq_lens_cpu"])  # no host lengths in the segment
         self.assertNotIn("strip_cfg", conv)
         core = s.kwargs("extend_in_graph")
-        self.assertIs(core["tables"], meta.flashinfer)
+        self.assertIs(core["tables"], meta.fi)
         self.assertIs(core["ssm_states"], self.backend.temporal)
         self.assertIsInstance(core["kernel"], _FlashInferKernel)
         self.assertEqual(
@@ -853,6 +859,128 @@ class TestExtendInGraph(unittest.TestCase):
         self.assertEqual(ncp["checkpoint_cu_starts"], "ncp_ck")
         self.assertEqual(ncp["checkpoint_every_n_tokens"], 64)
         self.assertEqual(tuple(out.shape), (1, 2, HV, D, D))
+
+
+class TestGraphTables(unittest.TestCase):
+    """The executor's FlashInfer tables of a captured bucket (gdn_prefill_tables.py),
+    moved from SGLang's GDN backend; SGLang asks for them and calls their refill."""
+
+    def setUp(self):
+        _install(self)
+        fakes = {
+            "sglang.kernels.ops.mamba.gdn_prefill_track": dict(
+                TRACK_FINAL_STATE=1, TRACK_CHUNK_STATE=2
+            ),
+            "sglang.srt.layers.attention.linear.gdn_prefill_graph": dict(
+                GDN_CHUNK_SIZE=64
+            ),
+            "sglang.srt.runtime_context": dict(
+                get_exec=lambda: SimpleNamespace(
+                    mamba=SimpleNamespace(enable_mamba_extra_buffer=True)
+                ),
+                mamba_cache_chunk_size=lambda: _STATE["cache_chunk"],
+            ),
+        }
+        _STATE["cache_chunk"] = 64
+        for name, attrs in fakes.items():
+            module = types.ModuleType(name)
+            module.__dict__.update(attrs)
+            patcher = mock.patch.dict(sys.modules, {name: module})
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, value in (
+            ("get_device_capability", (10, 0)),
+            ("get_device_properties", SimpleNamespace(multi_processor_count=148)),
+        ):
+            patcher = mock.patch.object(torch.cuda, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(torch.Tensor, "pin_memory", lambda t: t)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def backend(self, heads=HV, dtype=torch.bfloat16, kernel=_FlashInferKernel):
+        temporal = torch.zeros(1, SLOTS, heads, D, D, dtype=dtype)
+        return SimpleNamespace(
+            kernel_dispatcher=SimpleNamespace(extend_kernel=kernel()),
+            state_pool=SimpleNamespace(mamba_cache=SimpleNamespace(temporal=temporal)),
+            device="cpu",
+            _prefill_graph_track_rows=mock.Mock(),
+        )
+
+    def test_only_a_supported_backend_gets_tables(self):
+        self.assertIsInstance(tab.GraphTables.build(self.backend()), tab.GraphTables)
+        for setup, reason in (
+            (dict(kernel=_TritonKernel), "extend kernel"),
+            (dict(dtype=torch.float32), "SSM state dtype"),
+        ):
+            self.assertIn(reason, tab.unsupported_reason(self.backend(**setup)))
+        _STATE["cache_chunk"] = 256
+        self.assertIn("cache chunk", tab.unsupported_reason(self.backend()))
+        with mock.patch.object(
+            torch.cuda, "get_device_capability", return_value=(9, 0)
+        ):
+            self.assertIn("SM10x", tab.unsupported_reason(self.backend()))
+        # FlashInfer takes its CP kernel only while heads x 4 < SMs
+        self.assertTrue(tab.GraphTables(self.backend(), 8).cp_single)
+        self.assertFalse(tab.GraphTables(self.backend(heads=64), 8).cp_single)
+
+    def test_refill_splits_cp_and_non_cp_batches_per_bucket(self):
+        backend = self.backend()
+        tables = tab.GraphTables(backend, 4)
+        meta = SimpleNamespace(
+            max_seqs=4,
+            packed=torch.zeros(1),
+            cache_indices=torch.tensor([5, -1, -1, -1], dtype=torch.int32),
+        )
+        tables.refill(
+            meta, SimpleNamespace(extend_seq_lens_cpu=[130], mamba_track_mask=None)
+        )
+        one = tables.get(meta)
+        self.assertEqual(one.cp_cu_seqlens.tolist(), [0, 130])
+        self.assertEqual(one.cp_checkpoint_cu.tolist(), [0, 2])
+        self.assertEqual(one.cp_state_indices.tolist(), [5])
+        self.assertEqual(one.ncp_cu_seqlens.tolist(), [0] * 5)
+        self.assertIsNone(tables.get(SimpleNamespace()))
+        # a tracked three-sequence batch on the same bucket: the non-CP tables, and
+        # prefix-cache snapshots from the 64-token checkpoints or the initial state
+        backend._prefill_graph_track_rows.return_value = SimpleNamespace(
+            chunk_rows=[(0, 0), (2, 2)], final_rows=[1]
+        )
+        meta.cache_indices.copy_(torch.tensor([3, -1, 7, -1], dtype=torch.int32))
+        batch = SimpleNamespace(extend_seq_lens_cpu=[64, 10, 129], mamba_track_mask=1)
+        tables.refill(meta, batch)
+        self.assertIs(tables.get(meta), one)
+        backend._prefill_graph_track_rows.assert_called_once_with(batch)
+        self.assertEqual(one.cp_cu_seqlens.tolist(), [0, 0])
+        self.assertEqual(one.ncp_cu_seqlens.tolist(), [0, 64, 74, 203, 203])
+        self.assertEqual(one.ncp_checkpoint_cu.tolist(), [0, 1, 1, 3, 3])
+        self.assertEqual(one.ncp_state_indices.tolist(), [3, 0, 7, 0])
+        self.assertEqual(one.pre_track_mode.tolist(), [1, 0, 0, 0])
+        self.assertEqual(one.track_mode.tolist(), [0, 1, 2, 0])
+        self.assertEqual(one.track_h_row.tolist(), [0, 0, 2, 0])
+
+    def test_the_executor_asks_for_tables_only_with_the_switch_and_slot(self):
+        from sgl_nvidia_mega.qwen3_8.runtime.executor import Qwen3_8Executor
+
+        built = mock.Mock(max_seqs=8)
+        for env, draft, slot, granted in (
+            ("1", False, gp.DEFAULT, 8),
+            ("0", False, gp.DEFAULT, None),
+            ("1", True, gp.DEFAULT, None),
+            ("1", False, None, None),
+        ):
+            ex = SimpleNamespace(draft=draft, gdn_prefill=slot, gdn_tables=None)
+            with (
+                mock.patch.dict("os.environ", {tab.FLASHINFER_ENV: env}),
+                mock.patch.object(tab.GraphTables, "build", return_value=built),
+            ):
+                seqs = Qwen3_8Executor.linear_prefill_graph_seqs(ex, "backend")
+            self.assertEqual(seqs, granted)
+        Qwen3_8Executor.refill_prefill_graph(ex, "meta", "batch")  # no tables: no-op
+        ex.gdn_tables = mock.Mock()
+        Qwen3_8Executor.refill_prefill_graph(ex, "meta", "batch")
+        ex.gdn_tables.refill.assert_called_once_with("meta", "batch")
 
 
 class TestOptions(unittest.TestCase):

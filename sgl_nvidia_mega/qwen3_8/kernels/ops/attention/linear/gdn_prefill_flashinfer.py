@@ -16,7 +16,7 @@ this package's copy. FlashInfer's prefill function is the stock kernel's, so
 
 ``extend_in_graph`` is the source's ``FlashInferGDNKernel.extend_in_graph`` (the core of
 a GDN extend captured in a breakable prefill CUDA graph, on the bucket's static
-``GDNFlashInferGraphTables``), with this package's q / k / v preparation and the
+``gdn_prefill_tables.GDNFlashInferGraphTables``), with this package's q / k / v preparation and the
 bucket rows past the batch neutralized before the non-CP call as well.
 """
 
@@ -46,27 +46,6 @@ SGLANG_READS = {
         "use_state_pool",
         "_prefill_needs_fp32_state",
     ),
-    "srt/layers/attention/linear/gdn_prefill_graph.py": (
-        "cp_single",
-        "cp_cu_seqlens",
-        "cp_state_indices",
-        "cp_checkpoint_cu",
-        "ncp_cu_seqlens",
-        "ncp_state_indices",
-        "ncp_checkpoint_cu",
-    ),
-}
-
-# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
-# contract test skips each, naming the change, only where the installed SGLang lacks it.
-SGLANG_REQUIRES = {
-    "srt/layers/attention/linear/gdn_prefill_graph.py:cp_checkpoint_cu": "sglang#50157",
-    "srt/layers/attention/linear/gdn_prefill_graph.py:cp_cu_seqlens": "sglang#50157",
-    "srt/layers/attention/linear/gdn_prefill_graph.py:cp_single": "sglang#50157",
-    "srt/layers/attention/linear/gdn_prefill_graph.py:cp_state_indices": "sglang#50157",
-    "srt/layers/attention/linear/gdn_prefill_graph.py:ncp_checkpoint_cu": "sglang#50157",
-    "srt/layers/attention/linear/gdn_prefill_graph.py:ncp_cu_seqlens": "sglang#50157",
-    "srt/layers/attention/linear/gdn_prefill_graph.py:ncp_state_indices": "sglang#50157",
 }
 
 
@@ -195,7 +174,7 @@ def extend_in_graph(
     qk_one_launch: bool = False,
 ) -> Optional[torch.Tensor]:
     """The prefill core of a captured GDN extend on the bucket's static tables
-    (``GDNFlashInferGraphTables``): the CP kernel takes a one-sequence batch (if
+    (``gdn_prefill_tables.GDNFlashInferGraphTables``): the CP kernel takes a one-sequence batch (if
     ``tables.cp_single``), the non-CP kernel any other, and both update the pool in
     place by slot. ``output`` is [tokens, HV, V]; returns the [1, checkpoint_rows, HV,
     V, K] state checkpoints, if any."""

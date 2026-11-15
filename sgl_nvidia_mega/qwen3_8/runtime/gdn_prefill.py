@@ -53,7 +53,8 @@ FlashInfer's (its checkpoint plan and track rows are FlashInfer's only then).
 Inside a breakable prefill CUDA graph (the executor's prefill body, prefill_graph.py)
 the projections and the norm stay in the captured segment, and the core (conv, gates,
 FlashInfer, track copies) either runs there too, on the bucket's static tables
-(``LinearPrefillView.prefill_graph_metadata`` with FlashInfer's: ``_core_in_graph``),
+(``LinearPrefillView.prefill_graph_metadata`` with this package's FlashInfer tables,
+``gdn_prefill_tables.py``: ``_core_in_graph``),
 or, without them, as a graph break running the eager core on the live batch's rows
 (``prefill_graph.gdn_core``). Tables without FlashInfer's (SGLang's Triton chain) keep
 SGLang's forward.
@@ -131,14 +132,12 @@ SGLANG_READS = {
     "srt/kernel_plugins/nvidia/eagle_binding.py": ("prefill_graph_metadata",),
     "srt/layers/attention/linear/gdn_prefill_graph.py": (
         "GDN_CHUNK_SIZE",
-        "flashinfer",
         "track",
         "cu_seqlens",
         "cache_indices",
         "has_initial_state",
         "conv_block_table",
         "track_mode",
-        "pre_track_mode",
         "track_h_row",
         "track_conv_start",
         "track_dst",
@@ -195,8 +194,6 @@ SGLANG_READS = {
 # contract test skips each, naming the change, only where the installed SGLang lacks it.
 SGLANG_REQUIRES = {
     "srt/kernel_plugins/nvidia/eagle_binding.py:prefill_graph_metadata": "sglang#50157",
-    "srt/layers/attention/linear/gdn_prefill_graph.py:flashinfer": "sglang#50157",
-    "srt/layers/attention/linear/gdn_prefill_graph.py:pre_track_mode": "sglang#50157",
 }
 
 
@@ -422,17 +419,20 @@ def extend(executor, layer, x, st):
     core = None
     if graph:
         meta = st.view.prefill_graph_metadata
+        tables = None
+        if meta is not None and executor.gdn_tables is not None:
+            tables = executor.gdn_tables.get(meta)
         if meta is None:
             from sgl_nvidia_mega.qwen3_8.runtime import prefill_graph
 
             core = lambda qkv, a, b: prefill_graph.gdn_core(
                 executor, gdn, step, qkv, a, b
             )
-        elif meta.flashinfer is None:
+        elif tables is None:
             return None  # SGLang's own chain on the bucket's tables
         else:
             core = lambda qkv, a, b: _core_in_graph(
-                executor, options, step, gdn.attn, meta, qkv, a, b
+                executor, options, step, gdn.attn, meta, tables, qkv, a, b
             )
     out, impl = _forward(options, step, gdn, x, st.fb, core)
     st.ran(OP, impl)
@@ -598,9 +598,10 @@ def core_rows(options, step, gdn, fb, mixed_qkv, a, b, output) -> str:
     return _extend_core(options, step, gdn.attn, fb, mixed_qkv, a, b, output=output)[1]
 
 
-def _core_in_graph(executor, options, step, layer, meta, mixed_qkv, a, b):
+def _core_in_graph(executor, options, step, layer, meta, tables, mixed_qkv, a, b):
     """``_extend_core`` inside a breakable prefill graph on the bucket's static tables
-    (SGLang's ``GDNPrefillGraphMetadata`` with FlashInfer's): every launch grid from the
+    (SGLang's ``GDNPrefillGraphMetadata`` and this package's FlashInfer ``tables``,
+    gdn_prefill_tables.py): every launch grid from the
     bucket, the state updated in place by slot, the prefix-cache snapshots from the
     64-token state checkpoints. Returns ([1, T, HV, V], impl)."""
     from sglang.kernels.ops.mamba.gdn_prefill_track import (
@@ -621,7 +622,7 @@ def _core_in_graph(executor, options, step, layer, meta, mixed_qkv, a, b):
     )
 
     conv_states, ssm_states = step.conv_states, step.ssm_states
-    tables, rows = meta.flashinfer, mixed_qkv.shape[0]
+    rows = mixed_qkv.shape[0]
     if meta.track:
         # the conv windows before the conv updates the cache
         gdn_track_conv_window(

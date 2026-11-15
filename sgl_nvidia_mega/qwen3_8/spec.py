@@ -42,10 +42,10 @@ _FEATURES = frozenset(
 # arithmetic: bit for bit the reference, within 1.5e-5 of SGLang's verify output
 # (gdn_front/replayssm_pdl.py).
 _NUMERICS = Numerics(kind=NumericsKind.BITWISE)
-# The target's step view: the typed EAGLE hybrid view (QSA step/pool views, GDN pools
-# incl. the u-cache rings, layer readiness) where SGLang offers binding kinds. The
-# MTP draft keeps the default view: the EAGLE prefill view needs a linear-attention
-# backend, which the draft has not.
+# The target's step view: the typed EAGLE hybrid view (GDN metadata and pools, the
+# prefill view and its graph tables) where SGLang offers binding kinds. The MTP draft
+# keeps the default view: the EAGLE prefill view needs a linear-attention backend,
+# which the draft has not.
 _TARGET_BINDING = (
     {"binding": "eagle_hybrid"}
     if "binding" in getattr(MegakernelSpec, "__struct_fields__", ())

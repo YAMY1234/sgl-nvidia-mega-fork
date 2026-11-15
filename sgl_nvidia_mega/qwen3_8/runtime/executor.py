@@ -208,6 +208,9 @@ class Qwen3_8Executor:
         self.prefill_graph = False
         # gdn_prefill's in-graph core outputs, newest first (gdn_prefill._graph_output)
         self.gdn_graph_outputs = []
+        # FlashInfer's per-bucket GDN tables (gdn_prefill_tables.GraphTables), set
+        # when SGLang's GDN backend asks linear_prefill_graph_seqs
+        self.gdn_tables = None
         self._pools_checked = False
         self.mixers = {
             i: (
@@ -303,6 +306,23 @@ class Qwen3_8Executor:
             return None
         ids = input_ids if input_ids is not None else forward_batch.input_ids
         return Step(mode="prefill", rows=int(ids.shape[0]))
+
+    def linear_prefill_graph_seqs(self, backend):
+        """SupportsPrefillBody: run FlashInfer's GDN core in the graph on this
+        package's tables (SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER, slot
+        gdn_prefill); None keeps the GDN layers' graph breaks."""
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn_prefill_tables
+
+        if self.draft or self.gdn_prefill is None or not gdn_prefill_tables.requested():
+            return None
+        self.gdn_tables = gdn_prefill_tables.GraphTables.build(backend)
+        return None if self.gdn_tables is None else self.gdn_tables.max_seqs
+
+    def refill_prefill_graph(self, metadata, forward_batch):
+        """SupportsPrefillBody: refill the bucket's tables after SGLang refilled
+        ``metadata`` (its GDNPrefillGraphMetadata), before a capture or replay."""
+        if self.gdn_tables is not None:
+            self.gdn_tables.refill(metadata, forward_batch)
 
     @torch.no_grad()
     def forward_body(

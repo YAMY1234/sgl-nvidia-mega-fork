@@ -44,17 +44,7 @@ SGLANG_READS = {
     ),
     "srt/layers/attention/qsa/qsa_indexer.py": ("index_qk_proj",),
     "kernels/plugin_kernels/nvidia/spec.py": ("MegakernelSpec",),
-    "srt/environ.py": (
-        "envs",
-        "SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND",
-        "SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER",
-    ),
-}
-
-# Reads and mirrors that need an SGLang change newer than the unit job's pin: the
-# contract test skips each, naming the change, only where the installed SGLang lacks it.
-SGLANG_REQUIRES = {
-    "srt/environ.py:SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER": "sglang#50157",
+    "srt/environ.py": ("envs", "SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND"),
 }
 
 # Comma-separated kernel slots; unset or "" runs every op on its stock step
@@ -169,13 +159,16 @@ def _prefill_backend(graph_config) -> str:
 
 
 def gdn_graph_tables() -> bool:
-    """Whether breakable prefill graphs hand an external prefill body FlashInfer's GDN
-    tables; SGLang then captures no GDN extend of its own, slot gdn_prefill must."""
+    """Whether breakable prefill graphs run FlashInfer's GDN core on this package's
+    tables (gdn_prefill_tables.py); SGLang then captures no GDN extend of its own,
+    slot gdn_prefill must."""
     from sglang.srt.environ import envs
+
+    from sgl_nvidia_mega.qwen3_8.runtime import gdn_prefill_tables
 
     return bool(
         envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
-        and envs.SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER.get()
+        and gdn_prefill_tables.requested()
     )
 
 

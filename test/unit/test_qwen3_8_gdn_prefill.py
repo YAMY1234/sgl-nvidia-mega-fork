@@ -375,6 +375,9 @@ class TestDispatch(_Case):
             (True, True, True),
         )
         self.assertEqual(core["num_state_checkpoints"], 0)
+        # one FlashInfer call (its own CP routing) unless the recipe asks for the split
+        self.assertEqual(core["cp_split_min_tokens"], 0)
+        self.assertEqual(core["seq_lens_cpu"], [5, 3])
         # the norm: the stock gated RMSNorm call with the strided 3D z
         norm = s.kwargs("norm")
         self.assertEqual(tuple(norm["x"].shape), (8 * HV, D))
@@ -984,6 +987,18 @@ class TestGraphTables(unittest.TestCase):
 
 
 class TestOptions(unittest.TestCase):
+    def test_cp_split_only_where_the_recipe_asks(self):
+        for env, want in (
+            ({}, 0),
+            ({gp.CP_SPLIT_ENV: "0"}, 0),
+            ({gp.CP_SPLIT_ENV: "1"}, 8192),
+            ({gp.CP_SPLIT_ENV: "1", gp.CP_SPLIT_MIN_TOKENS_ENV: "256"}, 256),
+        ):
+            with mock.patch.dict("os.environ", env, clear=True):
+                o = gp.default_options()
+            self.assertEqual(o.cp_split_min_tokens, want)
+            self.assertEqual(o == gp.DEFAULT, want == 0)
+
     def test_defaults_are_the_recipe_values(self):
         o = gp.DEFAULT
         self.assertEqual(o.strip_cfg(), (32, 128, 4, 2048))

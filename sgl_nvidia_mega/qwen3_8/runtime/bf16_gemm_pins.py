@@ -621,7 +621,8 @@ def gated_mix(gr, hyper_input: torch.Tensor, normalized_input=None):
     _mix_compute where SGLang's mix runs _mix_compute."""
     from sgl_nvidia_mega.qwen3_8.runtime import hc_mix_tuned
 
-    # the source's row-aware HC mix tactics serve its split-K mix rows (<= 32; SGLang's <= 24)
+    # slot hc: the source's row-aware HC mix tactics serve its split-K mix rows (<= 32;
+    # SGLang's <= 24)
     tuned = (
         hyper_input.is_cuda
         and hyper_input.dtype in (torch.bfloat16, torch.float16)

@@ -193,7 +193,7 @@ runs every op on SGLang's module.
 
 | Slot | Runs | Numerics against SGLang's module |
 | --- | --- | --- |
-| `hc` | HC write-backs of 1 to 32 rows | rounding |
+| `hc` | HC write-backs of 1 to 32 rows; with `SGLANG_HC_MACRO` (on by default) at TP1, the HC reads the executor makes itself at 9 to 32 rows (the PLE layer's, and every layer's with the BF16 pin table) on the source's row-aware split-K tactics | rounding |
 | `hc_wide` | HC reads and write-backs of 33 to 1024 rows; at 33 to 320 rows, a write-back and the next read in one launch | rounding |
 | `gdn_native_pdl` | the GDN target verify on the circular ReplaySSM rings, as a PDL launch | within SGLang's own run-to-run variation |
 | `qsa_indexer` | the QSA indexer's fold, scorer and top-k in verify, decode and draft extend | the same blocks, except on ties |

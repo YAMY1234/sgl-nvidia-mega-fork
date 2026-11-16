@@ -916,6 +916,7 @@ class TestGatedMix(_Gemm):
         ])  # fmt: skip
         from sgl_nvidia_mega.qwen3_8.runtime import hc_mix_tuned
 
+        self.real_enabled = hc_mix_tuned.enabled
         self.tuned = {"on": False}
         for name, value in (
             ("enabled", lambda: self.tuned["on"]),
@@ -969,6 +970,35 @@ class TestGatedMix(_Gemm):
         self.fused["rows"] = 40
         bp.gated_mix(self.gr, _x(36, k=16))
         self.assertEqual(self.routes[-1], ("fused", 36))
+
+    def test_the_tuned_tactics_need_slot_hc(self):
+        # an empty slot list keeps every HC read on SGLang's mix (the README's contract)
+        from sgl_nvidia_mega.qwen3_8.runtime import SLOTS_ENV, hc_mix_tuned
+
+        patcher = mock.patch.object(hc_mix_tuned, "enabled", self.real_enabled)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop(hc_mix_tuned.ENV, None)
+        for slots, macro, tp, route in (
+            (None, None, 1, "sglang"),
+            ("", None, 1, "sglang"),
+            ("hc_wide,ple", None, 1, "sglang"),
+            ("hc", "0", 1, "sglang"),
+            ("hc", None, 4, "sglang"),
+            ("hc", None, 1, "tuned"),
+            ("hc_wide,hc", "1", 1, "tuned"),
+        ):
+            with self.subTest(slots=slots, macro=macro, tp=tp):
+                for var, value in ((SLOTS_ENV, slots), (hc_mix_tuned.ENV, macro)):
+                    if value is None:
+                        os.environ.pop(var, None)
+                    else:
+                        self.set_env(var, value)
+                self.state["tp"] = tp
+                self.routes.clear()
+                out = bp.gated_mix(self.gr, _x(12, k=16))
+                got = "sglang" if out == "sglang" else self.routes[-1][0]
+                self.assertEqual(got, route)
 
     def test_the_pinned_compute_is_mix_compute_on_the_pins(self):
         bp.enable_routes()

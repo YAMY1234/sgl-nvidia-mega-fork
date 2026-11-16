@@ -33,11 +33,14 @@ _cache: dict = {}
 
 
 def enabled() -> bool:
-    """The source's switch (its default on) and TP1, as the source gates its tuned tactics."""
+    """Slot ``hc``, and the source's switch (its default on) at TP1, as the source gates
+    its tuned tactics; without the slot the executor's HC reads keep SGLang's mix."""
     from sglang.srt.runtime_context import get_parallel
 
+    from sgl_nvidia_mega.qwen3_8.runtime import requested_slots
+
     on = os.environ.get(ENV, "1").strip().lower() not in ("0", "false", "no", "off")
-    return on and get_parallel().tp_size == 1
+    return on and "hc" in requested_slots() and get_parallel().tp_size == 1
 
 
 def tactic(m: int, n: int, k: int):

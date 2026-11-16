@@ -110,6 +110,7 @@ SGLANG_READS = {
         "hc_count",
         "layer_id",
         "_file_prefetcher",
+        "_stages_on_host",
         "_block_d",
         '"weight_scale"',
         "reduce",
@@ -180,13 +181,21 @@ SGLANG_READS = {
 SGLANG_MIRRORS = {
     "srt/models/qwen4_exp.py:_prepare_ple_batch": "a477dd61a4b46b4c",
     "srt/models/qwen4_exp.py:Qwen4ExpLayerExtensionMixin._add_ple_embedding": "5e9187867c87d802",
-    "srt/models/qwen4_exp.py:Qwen4ExpPLELayer.forward": "2b3ec67e3c1f2f25",
+    # Before and after sglang#43048, whose sequence-parallel branch config_reasons refuses
+    "srt/models/qwen4_exp.py:Qwen4ExpPLELayer.forward": (
+        "2b3ec67e3c1f2f25",
+        "3792aab7c6f1d424",
+    ),
     "srt/models/qwen4_exp.py:Qwen4ExpPLELayer._short_conv": "118efb0441706a59",
     "srt/models/qwen4_exp.py:Qwen4ExpPLELayer.start_prefetch": "439fc52bdbea4660",
     "srt/models/qwen4_exp.py:Qwen4ExpNGramEmbedding.forward": "655a10aade52c518",
     "srt/models/qwen4_exp.py:Qwen4ExpNGramEmbedding._embed_ngram_ids": "6d557fdc52f6d0a9",
     "srt/models/qwen4_exp.py:Qwen4ExpPinnedHostEmbedding.forward": "20c0ac5384c5bf8d",
-    "srt/models/qwen4_exp.py:Qwen4ExpPinnedHostEmbedding.gather": "d1b3188e18e1980e",
+    # Before and after sglang#50318, whose host gather of a file table model_reasons refuses
+    "srt/models/qwen4_exp.py:Qwen4ExpPinnedHostEmbedding.gather": (
+        "d1b3188e18e1980e",
+        "326ba34843d749f7",
+    ),
     "kernels/ops/mamba/qwen4_short_conv.py:fused_qwen4_verify_conv": "4b2ed8834a5a5d0d",
 }
 
@@ -202,6 +211,7 @@ SGLANG_REQUIRES = {
         "sglang#43032",
         ("463d39a6efea82fc",),
     ),
+    "srt/models/qwen4_exp.py:_stages_on_host": "sglang#50318",
 }
 
 
@@ -310,6 +320,24 @@ def build(model, options: Optional[Options] = DEFAULT) -> str:
         if enabled:
             attempt(name, fn)
     return "; ".join(failures)
+
+
+def model_reasons(model) -> list[str]:
+    """Why slot ple cannot serve this loaded model: SGLang reads a file-backed table's
+    prefill rows on the host on a GPU that faults pageable pages (sglang#50318), and the
+    slot's gather reads every row in its kernel."""
+    if not DEFAULT.gather_rows:
+        return []
+    for layer in model.model.layers:
+        if layer.ple is not None and getattr(
+            layer.ple.ple_embedding.ngram_embedding, "_stages_on_host", False
+        ):
+            return [
+                "slot ple: SGLang gathers this GPU's prefill rows of the file-backed "
+                "PLE table on the host, which the slot does not; use "
+                "--ple-offload-backend pinned or leave out slot ple"
+            ]
+    return []
 
 
 # -- prepare and commit -------------------------------------------------------------

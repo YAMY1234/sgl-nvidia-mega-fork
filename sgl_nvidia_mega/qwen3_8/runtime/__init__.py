@@ -178,6 +178,12 @@ def config_reasons(cfg, hf_config) -> list[str]:
         f"{SLOTS_ENV}: unknown slot {name!r}"
         for name in sorted(requested_slots() - set(KNOWN_SLOTS))
     ]
+    if getattr(cfg, "enable_layernorm_sp", False):
+        # sgl-project/sglang#43048 shards Qwen4-Exp's token rows over TP in prefill
+        reasons.append(
+            "--enable-layernorm-sp is not supported: the executor's layers and PLE "
+            "do not shard token rows"
+        )
     if ucache_requested():
         from sgl_nvidia_mega.qwen3_8.runtime.gdn_ucache_state import (
             UcacheState,
@@ -235,6 +241,10 @@ def model_reasons(model, hf_config) -> list[str]:
     if pp is not None and not (pp.is_first_rank and pp.is_last_rank):
         reasons.append("pipeline parallelism is not supported")
     draft = type(model).__name__.endswith("MTP")
+    if not draft and "ple" in requested_slots():
+        from sgl_nvidia_mega.qwen3_8.runtime import ple
+
+        reasons += ple.model_reasons(model)
     if not draft and gdn_graph_tables() and prefill_graphs_on():
         from sglang.srt.runtime_context import get_parallel
 

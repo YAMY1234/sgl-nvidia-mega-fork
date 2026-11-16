@@ -658,6 +658,29 @@ class TestReasons(unittest.TestCase):
             ctx.get_parallel = lambda: SimpleNamespace(attn_cp_size=1)
             self.assertEqual(runtime.model_reasons(SimpleNamespace(), None), [])
 
+    def test_layernorm_sp_is_refused(self):
+        (reason,) = runtime.config_reasons(
+            SimpleNamespace(enable_layernorm_sp=True), None
+        )
+        self.assertIn("--enable-layernorm-sp", reason)
+        cfg = SimpleNamespace(enable_layernorm_sp=False)
+        self.assertEqual(runtime.config_reasons(cfg, None), [])
+
+    def test_slot_ple_refuses_a_table_sglang_gathers_on_the_host(self):
+        def model(stages):
+            table = SimpleNamespace(_stages_on_host=stages)
+            embedding = SimpleNamespace(ngram_embedding=table)
+            ple = SimpleNamespace(ple_embedding=embedding)
+            layers = [SimpleNamespace(ple=None), SimpleNamespace(ple=ple)]
+            return SimpleNamespace(model=SimpleNamespace(layers=layers))
+
+        with mock.patch.dict(runtime.os.environ, {runtime.SLOTS_ENV: "ple"}):
+            (reason,) = runtime.model_reasons(model(True), None)
+            self.assertIn("slot ple", reason)
+            self.assertEqual(runtime.model_reasons(model(False), None), [])
+        with mock.patch.dict(runtime.os.environ, {runtime.SLOTS_ENV: "hc"}):
+            self.assertEqual(runtime.model_reasons(model(True), None), [])
+
     def test_model_reasons(self):
         pp = SimpleNamespace(is_first_rank=True, is_last_rank=False)
         self.assertTrue(runtime.model_reasons(SimpleNamespace(pp_group=pp), None))

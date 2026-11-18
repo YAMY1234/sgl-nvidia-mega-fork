@@ -185,8 +185,9 @@ SGLANG_MIRRORS = {
     "srt/models/qwen4_exp.py:Qwen4ExpPLELayer.forward": (
         "2b3ec67e3c1f2f25",
         "3792aab7c6f1d424",
+        "7b8e220c9a6ecba6",
     ),
-    "srt/models/qwen4_exp.py:Qwen4ExpPLELayer._short_conv": "118efb0441706a59",
+    "srt/models/qwen4_exp.py:Qwen4ExpPLELayer._short_conv": ("118efb0441706a59", "251bd1e8f255871d"),
     "srt/models/qwen4_exp.py:Qwen4ExpPLELayer.start_prefetch": "439fc52bdbea4660",
     "srt/models/qwen4_exp.py:Qwen4ExpNGramEmbedding.forward": "655a10aade52c518",
     "srt/models/qwen4_exp.py:Qwen4ExpNGramEmbedding._embed_ngram_ids": "6d557fdc52f6d0a9",

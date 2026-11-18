@@ -138,7 +138,7 @@ SGLANG_READS = {
 SGLANG_MIRRORS = {
     "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_router_experts": "251e3d343aec92fe",
     "srt/layers/moe/fused_moe_triton/layer.py:FusedMoE.forward_deferred_finalize": "af4b474cbaf33493",
-    "srt/layers/moe/moe_runner/flashinfer_trtllm.py:fused_experts_none_to_flashinfer_trtllm_fp4": "9cf153ccc3beee6f",
+    "srt/layers/moe/moe_runner/flashinfer_trtllm.py:fused_experts_none_to_flashinfer_trtllm_fp4": ("9cf153ccc3beee6f", "0dfa54f6aadafdb9"),
     "srt/layers/quantization/modelopt_quant.py:ModelOptNvFp4FusedMoEMethod.apply": "1dc4978c61c40ba6",
 }
 

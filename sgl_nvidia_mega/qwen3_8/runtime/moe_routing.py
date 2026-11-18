@@ -111,6 +111,7 @@ SGLANG_READS = {
         "flashinfer_trtllm_deferred_finalize_context",
         "FlashInferTrtllmDeferredFinalizeOutput",
         "trtllm_padded_hidden_size",
+        "fused_experts_none_to_flashinfer_trtllm_fp4",
     ),
     "srt/layers/moe/token_dispatcher/standard.py": (
         "StandardDispatchOutput",
@@ -488,11 +489,11 @@ def _call_kwargs(experts, topk_output, x_fp4, x_sf) -> dict:
 def _stock_deferred_call_passes_output() -> bool:
     """Whether SGLang's deferred-finalize FP4 call hands FlashInfer an (N, hidden) output
     (sglang#50195), which keys the tuner's entries, instead of FlashInfer's (N, 0) placeholder."""
-    from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
-
-    src = inspect.getsource(
-        flashinfer_trtllm.fused_experts_none_to_flashinfer_trtllm_fp4
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        fused_experts_none_to_flashinfer_trtllm_fp4,
     )
+
+    src = inspect.getsource(fused_experts_none_to_flashinfer_trtllm_fp4)
     return "symm_output = None" not in src
 
 

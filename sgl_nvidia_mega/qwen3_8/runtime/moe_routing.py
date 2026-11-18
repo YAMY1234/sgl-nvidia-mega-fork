@@ -49,6 +49,7 @@ unchanged and the finalize reads rows through the returned permutation
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 import os
 from dataclasses import dataclass
@@ -138,7 +139,10 @@ SGLANG_READS = {
 SGLANG_MIRRORS = {
     "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_router_experts": "251e3d343aec92fe",
     "srt/layers/moe/fused_moe_triton/layer.py:FusedMoE.forward_deferred_finalize": "af4b474cbaf33493",
-    "srt/layers/moe/moe_runner/flashinfer_trtllm.py:fused_experts_none_to_flashinfer_trtllm_fp4": ("9cf153ccc3beee6f", "0dfa54f6aadafdb9"),
+    "srt/layers/moe/moe_runner/flashinfer_trtllm.py:fused_experts_none_to_flashinfer_trtllm_fp4": (
+        "9cf153ccc3beee6f",
+        "0dfa54f6aadafdb9",
+    ),
     "srt/layers/quantization/modelopt_quant.py:ModelOptNvFp4FusedMoEMethod.apply": "1dc4978c61c40ba6",
 }
 
@@ -480,6 +484,18 @@ def _call_kwargs(experts, topk_output, x_fp4, x_sf) -> dict:
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _stock_deferred_call_passes_output() -> bool:
+    """Whether SGLang's deferred-finalize FP4 call hands FlashInfer an (N, hidden) output
+    (sglang#50195), which keys the tuner's entries, instead of FlashInfer's (N, 0) placeholder."""
+    from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
+
+    src = inspect.getsource(
+        flashinfer_trtllm.fused_experts_none_to_flashinfer_trtllm_fp4
+    )
+    return "symm_output = None" not in src
+
+
 def _fused(experts, x, topk_output):
     """The stock call's deferred output from the fused kernel and FlashInfer's
     prepared-routing body, or None when the tensors' layout does not fit the kernel."""
@@ -506,11 +522,17 @@ def _fused(experts, x, topk_output):
         experts, topk_output, x_fp4, x_sf.view(torch.float8_e4m3fn)
     )
     # Same shapes and dtypes as the stock op's own buffers: part of the tuner key. The
-    # stock deferred call passes no output, so the op profiles its (rows, 0) placeholder.
+    # stock deferred call passes a (rows, hidden) output since sglang#50195, else none.
     ids = torch.empty((num_tokens, op.TOP_K), dtype=torch.int32, device=device)
     weights = torch.empty((num_tokens, op.TOP_K), dtype=torch.bfloat16, device=device)
+    if _stock_deferred_call_passes_output():
+        output = torch.empty(
+            (num_tokens, op.HIDDEN_SIZE), dtype=torch.bfloat16, device=device
+        )
+    else:
+        output = alloc_trtllm_moe_output(num_tokens, op.HIDDEN_SIZE, False, device)
     inputs = MoeRunnerInputs(
-        output=alloc_trtllm_moe_output(num_tokens, op.HIDDEN_SIZE, False, device),
+        output=output,
         routing_logits=router_logits,
         topk_ids=ids,
         expert_weights=weights,

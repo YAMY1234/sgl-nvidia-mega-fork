@@ -134,8 +134,14 @@ SGLANG_READS = {
 SGLANG_MIRRORS = {
     "srt/models/qwen3_5.py:Qwen3_5GatedDeltaNet._forward_input_proj": "5269f43d28e6f303",
     "srt/models/qwen2_moe.py:Qwen2MoeMLP.forward": "60b6d1e897d94ed9",
-    "srt/layers/logits_processor.py:LogitsProcessor._compute_lm_head": "b4fe8c96270053f7",
-    "srt/layers/hyperconnection.py:GatedResidual.mix": "48230e9ab57c695a",
+    "srt/layers/logits_processor.py:LogitsProcessor._compute_lm_head": (
+        "b4fe8c96270053f7",
+        "d6485ed1c8a88abe",
+    ),
+    "srt/layers/hyperconnection.py:GatedResidual.mix": (
+        "48230e9ab57c695a",
+        "e5d2a6aeea6bd078",
+    ),
     "srt/models/qwen4_exp.py:Qwen4ExpLayerExtensionMixin._attn_mix": "9c0349424b16d0af",
     "srt/models/qwen4_exp.py:Qwen4ExpLayerExtensionMixin._ffn_mix": "cc60f61162f363c1",
     "srt/models/qwen4_exp.py:_MixStreams.__call__": "e7c5d6730d8ec20b",

@@ -205,12 +205,24 @@ SGLANG_MIRRORS = {
     "srt/models/qwen4_exp.py:Qwen4ExpAttentionDecoderLayer.self_attention": "e88bd51bae6665bc",
     "srt/models/qwen4_exp.py:Qwen4ExpAttentionDecoderLayer._compute_qsa_topk_indices_eager": "2cae5ae3a3167b95",
     "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer.forward_prepare_cuda_fused": "d10e23f5651990d0",
-    "kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py:fused_qk_gemma_rmsnorm_rope_gate": "191b6d63a9473398",
+    "kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py:fused_qk_gemma_rmsnorm_rope_gate": (
+        "191b6d63a9473398",
+        "7d985b797c7ae63c",
+    ),
     "srt/layers/attention/qsa/qsa_indexer.py:QSAIndexer._forward_impl": "a9ac6848a4d7811c",
-    "srt/layers/attention/qsa/qsa_indexer.py:QSAIndexer.select_prefill_tokens": "af28f4f745595f4c",
+    "srt/layers/attention/qsa/qsa_indexer.py:QSAIndexer.select_prefill_tokens": (
+        "af28f4f745595f4c",
+        "6913442aad3c8aec",
+    ),
     "srt/layers/radix_attention.py:RadixAttention.forward": "5973e131d911edc8",
-    "srt/layers/attention/qwen_sparse_attn_backend.py:QwenSparseAttnBackend.forward_extend": "529e03bea0a3823c",
-    "srt/layers/attention/qwen_sparse_attn_backend.py:QwenSparseAttnBackend.capture_mtp_sparse_indices": "bc39db1cc9b58976",
+    "srt/layers/attention/qwen_sparse_attn_backend.py:QwenSparseAttnBackend.forward_extend": (
+        "529e03bea0a3823c",
+        "183a40a1aae22091",
+    ),
+    "srt/layers/attention/qwen_sparse_attn_backend.py:QwenSparseAttnBackend.capture_mtp_sparse_indices": (
+        "bc39db1cc9b58976",
+        "1fce533c92103213",
+    ),
 }
 
 # Reads and mirrors that need an SGLang change newer than the unit job's pin: the

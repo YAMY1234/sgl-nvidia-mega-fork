@@ -135,7 +135,10 @@ SGLANG_READS = {
 
 # forward mirrors GatedDeltaNet.forward when BF16 pins are on
 SGLANG_MIRRORS = {
-    "srt/models/qwen3_5.py:Qwen3_5GatedDeltaNet.forward": "ff40a6653f83b8b6",
+    "srt/models/qwen3_5.py:Qwen3_5GatedDeltaNet.forward": (
+        "ff40a6653f83b8b6",
+        "604e1c2afbed13db",
+    ),
 }
 
 # Reads and mirrors that need an SGLang change newer than the unit job's pin: the

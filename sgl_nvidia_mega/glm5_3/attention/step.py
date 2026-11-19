@@ -151,6 +151,9 @@ SGLANG_MIRRORS = {
         # above; no SGLang class overrides them) and #38943 (the DCP extend
         # gather): the same verify step
         "19896b37f7714fbd",
+        # rt-s1 (local, not for upstream): SGLang 043cfc4d3a (+ Stack D overlay); served path unchanged for GLM-5.2 TP4 (results/T73)
+        "194ed4e38d4c6e30",
+        "3a46efe7f101d64c",
     ),
     # before and after sgl-project/sglang#45946, which added a SAIL-only fp8 condition
     "srt/models/deepseek_common/attention_forward_methods/forward_mla.py:DeepseekMLAForwardMixin.forward_absorb_core": (
@@ -159,14 +162,22 @@ SGLANG_MIRRORS = {
         # sgl-project/sglang#44503: the W_UV projection moved into the
         # project_mla_values hook (same branches; the bf16 bmm the spec serves)
         "a4d250aebbab19fb",
+        # rt-s1 (local, not for upstream): SGLang 043cfc4d3a (+ Stack D overlay); served path unchanged for GLM-5.2 TP4 (results/T73)
+        "8fc6cb58e195f46a",
     ),
     # before and after sgl-project/sglang#46890 (a prefill-CP condition on the
     # split-op prefill surface; verify unchanged)
     "srt/layers/attention/dsa/dsa_indexer.py:Indexer.forward_cuda": (
         "805ab11bf040ed52",
         "a2619a55994b4ec8",
+        # rt-s1 (local, not for upstream): SGLang 043cfc4d3a (+ Stack D overlay); served path unchanged for GLM-5.2 TP4 (results/T73)
+        "fa3317583c69f507",
     ),
-    "srt/layers/attention/dsa/dsa_indexer.py:Indexer._fused_q_prepare_and_store": "6ac8fd1c71413a93",
+    "srt/layers/attention/dsa/dsa_indexer.py:Indexer._fused_q_prepare_and_store": (
+        "6ac8fd1c71413a93",
+        # rt-s1 (local, not for upstream): SGLang 043cfc4d3a (+ Stack D overlay); served path unchanged for GLM-5.2 TP4 (results/T73)
+        "59e26fd79aaddacc",
+    ),
     # before and after sgl-project/sglang#46990, which stores and reads the KV through
     # the pool's layer router: on the DSA pool, the same set_mla_kv_buffer and
     # get_key_buffer calls
@@ -176,6 +187,8 @@ SGLANG_MIRRORS = {
         # sgl-project/sglang#46890: prefill-CP rows narrowed before the store
         # (no change without prefill CP)
         "bc7b885acb04e4d7",
+        # rt-s1 (local, not for upstream): SGLang 043cfc4d3a (+ Stack D overlay); served path unchanged for GLM-5.2 TP4 (results/T73)
+        "f98748138ff8ba0c",
     ),
     # the fused top-k page table is the top-k indices on the top-k backends the spec
     # serves (attention_step_reasons); the two padding helpers are copied below

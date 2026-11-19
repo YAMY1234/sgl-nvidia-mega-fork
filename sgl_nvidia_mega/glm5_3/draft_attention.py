@@ -109,6 +109,8 @@ SGLANG_MIRRORS = {
     "srt/layers/attention/dsa_backend.py:DeepseekSparseAttnBackend.forward_decode": (
         "52e50cfcdda18bea",
         "35f75d4c546f4c15",
+        # rt-s1 (local, not for upstream): SGLang 043cfc4d3a (+ Stack D overlay); served path unchanged for GLM-5.2 TP4 (results/T73)
+        "1b0d31693d82ffa9",
     ),
 }
 

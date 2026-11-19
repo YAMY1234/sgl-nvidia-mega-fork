@@ -172,6 +172,8 @@ SGLANG_MIRRORS = {
         # sgl-project/sglang#47200: vocab-sharded target-verify logits (a target verify only; the draft
         # steps take the gather as before)
         "48c24aac22ca5303",
+        # rt-s1 (local, not for upstream): SGLang 043cfc4d3a (+ Stack D overlay); served path unchanged for GLM-5.2 TP4 (results/T73)
+        "4e837e75ff65c280",
     ),
     "srt/layers/logits_processor.py:LogitsProcessor._get_logits": "0bfb8f2f72aa5755",
 }

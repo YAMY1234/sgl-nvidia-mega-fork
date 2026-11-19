@@ -233,6 +233,7 @@ def _install(test):
             get_activation_type=lambda act, is_gated: ("act", act, is_gated),
             trtllm_moe_enable_pdl=lambda rows: rows <= 32,
             FlashInferTrtllmDeferredFinalizeOutput=SimpleNamespace,
+            fused_experts_none_to_flashinfer_trtllm_fp4=_stock_fp4_before_50195,
         ),
         "sglang.srt.layers.moe.token_dispatcher.standard": dict(
             StandardDispatchOutput=SimpleNamespace
@@ -275,6 +276,17 @@ def _install(test):
         patcher.start()
         test.addCleanup(patcher.stop)
     mr._log_once.cache_clear()
+    mr._stock_deferred_call_passes_output.cache_clear()
+    test.addCleanup(mr._stock_deferred_call_passes_output.cache_clear)
+
+
+def _stock_fp4_before_50195():  # the stock deferred call passes FlashInfer no output
+    symm_output = None
+    return symm_output
+
+
+def _stock_fp4_since_50195():  # sglang#50195: it passes an (N, hidden) bf16 output
+    return None
 
 
 def _restore(name, old):
@@ -391,7 +403,8 @@ class TestFusedRouting(_Case):
         ((op_name, runners, config, inputs, kw),) = _STATE["tuner"].calls
         self.assertEqual(op_name, "flashinfer::trtllm_fp4_block_scale_moe")
         self.assertEqual(runners, [runner])
-        # the stock deferred call passes no output: the op's (rows, 0) placeholder
+        # before sglang#50195 the stock deferred call passes no output: the op's
+        # (rows, 0) placeholder
         self.assertEqual(tuple(inputs[0].shape), (8, 0))
         self.assertEqual(
             config[1],
@@ -418,6 +431,14 @@ class TestFusedRouting(_Case):
             (HIDDEN, TOP_K, INTER),
         )
         self.assertEqual(runner.kw["dtype_act"], ("dtype", torch.uint8, FP8))
+
+    def test_the_lookup_takes_the_output_sglang_50195_passes(self):
+        stock = sys.modules["sglang.srt.layers.moe.moe_runner.flashinfer_trtllm"]
+        stock.fused_experts_none_to_flashinfer_trtllm_fp4 = _stock_fp4_since_50195
+        self.run_step(rows=8)
+        ((_, _, _, inputs, _),) = _STATE["tuner"].calls
+        self.assertEqual(tuple(inputs[0].shape), (8, HIDDEN))
+        self.assertEqual(inputs[0].dtype, torch.bfloat16)
 
     def test_call_kwargs(self):
         experts = _FusedMoE([])

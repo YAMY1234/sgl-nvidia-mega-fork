@@ -31,8 +31,14 @@ SGLANG_READS = {"kernels/ops/attention/fla/utils.py": ("is_tf32_supported",)}
 SGLANG_MIRRORS = {
     # In fla/ before sgl-project/sglang#45112 regrouped SGLang's kernels and in linear/
     # after; the wildcard goes once all supported SGLangs have the move
-    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:gdn_replayssm_spec_circular_kernel": "9ad1193ce666552d",
-    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:_launch_gdn_spec": "8bf89daf973334cc",
+    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:gdn_replayssm_spec_circular_kernel": (
+        "9ad1193ce666552d",
+        "2957b47bcee2fd5b",
+    ),
+    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:_launch_gdn_spec": (
+        "8bf89daf973334cc",
+        "8acb385876f4caf8",
+    ),
     "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:gdn_replayssm_spec_decode": "c3fcd760148facd7",
 }
 
@@ -403,7 +409,9 @@ def gdn_replayssm_spec_circular_kernel(
     for ii in range(2, BS):
         row = tl.sum(tl.where((o_s == ii)[:, None], -A_mat, 0.0), axis=0)
         row = tl.where(o_s < ii, row, 0.0)
-        row = row + tl.sum(row[:, None] * b_Ai, axis=0)
+        row = row + tl.sum(
+            row[:, None] * tl.where((o_s < ii)[:, None], b_Ai, 0.0), axis=0
+        )
         b_Ai = tl.where((o_s == ii)[:, None], row, b_Ai)
     T_mat = b_Ai + (o_s[:, None] == o_s[None, :]).to(tl.float32)
 
@@ -419,7 +427,9 @@ def gdn_replayssm_spec_circular_kernel(
     for j in tl.static_range(BS):
         Rj = tl.sum(tl.where((o_s == j)[None, :], R_mat, 0.0), axis=1)
         Tj = tl.sum(tl.where((o_s == j)[None, :], T_mat, 0.0), axis=1)
-        D_spec += Rj[:, None] * Tj[None, :]
+        D_spec = tl.where(
+            (o_s >= j)[None, :], tl.fma(Rj[:, None], Tj[None, :], D_spec), D_spec
+        )
 
     # ------------------------------------------------------------------
     # outputs.
@@ -431,7 +441,7 @@ def gdn_replayssm_spec_circular_kernel(
     for j in tl.static_range(BS):
         Dj = tl.sum(tl.where((o_s == j)[None, :], D_spec, 0.0), axis=1)
         Fj = tl.sum(tl.where((o_s == j)[:, None], F_mat, 0.0), axis=0)
-        DF += Dj[:, None] * Fj[None, :]
+        DF = tl.where((o_s >= j)[None, :], tl.fma(Dj[:, None], Fj[None, :], DF), DF)
     O_tile = expG_s[None, :] * hw_q + DF
 
     tl.store(p_o, tl.trans(O_tile).to(p_o.dtype.element_ty), mask=out_mask)

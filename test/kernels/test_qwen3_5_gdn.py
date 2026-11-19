@@ -350,6 +350,108 @@ def test_replayssm_verify_is_sglangs(pdl, gate, ring_len, tp, bs):
     assert all(torch.equal(x, y) for x, y in zip(got_ring, want_ring))
 
 
+REJECTED_DRAFTS = {
+    "token": lambda qkv, ba, h, hv: (qkv.fill_(float("nan")), ba.fill_(float("nan"))),
+    "k": lambda qkv, ba, h, hv: qkv[h * K : 2 * h * K].fill_(float("nan")),
+    "v": lambda qkv, ba, h, hv: qkv[2 * h * K :].fill_(float("inf")),
+    "b": lambda qkv, ba, h, hv: ba[:hv].fill_(float("nan")),
+    "a": lambda qkv, ba, h, hv: ba[hv:].fill_(float("nan")),
+}
+
+
+@pytest.mark.parametrize("tp, bs", [(8, 1), (8, 16), (8, 128), (2, 10), (1, 32)])
+@pytest.mark.parametrize("pdl, gate", [(False, False), (True, True)])
+@pytest.mark.parametrize("first", [1, 3, 6])
+@pytest.mark.parametrize("poison", list(REJECTED_DRAFTS))
+def test_replayssm_verify_keeps_a_rejected_drafts_non_finite_row_from_earlier_positions(
+    poison, first, pdl, gate, tp, bs
+):
+    H, HV, D = _heads(tp)
+    from sgl_nvidia_mega.qwen3_5.gdn import replayssm
+
+    g = torch.Generator(device="cuda").manual_seed(7 + first + 10 * bs)
+    ring_len, tokens = 16, bs * DRAFT
+
+    def rand(*shape, scale=1.0):
+        return (torch.randn(*shape, device="cuda", generator=g) * scale).to(
+            torch.bfloat16
+        )
+
+    qkv, ba = rand(tokens, D), rand(tokens, 2 * HV)
+    A_log = torch.rand(HV, device="cuda", generator=g)
+    dt_bias = torch.rand(HV, device="cuda", generator=g)
+    state = rand(SLOTS, HV, V, K, scale=0.05)
+    ring = [
+        rand(SLOTS, HV, ring_len, V, scale=0.05),
+        rand(SLOTS, H, ring_len, K, scale=0.09),
+        -torch.rand(SLOTS, HV, ring_len, device="cuda", generator=g) * 0.5,
+        rand(SLOTS, HV, ring_len, V, scale=1e-4),
+        rand(SLOTS, H, ring_len, K, scale=1e-4),
+    ]
+    write_pos = torch.randint(0, ring_len - DRAFT, (SLOTS,), device="cuda", generator=g)
+    write_pos = write_pos.to(torch.int32)
+    cache_base = torch.randint(0, ring_len, (SLOTS,), device="cuda", generator=g)
+    cache_base = cache_base.to(torch.int32)
+    is_flush = torch.zeros(SLOTS, dtype=torch.int8, device="cuda")
+    qsl = torch.arange(0, tokens + 1, DRAFT, dtype=torch.int32, device="cuda")
+    states = torch.tensor(RING_SLOTS[:bs], dtype=torch.int32, device="cuda")
+    replay = torch.tensor(REPLAY_SLOTS[:bs], dtype=torch.int32, device="cuda")
+
+    def run(qkv, ba):
+        entries = [t.clone() for t in ring]
+        out = torch.zeros(tokens, HV, V, dtype=torch.bfloat16, device="cuda")
+        replayssm.verify(
+            qkv[:, : H * K].view(tokens, H, K),
+            qkv[:, H * K : 2 * H * K].view(tokens, H, K),
+            qkv[:, 2 * H * K :].view(tokens, HV, V),
+            ba[:, HV:],
+            ba[:, :HV],
+            A_log,
+            dt_bias,
+            out,
+            state,
+            *entries,
+            None,
+            qsl,
+            states,
+            replay,
+            write_pos,
+            cache_base,
+            is_flush,
+            max_cache_len=ring_len,
+            max_spec_len=DRAFT,
+            scale=K**-0.5,
+            null_block_id=-1,
+            block_v=32,
+            num_warps=2,
+            pdl=pdl,
+            wait_for_gate_producer=gate,
+        )
+        return out, entries
+
+    want, want_ring = run(qkv, ba)
+    poisoned = bs // 2
+    row = poisoned * DRAFT + first
+    qkv, ba = qkv.clone(), ba.clone()
+    REJECTED_DRAFTS[poison](qkv[row], ba[row], H, HV)
+    got, got_ring = run(qkv, ba)
+
+    assert not got[row].isfinite().all()
+    kept = torch.ones(tokens, dtype=torch.bool, device="cuda")
+    kept[row : (poisoned + 1) * DRAFT] = False
+    assert got[kept].isfinite().all()
+    assert torch.equal(got[kept], want[kept])
+    # the ring entries of the rejected positions are the only ones that may differ
+    slot = REPLAY_SLOTS[poisoned]
+    at = int(cache_base[slot]) + int(write_pos[slot])
+    rejected = [(at + s) % ring_len for s in range(first, DRAFT)]
+    for x, y in zip(got_ring, want_ring):
+        keep = torch.ones_like(x, dtype=torch.bool)
+        keep[slot, :, rejected] = False
+        assert x[keep].isfinite().all()
+        assert torch.equal(x[keep], y[keep])
+
+
 # -------------------------------------------------------------------- slot gdn_core
 
 
@@ -536,6 +638,81 @@ def test_core_is_gdn_verify_numerically(pad, history, tp, bs):
     assert torch.allclose(got_ring[2], want_ring[2], rtol=0, atol=1e-5)
 
 
+@pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("tp, bs", [(8, 1), (8, 16), (4, 1), (1, 32)])
+def test_core_takes_sglangs_bf16_dt_bias_as_its_fp32_value(gate_dtype, tp, bs):
+    H, HV, D = _heads(tp)
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn.core import core, prime_gate_params
+
+    g = torch.Generator(device="cuda").manual_seed(31 * bs + tp)
+    ring_len, slots, tokens = 16, bs + 3, bs * DRAFT
+
+    def rand(*shape, scale=1.0):
+        return (torch.randn(*shape, device="cuda", generator=g) * scale).to(
+            torch.bfloat16
+        )
+
+    qkvz = rand(tokens, D + HV * V)
+    qkv, z = qkvz[:, :D], qkvz[:, D:].view(tokens, HV, V)
+    ba = rand(tokens, 2 * HV)
+    b, a = ba[:, :HV], ba[:, HV:]
+    # distinct per head, so a head reading another head's (or a half's) bits shows
+    A_log = (torch.rand(HV, device="cuda", generator=g) - 2).to(gate_dtype)
+    dt_bias = (torch.rand(HV, device="cuda", generator=g) * 4 - 2).to(gate_dtype)
+    state = rand(slots, HV, V, K, scale=0.05)
+    ring = [
+        rand(slots, HV, ring_len, V, scale=0.05),
+        rand(slots, H, ring_len, K, scale=0.09),
+        -torch.rand(slots, HV, ring_len, device="cuda", generator=g) * 0.5,
+        rand(slots, HV, ring_len, V, scale=1e-4),
+        rand(slots, H, ring_len, K, scale=1e-4),
+    ]
+    states = torch.randperm(slots, device="cuda", generator=g)[:bs].to(torch.int32)
+    replay = torch.randperm(slots, device="cuda", generator=g)[:bs]
+    write_pos = torch.randint(
+        1, ring_len - DRAFT + 1, (slots,), device="cuda", generator=g
+    ).to(torch.int32)
+    cache_base = torch.randint(0, ring_len, (slots,), device="cuda", generator=g)
+    cache_base = cache_base.to(torch.int32)
+    is_flush = torch.zeros(slots, dtype=torch.int8, device="cuda")
+    weight = rand(V)
+    scale = torch.tensor([0.02], device="cuda")
+    prime_gate_params(A_log, dt_bias)
+
+    def run(gates):
+        r = [t.clone() for t in ring]
+        o = torch.zeros(tokens, HV, V, dtype=torch.bfloat16, device="cuda")
+        y = torch.empty(tokens, HV * V, dtype=torch.float8_e4m3fn, device="cuda")
+        core(
+            qkv,
+            z,
+            a,
+            b,
+            *gates,
+            state,
+            *r,
+            states,
+            replay,
+            write_pos,
+            cache_base,
+            is_flush,
+            weight,
+            scale,
+            1e-6,
+            y,
+            rows_per_request=DRAFT,
+            num_k_heads=H,
+            o_out=o,
+        )
+        return y, o, r
+
+    want = run((A_log.float(), dt_bias.float()))
+    got = run((A_log, dt_bias))
+    assert torch.equal(got[0].view(torch.uint8), want[0].view(torch.uint8))
+    assert torch.equal(got[1], want[1])
+    assert all(torch.equal(x, w) for x, w in zip(got[2], want[2]))
+
+
 @pytest.mark.parametrize(
     "variant", [{}, {"early_dependents": True}, {"min_blocks": 3}, {"early_hist": True}]
 )
@@ -616,6 +793,114 @@ def test_core_flat_stores_leave_every_byte_as_it_was(low, bs, variant):
     assert torch.equal(y0, y1)
     assert all(u is None and v is None or torch.equal(u, v) for u, v in zip(r0, r1))
     assert not torch.equal(r1[0], ring[0])  # the step wrote ring entries
+
+
+@pytest.mark.parametrize("bs", range(5, 17))
+def test_core_releasing_out_proj_at_entry_leaves_every_byte_as_it_was(bs):
+    from sglang.srt.layers.quantization.fp8_utils import flashinfer_bmm_fp8
+
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn.core import core
+
+    h, hv = H, HV
+    d = 2 * h * K + hv * V
+    g = torch.Generator(device="cuda").manual_seed(9100 + bs)
+    ring_len, slots, tokens = 16, bs + 3, bs * DRAFT
+
+    def rand(*shape, scale=1.0):
+        return (torch.randn(*shape, device="cuda", generator=g) * scale).to(
+            torch.bfloat16
+        )
+
+    qkvz = rand(tokens, d + hv * V)
+    ba = rand(tokens, 2 * hv)
+    A_log = torch.rand(hv, device="cuda", generator=g)
+    dt_bias = torch.rand(hv, device="cuda", generator=g)
+    state = rand(slots, hv, V, K, scale=0.05)
+    ring = [
+        rand(slots, hv, ring_len, V, scale=0.05),
+        rand(slots, h, ring_len, K, scale=0.09),
+        -torch.rand(slots, hv, ring_len, device="cuda", generator=g) * 0.5,
+        rand(slots, hv, ring_len, V, scale=1e-4),
+        rand(slots, h, ring_len, K, scale=1e-4),
+    ]
+    states = torch.randperm(slots, device="cuda", generator=g)[:bs].to(torch.int32)
+    states[-1] = -1  # a padded request
+    replay = torch.randperm(slots, device="cuda", generator=g)[:bs]
+    write_pos = torch.randint(0, ring_len, (slots,), device="cuda", generator=g).to(
+        torch.int32
+    )
+    cache_base = torch.randint(0, ring_len, (slots,), device="cuda", generator=g).to(
+        torch.int32
+    )
+    is_flush = torch.zeros(slots, dtype=torch.int8, device="cuda")
+    weight = rand(V)
+    scale = torch.tensor([0.02], device="cuda")
+    w_out = (torch.randn(4096, hv * V, device="cuda", generator=g) * 0.05).to(
+        torch.float8_e4m3fn
+    )
+    w_scale = torch.tensor([0.002], device="cuda")
+
+    def arm(early):
+        r = [t.clone() for t in ring]
+        y = torch.zeros(tokens, hv * V, dtype=torch.float8_e4m3fn, device="cuda")
+
+        def step():
+            core(
+                qkvz[:, :d],
+                qkvz[:, d:].view(tokens, hv, V),
+                ba[:, hv:],
+                ba[:, :hv],
+                A_log,
+                dt_bias,
+                state,
+                *r,
+                states,
+                replay,
+                write_pos,
+                cache_base,
+                is_flush,
+                weight,
+                scale,
+                1e-6,
+                y,
+                rows_per_request=DRAFT,
+                num_k_heads=h,
+                early_dependents=early,
+            )
+            return flashinfer_bmm_fp8(y, w_out.t(), scale, w_scale, torch.bfloat16)
+
+        return r, y, step
+
+    def bits(r, y, o):
+        torch.cuda.synchronize()
+        return [y.view(torch.uint8).clone(), o.view(torch.int16).clone()] + [
+            t.clone() for t in r
+        ]
+
+    arms = [arm(early) for early in (False, True)]
+    eager = [bits(r, y, step()) for r, y, step in arms]
+    assert all(torch.equal(u, v) for u, v in zip(*eager))
+    assert eager[0][1].any() and not torch.equal(eager[0][2], ring[0])
+    graphs = []
+    for r, y, step in arms:
+        for t, t0 in zip(r, ring):
+            t.copy_(t0)
+        step()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = step()
+        graphs.append((graph, out))
+    qkvz.copy_(rand(tokens, d + hv * V))
+    ba.copy_(rand(tokens, 2 * hv))
+    replayed = []
+    for (r, y, _), (graph, out) in zip(arms, graphs):
+        for t, t0 in zip(r, ring):
+            t.copy_(t0)
+        graph.replay()
+        replayed.append(bits(r, y, out))
+    assert all(torch.equal(u, v) for u, v in zip(*replayed))
+    assert not torch.equal(replayed[0][0], eager[0][0])  # the fresh inputs ran
 
 
 # ------------------------------------------------------------------- slot gdn_front

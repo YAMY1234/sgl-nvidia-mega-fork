@@ -23,6 +23,7 @@ Run with ``python test/kernels/test_qwen3_5_draft_hop.py --num-gpu 4``.
 import os
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -169,14 +170,9 @@ def test_draft_hop_rounding(rank, draft):
     world = torch.distributed.get_world_size()
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     hop = draft.hop
-    calls = [
-        (m, add_norm, early)
-        for m in (1, 2, 7)
-        for add_norm in (False, True)
-        for early in (False, True)
-    ]
+    calls = [(m, early) for m in (1, 2, 7) for early in (False, True)]
     with torch.inference_mode():
-        for i, (m, add_norm, early) in enumerate(calls):
+        for i, (m, early) in enumerate(calls):
             x = _operands(m, device, rank, seed=i)
             norm = _Norm(x["weight"])
             summed = _rank_sum(x["partial"])
@@ -186,24 +182,14 @@ def test_draft_hop_rounding(rank, draft):
                 hop,
                 local_contribution=x["partial"],
                 residual=x["residual"],
-                gamma=norm.weight if add_norm else norm.gemma_weight,
+                gamma=norm.weight,
                 eps=EPS,
-                weight_bias=1.0 if add_norm else 0.0,
-                add_norm=add_norm,
+                weight_bias=1.0,
                 early_release=early,
             )
-            if add_norm:
-                want_x, want_r = summed.clone(), x["residual"].clone()
-                gemma_fused_add_rmsnorm(want_x, want_r, norm.weight, EPS)
-                _same(got, (want_x, want_r))
-            else:
-                pre = summed + x["residual"]  # bf16 add, as __hadd
-                _same(got[1:], (pre,))
-                f = pre.float()
-                ref = f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + EPS)
-                ref = (ref * norm.gemma_weight.float()).bfloat16().float()
-                # bf16 squares and an approximate rsqrt: at most one bf16 ulp off
-                assert ((got[0].float() - ref).abs() <= ref.abs() * 2**-7).all()
+            want_x, want_r = summed.clone(), x["residual"].clone()
+            gemma_fused_add_rmsnorm(want_x, want_r, norm.weight, EPS)
+            _same(got, (want_x, want_r))
             # the decode hop's own hop in between keeps the stage order shared
             y = _operands(m, device, rank, seed=1000 + i)
             hop.all_reduce_residual_rms_norm(
@@ -230,10 +216,9 @@ def test_draft_gemv_and_push(rank, draft):
                 draft.hop,
                 local_contribution=plain,
                 residual=x["residual"],
-                gamma=norm.gemma_weight,
+                gamma=norm.weight,
                 eps=EPS,
-                weight_bias=0.0,
-                add_norm=False,
+                weight_bias=1.0,
             )
             pushed = draft.o_proj(x["attn"], x["o_proj"])  # pushes into the hop
             assert draft.has_pushed(pushed)
@@ -299,10 +284,101 @@ def test_draft_step_replays_from_a_cuda_graph(rank, draft):
                 fresh = _operands(1, device, rank, seed=400 + 10 * replay + i)
                 for name, tensor in x.items():
                     tensor.copy_(fresh[name])
-                norms[i].gemma_weight.copy_(torch.add(x["weight"], 1.0))
             graph.replay()
             for x, norm, got in zip(static, norms, outputs):
                 _same(got, step(x, norm))
+        torch.cuda.synchronize()
+
+
+def _finalize_ref(routed, weights, rows, shared):
+    m, top_k = rows.shape
+    acc = torch.zeros(m, HIDDEN, device=routed.device)
+    for k in range(top_k):
+        acc = acc + routed[rows[:, k].long()].float() * weights[:, k : k + 1].float()
+    if shared is not None:
+        acc = acc + shared.float()
+    return acc.bfloat16()
+
+
+@gpu
+def test_ffn_input_and_fin_norm_are_gemma_fused_add_rmsnorm(rank, draft):
+    from sgl_kernel import gemma_fused_add_rmsnorm
+
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop as decode_hop
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import hop as kernels
+
+    world = torch.distributed.get_world_size()
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    identity = torch.arange(MAX_M * 10, dtype=torch.int32, device=device)
+    decode_hop.register_identity_rows(identity)
+    cases = [
+        (m, top_k, with_shared, ident)
+        for m in (1, 2, 7)
+        for top_k, with_shared, ident in (
+            (8, True, False),
+            (10, True, True),
+            (8, False, True),
+            (10, False, False),
+        )
+    ]
+
+    def want(summed, residual, weight):
+        want_x, want_r = summed.clone(), residual.clone()
+        gemma_fused_add_rmsnorm(want_x, want_r, weight, EPS)
+        return want_x, want_r
+
+    with torch.inference_mode():
+        for i, (m, top_k, with_shared, ident) in enumerate(cases):
+            x = _operands(m, device, rank, seed=700 + i)
+            norm = _Norm(x["weight"])
+            got = draft.ffn_input(
+                x["partial"], x["residual"], norm, moe_single_launch=i % 2 == 0
+            )
+            _same(got, want(_rank_sum(x["partial"]), x["residual"], norm.weight))
+            if m == 1:
+                plain = torch.empty(1, HIDDEN, dtype=torch.bfloat16, device=device)
+                kernels.draft_gemv(x["attn"], x["o_proj"], plain)
+                pushed = draft.o_proj(x["attn"], x["o_proj"])
+                got = draft.ffn_input(
+                    pushed, x["residual"], norm, moe_single_launch=True
+                )
+                _same(got, want(_rank_sum(plain), x["residual"], norm.weight))
+            g = torch.Generator(device=device).manual_seed(7000 + 100 * i + rank)
+            n_routed = m * top_k + 3
+            routed = torch.randn(n_routed, HIDDEN, device=device, generator=g)
+            routed = routed.bfloat16()
+            weights = torch.rand(m, top_k, device=device, generator=g).bfloat16()
+            if ident:
+                rows = identity[: m * top_k].view(m, top_k)
+            else:
+                rows = torch.randperm(n_routed, device=device, generator=g)
+                rows = rows[: m * top_k].int().view(m, top_k)
+            shared = (
+                torch.randn(m, HIDDEN, device=device, generator=g).bfloat16()
+                if with_shared
+                else None
+            )
+            owed = SimpleNamespace(
+                routed_output=routed,
+                expert_weights=weights,
+                permuted_indices=rows,
+                gated_shared_output=shared,
+                m=m,
+            )
+            if i % (world + 1) == rank:
+                torch.cuda._sleep(2_000_000)  # this rank publishes late
+            got = draft.fin_norm(owed, x["residual"], norm)
+            summed = _rank_sum(_finalize_ref(routed, weights, rows, shared))
+            _same(got, want(summed, x["residual"], norm.weight))
+            # the decode hop's own finalize in between keeps the stage order shared
+            draft.hop.moe_finalize_all_reduce_rms_norm(
+                routed_output=routed,
+                expert_weights=weights,
+                permuted_indices=rows,
+                gated_shared_output=shared,
+                residual=x["residual"],
+                gamma=norm.gemma_weight,
+            )
         torch.cuda.synchronize()
 
 

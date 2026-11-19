@@ -3,7 +3,7 @@
 """The Qwen3.5 megakernel's runtime on CPU: the steps it covers, the binding and the
 EAGLE entries at build, the MTP draft spec, the step state and the parity check."""
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -18,6 +18,9 @@ from sgl_nvidia_mega.qwen3_5 import (
 from sgl_nvidia_mega.qwen3_5.runtime import executor, hooks, parity
 from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
 
+# SGLang's switch of the megakernel runtime optimizations
+RUNTIME_ENV = "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION"
+
 
 @pytest.fixture(autouse=True)
 def registered(monkeypatch):
@@ -25,6 +28,7 @@ def registered(monkeypatch):
 
     monkeypatch.setattr(registry, "_REGISTRY", {})
     monkeypatch.delenv(plugin.PARITY_SORT_ENV, raising=False)
+    monkeypatch.delenv(RUNTIME_ENV, raising=False)
     monkeypatch.setattr(
         plugin_binding, "megakernel_agree", lambda *args, **kwargs: None
     )
@@ -188,8 +192,6 @@ def test_config_filter_derives_attention_tp_before_publication(monkeypatch):
         attn_cp_size=1,
         attn_dp_size=8,
         ep_size=8,
-        enable_dp_attention=True,
-        dp_size=8,
         disaggregation_mode="decode",
     )
 
@@ -497,7 +499,7 @@ def test_hook_slots_are_accepted_but_build_no_verify_width(monkeypatch):
     monkeypatch.setattr(
         hooks,
         "build",
-        lambda model, binding: calls.append((model, binding)) or factory,
+        lambda model, binding, **kw: calls.append((model, binding, kw)) or factory,
     )
 
     model = SimpleNamespace(
@@ -509,7 +511,9 @@ def test_hook_slots_are_accepted_but_build_no_verify_width(monkeypatch):
     built = runtime.build(model, ctx)
     assert built.summary() == "slots none (stock)"
     assert built.speculative_runtime_hooks is factory
-    assert calls == [(model, "EagleBinding")]
+    assert calls == [
+        (model, "EagleBinding", {"sharded": True, "gathered": False, "draft": False})
+    ]
 
 
 def test_draft_fin_owns_the_exact_bf16_finalize_policy():
@@ -879,6 +883,31 @@ def test_the_draft_extend_takes_the_split_kv_variants_with_slot_draft_skv2(
     assert built.graph_variants["draft_extend"] is route.EXTEND
 
 
+@pytest.mark.parametrize(
+    "slots, needs",
+    [
+        ({"gumbel_fast"}, "slot 'gumbel_fast' draws slot 'sharded_gumbel''s noise"),
+        ({"verify_head"}, "slot 'verify_head' is offered by slot 'sharded_gumbel''s"),
+        (
+            {"sharded_gumbel", "verify_head", "verify_head_keys"},
+            "slot 'verify_head_keys' hands slot 'verify_head''s keys",
+        ),
+        (
+            {"sharded_gumbel", "gumbel_fast", "verify_head_keys"},
+            "slot 'verify_head_keys' hands slot 'verify_head''s keys",
+        ),
+    ],
+)
+def test_the_verify_keys_options_need_the_slots_they_act_in(slots, needs):
+    assert any(needs in reason for reason in runtime.slot_reasons(frozenset(slots)))
+    full = frozenset(
+        {"sharded_gumbel", "gumbel_fast", "verify_head", "verify_head_keys"}
+    )
+    assert not any(
+        "verify_head" in r or "gumbel" in r for r in runtime.slot_reasons(full)
+    )
+
+
 def test_the_cp_slots_offer_the_draft_runners_a_cp_variant(monkeypatch):
     from sgl_nvidia_mega.qwen3_5 import draft
     from sgl_nvidia_mega.qwen3_5.attention import route
@@ -983,7 +1012,7 @@ def test_the_draft_decode_keeps_cp_lite_for_cp_variants_and_multi_request(
         )
     )
     attn.heads, attn.head_dim, attn.page_size = heads, dim, page
-    attn.q1 = attn.skv2 = None
+    attn.q1 = None
     attn._noted = set()
     attn.cp_b1 = draft_attention.DraftCP(
         split_kv, route, steps=True, extend=True, multi=requests > 1
@@ -1009,6 +1038,92 @@ def test_the_draft_decode_keeps_cp_lite_for_cp_variants_and_multi_request(
             False if requests > 1 else None,
         )
     ]
+
+
+@pytest.mark.parametrize("label", ["split_kv_long", "split_kv_stock", None])
+def test_the_one_request_draft_extend_runs_the_stock_decode_below_the_cp_length(
+    monkeypatch, label
+):
+    import sys
+
+    from sgl_nvidia_mega.qwen3_5.attention import route, split_kv
+    from sgl_nvidia_mega.qwen3_5.draft import attention as draft_attention
+
+    heads, dim, page, rows = 4, 256, 64, 7
+    calls = []
+
+    def stock(**kw):
+        calls.append(
+            (
+                "stock",
+                tuple(kw["query"].shape),
+                kw.get("q_len_per_req"),
+                kw["bmm1_scale"],
+                kw["bmm2_scale"],
+            )
+        )
+        return torch.full((rows, heads, dim), 2.0, dtype=torch.bfloat16)
+
+    def skv2(*args, **kwargs):
+        calls.append(("skv2",))
+        return torch.zeros(rows, heads * dim, dtype=torch.bfloat16)
+
+    def cp_core(*args, **kwargs):
+        calls.append(("cp_core",))
+        return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        SimpleNamespace(
+            decode=SimpleNamespace(trtllm_batch_decode_with_kv_cache=stock)
+        ),
+    )
+    monkeypatch.setattr(split_kv, "skv2", skv2)
+    monkeypatch.setattr(split_kv, "cp_core", cp_core)
+    monkeypatch.setattr(draft_attention, "_q1_label", lambda: label)
+    attn = draft_attention.Attention.__new__(draft_attention.Attention)
+    attn.layer = SimpleNamespace(
+        attn=SimpleNamespace(
+            layer_id=5,
+            scaling=0.5,
+            sliding_window_size=-1,
+            tp_q_head_num=heads,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            head_dim=dim,
+        )
+    )
+    attn.heads, attn.head_dim, attn.page_size = heads, dim, page
+    attn.max_context_len, attn.workspace, attn.counters = 262144, None, None
+    attn.q1 = None
+    attn._noted = set()
+    attn.skv2 = SimpleNamespace(long=lambda: True, run=lambda *args: skv2())
+    attn.cp_b1 = draft_attention.DraftCP(split_kv, route, steps=True, extend=True)
+    attn._paged = lambda k, v: (k, v)
+    cache = torch.zeros(4 * page, 1, dim, dtype=torch.float8_e4m3fn)
+    kv = SimpleNamespace(
+        layer_ids=(5,), k=(cache,), v=(cache,), k_scale=(2.0,), v_scale=(3.0,)
+    )
+    meta = SimpleNamespace(
+        page_table=torch.zeros(1, 4, dtype=torch.int32),
+        cache_seqlens=torch.full((1,), 100, dtype=torch.int32),
+    )
+    q8 = torch.zeros(rows, heads * dim, dtype=torch.float8_e4m3fn)
+    out = attn.decode(q8, meta, kv, rows_per_request=rows)
+    assert calls == [("stock", (rows, heads, dim), rows, 1.0, 3.0)]
+    assert out.shape == (rows, heads * dim) and bool((out == 2).all())
+
+
+def test_slot_draft_skv2_builds_no_split_kv_decode(monkeypatch, caplog):
+    import logging
+
+    from sgl_nvidia_mega.qwen3_5.draft import attention as draft_attention
+
+    assert not hasattr(draft_attention.DraftExtendSplitKV, "run")
+    with caplog.at_level(logging.INFO, logger=draft_attention.__name__):
+        draft_attention.DraftExtendSplitKV.note()
+    assert any("stock trtllm-gen decode" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.parametrize(
@@ -1102,9 +1217,9 @@ def test_the_draft_extends_moe_output_is_reduced_once(
         log.append("mlp deferred" if defer_finalize else "mlp")
         return owed(reduced=True) if defer_finalize else h
 
-    def fin(*, residual, gamma, **_):
+    def fin(owed, residual, norm):
         log.append("fin")
-        return residual + gamma, residual
+        return residual + 100.0, residual
 
     def norm(h, residual):
         log.append("norm")
@@ -1116,13 +1231,10 @@ def test_the_draft_extends_moe_output_is_reduced_once(
 
     mlp.supports_deferred_finalize = True
     mkm.takes = lambda r, rows_per_request: True
-    norm.gemma_weight = 100.0
     extend_hop = SimpleNamespace(
-        hop=SimpleNamespace(
-            supports=lambda m: m <= rows,
-            moe_finalize_all_reduce_rms_norm=fin,
-        ),
+        hop=SimpleNamespace(supports=lambda m: m <= rows),
         ffn_input=lambda h, residual, norm, moe_single_launch: (h, residual),
+        fin_norm=fin,
     )
     parts = SimpleNamespace(
         layer=SimpleNamespace(
@@ -1134,6 +1246,8 @@ def test_the_draft_extends_moe_output_is_reduced_once(
         hop=extend_hop,
         moe=None,
         moe_mkm=mkm if path == "mkm" else None,
+        moe_block=None,
+        oproj_push=None,
         slots=frozenset({"draft_hop", "draft_fin"} if fused else {"draft_hop"}),
         model=SimpleNamespace(norm=norm),
     )
@@ -1156,7 +1270,7 @@ def test_only_tep8_draft_fin_uses_the_target_mnnvl_workspace(monkeypatch):
 
     from sgl_nvidia_mega.qwen3_5.draft import layer
 
-    workspace = SimpleNamespace(supports=lambda rows: rows <= 896)
+    workspace = SimpleNamespace(supports=lambda rows: rows <= 512)
     monkeypatch.setattr(flashinfer_mnnvl_cutedsl, "_WORKSPACE", workspace)
     parts = SimpleNamespace(slots=frozenset({"draft_fin"}))
 
@@ -1164,8 +1278,8 @@ def test_only_tep8_draft_fin_uses_the_target_mnnvl_workspace(monkeypatch):
         "sglang.srt.runtime_context.get_parallel",
         lambda: SimpleNamespace(tp_size=8, moe_ep_size=4),
     )
-    assert layer._mnnvl_workspace(parts, 896) is workspace
-    assert layer._mnnvl_workspace(parts, 897) is None
+    assert layer._mnnvl_workspace(parts, 512) is workspace
+    assert layer._mnnvl_workspace(parts, 513) is None
     assert layer._mnnvl_workspace(SimpleNamespace(slots=frozenset()), 32) is None
 
     monkeypatch.setattr(
@@ -1184,11 +1298,21 @@ def test_tep8_draft_fin_uses_the_target_workspace_past_the_hop(monkeypatch, defe
 
     def fused_ar(*, local_contribution, residual, gamma):
         calls.append("fused ar")
-        return local_contribution + gamma, residual
+        assert not residual.any()
+        return local_contribution + gamma, local_contribution
 
     def fused_fin(*, residual, gamma, **_):
         calls.append("fused finalize")
-        return residual + gamma, residual
+        assert not residual.any()
+        return residual + gamma, residual + 3.0
+
+    def gemma_norm(scale, name):
+        def norm(hidden, residual):
+            calls.append(name)
+            return (hidden + residual) * scale, hidden + residual
+
+        norm.gemma_weight = scale
+        return norm
 
     workspace = SimpleNamespace(
         all_reduce_residual_rms_norm=fused_ar,
@@ -1209,8 +1333,8 @@ def test_tep8_draft_fin_uses_the_target_workspace_past_the_hop(monkeypatch, defe
         )
 
     mlp.supports_deferred_finalize = deferred
-    post_norm = SimpleNamespace(gemma_weight=10.0)
-    final_norm = SimpleNamespace(gemma_weight=100.0)
+    post_norm = gemma_norm(10.0, "post norm")
+    final_norm = gemma_norm(100.0, "final norm")
     parts = SimpleNamespace(
         layer=SimpleNamespace(
             input_layernorm=lambda hidden: hidden,
@@ -1221,6 +1345,8 @@ def test_tep8_draft_fin_uses_the_target_workspace_past_the_hop(monkeypatch, defe
         hop=None,
         moe=None,
         moe_mkm=None,
+        moe_block=None,
+        oproj_push=None,
         slots=frozenset({"draft_hop", "draft_fin"}),
         model=SimpleNamespace(norm=final_norm),
     )
@@ -1232,12 +1358,19 @@ def test_tep8_draft_fin_uses_the_target_workspace_past_the_hop(monkeypatch, defe
         "sglang.srt.distributed.tensor_model_parallel_all_reduce", stock_all_reduce
     )
     out = layer.layer(parts, x, None, None, None, None, rows_per_request=1)
+    moe_in, residual = (x + x) * 10.0, x + x
     if deferred:
-        assert calls == ["fused ar", "mlp deferred", "fused finalize"]
-        assert torch.equal(out, x + 100.0)
+        assert calls == [
+            "fused ar",
+            "post norm",
+            "mlp deferred",
+            "fused finalize",
+            "final norm",
+        ]
+        assert torch.equal(out, (3.0 + residual) * 100.0)
     else:
-        assert calls == ["fused ar", "mlp", "fused ar"]
-        assert torch.equal(out, 2 * (x + 10.0) + 100.0)
+        assert calls == ["fused ar", "post norm", "mlp", "fused ar", "final norm"]
+        assert torch.equal(out, (2 * moe_in + residual) * 100.0)
 
 
 class _DraftParts:
@@ -1246,6 +1379,8 @@ class _DraftParts:
     def __init__(self, slots=frozenset(), tp_size=8):
         self.slots, self.mkd, self.top1x, self.engaged = slots, None, None, []
         self.binding = SimpleNamespace(tp_size=tp_size)
+        self.fc_input_table = None  # slot draft_fc_input off
+        self.fc_tp = None  # slot draft_fc_tp off
 
     def note_engaged(self, entry, bs):
         self.engaged.append((entry, bs))
@@ -1415,6 +1550,7 @@ def test_the_draft_embeds_through_the_exchange_where_it_fits():
     calls = []
     parts = Parts.__new__(Parts)
     parts.model = SimpleNamespace(embed_tokens=lambda t: calls.append("sglang") or t)
+    parts.embed_local = None
     parts.embedx = None
     parts.embed(torch.zeros(4, dtype=torch.int64))
     parts.embedx = lambda t: calls.append("exchange") or t
@@ -1895,6 +2031,215 @@ def test_prefill_keeps_stock_speculative_hooks_under_the_runtime_switch(monkeypa
     assert plugin_binding.bind_speculative_runtime_hooks(model, defaults) is defaults
 
 
+def _fake_prefill_front(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    for name in (
+        "sgl_nvidia_mega.qwen3_5.sm103.gdn.prefill_front",
+        "sgl_nvidia_mega.qwen3_5.sm103.attention.qk_norm_rope_rows",
+    ):
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+
+
+@pytest.mark.parametrize(
+    "switch, pp, slots, summary, refused",
+    [
+        pytest.param(
+            None,
+            4,
+            None,
+            "prefill TP1/PP4; gdn_prefill_split_conv stock",
+            "(PD prefill TP1/PP4 only supports gdn_prefill_split_conv)",
+            id="pp4-megakernel-alone",
+        ),
+        pytest.param(
+            "1",
+            4,
+            None,
+            "prefill TP1/PP4; gdn_prefill_split_conv stock",
+            "(PD prefill TP1/PP4 only supports gdn_prefill_split_conv)",
+            id="pp4-measured",
+        ),
+        pytest.param(
+            "1",
+            4,
+            "gdn_prefill_split_conv",
+            "prefill TP1/PP4; gdn_prefill_split_conv built",
+            None,
+            id="pp4-split-conv",
+        ),
+        pytest.param(
+            "1",
+            2,
+            None,
+            "prefill TP1/PP2; gdn_prefill_front, attn_prefill_qk_rows built "
+            "(prefill body)",
+            "(PD prefill TP1/PP2 only supports gdn_prefill_front, "
+            "gdn_prefill_track_snapshot, moe_prefill_input_nvfp4, "
+            "moe_prefill_add_norm, moe_prefill_noclone, prefill_gate_fp8, "
+            "prefill_act_fp8, gdn_prefill_norm_fp8, prefill_norm_fp8, "
+            "attn_prefill_qk_rows)",
+            id="pp2-measured",
+        ),
+    ],
+)
+def test_each_prefill_shape_builds_the_prefill_body(
+    monkeypatch, caplog, switch, pp, slots, summary, refused
+):
+    from sgl_nvidia_mega.qwen3_5 import spec
+    from sgl_nvidia_mega.qwen3_5.gdn import fi_track_snapshot
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+
+    _fake_prefill_front(monkeypatch)
+    monkeypatch.setattr(
+        fi_track_snapshot, "flashinfer_reasons", lambda: ["needs FlashInfer"]
+    )
+    for name, value in ((RUNTIME_ENV, switch), (runtime.SLOTS_ENV, slots)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    monkeypatch.setattr(spec, "prefill_body_offered", spec._offers_prefill_body)
+    monkeypatch.setattr(runtime, "MEASURED_KEY", None)
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    parallel = _parallel(1, 1, 1, 1, pp)
+    monkeypatch.setattr("sglang.srt.runtime_context.get_parallel", lambda: parallel)
+    # the megakernel alone reads no GPU
+    sku = (lambda: topology.GB300) if switch else _no_gpu
+    monkeypatch.setattr(topology, "device_sku", sku)
+    binding = SimpleNamespace(prefill_view=lambda: None)
+    with caplog.at_level("INFO"):
+        built = runtime.build(
+            _empty_model(), SimpleNamespace(tokens_per_request=7, binding=binding)
+        )
+    assert isinstance(built, Qwen35Prefill) and built.summary() == summary
+    assert built.enabled is (slots is not None)
+    assert built.front is built.qk_rows is (pp == 2)
+    if switch and slots is None:
+        assert runtime.MEASURED_KEY == (f"p_tp1_pp{pp}", topology.GB300)
+        if pp == 2:
+            assert runtime.SLOTS == _MEASURED_PREFILL
+            assert "measured plan at p_tp1_pp2 on" in caplog.text
+        else:
+            assert runtime.SLOTS == _SHIPPED
+            assert "has no measured plan at p_tp1_pp4 on" in caplog.text
+    if refused is None:
+        assert "use stock (PD prefill" not in caplog.text
+    else:
+        assert f"use stock {refused}" in caplog.text, caplog.text
+    assert built.snapshot is None
+
+
+@pytest.mark.parametrize(
+    "slots, reasons, summary, stock",
+    [
+        pytest.param(
+            None,
+            [],
+            "prefill TP1/PP2; gdn_prefill_front, attn_prefill_qk_rows built "
+            "(prefill body); gdn_prefill_track_snapshot built",
+            None,
+            id="measured-pinned-flashinfer",
+        ),
+        pytest.param(
+            None,
+            ["FlashInfer 0.7.3's gdn_prefill.py differ"],
+            "prefill TP1/PP2; gdn_prefill_front, attn_prefill_qk_rows built "
+            "(prefill body)",
+            "(FlashInfer 0.7.3's gdn_prefill.py differ)",
+            id="measured-other-flashinfer",
+        ),
+        pytest.param(
+            "gdn_prefill_track_snapshot",
+            [],
+            "prefill TP1/PP2; SGLang's forward",
+            "(no gdn_prefill_front)",
+            id="slot-without-the-front",
+        ),
+    ],
+)
+def test_the_tp1_pp2_prefill_builds_the_track_snapshot_with_the_front(
+    monkeypatch, caplog, slots, reasons, summary, stock
+):
+    from sgl_nvidia_mega.qwen3_5 import spec
+    from sgl_nvidia_mega.qwen3_5.gdn import fi_track_snapshot
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+
+    _fake_prefill_front(monkeypatch)
+    monkeypatch.setattr(fi_track_snapshot, "flashinfer_reasons", lambda: reasons)
+    monkeypatch.setenv(RUNTIME_ENV, "1")
+    if slots is None:
+        monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(runtime.SLOTS_ENV, slots)
+    monkeypatch.setattr(spec, "prefill_body_offered", spec._offers_prefill_body)
+    monkeypatch.setattr(runtime, "MEASURED_KEY", None)
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    parallel = _parallel(1, 1, 1, 1, 2)
+    monkeypatch.setattr("sglang.srt.runtime_context.get_parallel", lambda: parallel)
+    monkeypatch.setattr(topology, "device_sku", lambda: topology.GB300)
+    binding = SimpleNamespace(prefill_view=lambda: None)
+    with caplog.at_level("INFO"):
+        built = runtime.build(
+            _empty_model(), SimpleNamespace(tokens_per_request=7, binding=binding)
+        )
+    assert isinstance(built, Qwen35Prefill) and built.summary() == summary
+    assert (built.snapshot is not None) is (stock is None)
+    line = "slot gdn_prefill_track_snapshot uses stock"
+    if stock is None:
+        assert line not in caplog.text
+        assert isinstance(built.snapshot, fi_track_snapshot.TrackSnapshot)
+    else:
+        assert f"{line} {stock}" in caplog.text, caplog.text
+
+
+def test_the_track_snapshot_needs_the_front_in_a_slot_list(monkeypatch):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"gdn_prefill_track_snapshot"}))
+    assert (
+        f"{runtime.SLOTS_ENV}: slot 'gdn_prefill_track_snapshot' runs in slot "
+        "'gdn_prefill_front''s extend"
+    ) in runtime.slot_reasons()
+    monkeypatch.setattr(
+        runtime,
+        "SLOTS",
+        frozenset({"gdn_prefill_track_snapshot", "gdn_prefill_front"}),
+    )
+    assert runtime.slot_reasons() == []
+
+
+@pytest.mark.parametrize("sku", ["B300", "GB200"])
+def test_the_tp1_pp2_prefill_body_runs_only_on_its_measured_gpu(
+    monkeypatch, caplog, sku
+):
+    from sgl_nvidia_mega.qwen3_5 import spec
+    from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
+
+    _fake_prefill_front(monkeypatch)
+    monkeypatch.setenv(RUNTIME_ENV, "1")
+    monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    # offered, as on an SGLang with the prefill body seam (spec._offers_prefill_body)
+    monkeypatch.setattr(spec, "prefill_body_offered", lambda: True)
+    monkeypatch.setattr(runtime, "MEASURED_KEY", None)
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    parallel = _parallel(1, 1, 1, 1, 2)
+    monkeypatch.setattr("sglang.srt.runtime_context.get_parallel", lambda: parallel)
+    gpu = {"B300": _B300, "GB200": _GB200}[sku]
+    monkeypatch.setattr(topology, "device_sku", lambda: gpu)
+    binding = SimpleNamespace(prefill_view=lambda: None)
+    with caplog.at_level("INFO"):
+        built = runtime.build(
+            _empty_model(), SimpleNamespace(tokens_per_request=7, binding=binding)
+        )
+    assert runtime.MEASURED_KEY == ("p_tp1_pp2", gpu)
+    assert "has no measured plan at p_tp1_pp2 on" in caplog.text
+    assert not set(runtime.MEASURED_PREFILL) & runtime.SLOTS
+    assert isinstance(built, Qwen35Prefill)
+    assert built.front is built.qk_rows is False
+    assert built.summary() == "prefill TP1/PP2; SGLang's forward"
+    assert "runs at" not in caplog.text
+
+
 def _gdn_prefill_state_case(monkeypatch, strided):
     from sglang.srt.layers.attention.linear import gdn_backend
 
@@ -1971,6 +2316,7 @@ def _gdn_prefill_state_case(monkeypatch, strided):
         state_checkpoint_cu_starts=None,
         num_state_checkpoints=None,
         state_checkpoint_every_n_tokens=None,
+        prefill_state_staging=None,
     )
     backend = SimpleNamespace(
         prefill_graph_metadata=None,
@@ -1980,9 +2326,18 @@ def _gdn_prefill_state_case(monkeypatch, strided):
         state_layer_cache=lambda _: SimpleNamespace(
             conv=(conv[0],), temporal=temporal[0]
         ),
-        kernel_dispatcher=SimpleNamespace(extend=recurrence),
+        kernel_dispatcher=SimpleNamespace(
+            extend=recurrence,
+            extend_kernel=SimpleNamespace(defers_prefill_gates=False),
+            extend_honors_slot_pitch=False,
+        ),
         _prefill_gates=lambda *args: (torch.zeros(1, 4, 1), torch.zeros(1, 4, 1)),
     )
+    # SGLang's own staging helpers, where its forward_extend calls them
+    for name in ("_prefill_kernels_follow_slot_pitch", "_prefill_state_staging"):
+        method = getattr(gdn_backend.GDNAttnBackend, name, None)
+        if method is not None:
+            setattr(backend, name, MethodType(method, backend))
     backend._convolve_prefill = lambda *args: (
         gdn_backend.GDNAttnBackend._convolve_prefill(backend, *args)
     )
@@ -2266,3 +2621,586 @@ def test_an_explicit_slot_keeps_stock_for_a_refused_mkd_build(monkeypatch, caplo
             is None
         )
     assert "MKD draft boundary disabled (needs an aligned NVLink" in caplog.text
+
+
+_BT_TAIL = frozenset({"bt_tail", "bt_tail_early", "bt_tail_early_fin"})
+_MEASURED = (
+    (_RECIPE - {"route_gemm", "draft_xchg", "route_lin", "mkm_wide_bal"})
+    | _BT_TAIL
+    | set(runtime.MEASURED_CP_LITE)
+    | {"gdn_conv_core", "lowm_ba"}
+    | set(runtime.MEASURED_DRAFT)
+    | set(runtime.MEASURED_HOOKS)
+)
+_OPTIONS = frozenset(
+    {
+        "gdn_value_split",
+        "gemm_tactics",
+        "gdn_commit",
+        "embed_local",
+        "draft_top1_cfg",
+        "draft_oproj_push",
+        "draft_early_hops",
+        "draft_head_keys",
+        "draft_merge_early",
+        "draft_hilo_trig",
+    }
+)
+_TEP8_OPTIONS = frozenset(
+    {"draft_moe_engine", "draft_moe_wide", "draft_shared_lowm", "draft_fc_push"}
+)
+_DRAFT_TEP8 = frozenset({"draft_fc_tp"})
+_BT_AR = frozenset({"gemm_ar", "fc2ar"})
+_TEP8 = (
+    frozenset(
+        {
+            "moe_engine",
+            "moe_ring",
+            "route_big_gemm",
+            "route_lean",
+            "moe_engine_route",
+            "route_big_mid",
+            "lowm_se_tep8",
+            "lowm_se_wide",
+            "lowm_se_coresident",
+        }
+    )
+    | _BT_AR
+)
+# the rows TP8 and TEP8 run between them
+_REQUESTED = _MEASURED | _TEP8 | _DRAFT_TEP8
+_SHIPPED = frozenset(runtime.SHIPPED_SLOTS)
+_DEP4 = frozenset(
+    {"gdn_verify", "gdn_core", "gdn_core_tc", "gdn_commit_fold", "gathered_cdf"}
+)
+_MEASURED_DEP4 = _SHIPPED | _DEP4
+_DEP4_ONLY = _DEP4 - _MEASURED
+_PREFILL = frozenset(
+    {
+        "gdn_prefill_front",
+        "gdn_prefill_track_snapshot",
+        "moe_prefill_input_nvfp4",
+        "moe_prefill_add_norm",
+        "moe_prefill_noclone",
+        "prefill_gate_fp8",
+        "prefill_act_fp8",
+        "gdn_prefill_norm_fp8",
+        "prefill_norm_fp8",
+        "attn_prefill_qk_rows",
+    }
+)
+_MEASURED_PREFILL = _SHIPPED | _PREFILL
+_EVERY = _REQUESTED | _MEASURED_DEP4 | _MEASURED_PREFILL
+_B300 = topology.Sku(10, 3, 148)
+_GB200 = topology.Sku(10, 0, 148)
+
+
+@pytest.fixture
+def measured(monkeypatch):
+    monkeypatch.setenv(RUNTIME_ENV, "1")
+    monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    monkeypatch.setattr(runtime, "MEASURED_KEY", None)
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    monkeypatch.setattr(topology, "device_sku", _no_gpu)
+
+
+def _no_gpu():
+    raise AssertionError("read the GPU")
+
+
+_DRAFT_LINE = "the target resolved no measured plan"
+
+
+@pytest.mark.parametrize(
+    "switch, slots, on",
+    [
+        (None, None, False),
+        ("0", None, False),
+        ("1", None, True),
+        ("true", None, True),
+        ("1", "", False),
+        ("1", "hop", False),
+        (None, "hop", False),
+    ],
+)
+def test_the_measured_stack_is_the_runtime_switch_without_a_slot_list(
+    monkeypatch, switch, slots, on
+):
+    for name, value in ((RUNTIME_ENV, switch), (runtime.SLOTS_ENV, slots)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert runtime._measured_stack_on() is on
+    key = ("tep8", topology.GB300)
+    assert runtime._measured_rows_on(key, "gdn_core") is on
+    assert not runtime._measured_rows_on(("tp4", topology.GB300), "gdn_core")
+    assert not runtime._measured_rows_on(("tep8", _B300), "gdn_core")
+
+
+def test_tp8_tep8_and_dep4_on_gb300_hold_the_measured_slots(monkeypatch):
+    assert set(runtime.MEASURED_PLAN) == {
+        ("tp8", topology.GB300),
+        ("tep8", topology.GB300),
+        ("dep4", topology.GB300),
+        ("p_tp1_pp2", topology.GB300),
+    }
+    plan = runtime.MEASURED_PLAN
+    assert plan["tp8", topology.GB300] == _MEASURED | _OPTIONS
+    assert (
+        plan["tep8", topology.GB300]
+        == _MEASURED | _OPTIONS | _TEP8 | _TEP8_OPTIONS | _DRAFT_TEP8
+    )
+    assert plan["dep4", topology.GB300] == _MEASURED_DEP4
+    assert plan["p_tp1_pp2", topology.GB300] == _MEASURED_PREFILL
+    assert set(runtime.MEASURED_PREFILL) == _PREFILL
+    assert set(runtime.MEASURED_DEP4) == _DEP4 == topology.DEP4_SLOTS
+    assert _MEASURED == (
+        _SHIPPED
+        | set(runtime.MEASURED_OPT_IN)
+        | set(runtime.MEASURED_BT_TAIL)
+        | set(runtime.MEASURED_CP_LITE)
+        | set(runtime.MEASURED_DRAFT)
+        | set(runtime.MEASURED_HOOKS)
+    )
+    assert set(runtime.MEASURED_OPTIONS) == _OPTIONS
+    assert set(runtime.MEASURED_TEP8_OPTIONS) == _TEP8_OPTIONS
+    assert runtime.OPTION_ROWS == _OPTIONS | _TEP8_OPTIONS
+    assert set(runtime.MEASURED_DRAFT_TEP8) == _DRAFT_TEP8
+    assert set(runtime.MEASURED_TEP8) | set(runtime.MEASURED_BT_AR) == _TEP8
+    assert set(runtime.MEASURED_BT_AR) == _BT_AR
+    assert len(runtime.MEASURED_OPT_IN) == 31
+    assert not _SHIPPED & set(runtime.MEASURED_OPT_IN)
+    assert not _RECIPE & set(runtime.MEASURED_HOOKS)
+    monkeypatch.setattr(runtime, "SLOTS", _REQUESTED)
+    assert runtime.slot_reasons() == []
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [pytest.param((8, 8, 1, 1, 1), id="tp8"), pytest.param((8, 8, 1, 4, 1), id="tep8")],
+)
+def test_the_measured_stack_runs_the_bt_tail_at_tp8_and_tep8(measured, shape):
+    parallel = _parallel(*shape)
+    runtime.apply_measured_plan(parallel, topology.GB300)
+    runtime.apply_expert_parallel(parallel.moe_ep_size)
+    runtime.apply_cp_lite_topology(parallel.attn_tp_size)
+    runtime.apply_topology(parallel)
+    assert _BT_TAIL <= runtime.SLOTS
+    assert _BT_TAIL <= set(runtime.MEASURED_BITWISE)
+    assert not _BT_TAIL & set(runtime.NUMERICS_CHANGE)
+
+
+@pytest.mark.parametrize(
+    "switch, slots", [(None, None), ("0", None), ("1", ",".join(sorted(_RECIPE)))]
+)
+def test_the_bt_tail_stays_off_outside_the_measured_stack(monkeypatch, switch, slots):
+    for name, value in ((RUNTIME_ENV, switch), (runtime.SLOTS_ENV, slots)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert not (_BT_TAIL | _BT_AR) & runtime._requested_slots()
+
+
+@pytest.mark.parametrize(
+    "shape, on",
+    [
+        pytest.param((8, 8, 1, 1, 1), False, id="tp8"),
+        pytest.param((8, 8, 1, 4, 1), True, id="tep8"),
+    ],
+)
+def test_the_measured_stack_runs_gemm_ar_and_fc2ar_at_tep8_only(measured, shape, on):
+    parallel = _parallel(*shape)
+    runtime.apply_measured_plan(parallel, topology.GB300)
+    runtime.apply_expert_parallel(parallel.moe_ep_size)
+    runtime.apply_cp_lite_topology(parallel.attn_tp_size)
+    runtime.apply_topology(parallel)
+    assert (_BT_AR <= runtime.SLOTS) is on
+    assert not on or runtime.slot_reasons() == []
+    assert _BT_AR <= set(runtime.MEASURED_BITWISE)
+    assert not _BT_AR & set(runtime.NUMERICS_CHANGE)
+
+
+def test_gemm_ar_and_fc2ar_run_on_the_bt_tail_and_fc2ar_on_the_moe_engine():
+    assert runtime.slot_reasons(frozenset({"gemm_ar", "fc2ar"})) == [
+        f"{runtime.SLOTS_ENV}: slot 'gemm_ar' runs in slot 'bt_tail''s MoE-input point",
+        f"{runtime.SLOTS_ENV}: slot 'fc2ar' folds slot 'moe_engine''s FC2 rows at slot "
+        "'bt_tail''s points",
+    ]
+    assert runtime.slot_reasons(frozenset({"bt_tail", "fc2ar"})) == [
+        f"{runtime.SLOTS_ENV}: slot 'fc2ar' folds slot 'moe_engine''s FC2 rows at slot "
+        "'bt_tail''s points",
+    ]
+    assert runtime.slot_reasons(frozenset({"bt_tail", "gemm_ar"})) == []
+
+
+def test_the_measured_stack_requests_every_measured_slot(monkeypatch):
+    monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    assert runtime._requested_slots() == _SHIPPED
+    monkeypatch.setenv(RUNTIME_ENV, "1")
+    assert runtime._requested_slots() == _EVERY
+    monkeypatch.setenv(runtime.SLOTS_ENV, "hop,route_topk")
+    assert runtime._requested_slots() == {"hop", "route_topk"}
+
+
+@pytest.mark.parametrize(
+    "shape, sku, name, want",
+    [
+        pytest.param((8, 8, 1, 1, 1), topology.GB300, "tp8", _MEASURED, id="tp8"),
+        pytest.param((8, 8, 1, 4, 1), topology.GB300, "tep8", _REQUESTED, id="tep8"),
+        pytest.param((8, 8, 1, 4, 1), _B300, "tep8", _SHIPPED, id="tep8-b300"),
+        pytest.param((8, 8, 1, 1, 1), _GB200, "tp8", _SHIPPED, id="tp8-gb200"),
+        pytest.param((4, 4, 1, 1, 1), topology.GB300, "tp4", _SHIPPED, id="tp4"),
+        pytest.param((2, 2, 1, 1, 1), topology.GB300, "tp2", _SHIPPED, id="tp2"),
+        pytest.param((8, 1, 8, 8, 1), topology.GB300, "dep8", _SHIPPED, id="dep8"),
+        pytest.param(
+            (4, 1, 4, 4, 1), topology.GB300, "dep4", _MEASURED_DEP4, id="dep4"
+        ),
+        pytest.param((4, 1, 4, 4, 1), _B300, "dep4", _SHIPPED, id="dep4-b300"),
+        pytest.param(
+            (1, 1, 1, 1, 4), topology.GB300, "p_tp1_pp4", _SHIPPED, id="prefill"
+        ),
+        pytest.param(
+            (1, 1, 1, 1, 2),
+            topology.GB300,
+            "p_tp1_pp2",
+            _MEASURED_PREFILL,
+            id="prefill-pp2",
+        ),
+        pytest.param(
+            (1, 1, 1, 1, 2), _B300, "p_tp1_pp2", _SHIPPED, id="prefill-pp2-b300"
+        ),
+    ],
+)
+def test_each_key_runs_its_measured_plan_or_the_shipped_slots(
+    measured, caplog, shape, sku, name, want
+):
+    parallel = _parallel(*shape)
+    with caplog.at_level("INFO"):
+        assert runtime.apply_measured_plan(parallel, sku) == _EVERY - want
+    assert runtime.SLOTS == want
+    assert runtime.MEASURED_KEY == (name, sku)
+    line = "measured plan at" if want != _SHIPPED else "has no measured plan at"
+    assert f"{line} {name} on" in caplog.text
+    # a second resolve keeps the first; the draft's build follows it and logs nothing
+    assert runtime.apply_measured_plan(parallel, sku) == frozenset()
+    with caplog.at_level("INFO"):
+        assert runtime.follow_measured_plan() == frozenset()
+    assert runtime.SLOTS == want and runtime.MEASURED_KEY == (name, sku)
+    assert _DRAFT_LINE not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "shape, want",
+    [
+        pytest.param(
+            (8, 8, 1, 1, 1), _MEASURED | {"route_lin", "mkm_wide_bal"}, id="tp8"
+        ),
+        pytest.param((8, 8, 1, 4, 1), _REQUESTED - runtime.EP_STOCK_SLOTS, id="tep8"),
+        pytest.param((4, 1, 4, 4, 1), _DEP4, id="dep4"),
+    ],
+)
+def test_the_topology_filters_and_the_tp8_plan_follow_the_measured_plan(
+    measured, shape, want
+):
+    parallel = _parallel(*shape)
+    runtime.apply_measured_plan(parallel, topology.GB300)
+    runtime.apply_expert_parallel(parallel.moe_ep_size)
+    runtime.apply_cp_lite_topology(parallel.attn_tp_size)
+    runtime.apply_topology(parallel)
+    assert runtime.SLOTS == want
+    assert runtime.slot_reasons() == []
+
+
+@pytest.mark.parametrize(
+    "switch, slots",
+    [
+        (None, None),
+        ("1", "hop,route_topk"),
+        (None, "gdn_verify,gdn_core"),
+        ("1", "bt_tail,gdn_verify,hop"),
+    ],
+)
+def test_without_the_measured_stack_no_gpu_is_read_and_the_policy_stays(
+    monkeypatch, caplog, switch, slots
+):
+    if switch is not None:
+        monkeypatch.setenv(RUNTIME_ENV, switch)
+    if slots is not None:
+        monkeypatch.setenv(runtime.SLOTS_ENV, slots)
+    monkeypatch.setattr(runtime, "MEASURED_KEY", None)
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    monkeypatch.setattr(topology, "device_sku", _no_gpu)
+    before = runtime.SLOTS
+    assert runtime.apply_measured_plan(_parallel(8, 8, 1, 4, 1)) == frozenset()
+    assert runtime.SLOTS == before and runtime.MEASURED_KEY is None
+    with caplog.at_level("INFO"):
+        assert runtime.follow_measured_plan() == frozenset()
+    assert runtime.SLOTS == before and runtime.MEASURED_KEY is None
+    assert _DRAFT_LINE not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "shape, name, numeric",
+    [
+        pytest.param(
+            (8, 8, 1, 1, 1),
+            "tp8",
+            set(runtime.NUMERICS_CHANGE)
+            - _TEP8
+            - _TEP8_OPTIONS
+            - _DRAFT_TEP8
+            - _DEP4_ONLY
+            - _PREFILL,
+            id="tp8",
+        ),
+        pytest.param(
+            (8, 8, 1, 4, 1),
+            "tep8",
+            set(runtime.NUMERICS_CHANGE)
+            - {"route_lin", "draft_moe"}
+            - _DEP4_ONLY
+            - _PREFILL,
+            id="tep8",
+        ),
+        pytest.param((4, 1, 4, 4, 1), "dep4", set(_DEP4), id="dep4"),
+        # a PD prefill key names the prefill slots its build runs
+        pytest.param(
+            (1, 1, 1, 1, 2), "p_tp1_pp2", {"attn_prefill_qk_rows"}, id="p_tp1_pp2"
+        ),
+    ],
+)
+def test_the_startup_line_names_the_numeric_slots_with_the_topology_plan(
+    measured, caplog, shape, name, numeric
+):
+    with caplog.at_level("INFO"):
+        runtime.apply_measured_plan(_parallel(*shape), topology.GB300)
+    assert f"numeric with the {name} plan: {sorted(numeric)}" in caplog.text
+
+
+@pytest.mark.parametrize("switch", [None, "1"])
+def test_the_plan_rows_follow_measured_rows_on_alone(monkeypatch, switch):
+    if switch is not None:
+        monkeypatch.setenv(RUNTIME_ENV, switch)
+    monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    bitwise = _MEASURED & set(runtime.MEASURED_BITWISE)
+    monkeypatch.setattr(
+        runtime,
+        "_measured_rows_on",
+        lambda key, row: row in runtime.MEASURED_PLAN.get(key, ()) and row in bitwise,
+    )
+    monkeypatch.setattr(runtime, "MEASURED_KEY", None)
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    monkeypatch.setattr(topology, "device_sku", _no_gpu)
+    assert runtime.SLOTS == _SHIPPED | bitwise
+    assert runtime.apply_measured_plan(_parallel(8, 8, 1, 1, 1), topology.GB300) == (
+        frozenset()
+    )
+    assert runtime.SLOTS == _SHIPPED | bitwise
+    monkeypatch.setattr(runtime, "MEASURED_KEY", None)
+    assert runtime.apply_measured_plan(_parallel(4, 4, 1, 1, 1), topology.GB300) == (
+        bitwise
+    )
+    assert runtime.SLOTS == _SHIPPED
+
+
+def test_with_every_row_off_no_gpu_is_read(measured, monkeypatch):
+    monkeypatch.setattr(runtime, "_measured_rows_on", lambda key, row: False)
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    assert runtime.SLOTS == _SHIPPED
+    assert runtime.apply_measured_plan(_parallel(8, 8, 1, 4, 1)) == frozenset()
+    assert runtime.SLOTS == _SHIPPED and runtime.MEASURED_KEY is None
+    assert runtime.follow_measured_plan() == frozenset()
+    assert runtime.SLOTS == _SHIPPED and runtime.MEASURED_KEY is None
+
+
+def test_the_ranks_agree_on_the_gpu_before_the_plan(measured, monkeypatch):
+    from sglang.srt.kernel_plugins.nvidia import binding as plugin_binding
+
+    agreed = []
+    monkeypatch.setattr(
+        plugin_binding,
+        "megakernel_agree",
+        lambda value, **kwargs: agreed.append((value, kwargs["what"])),
+    )
+    monkeypatch.setattr(topology, "device_sku", lambda: topology.GB300)
+    runtime.apply_measured_plan(_parallel(8, 8, 1, 4, 1))
+    assert agreed == [((10, 3, 152), "Qwen3.5 GPU (compute capability, SMs)")]
+    assert runtime.MEASURED_KEY == ("tep8", topology.GB300)
+
+
+@pytest.mark.parametrize(
+    "spec_name, plan_step",
+    [("target", "apply_measured_plan"), ("draft", "follow_measured_plan")],
+)
+def test_each_build_settles_its_plan_before_the_other_filters(
+    monkeypatch, spec_name, plan_step
+):
+    from sgl_nvidia_mega.qwen3_5 import draft
+
+    calls = []
+
+    class Stop(Exception):
+        pass
+
+    def record(name, stop=False):
+        def call(*args, **kwargs):
+            calls.append(name)
+            if stop:
+                raise Stop
+            return frozenset()
+
+        return call
+
+    for name in (
+        "apply_measured_plan",
+        "follow_measured_plan",
+        "apply_expert_parallel",
+        "apply_cp_lite_topology",
+    ):
+        monkeypatch.setattr(runtime, name, record(name))
+    monkeypatch.setattr(runtime, "build_cp_lite", record("build_cp_lite"))
+    monkeypatch.setattr(runtime, "apply_topology", record("apply_topology", stop=True))
+    ctx = SimpleNamespace(
+        widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
+    )
+    with pytest.raises(Stop):
+        if spec_name == "target":
+            runtime.build(_empty_model(), ctx)
+        else:
+            draft.SPEC.build("lm", None, ctx)
+    assert calls[0] == plan_step
+    assert calls.count(plan_step) == 1
+    assert {"apply_measured_plan", "follow_measured_plan"} & set(calls) == {plan_step}
+
+
+class _Built(Exception):
+    pass
+
+
+def _build_to_the_filters(monkeypatch, spec_name, parallel):
+    from sgl_nvidia_mega.qwen3_5 import draft
+
+    def stop(*args):
+        raise _Built
+
+    monkeypatch.setattr("sglang.srt.runtime_context.get_parallel", lambda: parallel)
+    monkeypatch.setattr(runtime, "apply_expert_parallel", stop)
+    ctx = SimpleNamespace(
+        widths=(7,), tokens_per_request=7, deadline_s=60.0, binding="EagleBinding"
+    )
+    with pytest.raises(_Built):
+        if spec_name == "target":
+            runtime.build(_empty_model(), ctx)
+        else:
+            draft.SPEC.build("lm", None, ctx)
+
+
+@pytest.mark.parametrize(
+    "shape, name, want",
+    [
+        pytest.param((8, 8, 1, 4, 1), "tep8", _REQUESTED, id="tep8"),
+        pytest.param((4, 4, 1, 1, 1), "tp4", _SHIPPED, id="tp4"),
+    ],
+)
+def test_after_the_target_the_draft_keeps_its_key_and_slots(
+    measured, monkeypatch, caplog, shape, name, want
+):
+    monkeypatch.setattr(topology, "device_sku", lambda: topology.GB300)
+    parallel = _parallel(*shape)
+    with caplog.at_level("INFO"):
+        _build_to_the_filters(monkeypatch, "target", parallel)
+        assert runtime.SLOTS == want
+        _build_to_the_filters(monkeypatch, "draft", parallel)
+    assert runtime.SLOTS == want
+    assert runtime.MEASURED_KEY == (name, topology.GB300)
+    assert caplog.text.count(f"plan at {name} on") == 1
+    assert _DRAFT_LINE not in caplog.text
+
+
+def test_a_draft_built_alone_resolves_no_key_and_runs_the_shipped_slots(
+    measured, monkeypatch, caplog
+):
+    from sglang.srt.kernel_plugins.nvidia import binding as plugin_binding
+
+    def agree(*args, **kwargs):
+        raise AssertionError("agreed on a plan key")
+
+    monkeypatch.setattr(plugin_binding, "megakernel_agree", agree)
+    assert runtime.SLOTS == _EVERY
+    with caplog.at_level("INFO"):
+        _build_to_the_filters(monkeypatch, "draft", _parallel(8, 8, 1, 4, 1))
+        # a second call drops nothing more and logs nothing
+        assert runtime.follow_measured_plan() == frozenset()
+    assert runtime.SLOTS == _SHIPPED
+    assert runtime.MEASURED_KEY is None
+    plan_rows = {row for rows in runtime.MEASURED_PLAN.values() for row in rows}
+    assert not any(runtime.measured_option(row) for row in plan_rows)
+    assert not runtime._cp_lite_constants_on()
+    assert caplog.text.count(_DRAFT_LINE) == 1
+    assert "measured plan at" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "shape, sku, on",
+    [
+        pytest.param((8, 8, 1, 1, 1), topology.GB300, True, id="tp8"),
+        pytest.param((8, 8, 1, 4, 1), topology.GB300, True, id="tep8"),
+        pytest.param((8, 8, 1, 4, 1), _B300, False, id="tep8-b300"),
+        pytest.param((4, 4, 1, 1, 1), topology.GB300, False, id="tp4"),
+        pytest.param((8, 1, 8, 8, 1), topology.GB300, False, id="dep8"),
+    ],
+)
+def test_the_options_run_at_their_keys_and_are_never_requested_as_slots(
+    measured, caplog, shape, sku, on
+):
+    every = _OPTIONS | _TEP8_OPTIONS
+    tep8 = on and shape == (8, 8, 1, 4, 1)
+    assert not runtime.SLOTS & every
+    assert not any(runtime.measured_option(name) for name in every)
+    with caplog.at_level("INFO"):
+        runtime.apply_measured_plan(_parallel(*shape), sku)
+    assert not runtime.SLOTS & every
+    assert runtime.slot_reasons() == []
+    for name in _OPTIONS:
+        assert runtime.measured_option(name) is on
+    for name in _TEP8_OPTIONS:
+        assert runtime.measured_option(name) is tep8
+    if on:
+        want = sorted(_OPTIONS | (_TEP8_OPTIONS if tep8 else frozenset()))
+        assert f"options {want}" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "switch, slots",
+    [(None, None), ("0", None), ("1", "hop,route_topk"), (None, "gdn_verify,gdn_core")],
+)
+def test_the_options_follow_the_measured_stack(monkeypatch, switch, slots):
+    """MK alone, the switch off or a slot list: no option runs, at any key."""
+    for name, value in ((RUNTIME_ENV, switch), (runtime.SLOTS_ENV, slots)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    for key in runtime.MEASURED_PLAN:
+        monkeypatch.setattr(runtime, "MEASURED_KEY", key)
+        assert not any(
+            runtime.measured_option(name) for name in _OPTIONS | _TEP8_OPTIONS
+        )
+
+
+def test_the_options_alone_resolve_the_key(measured, monkeypatch):
+    """With only the options' rows on, the key still resolves and the slots stay."""
+    monkeypatch.setattr(
+        runtime,
+        "_measured_rows_on",
+        lambda key, row: row in runtime.MEASURED_PLAN.get(key, ()) and row in _OPTIONS,
+    )
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    assert runtime.SLOTS == _SHIPPED
+    assert runtime.apply_measured_plan(_parallel(8, 8, 1, 4, 1), topology.GB300) == (
+        frozenset()
+    )
+    assert runtime.SLOTS == _SHIPPED
+    assert all(runtime.measured_option(name) for name in _OPTIONS)

@@ -64,11 +64,9 @@ def _fill(q, pools, table, lengths, length, g):
     lengths.fill_(length)
 
 
-def _inputs(length, g, spare_pages=8):
-    """FP8 query rows, a paged FP8 KV pool with the request's pages scattered, its page
-    table and its length."""
+def _inputs(length, g, spare_pages=8, heads=HEADS):
     total = math.ceil(length / PAGE) + spare_pages
-    q = torch.empty(ROWS, HEADS, DIM, dtype=torch.float8_e4m3fn, device="cuda")
+    q = torch.empty(ROWS, heads, DIM, dtype=torch.float8_e4m3fn, device="cuda")
     pools = [
         torch.empty(total * PAGE, 1, DIM, dtype=torch.float8_e4m3fn, device="cuda")
         for _ in range(2)

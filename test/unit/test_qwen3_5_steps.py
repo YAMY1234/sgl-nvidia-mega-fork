@@ -223,9 +223,16 @@ def _moe_kernels(log):
         yield
 
 
+# every all-to-all backend check the block makes, on the SGLangs it runs on
 _NO_A2A = {
     name: (lambda: False)
-    for name in ("is_deepep", "is_deepep_v2", "is_mori", "is_ascend_fuseep")
+    for name in (
+        "is_deepep",
+        "is_deepep_v2",
+        "is_mori",
+        "is_ascend_fuseep",
+        "is_ascend_ops",
+    )
 }
 
 
@@ -1065,7 +1072,14 @@ def _gdn_build_model():
     layer = qwen3_5.Qwen3_5LinearDecoderLayer.__new__(qwen3_5.Qwen3_5LinearDecoderLayer)
     torch.nn.Module.__init__(layer)
     layer.linear_attn = SimpleNamespace(
-        attn=SimpleNamespace(layer_id=0, num_k_heads=2, num_v_heads=8),
+        # SGLang's gate parameters: A_log FP32, dt_bias in the model dtype
+        attn=SimpleNamespace(
+            layer_id=0,
+            num_k_heads=2,
+            num_v_heads=8,
+            A_log=torch.zeros(8),
+            dt_bias=torch.ones(8, dtype=torch.bfloat16),
+        ),
         norm=SimpleNamespace(weight=torch.ones(128)),
         out_proj=SimpleNamespace(weight=torch.ones(4, 4)),
     )
@@ -2131,10 +2145,17 @@ def test_trt_lowm_takes_trts_gdn_tactics_and_refuses_an_unprepared_launch(
 def test_sglangs_verify_intermediate_rows_are_the_batch_rows(monkeypatch):
     """The TensorRT-LLM front writes a request's conv windows at its batch row, as SGLang's
     target verify indexes them (verify_intermediate_state_indices: request r, row r)."""
+    from sglang.srt.layers import dp_attention
     from sglang.srt.layers.attention.linear import utils
     from sglang.srt.utils import common
 
-    monkeypatch.setattr(common, "get_eager_max_batch_size", lambda n: n)
+    # no padded batches: the bounds live in utils.common or, later, in dp_attention
+    for module, name in (
+        (common, "get_eager_max_batch_size"),
+        (dp_attention, "get_eager_max_batch_size"),
+        (dp_attention, "get_cuda_graph_max_batch_size"),
+    ):
+        monkeypatch.setattr(module, name, lambda n: n, raising=False)
     assert utils.build_verify_intermediate_state_indices(8, "cpu").tolist() == list(
         range(8)
     )
@@ -2637,7 +2658,19 @@ def test_the_skv2_cp_slot_runs_cp_lite_for_one_request_in_its_variant(
 
     class CpLite:
         def attend(
-            self, q, kv, pages, lens, q_len, bmm1, bmm2, ws, layer, fb, min_bs=None
+            self,
+            q,
+            kv,
+            pages,
+            lens,
+            q_len,
+            bmm1,
+            bmm2,
+            ws,
+            layer,
+            fb,
+            min_bs=None,
+            precise=False,
         ):
             calls.append(
                 (
@@ -2652,6 +2685,7 @@ def test_the_skv2_cp_slot_runs_cp_lite_for_one_request_in_its_variant(
                     layer is attn,
                     fb is st.fb,
                     min_bs,
+                    precise,
                 )
             )
             return out if served else None
@@ -2662,10 +2696,9 @@ def test_the_skv2_cp_slot_runs_cp_lite_for_one_request_in_its_variant(
         patch("sglang.srt.runtime_context.get_buffer", lambda name, make: None),
     ):
         o = split_kv.core(attn, q8, st)
-    # the request's 7 rows on the view's pool pages, as SKV2 takes them, at one request
     assert calls == [
         ((7, 4, 256), (3, 1, 64, 256), (16384, 16384, 256, 1), True, True, 7)
-        + (0.75 * 0.0625, 0.5, True, True, 1)
+        + (0.75 * 0.0625, 0.5, True, True, 1, True)
     ]
     if served:
         assert o.shape == (7, 1024) and bool((o == 1).all()) and len(log) == 0
@@ -2689,7 +2722,19 @@ def test_cp_slots_keep_multi_request_target_verify_in_the_plugin(monkeypatch, se
 
     class CpLite:
         def attend(
-            self, q, kv, pages, lens, q_len, bmm1, bmm2, ws, layer, fb, min_bs=None
+            self,
+            q,
+            kv,
+            pages,
+            lens,
+            q_len,
+            bmm1,
+            bmm2,
+            ws,
+            layer,
+            fb,
+            min_bs=None,
+            p2f16=False,
         ):
             calls.append(
                 (
@@ -2699,6 +2744,7 @@ def test_cp_slots_keep_multi_request_target_verify_in_the_plugin(monkeypatch, se
                     q_len,
                     fb is st.fb,
                     min_bs,
+                    p2f16,
                 )
             )
             return out if served else None
@@ -2711,7 +2757,7 @@ def test_cp_slots_keep_multi_request_target_verify_in_the_plugin(monkeypatch, se
     ):
         got = split_kv.core(attn, q8, st)
 
-    assert calls == [((rows, 4, 256), (requests, 4), (requests,), 7, True, None)]
+    assert calls == [((rows, 4, 256), (requests, 4), (requests,), 7, True, None, True)]
     if served:
         assert got.shape == (rows, 1024) and bool((got == 1).all())
         assert not log
@@ -3830,3 +3876,787 @@ def test_shared_expert_tail_uses_sglang_fp4_helpers(monkeypatch, fused):
         else ["eligible", "activation", "down"]
     )
     assert calls[0][1] is expert and calls[0][2] is gate_up
+
+
+# ------------------------------------------------- slot bt_tail
+
+
+@pytest.mark.parametrize("taken", [False, True])
+def test_with_slot_bt_tail_the_mixer_and_moe_inputs_run_on_the_bt_tail(
+    monkeypatch, taken
+):
+    from sgl_nvidia_mega.qwen3_5 import boundary
+
+    log = []
+    for point in ("layer_input", "moe_input", "final_norm"):
+        monkeypatch.setattr(
+            boundary_hop,
+            point,
+            lambda engine, *a, point=point: (
+                log.append((point, engine)) or (point if taken else None)
+            ),
+        )
+    monkeypatch.setattr(
+        "sglang.srt.layers.layer_boundary.residual.batch.final_norm",
+        lambda *a, **k: "sglang final norm",
+    )
+    layer = SimpleNamespace(
+        attn_boundary=SimpleNamespace(
+            prepare=lambda h, fb, capture_gathered: "sglang layer input",
+            finish=lambda part, fb: "handle",
+        ),
+        ffn_boundary=SimpleNamespace(prepare=lambda h, fb: "sglang MoE input"),
+    )
+    st = SimpleNamespace(
+        fb="fb",
+        slots=plan.Slots(bt_tail=True),
+        bound={"boundary": boundary_hop.Bound(hop="the hop", bt="the tail")},
+        model=SimpleNamespace(norm="norm", flashinfer_mnnvl_cutedsl_fusion=None),
+    )
+    got = (
+        boundary.pre(layer, "h", st),
+        boundary.post_attn(layer, "part", st),
+        boundary.close_stream(st, "h"),
+    )
+    if taken:
+        assert got == ("layer_input", "moe_input", "sglang final norm")
+    else:
+        assert got == ("sglang layer input", "sglang MoE input", "sglang final norm")
+    assert log == [("layer_input", "the tail"), ("moe_input", "the tail")]
+    assert boundary.pre(layer, "h", st, capture=[]) == "sglang layer input"
+    st.slots = plan.Slots()
+    assert boundary.pre(layer, "h", st) == "sglang layer input"
+    assert len(log) == 2
+
+
+def test_slot_bt_tail_quantizes_the_layer_input_for_the_mixer_projection():
+    from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
+
+    from sgl_nvidia_mega.qwen3_5 import lowm as lowm_mod
+
+    scale = torch.ones(1)
+    layer = Qwen3_5LinearDecoderLayer.__new__(Qwen3_5LinearDecoderLayer)
+    object.__setattr__(
+        layer,
+        "linear_attn",
+        SimpleNamespace(in_proj_qkvz=SimpleNamespace(input_scale=scale)),
+    )
+    st = SimpleNamespace(slots=plan.Slots(bt_tail=True, gdn_verify=True))
+    assert lowm_mod.layer_input_fp8_scale(layer, st, 56) is scale
+    assert lowm_mod.reads_fp8(st)
+    st.slots = plan.Slots(gdn_verify=True)
+    assert lowm_mod.layer_input_fp8_scale(layer, st, 56) is None
+    # a copy no projection took is dropped
+    st = SimpleNamespace(scratch={})
+    x, x8 = torch.zeros(4, 8), torch.zeros(4, 8, dtype=torch.float8_e4m3fn)
+    lowm_mod.stash_fp8(st, x, x8)
+    lowm_mod.clear_fp8(st)
+    assert lowm_mod.take_fp8(st, x) is None
+
+
+@pytest.mark.parametrize("point", ["layer input", "MoE input"])
+def test_a_hop_point_without_an_e4m3_copy_drops_one_left_untaken(cutedsl_gates, point):
+    from sglang.srt.layers.layer_boundary import PLAIN_ADD
+    from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+
+    from sgl_nvidia_mega.qwen3_5 import lowm as lowm_mod
+
+    log = []
+    layer = _hop_layer(_Fused([]))
+    stream = ResidualStream(torch.randn(7, 16).bfloat16())
+    st = SimpleNamespace(
+        fb=_verify_batch(stream),
+        model=SimpleNamespace(norm=None),
+        slots=plan.Slots(hop=True, hop_fp8=True, mka=True),
+        scratch={},
+    )
+    untaken = torch.zeros(7, 16, dtype=torch.bfloat16)
+    lowm_mod.stash_fp8(st, untaken, torch.zeros(7, 16, dtype=torch.float8_e4m3fn))
+    if point == "MoE input":
+        handle = layer.attn_boundary.finish(torch.randn(7, 16).bfloat16(), st.fb)
+        x = boundary_hop.moe_input(_Fused(log), layer, handle, st)
+    else:
+        handle = stream.record(_handoff(), PLAIN_ADD)
+        x = boundary_hop.layer_input(_Fused(log), layer, handle, st)
+    assert x is not None and len(log) == 1
+    assert "lowm.fp8" not in st.scratch
+    assert lowm_mod.take_fp8(st, untaken) is None
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_in_proj_fp8_joins_in_proj_ba_where_its_caller_says(deferred):
+    from sgl_nvidia_mega.qwen3_5 import lowm as lowm_mod
+
+    x = torch.zeros(56, 16, dtype=torch.bfloat16)
+    x8 = torch.zeros(56, 16, dtype=torch.float8_e4m3fn)
+    qkvz, ba = torch.zeros(56, 40), torch.zeros(56, 8)
+    log = _log(x=x, x8=x8, qkvz=qkvz, ba=ba)
+    lin = SimpleNamespace(
+        weight=torch.zeros(16, 40),
+        input_scale=torch.ones(1),
+        weight_scale=torch.ones(1),
+    )
+    log.known.update(
+        w=lin.weight, sx=lin.input_scale, sw=lin.weight_scale, bf16=torch.bfloat16
+    )
+    gdn = SimpleNamespace(
+        in_proj_qkvz=lin,
+        in_proj_ba=log.op("in_proj_ba", (ba, None)),
+        alt_stream=_Stream("alt", log),
+    )
+    with (
+        _streams(log, capture=True),
+        patch(
+            "sglang.srt.layers.quantization.fp8_utils.flashinfer_bmm_fp8",
+            log.op("bmm", qkvz),
+            create=True,  # defined where FlashInfer's BMM is available
+        ),
+    ):
+        if deferred:
+            got = lowm_mod.in_proj_fp8_deferred(gdn, x, x8, "bt_tail")
+            log.append(("conv",))
+            got[2]()
+        else:
+            got = lowm_mod.in_proj_fp8(gdn, x, x8)
+            log.append(("conv",))
+    assert got[0] is qkvz and got[1] is ba
+    launches = [
+        ("wait", "alt", "main"),
+        ("bmm", "main", ("x8(56, 16)", "w(16, 40)", "sx(1,)", "sw(1,)", "bf16"), ()),
+        ("in_proj_ba", "alt", ("x(56, 16)",), ()),
+    ]
+    join = ("wait", "main", "alt")
+    assert log == launches + ([("conv",), join] if deferred else [join, ("conv",)])
+
+
+class _Pools:
+    """Any attribute or item of the step's views: itself."""
+
+    shape = (16, 16)
+
+    def __getattr__(self, name):
+        return self
+
+    def __getitem__(self, index):
+        return self
+
+    def index(self, value):
+        return 0
+
+
+@pytest.mark.parametrize("bt_tail, core", [(True, True), (True, False), (False, True)])
+def test_slot_bt_tail_defers_the_in_proj_ba_join_to_the_first_read(
+    monkeypatch, bt_tail, core
+):
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5 import lowm as lowm_mod
+    from sgl_nvidia_mega.qwen3_5.gdn import conv, replayssm, verify
+
+    events = []
+    x = torch.zeros(56, 16, dtype=torch.bfloat16)
+    x8 = torch.zeros(56, 16, dtype=torch.float8_e4m3fn)
+    qkvz, ba = torch.zeros(56, 40), torch.zeros(56, 8)
+    attn = SimpleNamespace(
+        layer_id=0,
+        conv_weights=None,
+        bias=None,
+        activation="silu",
+        A_log=None,
+        dt_bias=None,
+        q_dim=4,
+        k_dim=4,
+        v_dim=8,
+        num_k_heads=2,
+        head_k_dim=2,
+        num_v_heads=4,
+        head_v_dim=2,
+    )
+    gdn = SimpleNamespace(
+        num_k_heads=2,
+        num_v_heads=4,
+        attn_tp_size=1,
+        head_k_dim=2,
+        head_v_dim=2,
+        attn=attn,
+    )
+    st = SimpleNamespace(
+        slots=plan.Slots(
+            gdn_verify=True, gdn_core=core, bt_tail=bt_tail, hop_fp8=not bt_tail
+        ),
+        scratch={},
+        view=_Pools(),
+        fb=_Pools(),
+    )
+    lowm_mod.stash_fp8(st, x, x8)
+
+    def deferred(gdn_, x_, x8_, slot, ba_tactic=None):
+        assert x8_ is x8 and slot == "bt_tail"
+        events.append("in_proj")
+        return qkvz, ba, lambda: events.append("join")
+
+    def joined(gdn_, x_, x8_, ba_tactic=None):
+        events.extend(("in_proj", "join"))
+        return qkvz, ba
+
+    def views(qkvz_, ba_, *dims):
+        events.append("views")
+        return qkvz_[:, :16], qkvz_[:, 16:].view(56, 4, 6), ba_[:, :4], ba_[:, 4:]
+
+    def conv_update(*args, **kw):
+        events.append("conv")
+        return torch.zeros(1, 56, 16).transpose(1, 2)
+
+    opts = msgspec.structs.replace(verify.SLOT, core=core)
+    with (
+        patch.object(lowm_mod, "in_proj_fp8_deferred", deferred),
+        patch.object(lowm_mod, "in_proj_fp8", joined),
+        patch(
+            "sglang.kernels.ops.attention.triton_gdn_fused_proj.qwen3_5_gdn_prefill_projection_views",
+            views,
+        ),
+        patch.object(verify, "_conv", lambda *a: events.append("conv") or "qkv"),
+        patch.object(verify, "_fused", lambda *a: events.append("core") or "out"),
+        patch.object(conv, "conv_update", conv_update),
+        patch.object(
+            replayssm, "verify", lambda *a, **k: events.append("core") or None
+        ),
+    ):
+        try:
+            verify.step(gdn, x, st, opts)
+        except AttributeError:
+            assert not core  # the stub layer has no gated norm past the core
+    if bt_tail and core:
+        assert events == ["in_proj", "views", "conv", "join", "core"]
+    else:
+        # joined at once, before any launch past the projections
+        assert events[:3] == ["in_proj", "join", "views"]
+
+
+def _bt_workspace(
+    rms_threads=1024,
+    capacity=703,
+    prenorm_shape=None,
+    output_dtype=torch.bfloat16,
+    fused_from=None,
+):
+    from dataclasses import replace
+
+    pytest.importorskip("flashinfer.comm.mnnvl_cutedsl.kernel_bt.protocol")
+    from flashinfer.comm.mnnvl_cutedsl import KernelTarget, MRangeDispatch, ProtocolKind
+    from flashinfer.comm.mnnvl_cutedsl.kernel_bt.device_kernels import STAGE_STATE_WORDS
+    from flashinfer.comm.mnnvl_cutedsl.kernel_bt.protocol import (
+        BTAllReduceTuning,
+        BTCollectiveTuning,
+        BTFinalizeTuning,
+        BTProtocol,
+    )
+
+    collective = BTCollectiveTuning(rms_threads=rms_threads)
+    fin_bt = BTFinalizeTuning(collective=collective)
+    ar_bt = BTAllReduceTuning(collective=replace(collective, reduction_threads=32))
+    ar_fused = replace(ar_bt, fused=True)
+
+    def routes(bounds, *bt):
+        kinds = (ProtocolKind.LL, *(ProtocolKind.BT for _ in bt), ProtocolKind.HT)
+        presets = ("other", *bt, "other")
+        return MRangeDispatch(
+            upper_bounds=bounds,
+            targets=tuple(
+                KernelTarget(protocol=k, preset=p) for k, p in zip(kinds, presets)
+            ),
+        )
+
+    protocol = BTProtocol.__new__(BTProtocol)
+    protocol.capacity_m = capacity
+    protocol.finalize_kernels = {fin_bt: "fin-bt"}
+    protocol.all_reduce_kernels = {ar_bt: "ar-bt", ar_fused: "ar-fused"}
+    protocol.state = SimpleNamespace(
+        prenorm_mailbox=SimpleNamespace(
+            tensor=torch.empty(
+                prenorm_shape or (3, capacity, 4096), dtype=torch.bfloat16
+            ),
+            multicast_address=1 << 20,
+        ),
+        stage_state=torch.zeros(STAGE_STATE_WORDS, dtype=torch.int32),
+    )
+    all_reduce_routes = (
+        routes((15, 1024, None), ar_bt)
+        if fused_from is None
+        else routes((15, fused_from - 1, 1024, None), ar_bt, ar_fused)
+    )
+    ws = SimpleNamespace(
+        hidden_dim=4096,
+        dtype=torch.bfloat16,
+        apply_rms_norm=True,
+        add_residual=True,
+        write_residual_output=True,
+        weight_bias=0.0,
+        rms_eps=1e-6,
+        output_dtype=output_dtype,
+        write_norm_output=False,
+        dynamic_fp8=False,
+        _protocols={ProtocolKind.BT: protocol},
+        profile=SimpleNamespace(
+            finalize_routes=routes((23, 703, None), fin_bt),
+            all_reduce_routes=all_reduce_routes,
+        ),
+    )
+    return SimpleNamespace(workspace=ws, supports=lambda m: 1 <= m <= capacity)
+
+
+def _bt_tail(service):
+    from sgl_nvidia_mega.qwen3_5.boundary.bt_tail import BTTail
+    from sgl_nvidia_mega.qwen3_5.sm103.hop import bt_tail as kernels
+
+    with patch.object(kernels, "kernels", lambda *a: {}):
+        return BTTail(
+            service=service,
+            eps=1e-6,
+            device="cpu",
+            min_rows=plan.BT_TAIL_MIN_ROWS,
+            max_rows=plan.BT_TAIL_MAX_ROWS,
+        )
+
+
+def test_the_bt_tail_binds_to_sglangs_workspace_once_it_is_built():
+    service = SimpleNamespace(_workspace=None)
+    tail = _bt_tail(service)
+    assert not tail.supports(56)
+    assert tail.bind() == ["SGLang has not built its FlashInfer workspace"]
+    service._workspace = _bt_workspace()
+    covered = [m for m in range(1, 900) if tail.supports(m)]
+    assert covered == list(range(24, 704))
+    assert tail.bind() == []
+    assert tail._route(56) == ("fin-bt", "ar-bt")
+
+
+def test_the_bt_tail_leaves_flashinfers_fused_all_reduce_stock():
+    tail = _bt_tail(SimpleNamespace(_workspace=_bt_workspace(fused_from=300)))
+    assert tail.bind() == []
+    covered = [m for m in range(1, 900) if tail.supports(m)]
+    assert covered == list(range(24, 300))
+
+
+@pytest.mark.parametrize(
+    "kw, why",
+    [
+        (dict(rms_threads=256), "the finalize BT RMSNorm runs 256 threads"),
+        (dict(prenorm_shape=(2, 703, 4096)), "BT state: prenorm"),
+        (dict(output_dtype=torch.float8_e4m3fn), "output (torch.float8_e4m3fn,"),
+    ],
+)
+def test_the_bt_tail_refuses_a_protocol_it_does_not_reproduce(monkeypatch, kw, why):
+    logged = []
+    monkeypatch.setattr(
+        runtime, "unavailable_slots", lambda slots, reason: logged.append(reason)
+    )
+    tail = _bt_tail(SimpleNamespace(_workspace=_bt_workspace(**kw)))
+    reasons = tail.bind()
+    assert any(why in r for r in reasons), reasons
+    assert logged and why in logged[0]
+    assert not any(tail.supports(m) for m in (24, 56, 703))
+    assert tail.bind() == logged
+
+
+def test_the_bt_tail_refuses_another_flashinfer(monkeypatch, tmp_path):
+    import hashlib
+
+    from sgl_nvidia_mega.qwen3_5.boundary import bt_tail
+
+    for relative in bt_tail.FLASHINFER_SOURCES:
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(relative)
+    monkeypatch.setattr(bt_tail, "flashinfer_root", lambda: tmp_path)
+    (why,) = bt_tail.flashinfer_reasons()
+    assert all(relative in why for relative in bt_tail.FLASHINFER_SOURCES)
+    pinned = {
+        r: (hashlib.sha256(r.encode()).hexdigest(),) for r in bt_tail.FLASHINFER_SOURCES
+    }
+    monkeypatch.setattr(bt_tail, "FLASHINFER_SOURCES", pinned)
+    assert bt_tail.flashinfer_reasons() == []
+    monkeypatch.setattr(bt_tail, "flashinfer_root", lambda: None)
+    assert bt_tail.flashinfer_reasons() == ["needs FlashInfer"]
+
+
+@pytest.mark.parametrize("conv_core", [False, True])
+def test_slot_gdn_conv_core_hands_the_raw_rows_and_the_conv_to_the_core(conv_core):
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5.gdn import conv
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
+
+    log = _log()
+    verify, gdn, st = _gdn_verify_setup(log)
+    k = log.known
+    k["arrive2"] = torch.zeros(4, dtype=torch.int32)
+    k["split2"] = torch.zeros(4, dtype=torch.int32)
+    st.bound = {
+        "gdn": SimpleNamespace(
+            arrive={2: k["arrive2"]},
+            arrive_split={2: k["split2"]},
+            gdn_core_tc=False,
+            gdn_commit_fold=False,
+        )
+    }
+    opts = msgspec.structs.replace(
+        verify.SLOT, core=True, conv_rows=True, conv_core=conv_core
+    )
+    calls = {}
+
+    def views(qkvz, ba, nk, nv, hk, hv):
+        return qkvz[:, :32], qkvz[:, 32:].view(7, nv, hv), ba[:, :4], ba[:, 4:]
+
+    def conv_update(x, *args, **kw):
+        calls["conv"] = x
+        return torch.zeros(1, 7, 32).transpose(1, 2)
+
+    def core(qkv, *args, **kw):
+        calls["core"] = (qkv, kw)
+        return args[-1]
+
+    with (
+        patch(
+            "sglang.kernels.ops.attention.triton_gdn_fused_proj.qwen3_5_gdn_prefill_projection_views",
+            views,
+        ),
+        patch.object(conv, "conv_update", conv_update),
+        patch.object(core_kernel, "core", core),
+        patch.object(verify, "_out_proj", lambda *a: "out"),
+    ):
+        assert verify.step(gdn, torch.zeros(7, 4), st, opts) == "out"
+    qkv, kw = calls["core"]
+    assert kw["vsplit"] == 1
+    if not conv_core:
+        assert "conv" in calls and kw["conv"] is None
+        assert kw["early_dependents"] is False  # 7 rows: outside gdn_core's window
+        return
+    assert "conv" not in calls
+    assert qkv.data_ptr() == k["qkvz"].data_ptr() and tuple(qkv.shape) == (7, 32)
+    c = kw["conv"]
+    assert c.weight is gdn.attn.conv_weights and c.bias is None
+    for got, want in ((c.state, k["conv"][2]), (c.windows, k["window"][2])):
+        assert got.data_ptr() == want.data_ptr() and got.shape == want.shape
+    assert c.window_indices is k["inter"] and c.arrive is k["arrive2"]
+    assert c.arrive_split is k["split2"]
+    assert kw["early_dependents"] is True
+
+
+def test_slot_gdn_conv_core_builds_per_layer_counters_or_falls_back(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core
+
+    built = []
+    monkeypatch.setattr(verify, "unsupported", lambda _: "")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    monkeypatch.setattr(core, "build", lambda *a, **kw: built.append(kw))
+    model = _gdn_build_model()
+    model.model.layers[0].linear_attn.attn.__dict__.update(
+        conv_weights=torch.zeros(1536, 4, dtype=torch.bfloat16),
+        bias=None,
+        activation="silu",
+    )
+    slots = {"gdn_verify", "gdn_conv", "gdn_core", "gdn_conv_core"}
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
+    bound = gdn.build(model, SimpleNamespace(tokens_per_request=7))
+    for counters in (bound.arrive, bound.arrive_split):
+        assert list(counters) == [0] and counters[0].shape == (64,)
+        assert counters[0].dtype == torch.int32 and not counters[0].any()
+    assert built == [{"conv": True}] and bound.reason == ""
+    built.clear()
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots - {"gdn_conv"}))
+    bound = gdn.build(model, SimpleNamespace(tokens_per_request=7))
+    assert bound.arrive == {} and built == [{}] and bound.gdn_core
+    assert "gdn_conv_core: requires gdn_core and gdn_conv" in bound.reason
+    built.clear()
+    model.model.layers[0].linear_attn.attn.activation = None
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
+    bound = gdn.build(model, SimpleNamespace(tokens_per_request=7))
+    assert bound.arrive == {} and built == [{}]
+    assert "gdn_conv_core: layer 0: conv activation None" in bound.reason
+    model.model.layers[0].linear_attn.attn.activation = "silu"
+    for rows in (3, 9):
+        built.clear()
+        bound = gdn.build(model, SimpleNamespace(tokens_per_request=rows))
+        assert bound.arrive == {} and built == [{}]
+        assert f"gdn_conv_core: {rows} rows a request" in bound.reason
+
+
+@pytest.mark.parametrize("option", [False, True])
+def test_the_value_split_builds_only_under_the_measured_option(monkeypatch, option):
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core
+
+    built = []
+    monkeypatch.setattr(verify, "unsupported", lambda _: "")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    monkeypatch.setattr(core, "build", lambda *a, **kw: built.append(kw))
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"gdn_verify", "gdn_core"}))
+    monkeypatch.setattr(
+        runtime, "measured_option", lambda name: option and name == "gdn_value_split"
+    )
+    bound = gdn.build(_gdn_build_model(), SimpleNamespace(tokens_per_request=7))
+    assert bound.value_split is option
+    assert built == [{"vsplit": True} if option else {}]
+
+
+def test_the_value_split_runs_at_the_tp8_shards_7_through_112_rows():
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core
+
+    assert core.VSPLIT_HV == 8 and core.VSPLIT_ROWS == (7, 112)
+    assert [r for r in range(1, 900) if core.vsplit_for(r, 8) == 2] == list(
+        range(7, 113)
+    )
+    assert all(core.vsplit_for(r, hv) == 1 for r in (7, 56, 112) for hv in (4, 16))
+
+
+@pytest.mark.parametrize("value_split", [False, True])
+@pytest.mark.parametrize("conv_counters", [None, True, False])
+def test_the_core_takes_the_value_split_where_the_plan_runs_it(
+    monkeypatch, value_split, conv_counters
+):
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
+
+    verify, gdn, st = _gdn_verify_setup(_log())
+    monkeypatch.setattr(core_kernel, "VSPLIT_HV", 4)  # the setup's value heads
+    seen = []
+    monkeypatch.setattr(core_kernel, "core", lambda *a, **kw: seen.append(kw["vsplit"]))
+    monkeypatch.setattr(verify, "_out_proj", lambda *a: "out")
+    opts = msgspec.structs.replace(
+        verify.SLOT_PDL,
+        core=True,
+        value_split=value_split,
+        conv_core=conv_counters is not None,
+    )
+    counters = torch.zeros(4, dtype=torch.int32)
+    st.bound = {
+        "gdn": SimpleNamespace(
+            arrive={2: counters},
+            arrive_split={2: counters} if conv_counters else {},
+            gdn_core_tc=False,
+            gdn_commit_fold=False,
+        )
+    }
+    for rows in (7, 112, 119):
+        verify._fused(gdn, torch.zeros(rows, 4), *(None,) * 3, st, opts)
+    split = value_split and conv_counters is not False
+    assert seen == ([2, 2, 1] if split else [1, 1, 1])
+
+
+@pytest.mark.parametrize(
+    "conv_core, value_split",
+    [
+        pytest.param(True, False, id="conv"),
+        pytest.param(False, True, id="value-split"),
+    ],
+)
+def test_the_commit_fold_fails_closed_on_a_step_the_tcgen05_launch_cannot_take(
+    monkeypatch, conv_core, value_split
+):
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
+
+    verify, gdn, st = _gdn_verify_setup(_log())
+    monkeypatch.setattr(core_kernel, "VSPLIT_HV", 4)  # the setup's value heads
+    launched = []
+    monkeypatch.setattr(core_kernel, "core", lambda *a, **kw: launched.append(kw))
+    monkeypatch.setattr(verify, "_out_proj", lambda *a: "out")
+    opts = msgspec.structs.replace(
+        verify.SLOT_PDL, core=True, value_split=value_split, conv_core=conv_core
+    )
+    counters = torch.zeros(4, dtype=torch.int32)
+    bound = SimpleNamespace(
+        arrive={2: counters},
+        arrive_split={2: counters},
+        gdn_core_tc=True,
+        gdn_commit_fold=True,
+    )
+    st.bound = {"gdn": bound}
+    with pytest.raises(RuntimeError, match="gdn_commit_fold.* at 7 rows"):
+        verify._fused(gdn, torch.zeros(7, 4), *(None,) * 3, st, opts)
+    assert launched == []
+    # without the fold the same step runs gdn_core's own launch
+    bound.gdn_commit_fold = False
+    verify._fused(gdn, torch.zeros(7, 4), *(None,) * 3, st, opts)
+    ((kw,),) = [launched]
+    assert (kw["conv"] is not None) is conv_core
+    assert kw["vsplit"] == (2 if value_split else 1)
+
+
+def test_slot_gdn_core_releases_out_proj_at_its_entry_over_35_to_56_rows(
+    monkeypatch, caplog
+):
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
+
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"gdn_verify", "gdn_core"}))
+    _, gdn, st = _gdn_verify_setup(_log())
+    st.bound = {"gdn": SimpleNamespace(gdn_core_tc=False, gdn_commit_fold=False)}
+    seen = []
+    monkeypatch.setattr(
+        core_kernel, "core", lambda *a, **kw: seen.append(kw["early_dependents"])
+    )
+    monkeypatch.setattr(verify, "_out_proj", lambda *a: "out")
+    monkeypatch.setattr(verify, "_ENGAGED", set())
+    opts = msgspec.structs.replace(verify.SLOT_PDL, core=True)
+    released = []
+    with caplog.at_level("INFO"):
+        for rows in range(7, 134, 7):
+            assert (
+                verify._fused(gdn, torch.zeros(rows, 4), *(None,) * 3, st, opts)
+                == "out"
+            )
+            if seen.pop():
+                released.append(rows)
+    assert released == list(range(35, 57, 7))
+    line = "releases out_proj's BMM at its entry at {} rows"
+    assert line.format(56) + "\n" in caplog.text + "\n"
+    assert core_kernel.RELEASE_MAX_ROWS == 56
+    # the low-M out_proj is not cuBLASLt's programmatic-dependent BMM
+    st.slots = plan.Slots(lowm_outproj=True)
+    verify._fused(gdn, torch.zeros(49, 4), *(None,) * 3, st, opts)
+    assert seen == [False]
+
+
+def test_slot_lowm_ba_compiles_its_widths_or_falls_back(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import lowm
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+
+    built = []
+    monkeypatch.setattr(verify, "unsupported", lambda _: "")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    monkeypatch.setattr(lowm, "prepare_ba", lambda dev, w: built.append(w) or ("t", w))
+    monkeypatch.setattr(lowm, "ba_unsupported", lambda lin: "")
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"gdn_verify", "lowm_ba"}))
+    ctx = SimpleNamespace(tokens_per_request=7, widths=(7, 77, 84, 98, 112, 119))
+    model = _gdn_build_model()
+    model.model.layers[0].linear_attn.in_proj_ba = SimpleNamespace()
+    bound = gdn.build(model, ctx)
+    assert built == [84, 98, 112] and bound.reason == ""
+    assert bound.ba_lowm == {w: ("t", w) for w in (84, 98, 112)}
+    monkeypatch.setattr(lowm, "ba_unsupported", lambda lin: "weight (32, 4096)")
+    bound = gdn.build(model, ctx)
+    assert bound.ba_lowm == {}
+    assert "lowm_ba: layer 0: weight (32, 4096)" in bound.reason
+
+
+class _Stop(Exception):
+    pass
+
+
+@pytest.mark.parametrize("lowm_ba", [False, True])
+def test_slot_lowm_ba_hands_in_proj_ba_its_widths_tactic(monkeypatch, lowm_ba):
+    from sgl_nvidia_mega.qwen3_5 import lowm
+
+    verify, gdn, st = _gdn_verify_setup(_log())
+    st.bound = {"gdn": SimpleNamespace(ba_lowm={7: "tactic"})}
+    st.slots = plan.Slots(lowm_ba=lowm_ba)
+    seen = []
+
+    def pinned(g, x, ba=None):
+        seen.append(ba)
+        raise _Stop
+
+    monkeypatch.setattr(lowm, "in_proj_pinned", pinned)
+    with pytest.raises(_Stop):
+        verify.step(gdn, torch.zeros(7, 4), st, verify.SLOT)
+    assert seen == ["tactic" if lowm_ba else None]
+
+
+@pytest.mark.parametrize("lowm_ba", [False, True])
+def test_slot_lowm_ba_runs_beside_the_boundarys_e4m3_rows_too(monkeypatch, lowm_ba):
+    from sgl_nvidia_mega.qwen3_5 import lowm
+
+    verify, gdn, st = _gdn_verify_setup(_log())
+    st.bound = {"gdn": SimpleNamespace(ba_lowm={98: "tactic"})}
+    st.slots = plan.Slots(lowm_ba=lowm_ba, hop_fp8=True)
+    st.scratch = {}
+    x = torch.zeros(98, 4)
+    x8 = torch.zeros(98, 4, dtype=torch.float8_e4m3fn)
+    lowm.stash_fp8(st, x, x8)
+    seen = []
+
+    def fp8(g, rows, rows8, ba=None):
+        seen.append((rows8 is x8, ba))
+        raise _Stop
+
+    monkeypatch.setattr(lowm, "in_proj_pinned", lambda *a: pytest.fail("quantized"))
+    monkeypatch.setattr(lowm, "in_proj_fp8", fp8)
+    with pytest.raises(_Stop):
+        verify.step(gdn, x, st, verify.SLOT)
+    assert seen == [(True, "tactic" if lowm_ba else None)]
+
+
+@pytest.mark.parametrize("lowm_ba", [False, True])
+def test_slot_lowm_ba_runs_on_slot_bt_tails_deferred_projection(monkeypatch, lowm_ba):
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5 import lowm
+
+    verify, gdn, st = _gdn_verify_setup(_log())
+    st.bound = {"gdn": SimpleNamespace(ba_lowm={98: "tactic"})}
+    st.slots = plan.Slots(lowm_ba=lowm_ba, bt_tail=True, gdn_verify=True)
+    st.scratch = {}
+    x = torch.zeros(98, 4)
+    x8 = torch.zeros(98, 4, dtype=torch.float8_e4m3fn)
+    lowm.stash_fp8(st, x, x8)
+    seen = []
+
+    def deferred(g, rows, rows8, slot, ba=None):
+        seen.append((rows8 is x8, slot, ba))
+        raise _Stop
+
+    monkeypatch.setattr(lowm, "in_proj_pinned", lambda *a: pytest.fail("quantized"))
+    monkeypatch.setattr(lowm, "in_proj_fp8_deferred", deferred)
+    opts = msgspec.structs.replace(verify.SLOT, core=True)
+    with pytest.raises(_Stop):
+        verify.step(gdn, x, st, opts)
+    assert seen == [(True, "bt_tail", "tactic" if lowm_ba else None)]
+
+
+@pytest.mark.parametrize("alt", [False, True])
+def test_the_deferred_projection_runs_the_tables_bmm_and_in_proj_bas_tactic(
+    monkeypatch, alt
+):
+    from sgl_nvidia_mega.qwen3_5 import gemm_tactics, lowm
+
+    order = []
+    x = torch.zeros((98, 8), dtype=torch.bfloat16)
+    x8 = torch.zeros((98, 8), dtype=torch.float8_e4m3fn)
+    lin = SimpleNamespace(
+        weight=None, input_scale=torch.ones(1), weight_scale=torch.ones(1)
+    )
+    monkeypatch.setattr(
+        gemm_tactics,
+        "bmm",
+        lambda a, *rest: order.append("bmm") or (a is x8 and "qkvz"),
+    )
+    monkeypatch.setattr(
+        lowm,
+        "in_proj_ba",
+        lambda g, t, tactic: order.append("ba") or ("low-M" if tactic else "sglang"),
+    )
+    stream = SimpleNamespace(wait_stream=lambda s: order.append("wait"))
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+
+    class _Alt:
+        def __init__(self, s):
+            pass
+
+        def __enter__(self):
+            order.append("alt")
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(torch.cuda, "stream", _Alt)
+    gdn = SimpleNamespace(in_proj_qkvz=lin, alt_stream=stream if alt else None)
+    qkvz, ba, join = lowm.in_proj_fp8_deferred(gdn, x, x8, "bt_tail", "t")
+    assert (qkvz, ba) == ("qkvz", "low-M")
+    join()
+    assert order == (["wait", "bmm", "alt", "ba", "wait"] if alt else ["bmm", "ba"])

@@ -7,6 +7,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import pytest
 from sglang.kernels.plugin_kernels.nvidia import spec as registry
 from sglang.srt.kernel_plugins.nvidia import binding as guards
@@ -55,6 +56,17 @@ DOCUMENTED = dict(
     mamba_ssm_dtype="bfloat16",
     enable_hierarchical_cache=True,
     cuda_graph_config=default_cuda_graph_config(),
+)
+
+
+PREFILL = dict(
+    tp_size=1,
+    nnodes=1,
+    disaggregation_mode="prefill",
+    enable_linear_replayssm_spec=False,
+    moe_runner_backend="flashinfer_cutedsl",
+    flashinfer_allreduce_fusion_backend=None,
+    linear_attn_prefill_backend="flashinfer",
 )
 
 
@@ -113,6 +125,54 @@ def test_prefill_tp1_pp4_is_admitted_with_the_data_only_binding():
     )
 
 
+@pytest.mark.parametrize(
+    "switch, slots",
+    [
+        pytest.param(None, None, id="megakernel-alone"),
+        pytest.param("0", None, id="switch-off"),
+        pytest.param("1", "hop", id="slot-list"),
+        pytest.param("1", "", id="empty-slot-list"),
+    ],
+)
+def test_prefill_tp1_pp2_is_refused_without_the_measured_stack(
+    monkeypatch, switch, slots
+):
+    for name, value in (
+        ("SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION", switch),
+        (runtime.SLOTS_ENV, slots),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    message = _refusal(**PREFILL, pp_size=2)
+    assert "PD prefill requires TP1/PP4 without expert parallelism" in message, message
+    # TP1/PP4 keeps its admission, the FlashInfer prefill route included
+    assert _refusal(**PREFILL, pp_size=4) == ""
+
+
+def test_prefill_tp1_pp2_is_admitted_under_the_measured_stack(measured):
+    assert _refusal(**PREFILL, pp_size=2) == ""
+    assert _refusal(**PREFILL, pp_size=4) == ""
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param(dict(pp_size=2, ep_size=2), id="ep2"),
+        pytest.param(dict(pp_size=2, tp_size=2), id="tp2"),
+        pytest.param(dict(pp_size=3), id="pp3"),
+        pytest.param(dict(pp_size=1), id="pp1"),
+    ],
+)
+def test_the_measured_stack_admits_no_other_prefill_shape(measured, args):
+    message = _refusal(**{**PREFILL, **args})
+    assert (
+        "PD prefill requires TP1/PP4 or TP1/PP2 without expert parallelism" in message
+    ), message
+
+
 BREAKABLE = with_phase(
     default_cuda_graph_config(), Phase.DECODE, backend=Backend.BREAKABLE
 )
@@ -123,7 +183,7 @@ BREAKABLE = with_phase(
     [
         (dict(tp_size=1, nnodes=1), "tp_size 1"),
         (dict(pp_size=2), "pipeline parallelism is in use"),
-        (dict(enable_dp_attention=True, dp_size=4), "DP attention requires DEP8"),
+        (dict(attn_dp_size=4), "DP attention requires DEP8"),
         (dict(kv_cache_dtype="auto"), "kv_cache_dtype 'auto'"),
         (dict(speculative_algorithm=None), "speculative_algorithm None"),
         (dict(speculative_eagle_topk=4), "speculative_eagle_topk 4"),
@@ -313,6 +373,13 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(7, every)) == sorted(
         set(plan.Slots.__struct_fields__)
         - {
+            "bt_tail",
+            "bt_tail_early",
+            "bt_tail_early_fin",
+            "gemm_ar",
+            "fc2ar",
+            "gdn_conv_core",
+            "lowm_ba",
             "mkm_m32",
             "mkm_m64",
             "mkm_m128",
@@ -323,6 +390,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
             "route_pre_topk",
             "route_shared",
             "route_topk",
+            "route_big_mid",
         }
     )
     # Two requests also take every measured low-M launch and the hop's FP8 copy.
@@ -363,6 +431,10 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
         ]
         if rows <= plan.GDN_TRT_FRONT_MAX_ROWS:
             expected.extend(("gdn_front", "gdn_trt_front"))
+        if plan.GDN_CONV_CORE_MIN_ROWS <= rows <= plan.GDN_CONV_CORE_MAX_ROWS:
+            expected.append("gdn_conv_core")
+        if plan.LOWM_BA_MIN_ROWS <= rows <= plan.LOWM_BA_MAX_ROWS:
+            expected.append("lowm_ba")
         if rows <= plan.MKM_M32_MAX_ROWS:
             expected.append("mkm_m32")
         if plan.MKM_M32_MAX_ROWS < rows <= plan.MKM_M64_MAX_ROWS:
@@ -375,6 +447,10 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
             expected.append("route_gemm")
         if rows <= plan.HOP_MID_MAX_ROWS:
             expected.extend(("hop", "hop_fp8", "mka_push"))
+        else:
+            expected.extend(("bt_tail", "bt_tail_early", "bt_tail_early_fin"))
+        if plan.GEMM_AR_MIN_ROWS <= rows <= plan.GEMM_AR_MAX_ROWS:
+            expected.append("gemm_ar")
         assert _on(plan.slots(rows, every)) == sorted(expected)
     for rows in (448, 896):
         expected = [
@@ -387,6 +463,8 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
         ]
         if rows <= plan.MKM_M512_MAX_ROWS:
             expected.append("mkm_m512")
+        if rows <= plan.BT_TAIL_MAX_ROWS:
+            expected.extend(("bt_tail", "bt_tail_early", "bt_tail_early_fin"))
         assert _on(plan.slots(rows, every)) == sorted(expected)
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]
     assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]
@@ -511,6 +589,84 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert plan.widest((7, 14, 28), plan.ROUTE_MAX_ROWS) == 14
     assert plan.widest((7, 14, 28), plan.HOP_MAX_ROWS) == 14
     assert plan.widest((28,), plan.HOP_MAX_ROWS) == 0
+
+
+def test_slot_bt_tail_takes_the_widths_past_the_hop_through_the_bt_routes():
+    tail = plan.Facts(bt_tail=True)
+    assert [r for r in range(1, plan.MAX_ROWS + 1) if plan.slots(r, tail).bt_tail] == (
+        list(range(plan.BT_TAIL_MIN_ROWS, plan.BT_TAIL_MAX_ROWS + 1))
+    )
+    for hop, first in ((dict(hop=True), 16), (dict(hop=True, hop_mid=True), 29)):
+        facts = plan.Facts(
+            **hop, bt_tail=True, bt_tail_early=True, bt_tail_early_fin=True
+        )
+        for rows in (7, 14, 15, 16, 21, 28, 29, 35, 56, 112, 224, 703, 704, 896):
+            got = plan.slots(rows, facts)
+            assert got.bt_tail == (first <= rows <= plan.BT_TAIL_MAX_ROWS), rows
+            assert got.bt_tail_early == got.bt_tail == got.bt_tail_early_fin
+            assert not (got.hop and got.bt_tail)
+    assert not plan.slots(56, plan.Facts(bt_tail_early=True)).bt_tail_early
+    assert plan.covered((7, 35, 56, 896), tail, 7) == (7, 35, 56)
+
+
+def test_slot_bt_tail_runs_at_tp4_tp8_and_tep8_and_its_variants_need_it():
+    slots = frozenset({"bt_tail", "bt_tail_early", "bt_tail_early_fin"})
+    for tp, ep, name in ((4, 1, "tp4"), (8, 1, "tp8"), (8, 4, "tep8"), (8, 8, "tep8")):
+        assert topology.select(slots, topology.Topology(tp, 1, ep)) == slots, name
+    for shape in (topology.Topology(2), topology.Topology(8, 8, 8)):
+        assert topology.select(slots, shape) == frozenset(), shape.name
+    assert runtime.slot_reasons(frozenset({"bt_tail_early", "bt_tail_early_fin"})) == [
+        f"{runtime.SLOTS_ENV}: slot 'bt_tail_early' changes slot 'bt_tail''s "
+        "MoE-input launch",
+        f"{runtime.SLOTS_ENV}: slot 'bt_tail_early_fin' changes slot 'bt_tail''s "
+        "layer-input launch",
+    ]
+    assert runtime.slot_reasons(slots) == []
+    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
+
+    assert spec.numerics(slots).kind is NumericsKind.BITWISE
+
+
+def test_slots_gemm_ar_and_fc2ar_take_their_rows_on_the_bt_tails_points():
+    facts = plan.Facts(bt_tail=True, gemm_ar=True, fc2ar=True, tep8_moe=True)
+    on = {
+        name: [
+            r
+            for r in range(1, plan.MAX_ROWS + 1)
+            if getattr(plan.slots(r, facts), name)
+        ]
+        for name in ("gemm_ar", "fc2ar")
+    }
+    assert on["gemm_ar"] == list(
+        range(plan.GEMM_AR_MIN_ROWS, plan.GEMM_AR_MAX_ROWS + 1)
+    )
+    assert on["fc2ar"] == list(range(plan.FC2AR_MIN_ROWS, plan.FC2AR_MAX_ROWS + 1))
+    assert (plan.GEMM_AR_MIN_ROWS, plan.FC2AR_MIN_ROWS) == (33, 35)
+    assert plan.GEMM_AR_MAX_ROWS == plan.FC2AR_MAX_ROWS == 128
+    # no BT tail at a width, or no build: no slot
+    assert not plan.slots(
+        56, plan.Facts(gemm_ar=True, fc2ar=True, tep8_moe=True)
+    ).gemm_ar
+    assert not plan.slots(56, plan.Facts(bt_tail=True, tep8_moe=True)).fc2ar
+    assert not plan.slots(56, plan.Facts(bt_tail=True, fc2ar=True)).fc2ar
+    # hop_mid's widths stay on the hop
+    mid = plan.Facts(**{**msgspec.structs.asdict(facts), "hop": True, "hop_mid": True})
+    assert not plan.slots(28, mid).gemm_ar and plan.slots(35, mid).fc2ar
+
+
+def test_slots_gemm_ar_and_fc2ar_run_where_their_engines_run():
+    for tp, ep, name in ((4, 1, "tp4"), (8, 1, "tp8"), (8, 4, "tep8")):
+        assert topology.select(
+            frozenset({"gemm_ar"}), topology.Topology(tp, 1, ep)
+        ) == {"gemm_ar"}, name
+    assert topology.select(frozenset({"fc2ar"}), topology.Topology(8, 1, 4)) == {
+        "fc2ar"
+    }
+    for shape in (topology.Topology(4), topology.Topology(8), topology.Topology(2)):
+        assert topology.select(frozenset({"fc2ar"}), shape) == frozenset(), shape.name
+    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
+
+    assert spec.numerics({"bt_tail", "gemm_ar", "fc2ar"}).kind is NumericsKind.BITWISE
 
 
 def test_the_slot_plans_row_bounds_are_the_kernels():
@@ -690,8 +846,7 @@ def test_dep8_accepts_the_recipe_stock_moe_and_dp_lm_head(a2a):
     assert (
         _refusal(
             disaggregation_mode="decode",
-            enable_dp_attention=True,
-            dp_size=8,
+            attn_dp_size=8,
             ep_size=8,
             enable_dp_lm_head=True,
             moe_runner_backend="flashinfer_cutedsl",
@@ -700,3 +855,320 @@ def test_dep8_accepts_the_recipe_stock_moe_and_dp_lm_head(a2a):
         )
         == ""
     )
+
+
+@pytest.mark.parametrize(
+    "fields, name",
+    [
+        pytest.param(dict(tp_size=8, attn_dp_size=8, ep_size=8), "dep8", id="dep8"),
+        pytest.param(
+            dict(tp_size=8, attn_dp_size=1, dp_size=2, ep_size=8), "tep8", id="replicas"
+        ),
+    ],
+)
+def test_the_configured_topology_reads_only_the_resolved_attention_dp_width(
+    fields, name
+):
+    assert topology.from_config(SimpleNamespace(**fields)).name == name
+
+
+_DEP4_ARGS = dict(
+    tp_size=4,
+    nnodes=1,
+    disaggregation_mode="decode",
+    attn_dp_size=4,
+    ep_size=4,
+    moe_a2a_backend="flashinfer",
+    flashinfer_allreduce_fusion_backend=None,
+)
+
+
+@pytest.fixture
+def measured(monkeypatch):
+    monkeypatch.setenv("SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION", "1")
+    monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param({}, id="tp8"),
+        pytest.param(dict(disaggregation_mode="decode", ep_size=4), id="tep8"),
+        pytest.param(dict(tp_size=4, nnodes=1), id="tp4"),
+        pytest.param(dict(tp_size=2, nnodes=1, disaggregation_mode="decode"), id="tp2"),
+        pytest.param(
+            dict(
+                disaggregation_mode="decode",
+                attn_dp_size=8,
+                ep_size=8,
+                enable_dp_lm_head=True,
+                moe_runner_backend="flashinfer_cutedsl",
+                moe_a2a_backend="flashinfer_nvlink_one_sided",
+                flashinfer_allreduce_fusion_backend=None,
+            ),
+            id="dep8",
+        ),
+        pytest.param(_DEP4_ARGS, id="dep4"),
+    ],
+)
+def test_the_measured_request_is_accepted_at_every_decode_topology(measured, args):
+    # the launcher checks the request before a process reads its GPU and key
+    assert runtime.SLOTS > frozenset(runtime.SHIPPED_SLOTS)
+    assert _refusal(**args) == ""
+
+
+_KEY_SHAPES = {"tp8": (8, 1, 1), "tep8": (8, 1, 4), "dep4": (4, 4, 4)}
+
+
+def _key_slots(name, slots) -> frozenset:
+    if name not in _KEY_SHAPES:
+        return frozenset(
+            slot
+            for slot in slots
+            if name in topology.SLOT_TOPOLOGIES.get(slot, frozenset())
+        )
+    return topology.plan(slots, topology.Topology(*_KEY_SHAPES[name]))
+
+
+def _turned_on() -> frozenset:
+    return frozenset().union(
+        *(
+            _key_slots(name, slots) | (slots & runtime.OPTION_ROWS)
+            for (name, _), slots in runtime.MEASURED_PLAN.items()
+        )
+    ) - frozenset(runtime.SHIPPED_SLOTS)
+
+
+def _has_row(name: str) -> bool:
+    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
+
+    from sgl_nvidia_mega.qwen3_5 import draft
+
+    return name in spec.NUMERIC_TOLERANCES or (
+        (name in runtime.DRAFT_SLOTS or name in runtime.OPTION_ROWS)
+        and draft.numerics(frozenset({name})).kind is NumericsKind.TOLERANCE
+    )
+
+
+def test_each_slot_the_measured_stack_turns_on_is_labelled_bitwise_or_numeric():
+    bitwise, numeric = runtime.MEASURED_BITWISE, runtime.NUMERICS_CHANGE
+    assert len(set(bitwise)) == len(bitwise) and len(set(numeric)) == len(numeric)
+    assert not set(bitwise) & set(numeric)
+    assert set(bitwise) | set(numeric) == _turned_on()
+    opt_in = (
+        set(runtime.MEASURED_OPT_IN)
+        | set(runtime.MEASURED_DEP4)
+        | set(runtime.MEASURED_PREFILL)
+    )
+    assert len(_turned_on()) == (
+        len(opt_in)
+        + 2
+        + len(runtime.MEASURED_TEP8)
+        + len(runtime.MEASURED_BT_TAIL)
+        + len(runtime.MEASURED_BT_AR)
+        + len(runtime.MEASURED_CP_LITE)
+        + len(runtime.MEASURED_OPTIONS)
+        + len(runtime.MEASURED_TEP8_OPTIONS)
+        + len(runtime.MEASURED_DRAFT)
+        + len(runtime.MEASURED_DRAFT_TEP8)
+        + len(runtime.MEASURED_HOOKS)
+    )
+
+
+def test_each_numeric_slot_has_a_spec_row_except_the_unbounded_ones():
+    unbounded = {name for name in runtime.NUMERICS_CHANGE if not _has_row(name)}
+    assert unbounded == set(runtime.NUMERICS_UNBOUNDED) == {"hop_mid"}
+    assert not any(_has_row(name) for name in runtime.MEASURED_BITWISE)
+
+
+def test_the_measured_numerics_claim_carries_each_numerics_change_row(measured):
+    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
+
+    from sgl_nvidia_mega.qwen3_5 import draft
+
+    claim = spec.numerics(
+        topology.plannable(runtime.SLOTS) | runtime.measured_options()
+    )
+    assert claim.kind is NumericsKind.TOLERANCE
+    assert dict(claim.tolerances) == {
+        key: bound
+        for name in runtime.NUMERICS_CHANGE
+        for key, bound in spec.NUMERIC_TOLERANCES.get(name, {}).items()
+    }
+    assert dict(draft.numerics(draft._requested()).tolerances) == {
+        "draft_logits.rel": 2**-7
+    }
+
+
+def test_slot_gdn_conv_core_takes_gdn_cores_widths_from_29_through_224_rows():
+    import msgspec
+
+    every = plan.Facts(
+        gdn_verify=True, gdn_pdl=True, gdn_core=True, gdn_conv=True, gdn_conv_core=True
+    )
+    covered = [
+        w for w in range(7, plan.MAX_ROWS + 1, 7) if plan.slots(w, every).gdn_conv_core
+    ]
+    assert covered == list(range(35, plan.GDN_CONV_CORE_MAX_ROWS + 1, 7))
+    assert plan.slots(plan.GDN_CONV_CORE_MIN_ROWS, every).gdn_conv_core
+    assert not plan.slots(plan.GDN_CONV_CORE_MIN_ROWS - 1, every).gdn_conv_core
+    assert not plan.slots(plan.GDN_CONV_CORE_MAX_ROWS + 1, every).gdn_conv_core
+    # past gdn_trt_front's rows, whose front already runs the conv
+    assert plan.GDN_CONV_CORE_MIN_ROWS == plan.GDN_TRT_FRONT_MAX_ROWS + 1
+    assert plan.GDN_CONV_CORE_MAX_ROWS <= plan.GDN_CORE_MAX_ROWS
+    for off in ("gdn_core", "gdn_conv", "gdn_verify"):
+        facts = msgspec.structs.replace(every, **{off: False})
+        assert not any(plan.slots(w, facts).gdn_conv_core for w in range(29, 225))
+
+
+def test_slot_gdn_conv_core_claims_bitwise_numerics():
+    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
+
+    slots = frozenset({"gdn_verify", "gdn_core", "gdn_conv"})
+    assert "gdn_conv_core" not in spec.NUMERIC_TOLERANCES
+    assert spec.numerics(slots | {"gdn_conv_core"}) == spec.numerics(slots)
+    assert spec.numerics(frozenset({"gdn_conv_core"})).kind is NumericsKind.BITWISE
+
+
+@pytest.mark.parametrize(
+    "shape, conv_core",
+    [
+        ((2,), True),
+        ((4,), True),
+        ((8,), True),
+        ((8, 1, 4), True),
+        ((8, 8, 8), False),
+    ],
+)
+def test_the_gdn_core_variants_run_on_their_topologies(shape, conv_core):
+    slots = frozenset({"gdn_verify", "gdn_core", "gdn_conv", "gdn_conv_core"})
+    selected = topology.select(slots, topology.Topology(*shape))
+    assert ("gdn_conv_core" in selected) is conv_core
+    assert ("gdn_conv_core" in selected) == ("gdn_core" in selected)
+    assert runtime.slot_reasons(slots) == []
+
+
+def test_the_gdn_core_variants_need_gdn_core():
+    conv_core = (
+        f"{runtime.SLOTS_ENV}: slot 'gdn_conv_core' runs slot 'gdn_conv''s conv in "
+        "slot 'gdn_core''s launch"
+    )
+    for slots in (
+        {"gdn_verify", "gdn_core", "gdn_conv_core"},
+        {"gdn_verify", "gdn_conv", "gdn_conv_core"},
+    ):
+        assert runtime.slot_reasons(frozenset(slots)) == [conv_core]
+
+
+@pytest.mark.parametrize(
+    "overlap", ["enable_two_batch_overlap", "enable_single_batch_overlap"]
+)
+def test_slot_gdn_conv_core_never_runs_under_batch_overlap(monkeypatch, overlap):
+    monkeypatch.setattr(
+        runtime,
+        "SLOTS",
+        frozenset({"gdn_verify", "gdn_core", "gdn_conv", "gdn_conv_core"}),
+    )
+    assert registry.Feature.TWO_BATCH_OVERLAP not in spec.SPEC.features
+    message = _refusal(**{overlap: True})
+    assert "overlap is in use and Qwen3.5 does not accept it" in message, message
+
+
+def test_slot_lowm_ba_takes_84_through_112_rows_of_gdn_verify():
+    every = plan.Facts(gdn_verify=True, lowm_ba=True)
+    covered = [
+        w for w in range(7, plan.MAX_ROWS + 1, 7) if plan.slots(w, every).lowm_ba
+    ]
+    assert covered == [84, 91, 98, 105, 112]
+    assert not any(
+        plan.slots(w, plan.Facts(lowm_ba=True)).lowm_ba for w in range(84, 113)
+    )
+
+
+def test_slot_lowm_ba_claims_tolerance_numerics_on_the_tp8_shard(monkeypatch):
+    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
+
+    claim = spec.numerics(frozenset({"gdn_verify", "lowm_ba"}))
+    assert claim.kind is NumericsKind.TOLERANCE
+    slots = frozenset({"gdn_verify", "lowm_ba"})
+    for shape, on in (((8,), True), ((8, 1, 4), True), ((4,), False), ((2,), False)):
+        assert ("lowm_ba" in topology.select(slots, topology.Topology(*shape))) is on
+    assert runtime.slot_reasons(slots) == []
+    assert runtime.slot_reasons(frozenset({"lowm_ba"})) == [
+        f"{runtime.SLOTS_ENV}: slot 'lowm_ba' runs slot 'gdn_verify''s in_proj_ba"
+    ]
+
+
+def test_dep4_alone_keeps_the_upstream_refusal(monkeypatch):
+    monkeypatch.delenv("SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION", raising=False)
+    message = _refusal(**_DEP4_ARGS)
+    assert "Qwen3.5 DP attention requires DEP8" in message, message
+    assert "moe_a2a_backend 'flashinfer' is not 'none'" in message, message
+    assert "flashinfer_allreduce_fusion_backend None is not 'cutedsl'" in message
+
+
+def test_a_slot_list_keeps_the_dep4_refusal(measured, monkeypatch):
+    monkeypatch.setenv(runtime.SLOTS_ENV, "gdn_verify,gdn_core")
+    monkeypatch.setattr(runtime, "SLOTS", runtime._requested_slots())
+    assert "Qwen3.5 DP attention requires DEP8" in _refusal(**_DEP4_ARGS)
+
+
+@pytest.mark.parametrize(
+    "change, reason",
+    [
+        pytest.param(
+            dict(moe_runner_backend="flashinfer_cutedsl"),
+            "moe_runner_backend 'flashinfer_cutedsl' is not 'flashinfer_trtllm'",
+            id="runner",
+        ),
+        pytest.param(
+            dict(tp_size=8, nnodes=2, attn_dp_size=4, ep_size=8),
+            "Qwen3.5 DP attention requires DEP8",
+            id="dp4-of-tp8",
+        ),
+        pytest.param(
+            dict(attn_dp_size=2, ep_size=4),
+            "Qwen3.5 DP attention requires DEP8",
+            id="dp2",
+        ),
+    ],
+)
+def test_the_measured_stack_admits_dep4_only(measured, change, reason):
+    """Only DEP4's own shape is admitted, with its MoE runner pin."""
+    assert reason in _refusal(**{**_DEP4_ARGS, **change})
+
+
+def test_dep4_runs_only_its_declared_slots():
+    dep4, dep8 = topology.Topology(4, 4, 4), topology.Topology(8, 8, 8)
+    every = frozenset(topology.SLOT_TOPOLOGIES)
+    assert dep4.name == "dep4" and dep4.stock_widths
+    assert topology.select(every, dep4) == topology.DEP4_SLOTS
+    assert topology.plan(every, dep4) == topology.DEP4_SLOTS
+    # DEP8 and the TP8 / TEP8 keys declare none of DEP4's new rows
+    new = {"gdn_core_tc", "gdn_commit_fold", "gathered_cdf"}
+    for other in (dep8, topology.Topology(8), topology.Topology(8, 1, 4)):
+        assert not topology.select(every, other) & new
+    assert topology.select(every, dep8) == {
+        "gdn_verify",
+        "gdn_pdl",
+        "gdn_conv",
+        "mka",
+        "multi_request",
+        "sharded_gumbel",
+    }
+
+
+def test_dep4_rows_need_the_slots_they_run_in(monkeypatch):
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"gdn_verify", "gdn_core_tc"}))
+    assert "slot 'gdn_core_tc' runs slot 'gdn_core''s launch" in " ".join(
+        runtime.slot_reasons()
+    )
+    monkeypatch.setattr(
+        runtime, "SLOTS", frozenset({"gdn_verify", "gdn_core", "gdn_commit_fold"})
+    )
+    assert "slot 'gdn_commit_fold' folds the commit into slot 'gdn_core_tc''s" in (
+        " ".join(runtime.slot_reasons())
+    )
+    monkeypatch.setattr(runtime, "SLOTS", topology.DEP4_SLOTS)
+    assert runtime.slot_reasons() == []

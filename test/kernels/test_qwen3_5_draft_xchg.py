@@ -534,8 +534,11 @@ def test_round_replays_from_a_cuda_graph(ranks, boundary):
 V_TOP1 = 31040  # TP8's LM head shard rows
 
 
-@pytest.fixture(scope="module")
-def top1x(ranks):
+TOP1_CFGS = {"shipped": (256, 8, False, False), "cfg1": (256, 8, True, True)}
+
+
+@pytest.fixture(scope="module", params=sorted(TOP1_CFGS))
+def top1x(ranks, request):
     from sgl_nvidia_mega.qwen3_5.sm103.draft.top1 import Top1Exchange
 
     rank, world, group, cpu_group = ranks
@@ -548,6 +551,7 @@ def top1x(ranks):
         group=group,
         cpu_group=cpu_group,
         device=torch.device("cuda", torch.cuda.current_device()),
+        cfg=TOP1_CFGS[request.param],
     )
 
 

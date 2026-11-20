@@ -15,11 +15,11 @@ fused_a, DraftMlaQuery's FP8 query + the block's KV insert at its out_cache_loc 
 core stays SGLang's, its sliding-window MLA call on the pre-built FP8 query (``save_kv_cache=False``).
 
 Stage 3a (``SGLANG_K31_DRAFT_MK_ACCEPT``): the greedy verify accept, the gather of every rank's row argmax,
-the DFlash accept and the simulated acceptance, runs ``DraftAccept`` through SGLang's ``SupportsDraftAccept``.
+the DFlash accept and the simulated acceptance, runs ``DraftAccept``; the K3.1 DFlash runtime (kimi_k31/dflash) refuses it.
 
 Stage 2b (``SGLANG_K31_DRAFT_MK_AUX``): the DFlash worker's decode aux append, the committed rows'
-target context into the draft KV, runs ``DraftAux`` (aux.py) on the chain's comm through SGLang's
-``SupportsDraftAux`` for the same B1 x 8 rows; SGLang replays it on the main stream.
+target context into the draft KV, runs ``DraftAux`` (aux.py) on the chain's comm through the K3.1 DFlash
+runtime for the same B1 x 8 rows, which replays it on the main stream.
 
 Mailboxes: one captured graph per batch size replays ``parity=0`` every round; each of the 2L hops has its
 own slot, so a slot's reuse distance is a whole round, as for the target's graph-baked parity. All
@@ -55,6 +55,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     )
 
 from sgl_nvidia_mega.kimi_k31 import spec as target
+from sgl_nvidia_mega.kimi_k31.dflash.protocol import DRAFT_CHAINS
 from sgl_nvidia_mega.kimi_k31.k3.default_scope import best_default
 
 # The SGLang names this module reads, by file under the sglang package; test/unit/test_contract.py pins them.
@@ -147,11 +148,11 @@ AUX = ENABLED and best_default(AUX_ENV, "1", "0") not in ("", "0")
 M1B_ENV = "SGLANG_K31_DRAFT_MK_M1B"
 M1B = ENABLED and best_default(M1B_ENV, "1", "0") not in ("", "0")
 # Stage 2a: the draft graph's proposal (candidate top-k over the target lm_head + the selector walk, greedy or
-# sampled per request) on MK blocks too, through SGLang's SupportsDraftSelectorHead.
+# sampled per request) on MK blocks too, through the K3.1 DFlash runtime's draft sampler.
 HEAD_ENV = "SGLANG_K31_DRAFT_MK_HEAD"
 HEAD = ENABLED and best_default(HEAD_ENV, "1", "0") not in ("", "0")
-# Stage 3a: the greedy verify accept (row-argmax gather + DFlash accept + sim) on the chain's comm, through
-# SGLang's SupportsDraftAccept.
+# Stage 3a: the greedy verify accept (row-argmax gather + DFlash accept + sim) on the chain's comm; the K3.1
+# DFlash runtime refuses it (its round keeps SGLang's greedy accept).
 ACCEPT_ENV = "SGLANG_K31_DRAFT_MK_ACCEPT"
 ACCEPT = ENABLED and os.environ.get(ACCEPT_ENV, "0") not in ("", "0")  # off by default
 # Stage 2c: the block embedding on device (the anchor row from its owner rank's vocab shard, the mask rows
@@ -188,13 +189,14 @@ class DraftLayersOnChain:
     draft_loop = draft_extend = begin_draft_round = graph_variants = (
         None  # SGLang's own paths
     )
-    draft_aux_rows: tuple[int, ...] = ()  # SGLang's SupportsDraftAux
-    draft_head_requests: tuple[int, ...] = ()  # SGLang's SupportsDraftSelectorHead
+    # what the chain offers the K3.1 DFlash runtime (kimi_k31/dflash/runtime.py)
+    draft_aux_rows: tuple[int, ...] = ()
+    draft_head_requests: tuple[int, ...] = ()
     draft_head_sampling = (
         True  # the chain's DraftSelector walks greedy and sampled requests
     )
-    draft_accept_requests: tuple[int, ...] = ()  # SGLang's SupportsDraftAccept
-    draft_embed_requests: tuple[int, ...] = ()  # SGLang's SupportsDraftEmbed
+    draft_accept_requests: tuple[int, ...] = ()
+    draft_embed_requests: tuple[int, ...] = ()
     _embed_on = False  # attach_draft_embed ran: forward embeds input_ids on device
 
     def __init__(self, model, hf_config, ctx):
@@ -266,6 +268,8 @@ class DraftLayersOnChain:
         self.draft_embed_requests = (1,) if EMBED else ()
         self._accept = None
         self.m1b = M1B
+        # The target's DFlash runtime (dflash/runtime.py) serves only a draft chain built here.
+        DRAFT_CHAINS.append(self)
         if M1B:
             logger.info(
                 "NVIDIA megakernel: draft MK M1b: attention on MK blocks, core = SGLang's sliding-window MLA (%s)",
@@ -554,7 +558,7 @@ class DraftLayersOnChain:
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden)
 
     def attach_draft_head(self, *, lm_head, selector, draft_config):
-        """SGLang's SupportsDraftSelectorHead: the chain's candidate head over this rank's target lm_head shard
+        """The runtime's draft sampler: the chain's candidate head over this rank's target lm_head shard
         and the draft's selector; returns the selector's static (tokens, candidates, q)."""
         from sgl_nvidia_mega.kimi_k31.sm103.draft.chain import DraftHeadWeights
 
@@ -579,13 +583,13 @@ class DraftLayersOnChain:
         return walk.tokens, walk.candidates, walk.q
 
     def stage_draft_head_sampling(self, *, temperatures, greedy_mask):
-        """SGLang's SupportsDraftSelectorHead: the selector's host refresh before a draft forward."""
+        """The runtime's draft sampler: the selector's host refresh before a draft forward."""
         self.chain.selector.stage_sampling(
             temperatures=temperatures, greedy_mask=greedy_mask
         )
 
     def attach_draft_embed(self, *, embedding, mask_token_id):
-        """SGLang's SupportsDraftEmbed: the chain embeds the block from this rank's target vocab shard (the anchor
+        """The runtime's opt-in embed: the chain embeds the block from this rank's target vocab shard (the anchor
         row's owner rank multicasts it) and the mask token's row. Collective: the mask row goes through SGLang's
         vocab-parallel lookup once, so every rank holds it replicated."""
         from sgl_nvidia_mega.kimi_k31.sm103.draft.chain import DraftEmbedWeights
@@ -603,7 +607,7 @@ class DraftLayersOnChain:
         self._embed_on = True
 
     def attach_draft_accept(self, *, sim_real_token):
-        """SGLang's SupportsDraftAccept: DraftAccept on the chain's argmax box (compiles here)."""
+        """The runtime's opt-in greedy accept: DraftAccept on the chain's argmax box (compiles here)."""
         self._accept = self.chain.attach_accept(sim_real_token=sim_real_token)
 
     def draft_accept(self, *, local, candidates, prefix_lens, sim_commit, out, parity):
@@ -614,7 +618,7 @@ class DraftLayersOnChain:
     def draft_aux(
         self, *, target_hidden, positions, slots_2d, commit_lens, kv_caches, parity
     ):
-        """SGLang's SupportsDraftAux: the decode aux append on MK blocks (DraftAux)."""
+        """The runtime's aux append: the decode aux append on MK blocks (DraftAux)."""
         if target_hidden.shape[0] != self.aux.rows:
             raise RuntimeError(f"{AUX_ENV}: target_hidden {tuple(target_hidden.shape)}")
         # parity is the gather's one-hop mailbox slot; SGLang alternates it over every call, eager or replayed.

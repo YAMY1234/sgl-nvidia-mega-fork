@@ -99,6 +99,17 @@ class BuiltK31Verify:
     draft_loop = draft_extend = begin_draft_round = graph_variants = None
     # no speculative runtime hooks factory: SGLang keeps its own strategies
     speculative_runtime_hooks = None
+    # The DFlash runtime (SGLang's SupportsDFlashRuntime), by "module:attribute": SGLang's
+    # DFlash worker imports it at its start (not when SGLang loads this spec), checks it
+    # against SGLang's guard (sglang.srt.kernel_plugins.nvidia.kimi_k31_dflash_binding) and
+    # builds it with this target, or declines it for a setup it does not serve. It calls the phase methods below (prepare_sampled_accept, sampled_accept_fits,
+    # sampled_accept, kda_commit_enabled, kda_commit). K31MK_DFLASH_RUNTIME=0 names none:
+    # SGLang's stock DFlash round then runs beside the target megakernel.
+    dflash_runtime = (
+        "sgl_nvidia_mega.kimi_k31.dflash.runtime:K31DFlashRuntime"
+        if os.environ.get("K31MK_DFLASH_RUNTIME", "1") != "0"
+        else ""
+    )
 
     def __init__(self, weights, deadline_s):
         from .verify_weights import WeightModel
@@ -354,9 +365,15 @@ class BuiltK31Verify:
         self._count_round("sampled accept")
         return out
 
+    @property
+    def kda_commit_enabled(self):
+        """Whether kda_commit runs (K31MK_KDA_COMMIT, default_scope); fixed at build."""
+        return self._kda_commit
+
     def kda_commit(self, **kwargs):
         """Stage 3b: the post-verify KDA commit in one launch (draft.commit.kda_commit, keyword
-        arguments as there). False (the caller keeps today's path) with K31MK_KDA_COMMIT off (default_scope)."""
+        arguments as there). False (launching nothing) with K31MK_KDA_COMMIT off (default_scope); the DFlash
+        runtime calls it only while kda_commit_enabled."""
         if not self._kda_commit:
             return False
         from .sm103.draft.commit import kda_commit

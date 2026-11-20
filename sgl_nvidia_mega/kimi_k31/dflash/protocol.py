@@ -15,6 +15,7 @@ from typing import Any
 class _NoDraftChain:
     """Stands in for the draft when it is not on the megakernel chain: offers nothing."""
 
+    widths: tuple[int, ...] = ()
     draft_aux_rows: tuple[int, ...] = ()
     draft_head_requests: tuple[int, ...] = ()
     draft_accept_requests: tuple[int, ...] = ()

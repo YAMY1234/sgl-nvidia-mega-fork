@@ -106,23 +106,10 @@ class KdaCommit:
         slots: torch.Tensor,
         track: torch.Tensor,
     ) -> Optional[dict]:
-        backend = self._target_attn_backend
-        if isinstance(backend, HybridAttnBackend):
-            backend = backend.target_verify_backend()
-        if (
-            not isinstance(backend, HybridLinearAttnBackend)
-            or pp_spec_stable_rows_enabled()
-        ):
+        state = self._kda_state()
+        if state is None:
             return None
-        linear = backend.linear_attn_backend
-        state_pool = linear.state_pool
-        # Host-only checkpoints index the KDA ring by req_pool_idx; this commit
-        # writes it through the mamba slot, so SGLang's commit takes over.
-        if not state_pool.replayssm_is_kda or state_pool.replayssm_request_ring:
-            return None
-        spec_state = state_pool.get_speculative_mamba2_params_all_layers()
-        if len(spec_state.conv) != 1:
-            return None
+        linear, spec_state = state
         state_slots = linear.forward_state_slots(bs, batch.mamba_track_indices)
         slots.copy_(state_slots.working)
         if state_slots.track is None:
@@ -141,6 +128,28 @@ class KdaCommit:
             track_slots=track,
             track_interval=mamba_track_grid(batch.tree_cache.page_size),
         )
+
+    def _kda_state(self):
+        """(the linear-attention backend, its speculative state) when the commit's
+        kernel is laid out for the target's recurrent state, else None."""
+        backend = self._target_attn_backend
+        if isinstance(backend, HybridAttnBackend):
+            backend = backend.target_verify_backend()
+        if (
+            not isinstance(backend, HybridLinearAttnBackend)
+            or pp_spec_stable_rows_enabled()
+        ):
+            return None
+        linear = backend.linear_attn_backend
+        state_pool = linear.state_pool
+        # Host-only checkpoints index the KDA ring by req_pool_idx; this commit
+        # writes it through the mamba slot.
+        if not state_pool.replayssm_is_kda or state_pool.replayssm_request_ring:
+            return None
+        spec_state = state_pool.get_speculative_mamba2_params_all_layers()
+        if len(spec_state.conv) != 1:
+            return None
+        return linear, spec_state
 
     def _kda_commit_inputs(self, bs: int) -> Tuple[torch.Tensor, ...]:
         if self._kda_commit_buffers is None or self._kda_commit_buffers[0].numel() < bs:

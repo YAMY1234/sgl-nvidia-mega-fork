@@ -7,6 +7,7 @@ that storage."""
 import ast
 import contextlib
 import copy
+import os
 import sys
 import types
 import unittest
@@ -114,6 +115,7 @@ class K31DFlashRuntimeRound(unittest.TestCase):
         self.addCleanup(mlp_sync.stop)
         log = self.calls.append
         self.chain = types.SimpleNamespace(
+            widths=(self.BLOCK,),
             draft_aux_rows=(self.BLOCK,),
             draft_head_requests=(1,),
             draft_head_sampling=True,
@@ -171,7 +173,7 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             "batched_small_copy": False,
             "draft_model": types.SimpleNamespace(
                 candidate_selector=types.SimpleNamespace(top_k=16),
-                draft_config=None,
+                draft_config=types.SimpleNamespace(is_domino=False),
             ),
             "draft_model_runner": types.SimpleNamespace(
                 runner_ids=types.SimpleNamespace(space=lambda kind: None),
@@ -204,13 +206,23 @@ class K31DFlashRuntimeRound(unittest.TestCase):
                 )
             ),
         }
-        graphs = types.SimpleNamespace(
+        self.graphs = graphs = types.SimpleNamespace(
             graph=types.SimpleNamespace(
                 cuda_graph_config=types.SimpleNamespace(
                     decode=types.SimpleNamespace(bs=[1])
                 )
             )
         )
+        # The measured setup's server args; a test changes one before building.
+        self.spec = types.SimpleNamespace(
+            speculative_draft_window_size=1024,
+            speculative_dflash_draft_kv_ring=False,
+            speculative_use_block_verification=False,
+        )
+        self.kda_state = ("linear", "speculative state")
+        kda_state = patch.object(rt.KdaCommit, "_kda_state", lambda kda: self.kda_state)
+        kda_state.start()
+        self.addCleanup(kda_state.stop)
         verify_input = types.SimpleNamespace(
             prepare_for_verify=lambda *a, **kw: log("prepare_verify") or ("fb", True)
         )
@@ -219,6 +231,8 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             "built_megakernel": lambda model: self.chain,
             "get_parallel": lambda: types.SimpleNamespace(tp_rank=0),
             "get_exec": lambda: graphs,
+            "get_spec": lambda: self.spec,
+            "apply_dflash_verify_logits_adjustments": lambda **kw: log("adjust"),
             "_prepare_dflash_draft_block_unchecked": lambda **kw: log("prepare_block"),
             "ForwardBatch": lambda **kw: log("forward_batch") or kw,
             "DFlashVerifyInput": lambda **kw: verify_input,
@@ -240,6 +254,7 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             reads_from=lambda *a, **kw: types.SimpleNamespace(
                 bind=lambda fb, translator: log("bind")
             ),
+            bind=lambda fb, translator: log("bind (shared mapping)"),
             write_ids=lambda reader: torch.zeros(8, dtype=torch.int64),
         )
 
@@ -386,13 +401,138 @@ class K31DFlashRuntimeRound(unittest.TestCase):
                 self.assertEqual(out is not None, served)
                 self.assertEqual(bool(self.calls), served)
 
-    def test_init_refuses_what_the_round_does_not_serve(self):
+    def test_a_kernel_limit_sends_sampled_rounds_to_sglang_and_keeps_greedy_ones(self):
+        """Block verification, or no sampled-accept build: the megakernel sampled
+        accept cannot run, the greedy accept still can."""
+        for name, change in {
+            "block verification": lambda: setattr(
+                self.spec, "speculative_use_block_verification", True
+            ),
+            "no sampled accept": lambda: setattr(
+                self.target, "prepare_sampled_accept", lambda **kw: False
+            ),
+        }.items():
+            with (
+                self.subTest(name),
+                patch.object(self, "spec", copy.copy(self.spec)),
+                patch.object(self, "target", copy.copy(self.target)),
+            ):
+                change()
+                self.verify_out.logits_output.next_token_logits = "shard"
+                self.verify_out.logits_output.hidden_states = torch.zeros(8, 4)
+                runtime = self._runtime()
+                del self.calls[:]
+                out, _ = self._round(runtime, self._batch())
+                self.assertEqual((out, self.calls), (None, []))
+                out, _ = self._round(runtime, self._batch(is_all_greedy=True))
+                self.assertIsNotNone(out)
+                self.assertIn("kda_commit", self.calls)
+
+    def test_a_layout_the_kernels_do_not_serve_sends_every_round_to_sglang(self):
+        """No head for the captured graphs or the block, no aux, the draft KV ring, a
+        sliding-window draft pool, a recurrent state the KDA commit is not laid out
+        for: nothing fails at startup, and every round runs SGLang's, logged once."""
+        bindings = self.bindings
+        cases = {
+            "decode graphs [1, 2, 4]": lambda: setattr(
+                self.graphs.graph.cuda_graph_config.decode, "bs", [1, 2, 4]
+            ),
+            "block 5": lambda: bindings.__setitem__("block_size", 5),
+            "no aux": lambda: setattr(self.chain, "draft_aux_rows", ()),
+            "ring": lambda: setattr(
+                self.spec, "speculative_dflash_draft_kv_ring", True
+            ),
+            "sliding window": lambda: setattr(
+                bindings["draft_model_runner"].runner_ids, "space", lambda kind: "swa"
+            ),
+            "KDA state": lambda: setattr(self, "kda_state", None),
+        }
+        for name, change in cases.items():
+            with self.subTest(name):
+                saved = (
+                    dict(self.chain.__dict__),
+                    dict(self.spec.__dict__),
+                    dict(bindings),
+                    dict(bindings["draft_model_runner"].runner_ids.__dict__),
+                    self.kda_state,
+                )
+                change()
+                with self.assertLogs(self.rt.logger, "WARNING") as logs:
+                    runtime = self._runtime()
+                    del self.calls[:]
+                    out, published = self._round(runtime, self._batch())
+                    self._round(runtime, self._batch())
+                self.assertEqual((out, self.calls, published), (None, [], []))
+                (warning,) = logs.output  # once, at the draft graph's capture
+                self.assertIn("every round runs SGLang's round", warning)
+                self.chain.__dict__.update(saved[0])
+                self.spec.__dict__.update(saved[1])
+                bindings.update(saved[2])
+                bindings["draft_model_runner"].runner_ids.__dict__.update(saved[3])
+                self.kda_state = saved[4]
+                self.graphs.graph.cuda_graph_config.decode.bs = [1]
+        # The head stays off the draft graph only where it cannot serve it.
+        self.graphs.graph.cuda_graph_config.decode.bs = [1, 2, 4]
+        runtime = self.rt.K31DFlashRuntime(self._binding(), self.target)
+        self.assertIsNone(runtime.draft_sampler(lm_head="lm_head"))
+        self.graphs.graph.cuda_graph_config.decode.bs = [1]
+        # Without a draft graph (cuda graphs off) the worker never asks for the head.
+        runtime = self.rt.K31DFlashRuntime(self._binding(), self.target)
+        out, _ = self._round(runtime, self._batch())
+        self.assertIsNone(out)
+
+    def test_the_shared_draft_mapping_without_a_draft_window(self):
+        self.spec.speculative_draft_window_size = None
+        runtime = self._runtime()
+        del self.calls[:]
+        out, _ = self._round(runtime, self._batch())
+        self.assertIsNotNone(out)
+        self.assertNotIn("compact_lens", self.calls)
+        self.assertIn("bind (shared mapping)", self.calls)
+
+    def test_gathered_logits_of_a_greedy_batch_take_the_adjusted_argmax(self):
+        """SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER=0: no sampled accept is built, sampled
+        rounds run SGLang's, a greedy round accepts on the gathered logits."""
+        lp = self.bindings["target_logits_processor"]
+        lp.is_deferred_shard = lambda x: self.calls.append("is_deferred_shard") or False
+        plain = types.SimpleNamespace(is_set=lambda: True, get=lambda: False)
+        with patch.object(
+            self.rt,
+            "envs",
+            types.SimpleNamespace(SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER=plain),
+        ):
+            runtime = self._runtime()
+        self.assertNotIn("prepare_sampled", self.calls)
+        self.assertFalse(lp.defer_plain_gather)
+        self.assertIsNone(self._round(runtime, self._batch())[0])
+        logits = torch.zeros(8, 32)
+        logits[:, 5] = 1.0
+        self.verify_out.logits_output.next_token_logits = logits
+        del self.calls[:]
+        self._round(runtime, self._batch(is_all_greedy=True))
+        ((_, target_predict),) = [c for c in self.calls if c[0] == "accept_block"]
+        self.assertEqual(target_predict.tolist(), [5] * 8)
+        self.assertLess(
+            self.calls.index("adjust"),
+            self.calls.index(("accept_block", target_predict)),
+        )
+
+    def test_no_recurrent_commit_and_a_domino_draft_follow_sglangs_round(self):
+        self.bindings["need_mamba_verify_commit"] = False
+        self.bindings["draft_model"].draft_config.is_domino = True
+        runtime = self._runtime()
+        del self.calls[:]
+        out, _ = self._round(runtime, self._batch())
+        self.assertIsNotNone(out)
+        self.assertNotIn("kda_commit", self.calls)
+        # SGLang's round accepts a Domino draft greedily, sampled batch or not.
+        self.assertNotIn("sampled_accept", self.calls)
+        self.assertIn("deferred_argmax", self.calls)
+
+    def test_init_refuses_what_the_runtime_does_not_implement(self):
         for name, change in {
             "KDA commit": lambda: setattr(self.target, "kda_commit_enabled", False),
             "opt-in accept": lambda: setattr(self.chain, "draft_accept_requests", (1,)),
-            "sampled accept": lambda: setattr(
-                self.target, "prepare_sampled_accept", lambda **kw: False
-            ),
         }.items():
             with (
                 self.subTest(name),
@@ -403,10 +543,29 @@ class K31DFlashRuntimeRound(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "K3.1 DFlash runtime"):
                     self.rt.K31DFlashRuntime(self._binding(), self.target)
                 self.chain.__dict__.update(saved)
-        # without the draft graph (and its head) the round refuses to run
-        runtime = self.rt.K31DFlashRuntime(self._binding(), self.target)
-        with self.assertRaisesRegex(RuntimeError, "never attached"):
-            self._round(runtime, self._batch())
+
+
+class K31DFlashRuntimeNaming(unittest.TestCase):
+    def test_the_target_names_the_runtime_only_with_a_draft_on_the_chain(self):
+        """Without a draft on the megakernel chain (another TP size, another draft) the
+        runtime has nothing to run its rounds on: SGLang's DFlash round runs."""
+        try:
+            from sgl_nvidia_mega.kimi_k31.verify_spec import BuiltK31Verify
+        except ImportError as e:  # the GPU-only kernel packages
+            self.skipTest(f"verify_spec does not import here: {e}")
+        from sgl_nvidia_mega.kimi_k31.dflash.protocol import DRAFT_CHAINS
+
+        name = BuiltK31Verify.dflash_runtime.fget
+        saved = list(DRAFT_CHAINS)
+        self.addCleanup(lambda: DRAFT_CHAINS.__setitem__(slice(None), saved))
+        with patch.dict(os.environ):
+            os.environ.pop("K31MK_DFLASH_RUNTIME", None)
+            DRAFT_CHAINS.clear()
+            self.assertEqual(name(None), "")
+            DRAFT_CHAINS.append(object())
+            self.assertEqual(name(None), K31DFlashRuntimeGuard.PATH)
+            os.environ["K31MK_DFLASH_RUNTIME"] = "0"
+            self.assertEqual(name(None), "")
 
 
 class K31DFlashRuntimeGuard(unittest.TestCase):
@@ -488,25 +647,14 @@ class K31DFlashRuntimeGuard(unittest.TestCase):
             role="test",
         )
 
-    def test_the_measured_setup_is_served_and_any_other_is_named(self):
-        guard = self.sgl.DFlashGuard(self.runtime.guards)
-        self.assertEqual(guard.unmet(self.worker), [])
-        self.worker.block_size = 5
-        self.worker._use_aux_graph = False
-        unserved = guard.unmet(self.worker)
-        self.assertEqual([m.split()[0] for m in unserved], ["aux_graph", "block_size"])
-        self.assertEqual(unserved[1], "block_size is 5, expected 8")
-
-    def test_tp8_or_wider_decode_graphs_decline_to_sglangs_round(self):
-        """Setups that ran SGLang's stock DFlash round beside the target megakernel
-        before the runtime existed must still start, with one warning."""
-        for tp_size, graph_bs, key in ((8, (1,), "tp_size"), (16, (1, 2, 4), "decode")):
+    def test_no_setup_declines_the_runtime(self):
+        """The runtime declares no setup guards: SGLang binds it on the measured setup,
+        at TP8 and with decode graphs [1, 2, 4] alike; the target build and the draft
+        chain decide what runs (K31DFlashRuntimeRound)."""
+        self.assertEqual(self.runtime.guards, {})
+        for tp_size, graph_bs in ((16, (1,)), (8, (1,)), (16, (1, 2, 4))):
             with self.subTest(tp_size=tp_size, graph_bs=graph_bs):
                 self._publish(tp_size=tp_size, graph_bs=graph_bs)
-                with self.assertLogs(self.sgl.logger, "WARNING") as logs:
-                    bound = self.sgl.bind_dflash_runtime(self.worker, None)
-                self.assertIsNone(bound)
-                (warning,) = logs.output
-                self.assertIn("does not serve this DFLASH setup", warning)
-                self.assertIn(f"{key}", warning)
-                self.assertIn("DFlash phases run stock", warning)
+                guard = self.sgl.DFlashGuard(self.runtime.guards)
+                self.assertEqual(guard.unmet(self.worker), [])
+                self.sgl.DFlashBinding(self.worker, frozenset(self.runtime.bindings))

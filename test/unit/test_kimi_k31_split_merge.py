@@ -7,7 +7,6 @@ that storage."""
 import ast
 import contextlib
 import copy
-import os
 import sys
 import types
 import unittest
@@ -119,8 +118,6 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             draft_aux_rows=(self.BLOCK,),
             draft_head_requests=(1,),
             draft_head_sampling=True,
-            draft_accept_requests=(),
-            draft_embed_requests=(),
             attach_draft_head=lambda **kw: (
                 log("attach_head")
                 or (torch.arange(7), torch.zeros(1, 7, 16), torch.zeros(1, 7, 16))
@@ -130,7 +127,6 @@ class K31DFlashRuntimeRound(unittest.TestCase):
         protocol.DRAFT_CHAINS.append(self.chain)
         self.addCleanup(protocol.DRAFT_CHAINS.remove, self.chain)
         self.target = types.SimpleNamespace(
-            kda_commit_enabled=True,
             prepare_sampled_accept=lambda **kw: log("prepare_sampled") or True,
             sampled_accept_fits=lambda bs, logits=None: True,
             sampled_accept=lambda **kw: (
@@ -529,20 +525,23 @@ class K31DFlashRuntimeRound(unittest.TestCase):
         self.assertNotIn("sampled_accept", self.calls)
         self.assertIn("deferred_argmax", self.calls)
 
-    def test_init_refuses_what_the_runtime_does_not_implement(self):
-        for name, change in {
-            "KDA commit": lambda: setattr(self.target, "kda_commit_enabled", False),
-            "opt-in accept": lambda: setattr(self.chain, "draft_accept_requests", (1,)),
+    def test_a_chain_without_its_aux_or_head_builds_no_sampled_accept(self):
+        """The sampled accept (a collective build out of the KV budget) serves only
+        rounds on the chain; a chain without the aux or the head serves none."""
+        for name, offer in {
+            "no aux": "draft_aux_rows",
+            "no head": "draft_head_requests",
         }.items():
-            with (
-                self.subTest(name),
-                patch.object(self, "target", copy.copy(self.target)),
-            ):
+            with self.subTest(name):
                 saved = dict(self.chain.__dict__)
-                change()
-                with self.assertRaisesRegex(RuntimeError, "K3.1 DFlash runtime"):
-                    self.rt.K31DFlashRuntime(self._binding(), self.target)
+                setattr(self.chain, offer, ())
+                del self.calls[:]
+                self._runtime()
+                self.assertNotIn("prepare_sampled", self.calls)
                 self.chain.__dict__.update(saved)
+        del self.calls[:]
+        self._runtime()
+        self.assertIn("prepare_sampled", self.calls)
 
 
 class K31DFlashRuntimeNaming(unittest.TestCase):
@@ -553,18 +552,18 @@ class K31DFlashRuntimeNaming(unittest.TestCase):
             from sgl_nvidia_mega.kimi_k31.verify_spec import BuiltK31Verify
         except ImportError as e:  # the GPU-only kernel packages
             self.skipTest(f"verify_spec does not import here: {e}")
+        from sgl_nvidia_mega.kimi_k31 import verify_spec
         from sgl_nvidia_mega.kimi_k31.dflash.protocol import DRAFT_CHAINS
 
         name = BuiltK31Verify.dflash_runtime.fget
         saved = list(DRAFT_CHAINS)
         self.addCleanup(lambda: DRAFT_CHAINS.__setitem__(slice(None), saved))
-        with patch.dict(os.environ):
-            os.environ.pop("K31MK_DFLASH_RUNTIME", None)
+        with patch.object(verify_spec, "RUNTIME", True):
             DRAFT_CHAINS.clear()
             self.assertEqual(name(None), "")
             DRAFT_CHAINS.append(object())
             self.assertEqual(name(None), K31DFlashRuntimeGuard.PATH)
-            os.environ["K31MK_DFLASH_RUNTIME"] = "0"
+        with patch.object(verify_spec, "RUNTIME", False):  # K31MK_DFLASH_RUNTIME=0
             self.assertEqual(name(None), "")
 
 

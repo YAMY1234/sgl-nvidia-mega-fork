@@ -9,7 +9,13 @@ nothing, so no phase is served and no collective runs for it.
 
 from __future__ import annotations
 
+import os
 from typing import Any
+
+# The K3.1 DFlash runtime with everything it runs on: the draft chain's aux and head, the
+# sampled accept and the KDA commit. K31MK_DFLASH_RUNTIME=0 names no runtime, so SGLang's
+# DFlash round runs beside the target megakernel (the draft chain still builds).
+RUNTIME = os.environ.get("K31MK_DFLASH_RUNTIME", "1") != "0"
 
 
 class _NoDraftChain:
@@ -18,8 +24,6 @@ class _NoDraftChain:
     widths: tuple[int, ...] = ()
     draft_aux_rows: tuple[int, ...] = ()
     draft_head_requests: tuple[int, ...] = ()
-    draft_accept_requests: tuple[int, ...] = ()
-    draft_embed_requests: tuple[int, ...] = ()
 
 
 NO_DRAFT_CHAIN = _NoDraftChain()

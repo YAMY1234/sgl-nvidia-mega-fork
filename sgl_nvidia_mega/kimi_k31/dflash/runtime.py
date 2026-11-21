@@ -259,24 +259,18 @@ class K31DFlashRuntime:
         draft = self._draft_chain
         # Ranks that differ would wait in different collectives below.
         megakernel_agree(
-            (
-                draft.draft_aux_rows,
-                draft.draft_head_requests,
-                draft.draft_accept_requests,
-                draft.draft_embed_requests,
-            ),
+            (draft.draft_aux_rows, draft.draft_head_requests),
             what="DFlash draft chain offers",
         )
         self._aux_chain = offered(draft, draft.draft_aux_rows)
-        _require(
-            not draft.draft_accept_requests and not draft.draft_embed_requests,
-            "the opt-in megakernel accept and embed are not served "
-            "(unset SGLANG_K31_DRAFT_MK_ACCEPT and SGLANG_K31_DRAFT_MK_EMBED)",
+        # None: sampled rounds run SGLang's (_unserved); greedy rounds still run here. A
+        # chain without the aux or the head serves no round (_round_reason, draft_sampler),
+        # so nothing is built for it (rank-uniform: the offers agree above).
+        self._megakernel_sampled = (
+            self._prepare_megakernel_sampled_accept()
+            if self._aux_chain is not None and draft.draft_head_requests
+            else None
         )
-        # Fixed at build (K31MK_KDA_COMMIT).
-        _require(built.kda_commit_enabled, "the KDA commit is off (K31MK_KDA_COMMIT)")
-        # None: sampled rounds run SGLang's (_unserved); greedy rounds still run here.
-        self._megakernel_sampled = self._prepare_megakernel_sampled_accept()
 
     # ---- init phases
 
@@ -406,7 +400,7 @@ class K31DFlashRuntime:
         """Why no round can run here although the head serves the draft graphs: the
         aux and KDA kernels' layouts."""
         if self._aux_chain is None:
-            return "no megakernel aux on the draft chain (SGLANG_K31_DRAFT_MK_AUX)"
+            return "no megakernel aux on the draft chain (see the draft MK build log)"
         # The aux writes the per-slot draft table the ring replaces.
         if self._draft_kv_ring:
             return "the draft KV ring (the megakernel aux writes per-slot draft rows)"

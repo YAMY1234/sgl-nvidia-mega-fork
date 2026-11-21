@@ -507,8 +507,7 @@ sgl-nvidia-mega/
 The contribution suite consists of unit tests and E2E tests. Each supported
 model/hardware configuration needs an accuracy test and a performance test
 against the same native SGLang baseline. See the
-[contributor guide](CONTRIBUTING.md#required-tests) for the comparison protocol
-and the distinction between required coverage and the initial CI rollout.
+[CI test guide](AGENTS.md#3-ci-test-guide) for the comparison protocol.
 
 ```bash
 python3 -m pytest test/unit -v -rfE
@@ -532,10 +531,9 @@ standalone DeepSeek-V4.1-Flash kernel tests remain outside required contribution
 
 ## Contributing
 
-Follow [CONTRIBUTING.md](CONTRIBUTING.md): merge prerequisite SGLang bindings
-through normal SGLang CI first, then validate the Mega PR through the label-based
-integration flow. The guide defines unit/E2E coverage, matched accuracy and
-performance comparisons, and the evidence to include in a PR.
+Follow [AGENTS.md](AGENTS.md): its dev guide (what belongs in this repository and
+how to write it), contribution guide (the flow with SGLang and the PR) and CI test
+guide (unit and E2E tests and the comparison protocol).
 
 ## License
 

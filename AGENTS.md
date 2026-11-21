@@ -19,8 +19,8 @@ Terms used below: a **Mega PR** is a pull request to this repository; a
 replaces the stock code; **stock** code is the step as SGLang (or this package's
 copy of SGLang's step) runs it without the megakernel's kernels.
 
-[README.md](README.md) describes what each model's megakernel covers and how to
-launch it.
+[README.md](README.md) lists the supported models; each model's page in
+`docs/models/` describes what its megakernel covers and how to launch it.
 
 ## 1. Dev guide
 
@@ -279,9 +279,11 @@ flowchart LR
   | Same case | Performance | Measured result | Measured result | Relative change and noise | Result and link |
 
 - A new model adds, in the same PR: its entries in `SPECS`, its unit tests, its
-  E2E tests and its entry in `test/e2e/ci_models.yaml`, its row in the README's
-  supported-models table, and one line in `.github/CODEOWNERS` naming its owner.
-- Update the README wherever coverage, requirements or launch commands change.
+  E2E tests and its entry in `test/e2e/ci_models.yaml`, its page in
+  `docs/models/` and one row in the README's supported-models table, and one
+  line in `.github/CODEOWNERS` naming its owner.
+- Update the model's page wherever coverage, requirements or launch commands
+  change. Keep the README short: the per-model detail goes on the model's page.
 
 ### Reporting results
 

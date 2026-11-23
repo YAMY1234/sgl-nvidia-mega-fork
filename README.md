@@ -20,6 +20,7 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | Kimi K3 (packed MXFP4) | GB300 (SM103, 152 SMs); 148-SM B300 (SM103) and B200/GB200 (SM100) with `sm148` | 8 | Decode rows 1–8, 16, 32 and 64; fixed q4–q8 verification within 64 token rows. Admission and tested configurations differ; see [`spec.py`](sgl_nvidia_mega/kimi_k3/spec.py). The 148-SM admission has no TP8 serving validation yet; the same gate was validated on Kimi K3.1 at TP16 on GB200 |
 | Kimi K3.1 (packed MXFP4) | GB300 (SM103) | 16 (one NVLink domain); 8 | DFlash target verify steps of 8 rows a request (7 drafted tokens and the anchor) at 1 to 8 requests, without DCP or with DCP equal to TP, also as the decode role of a PD-disaggregated deployment; the DFlash2 draft decoder layers at one request. Served and measured end to end at TP16, one request. See [Kimi K3.1 on GB300](#kimi-k31-on-gb300) |
 | GLM-5.3, GLM-5.2 (NVFP4) | B300 / GB300 (SM103), Rubin (SM107) | 8 (one node, or two trays of one NVLink domain); 4 (one GB300 tray or one Rubin node) | TP8: MTP target verify steps of 4 to 16 rows (batch 1 to 4 at 4 rows a request, batch 1 to 2 at 6); TP4: verify steps of up to 48 rows at 4 to 6 rows a request (batch 1 to 8 at 6); the NextN draft step in its captured graphs |
+| GLM-5.2 (NVFP4) | Rubin (SM107) | 16 (four trays of one NVLink domain) | One request, EAGLE 7 steps / topk 1 / 8 draft tokens: the 75-layer decoder chain, dense layers 0-2, the fused NextN draft and the fused verify tail, launched from prebuilt cubins. See [TP16 on Rubin](docs/models/glm5_3.md#tp16-on-rubin) |
 
 For DeepSeek-V4.1-Flash, larger verify steps, prefill and extend run
 SGLang's standard path. Qwen3.5 also offers the explicit GDN prefill slot below. Their draft specs provide the DSpark proposal and the
@@ -187,6 +188,9 @@ With the megakernel on, all shipped slots run; none needs to be listed. `SGLANG_
   finite build deadline and compiles it into all six reachable TP8 remote-wait
   paths; expiry likewise stores through address 0x0 and traps.
 - **No silent fallback.** With `--enable-nvidia-megakernel`, an unsupported setup stops the server at startup, before the weights load, listing every reason; a model the loaded weights do not fit stops every rank after the load.
+
+Any EAGLE v2 model can also run its topk-1 decode step as one CUDA graph (off by
+default, behind its own switches); see [docs/spec_step.md](docs/spec_step.md).
 
 ## Quick Start
 

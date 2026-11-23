@@ -30,9 +30,7 @@ def config_disable_reasons(cfg, hf_config):
         reasons.append("K31 verify requires DFLASH")
     q = int(cfg.speculative_num_draft_tokens or 0)
     if not supported_query_width(q):
-        reasons.append(
-            "K31 verify requires explicit Q8, Q16, or opt-in K31MK_VERIFY_Q5=1"
-        )
+        reasons.append("K31 verify requires Q5, Q8 or Q16")
     if not cfg.enable_linear_replayssm_spec:
         reasons.append("K31 verify requires KDA ReplaySSM spec rings")
     if cfg.enable_linear_replayssm:
@@ -49,24 +47,17 @@ def config_disable_reasons(cfg, hf_config):
     dcp = int(getattr(cfg, "dcp_size", 1) or 1)
     cp = int(getattr(cfg, "attn_cp_size", 1) or 1)
     prefill_cp = bool(getattr(cfg, "enable_prefill_cp", False))
-    q5_scope = q == 5 and supported_query_width(q) and int(cfg.tp_size) == dcp == 8
-    if q == 5 and not (q5_scope and cp == 1 and not prefill_cp):
-        reasons.append(
-            "K31 Q5 is limited to TP8/DCP8 without extra context parallelism"
-        )
     if dcp > 1 or cp > 1 or prefill_cp:
         # Sparse verify's context-parallel path: index-K / latent KV token-strided over the
-        # whole TP group, Q8 rows (dsa/verify.py PreparedSparseVerifyMla).
+        # whole TP group, Q5/Q8 rows (dsa/verify.py PreparedSparseVerifyMla).
         if not (
             dcp == int(cfg.tp_size)
             and dcp in DCP_SIZES
-            and (q == 8 or q5_scope)
+            and q in (5, 8)
             and cp == 1
             and not prefill_cp
         ):
-            reasons.append(
-                "K31 verify supports DCP8/TP8 or DCP16/TP16 at Q8, or opt-in Q5 at DCP8/TP8"
-            )
+            reasons.append("K31 verify supports DCP8/TP8 or DCP16/TP16 at Q5 or Q8")
     reasons += _disaggregation_reasons(cfg)
     return reasons
 
@@ -117,22 +108,16 @@ class BuiltK31Verify:
 
         self.query_width = int(weights.query_width)
         if not supported_query_width(self.query_width):
-            raise ValueError("K31 verify requires Q8, Q16, or opt-in K31MK_VERIFY_Q5=1")
-        if self.query_width == 5:
-            from sglang.srt.runtime_context import get_parallel
-
-            parallel = get_parallel()
-            if int(parallel.tp_size) != 8 or int(parallel.attn_dcp_size) != 8:
-                raise ValueError("K31 Q5 requires TP8/DCP8")
+            raise ValueError("K31 verify requires Q5, Q8 or Q16")
         self.keys = verify_keys(self.query_width, weights.request_batches)
         self.request_batches = tuple(b for b, _, _ in self.keys)
         self.widths = tuple(r for _, _, r in self.keys)
-        if self.query_width == 5:
-            logger.info(
-                "NVIDIA megakernel: experimental Q5 enabled; Breq=%s, rows=%s",
-                self.request_batches,
-                self.widths,
-            )
+        logger.info(
+            "NVIDIA megakernel: Q%d enabled; Breq=%s, rows=%s",
+            self.query_width,
+            self.request_batches,
+            self.widths,
+        )
         model = WeightModel(weights)
         self.resources = build_resources(
             model,

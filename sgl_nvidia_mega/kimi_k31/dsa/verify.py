@@ -7,7 +7,6 @@ stock's [1,Q,H,D] score layout; per-row causal lengths mask top-k selection.
 """
 
 import logging
-import os
 from dataclasses import dataclass
 from functools import cache
 
@@ -32,7 +31,7 @@ from ..verify_binding import VerifyStepView
 from ..verify_contract import served_request_batches, verify_keys
 from ..verify_spec import BuiltK31Verify
 from .indexer import IndexProjection, IndexWeights
-from .mla import CpSparseMla, SparseMla
+from .mla import _CP_MAX_ROWS, CpSparseMla, SparseMla
 from .scratch import RowScratch, row_buffer
 
 # Names read from SGLang. A contract test checks these before GPU use.
@@ -77,31 +76,48 @@ def _gate_stream(device):
 
 @cache
 def _direct_query_state(group, device):
-    """One stable 128-head buffer for serial DCP8 sparse layers and graph profiles.
+    """One stable buffer of the DCP core's query rows (CpSparseMla: up to _CP_MAX_ROWS rows of
+    128 heads) for serial DCP sparse layers and graph profiles, or None (the query is
+    all-gathered on the group) where the group is not one NVLink clique with multicast.
 
     The entry barrier stays enabled on every gather: a rank cannot overwrite the
     previous layer's query until all ranks have finished consuming it on main.
     """
     if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("K31MK_DSA_DIRECT_QAG must initialize before graph capture")
+        raise RuntimeError(
+            "the direct DCP query gather must initialize before graph capture"
+        )
     if not all(in_the_same_node_as(group.cpu_group)) and not is_one_nvlink_clique(
         group.cpu_group, group.device
     ):
-        raise RuntimeError("K31MK_DSA_DIRECT_QAG requires one NVLink clique")
+        logger.info(
+            "NVIDIA megakernel: the DCP group is not one NVLink clique; the query is "
+            "all-gathered on the group"
+        )
+        return None
     state = create_state(
         group.device_group,
         group.rank_in_group,
-        64,
+        _CP_MAX_ROWS,
         128 * 576 // 2,
         device=device,
     )
-    if state.symm_mem_hdl.multicast_ptr == 0:
-        raise RuntimeError("K31MK_DSA_DIRECT_QAG requires multicast symmetric memory")
     # Raw FP8 bytes are transported as bf16-sized words, without conversion. The
-    # last 32 heads are padding and must stay zero, including on the first replay.
+    # padding heads past DCP x heads must stay zero, including on the first replay.
     state.comm_buff.zero_()
     torch.cuda.synchronize(device)
-    torch.distributed.barrier(group=group.cpu_group)
+    # Also the barrier: no rank writes into a peer's buffer before the peer zeroed it. The
+    # ranks agree on multicast, or they would gather on different paths.
+    multicast = torch.tensor([int(state.symm_mem_hdl.multicast_ptr != 0)])
+    torch.distributed.all_reduce(
+        multicast, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+    )
+    if not multicast.item():
+        logger.info(
+            "NVIDIA megakernel: the DCP group has no multicast; the query is all-gathered "
+            "on the group"
+        )
+        return None
     return state
 
 
@@ -188,16 +204,12 @@ class SparseVerifyStep(VerifyStepView):
             raise ValueError("the context-split indexer runs only in sparse verify")
 
 
-# ``K31MK_DSA_EARLY_QAG=1`` (default off), DCP sparse verify whose top-k merge is the custom one-shot kernel
-# (dsa_dcp_sharded._TOPK_MERGE usable for the rows): the query all-gather and its copies run on the main stream right
-# after the MLA query, overlapping the indexer chain on the index stream, instead of on the index stream after the
-# selection. Every rank orders its DCP collectives the same way: the selection's cross-rank merge waits for the
-# gather's event. Otherwise (no usable merge: a NCCL candidate gather on the index stream) today's order stays.
-DSA_EARLY_QAG = os.environ.get("K31MK_DSA_EARLY_QAG", "0") != "0"
+# DCP sparse verify whose top-k merge is the custom one-shot kernel (dsa_dcp_sharded._TOPK_MERGE usable for the
+# rows): the query all-gather and its copies run on the main stream right after the MLA query, overlapping the
+# indexer chain on the index stream, instead of on the index stream after the selection. Every rank orders its DCP
+# collectives the same way: the selection's cross-rank merge waits for the gather's event. Otherwise (no usable
+# merge: a NCCL candidate gather on the index stream) the gather follows the selection.
 _EARLY_QAG_LOGGED = []
-# Opt-in DCP8/TP8 transport only: preserve the early/legacy stream order, but
-# multicast each rank's 12 FP8 heads directly into the core's 128-head layout.
-DSA_DIRECT_QAG = os.environ.get("K31MK_DSA_DIRECT_QAG", "0") == "1"
 _DIRECT_QAG_LOGGED = []
 
 
@@ -249,8 +261,7 @@ class VerifySelection:
 
     def run(self, query, gates, cache, table, step, collective_after=None):
         """``collective_after``: DCP only, an event the cross-rank selection waits for after the scoring is enqueued
-        (K31MK_DSA_EARLY_QAG: the query all-gather on main), so every rank issues its DCP collectives in the same
-        order."""
+        (the early query all-gather on main), so every rank issues its DCP collectives in the same order."""
         import deep_gemm
         from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
             _restore_row_stride,
@@ -346,7 +357,7 @@ class PreparedSparseVerifyMla:
         self.packed_index_gate = False
         self._q_gathered = (
             torch.cuda.Event()
-        )  # K31MK_DSA_EARLY_QAG: the query all-gather (and its copies) done
+        )  # the early query all-gather (and its copies) done
         self.sparse_values = {}
         self.index_cache = None
         self.step = None
@@ -363,14 +374,10 @@ class PreparedSparseVerifyMla:
                 heads=self.dcp_size * base.heads,
                 scratch=scratch,
             )
-            if DSA_DIRECT_QAG:
-                if self.dcp_size != 8 or base.heads != 12 or not 0 < rows <= 64:
-                    raise ValueError(
-                        "K31MK_DSA_DIRECT_QAG requires DCP8, 12 local heads and <=64 rows"
-                    )
-                self.direct_qag = _direct_query_state(
-                    get_parallel().dcp_group, base.device
-                )
+            # Each rank multicasts its FP8 heads straight into the core's query rows; CpSparseMla
+            # bounds the heads and rows to the buffer's.
+            self.direct_qag = _direct_query_state(get_parallel().dcp_group, base.device)
+            if self.direct_qag is not None:
                 # Bind the full padded buffer before capture, not the 96-head
                 # slice returned by all_gather_inner. No copy or rebind at run time.
                 self.cp_mla.query = (
@@ -424,15 +431,15 @@ class PreparedSparseVerifyMla:
         return self
 
     def early_gather(self, rows):
-        """K31MK_DSA_EARLY_QAG and the selection's merge is the one-shot kernel for ``rows`` (no NCCL on the index
-        stream that could run concurrently with a gather on main)."""
+        """The selection's merge is the one-shot kernel for ``rows`` (no NCCL on the index stream that could run
+        concurrently with a gather on main)."""
         merge = DCP_SHARDED._TOPK_MERGE
-        if not (DSA_EARLY_QAG and merge is not None and merge.usable(rows)):
+        if merge is None or not merge.usable(rows):
             return False
         if not _EARLY_QAG_LOGGED:  # use-time, once per process
             _EARLY_QAG_LOGGED.append(True)
             logger.info(
-                "NVIDIA megakernel: K31MK_DSA_EARLY_QAG engaged (DCP sparse verify gathers the query on the "
+                "NVIDIA megakernel: early query gather engaged (DCP sparse verify gathers the query on the "
                 "main stream after the MLA query; the selection merge waits for it)"
             )
         return True
@@ -452,8 +459,9 @@ class PreparedSparseVerifyMla:
             if not _DIRECT_QAG_LOGGED:
                 _DIRECT_QAG_LOGGED.append(True)
                 logger.info(
-                    "NVIDIA megakernel: K31MK_DSA_DIRECT_QAG engaged (DCP8 direct FP8 query "
-                    "multicast into 128-head layout; entry and exit barriers retained)"
+                    "NVIDIA megakernel: direct query gather engaged (DCP%d FP8 query multicast "
+                    "into the 128-head layout; entry and exit barriers retained)",
+                    self.dcp_size,
                 )
             return
         own = query.view(torch.uint8).view(rows, self.base.heads * 576)

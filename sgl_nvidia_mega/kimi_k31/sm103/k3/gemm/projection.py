@@ -5,7 +5,6 @@ evict_first weight TMA; policies map padded rows to (M tile, N tile, split K,
 stages); attention owns live slot masks)."""
 
 import logging
-import os
 from functools import cache
 
 import cuda.bindings.driver as cuda
@@ -31,8 +30,8 @@ def matrix_view(tensor, *, output=False):
 
 # Packed attention input projections (TP8: MLA K3.1 [3776, 7168], K3 [3648, 7168]; KDA
 # [6288, 7168]): (M tile, N tile, split K, stages) per batch of rows, from GB300 sweeps.
-# The fallback is the tactic of up to 8 rows (one N8 tile); a wider unlisted batch would reread
-# the weights once per 8 rows, so it is logged once per (kind, batch) until a sweep adds it.
+# The fallback is the tactic of up to 8 rows (one N8 tile); a batch wider than every entry
+# rereads the weights once per 8 rows, so it is logged once per (kind, batch) until a sweep adds it.
 GB300_TACTICS = {
     "mla": {
         1: (64, 8, 1, 12),
@@ -94,34 +93,19 @@ _SM103_TP16_LOGGED: set = set()
 logger = logging.getLogger(__name__)
 
 
-def projection_tactic(kind, batch, device, tp=8, rows=None):
+def projection_tactic(kind, batch, device, rows=None):
     """The split-K tactic of the packed ``kind`` ("mla" / "kda") projection at ``batch``
-    (``rows``: the per-rank pitch, for the shape-keyed SM103 TP16 entries)."""
+    (``rows``: the per-rank pitch, for the shape-keyed SM103 entries)."""
     capability = torch.cuda.get_device_capability(device)
-    # Q5/R3 uses actual 15 rows in a single N16 tile. Reuse the existing B16
-    # policies, without a tactic sweep or padding the target step back to Q8.
-    if (
-        os.environ.get("K31MK_VERIFY_Q5", "0") == "1"
-        and capability == (10, 3)
-        and tp == 8
-        and batch == 15
-        and (kind, rows) in (("mla", 3648), ("kda", 6288))
-    ):
-        return GB300_TACTICS[kind][16]
-    # New Q5 production widths reuse existing instruction tiles. Tensor rows stay
-    # at 5 * requests; the Split-K kernel predicates the partial tile's outputs.
-    if (
-        os.environ.get("K31MK_VERIFY_Q5", "0") == "1"
-        and capability == (10, 3)
-        and tp == 8
-        and batch in (10, 20, 25, 30, 35)
-        and (kind, rows) in (("mla", 3648), ("kda", 6288))
-    ):
-        tile_rows = {10: 16, 20: 24, 25: 32, 30: 32, 35: 40}[batch]
-        if tile_rows in (16, 32):
-            return GB300_TACTICS[kind][tile_rows]
-        return SM103_TP8_TACTICS[(kind, rows, tile_rows)]
-    if capability == (10, 3):
+    sm103 = (SM103_TP8_TACTICS, SM103_TP16_TACTICS) if capability == (10, 3) else ()
+    wider = [b for table in sm103 for k, r, b in table if (k, r) == (kind, rows)]
+    wider = [b for b in wider + list(GB300_TACTICS[kind]) if b >= batch]
+    # A batch wider than the fallback's 8 rows with no entry runs the next wider entry's
+    # single N tile (SplitKGemm predicates the tile's extra rows), not 8-row tiles that reread
+    # the weights; GB300 TP8 Q5 (rows 10-35) served this way.
+    if batch > FALLBACK_MAX_ROWS and wider:
+        batch = min(wider)
+    if sm103:
         tactic = SM103_TP8_TACTICS.get((kind, rows, batch))
         if tactic is not None:
             return tactic

@@ -7,7 +7,6 @@ per request. Verify never modifies that checkpoint or persistent convolution.
 The host must complete commit/restore before launching the next verify.
 """
 
-import os
 from functools import cache
 
 import cutlass
@@ -21,9 +20,11 @@ from .prepared import decode_conv_weight
 
 # GB300 (SM103) TP8 (12 heads per rank) verify schedules (early, lanes per state row, minimum CTAs per SM, CTAs per
 # head) by (requests, queries), from a TP8 sweep (cold L2, the KDA kernel gates): from Breq 2, 4 CTAs per head beat
-# the default 8 (Breq 4: 9.4 vs 14.7 us). Not bitwise vs the default schedule.
+# the default 8 (Breq 4: 9.4 vs 14.7 us). Q5 Breq 3 (15 rows): the KDA layer 34.278 -> 31.189 us on GB300 TP8.
+# Not bitwise vs the default schedule.
 SM103_TP8_HEADS = 12
 SM103_TP8_VERIFY: dict = {
+    (3, 5): (0, 8, 2, 4),
     (2, 8): (0, 8, 2, 4),
     (3, 8): (0, 8, 2, 4),
     (4, 8): (0, 8, 2, 4),
@@ -38,12 +39,6 @@ def verify_schedule(requests, queries, device, heads=None):
     """GB300: (0, 8, 1 if Q > 8 else 2, 8), and the TP8 table above."""
     capability = torch.cuda.get_device_capability(device)
     if capability == (10, 3) and heads == SM103_TP8_HEADS:
-        # Experimental Q5/R3 point: preserve ReplaySSM dependency and arithmetic
-        # contracts while reusing the established four-CTA layout. Default off.
-        if (requests, queries) == (3, 5) and os.environ.get(
-            "K31MK_KDA_Q5_R3_C4", "0"
-        ) == "1":
-            return (0, 8, 2, 4)
         tactic = SM103_TP8_VERIFY.get((requests, queries))
         if tactic is not None:
             return tactic

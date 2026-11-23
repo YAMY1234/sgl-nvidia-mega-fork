@@ -721,3 +721,225 @@ class K31DFlashRuntimeGuard(unittest.TestCase):
                 guard = self.sgl.DFlashGuard(self.runtime.guards)
                 self.assertEqual(guard.unmet(self.worker), [])
                 self.sgl.DFlashBinding(self.worker, frozenset(self.runtime.bindings))
+
+
+def _load(path, names, **scope):
+    """The named top-level definitions of ``path`` (under kimi_k31), run without its GPU imports."""
+    body = ast.parse((ROOT.parent / path).read_text()).body
+    keep = [
+        n
+        for n in body
+        if getattr(n, "name", None) in names
+        or any(
+            getattr(t, "id", None) in names
+            for t in getattr(n, "targets", [getattr(n, "target", None)])
+        )
+    ]
+    exec(compile(ast.Module(body=keep, type_ignores=[]), path, "exec"), scope)
+    return scope
+
+
+class K31VerifyQ5(unittest.TestCase):
+    """Q5 is served by the draft token count, with no env: the R5 setup (GB300, TP8/DCP8, Q5, PD decode) is admitted
+    and gets the R5 kernel choices; Q5 is not tied to TP8/DCP8."""
+
+    def test_the_draft_token_count_admits_q5(self):
+        from sgl_nvidia_mega.kimi_k31 import verify_contract
+
+        reasons = _load(
+            "verify_spec.py",
+            {"config_disable_reasons", "_disaggregation_reasons", "DCP_SIZES"},
+            supported_query_width=verify_contract.supported_query_width,
+        )["config_disable_reasons"]
+        r5 = types.SimpleNamespace(
+            speculative_algorithm="DFLASH",
+            speculative_num_draft_tokens=5,
+            enable_linear_replayssm_spec=True,
+            enable_linear_replayssm=False,
+            context_length=1048576,
+            cuda_graph_config=types.SimpleNamespace(
+                decode=types.SimpleNamespace(backend="full")
+            ),
+            attention_backend=None,
+            prefill_attention_backend="dsa",
+            decode_attention_backend="dsa",
+            tp_size=8,
+            dcp_size=8,
+            attn_cp_size=1,
+            enable_prefill_cp=False,
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="mooncake",
+            disaggregation_decode_host_receive_threshold=1,
+        )
+        with patch.dict("os.environ", clear=True):
+            self.assertEqual(reasons(r5, None), [])
+            self.assertEqual(
+                verify_contract.verify_keys(
+                    5, verify_contract.served_request_batches(5)
+                ),
+                tuple((b, 5, 5 * b) for b in range(1, 9)),
+            )
+            for name, change, refused in (
+                ("TP16/DCP1", {"tp_size": 16, "dcp_size": 1}, False),
+                ("TP16/DCP16", {"tp_size": 16, "dcp_size": 16}, False),
+                ("DCP below TP", {"dcp_size": 4}, True),
+                ("prefill CP", {"enable_prefill_cp": True}, True),
+                ("Q4", {"speculative_num_draft_tokens": 4}, True),
+            ):
+                with self.subTest(name):
+                    cfg = copy.copy(r5)
+                    vars(cfg).update(change)
+                    self.assertEqual(bool(reasons(cfg, None)), refused)
+
+    def test_q5_rows_run_the_next_wider_projection_tile(self):
+        """A width with no tactic of its own runs the next wider entry's single N tile, which reproduces R5's Q5
+        tiles (rows 10/15/20/25/30/35 on 16/16/24/32/32/40); up to 8 rows, and past the widest entry, the 8-row
+        fallback stays."""
+        scope = _load(
+            "sm103/k3/gemm/projection.py",
+            {
+                "GB300_TACTICS",
+                "GB300_FALLBACK",
+                "FALLBACK_MAX_ROWS",
+                "_FALLBACK_LOGGED",
+                "_gb300_tactic",
+                "SM103_TP16_TACTICS",
+                "SM103_TP8_TACTICS",
+                "_SM103_TP16_LOGGED",
+                "projection_tactic",
+            },
+            torch=torch,
+            logger=types.SimpleNamespace(info=lambda *a: None, warning=lambda *a: None),
+        )
+        tactic, tp8, gb300 = (
+            scope["projection_tactic"],
+            scope["SM103_TP8_TACTICS"],
+            scope["GB300_TACTICS"],
+        )
+        with patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)):
+            for kind, rows in (("mla", 3648), ("kda", 6288)):
+                for batch, tile in {
+                    10: 16,
+                    15: 16,
+                    20: 24,
+                    25: 32,
+                    30: 32,
+                    35: 40,
+                    40: 40,
+                }.items():
+                    with self.subTest(kind=kind, batch=batch):
+                        want = gb300[kind].get(tile) or tp8[(kind, rows, tile)]
+                        self.assertEqual(tactic(kind, batch, 0, rows=rows), want)
+                self.assertEqual(
+                    tactic(kind, 5, 0, rows=rows), scope["GB300_FALLBACK"][kind]
+                )
+                self.assertEqual(
+                    tactic(kind, 72, 0, rows=rows), scope["GB300_FALLBACK"][kind]
+                )
+            # the measured TP16 Q8 B1 entry and the TP16 pitch's other widths
+            self.assertEqual(
+                tactic("mla", 8, 0, rows=2880),
+                scope["SM103_TP16_TACTICS"][("mla", 2880, 8)],
+            )
+            self.assertEqual(tactic("mla", 24, 0, rows=2880), gb300["mla"][32])
+
+    def test_q5_breq3_runs_four_ctas_per_kda_head(self):
+        scope = _load(
+            "sm103/k3/kda/verify.py",
+            {"SM103_TP8_HEADS", "SM103_TP8_VERIFY", "verify_schedule"},
+            torch=torch,
+        )
+        schedule = scope["verify_schedule"]
+        with (
+            patch.dict("os.environ", clear=True),
+            patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)),
+        ):
+            self.assertEqual(schedule(3, 5, 0, heads=12), (0, 8, 2, 4))
+            self.assertEqual(schedule(2, 5, 0, heads=12), (0, 8, 2, 8))
+
+
+class K31DcpQueryGather(unittest.TestCase):
+    """Under DCP the sparse verify gathers the query early wherever the one-shot merge serves the rows, and
+    multicasts it directly wherever the group has multicast; elsewhere it keeps the group's all-gather."""
+
+    def test_the_early_gather_follows_the_merge(self):
+        method = next(
+            n
+            for c in ast.parse((ROOT / "verify.py").read_text()).body
+            if isinstance(c, ast.ClassDef) and c.name == "PreparedSparseVerifyMla"
+            for n in c.body
+            if getattr(n, "name", "") == "early_gather"
+        )
+        host = types.SimpleNamespace(_TOPK_MERGE=None)
+        scope = {
+            "DCP_SHARDED": host,
+            "_EARLY_QAG_LOGGED": [],
+            "logger": types.SimpleNamespace(info=lambda *a: None),
+        }
+        exec(
+            compile(ast.Module(body=[method], type_ignores=[]), "verify.py", "exec"),
+            scope,
+        )
+        early = scope["early_gather"]
+        with patch.dict("os.environ", clear=True):
+            self.assertFalse(early(None, 40))  # no one-shot merge: NCCL candidates
+            host._TOPK_MERGE = types.SimpleNamespace(usable=lambda rows: rows <= 32)
+            self.assertTrue(early(None, 32))
+            self.assertFalse(early(None, 40))
+
+    def test_the_direct_gather_needs_one_clique_with_multicast_on_every_rank(self):
+        import functools
+
+        from sgl_nvidia_mega.kimi_k31.dsa.mla import _CP_MAX_ROWS
+
+        made = []
+
+        def create_state(group, rank, rows, words, device=None):
+            made.append((rows, words))
+            return types.SimpleNamespace(
+                symm_mem_hdl=types.SimpleNamespace(multicast_ptr=7),
+                comm_buff=torch.ones(1),
+            )
+
+        def scope(clique, peer_multicast):
+            def all_reduce(flag, op, group):
+                flag.fill_(min(int(flag.item()), peer_multicast))
+
+            return _load(
+                "dsa/verify.py",
+                {"_direct_query_state"},
+                cache=functools.cache,
+                torch=types.SimpleNamespace(
+                    tensor=torch.tensor,
+                    cuda=types.SimpleNamespace(
+                        is_current_stream_capturing=lambda: False,
+                        synchronize=lambda device: None,
+                    ),
+                    distributed=types.SimpleNamespace(
+                        all_reduce=all_reduce, ReduceOp=types.SimpleNamespace(MIN="min")
+                    ),
+                ),
+                in_the_same_node_as=lambda group: [True, False],
+                is_one_nvlink_clique=lambda group, device: clique,
+                create_state=create_state,
+                _CP_MAX_ROWS=_CP_MAX_ROWS,
+                logger=types.SimpleNamespace(info=lambda *a: None),
+            )["_direct_query_state"]
+
+        group = type(
+            "Group",
+            (),
+            {
+                "cpu_group": "cpu",
+                "device_group": "dev",
+                "rank_in_group": 0,
+                "device": 0,
+            },
+        )()
+        self.assertIsNone(scope(False, 1)(group, "cuda:0"))
+        self.assertEqual(made, [])
+        self.assertIsNone(scope(True, 0)(group, "cuda:0"))
+        state = scope(True, 1)(group, "cuda:0")
+        self.assertIsNotNone(state)
+        self.assertEqual(state.comm_buff.item(), 0)  # the padding heads start zero
+        self.assertEqual(made[-1], (_CP_MAX_ROWS, 128 * 576 // 2))

@@ -59,6 +59,9 @@ logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
+    # DRAFT_LM_HEAD_ENV: the EAGLE worker shares the target's lm_head weight into the draft through
+    # set_embed_and_head after the draft's pools are sized (eagle_worker_v2.py: init_lm_head)
+    "srt/models/deepseek_v2.py": ("set_embed_and_head",),
     "srt/distributed/communication_op.py": ("tensor_model_parallel_all_gather",),
     "srt/distributed/parallel_state.py": (
         "get_tp_group",
@@ -271,6 +274,7 @@ class FusedDraft:
         self.top1_timeout_ns = int(min(TOP1_TIMEOUT_S, deadline_s) * 1e9)
         # the draft LM head's MXFP8 copy (DRAFT_LM_HEAD_ENV), or None: SGLang's head
         self.lm_head_q = None
+        self._lm_head_w: Optional[torch.Tensor] = None
         self._lm_head_why = "off"
         self._arm(nextn)
 
@@ -352,9 +356,12 @@ class FusedDraft:
         )
 
     def _arm_lm_head(self, nextn) -> None:
-        """The MXFP8 copy of the draft's LM head shard and its stream kernels, when
-        ``DRAFT_LM_HEAD_ENV`` asks for it and every rank can serve it (else every rank
-        keeps SGLang's head)."""
+        """``DRAFT_LM_HEAD_ENV``: the MXFP8 copy of the draft's LM head shard. At this
+        build the draft's lm_head still holds its own checkpoint weight (GLM-5.2's NVFP4
+        MTP head, packed uint8); the EAGLE worker replaces it with the target's BF16
+        shard through ``set_embed_and_head`` once the pools are sized, before any graph
+        is captured. So the copy is made there (wrapped on this model instance), or now
+        when the head is already a BF16 shard."""
         mode = os.environ.get(DRAFT_LM_HEAD_ENV, "").strip().lower()
         if mode in ("", "0", "off", "bf16"):
             return
@@ -363,12 +370,34 @@ class FusedDraft:
                 f"NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: {DRAFT_LM_HEAD_ENV}={mode!r} "
                 "(expected mxfp8 or unset)"
             )
+        w = getattr(nextn.lm_head, "weight", None)
+        if w is not None and w.dtype == torch.bfloat16 and w.dim() == 2:
+            self._quantize_lm_head(w)
+            return
+        original = getattr(nextn, "set_embed_and_head", None)
+        if original is None:
+            self._lm_head_why = "the draft model has no set_embed_and_head"
+            return
+        self._lm_head_why = "waiting for the target's head (set_embed_and_head)"
+        fd = self
+
+        def set_embed_and_head(embed, head, *args, **kwargs):
+            out = original(embed, head, *args, **kwargs)
+            fd._quantize_lm_head(getattr(nextn.lm_head, "weight", None))
+            return out
+
+        nextn.set_embed_and_head = set_embed_and_head
+
+    def _quantize_lm_head(self, w: Optional[torch.Tensor]) -> None:
+        """Quantize ``w`` (this rank's BF16 LM head shard) to the MXFP8 copy and build
+        its stream kernels, outside capture; every rank serves it or none does."""
         from sgl_nvidia_mega.glm5_3.sm103.draft import lm_head_mxfp8 as lh
 
-        w = getattr(nextn.lm_head, "weight", None)
         q, why = None, ""
         if w is None:
             why = "the draft's lm_head has no weight"
+        elif torch.cuda.is_current_stream_capturing():
+            why = "the head was shared under CUDA-graph capture"
         else:
             why = lh.unsupported_reason(w, LM_HEAD_MAX_ROWS[-1])
         if not why:
@@ -380,8 +409,10 @@ class FusedDraft:
             for max_rows in LM_HEAD_MAX_ROWS:
                 lh.precompile(n, k, w.device, max_rows=max_rows)
                 lh.matmul(probe, q, max_rows=max_rows)  # module load outside capture
+            torch.cuda.synchronize(w.device)
         whys = runtime.tp_gather([why] if why else [])
         if any(whys):
+            self.lm_head_q, self._lm_head_w = None, None
             self._lm_head_why = "MXFP8 declined: " + runtime.per_rank(whys)
             if self.rank == 0:
                 logger.warning(
@@ -389,13 +420,16 @@ class FusedDraft:
                     self._lm_head_why,
                 )
             return
-        self.lm_head_q = q
+        # the BF16 tensor the copy was made from: served only while the head is it
+        self.lm_head_q, self._lm_head_w = q, w
+        self._lm_head_why = ""
         if self.rank == 0:
             logger.info(
                 "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: LM head on an MXFP8 copy "
-                "of the shard %s (rows 1-%d)",
+                "of the shard %s (rows 1-%d, copy %.1f MiB)",
                 tuple(q.shape),
                 LM_HEAD_MAX_ROWS[-1],
+                (q.codes.numel() + q.scales.numel()) / 2**20,
             )
 
     def lm_head_logits(self, x: torch.Tensor, lm_head) -> Optional[torch.Tensor]:
@@ -407,8 +441,13 @@ class FusedDraft:
             return None
         from sgl_nvidia_mega.glm5_3.sm103.draft import lm_head_mxfp8 as lh
 
-        w = getattr(lm_head, "weight", None)
-        if w is None or tuple(w.shape) != q.shape:
+        w, src = getattr(lm_head, "weight", None), self._lm_head_w
+        if (
+            w is None
+            or src is None
+            or w.data_ptr() != src.data_ptr()
+            or tuple(w.shape) != q.shape
+        ):
             return None
         rows = x.shape[0]
         max_rows = next((m for m in LM_HEAD_MAX_ROWS if rows <= m), None)

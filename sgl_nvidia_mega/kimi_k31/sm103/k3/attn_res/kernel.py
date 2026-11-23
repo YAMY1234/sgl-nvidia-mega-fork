@@ -28,7 +28,6 @@ from ..common.primitives import (
     wait,
     zeros,
 )
-from .aux import AuxMixture
 
 
 @cute.jit
@@ -81,15 +80,12 @@ class ClusterAttnRes:
         final=False,
         deadline_ns=0,
         aux_mixture=False,
-        aux_launch=True,
     ):
         self.nb, self.slots, self.has_delta = nb, slots, has_delta
         self.write, self.final = write, final
         self.deadline_ns = deadline_ns
+        # With saved blocks the caller runs AuxMixture for the aux rows (PreparedAttnRes.bind_aux, a side stream).
         self.aux_mixture = aux_mixture
-        self.aux_launch = (
-            aux_launch  # False: the caller launches AuxMixture itself (side stream)
-        )
         self.npre = 2 * nb
         self.npost = 2 if nb else 1
         self.kpre = 1 << max(self.npre - 1, 0).bit_length()
@@ -98,8 +94,6 @@ class ClusterAttnRes:
     @cute.jit
     def __call__(self, *args):
         launch(self.kernel, args, (7, args[1].shape[0], 1), 128, 7)
-        if cutlass.const_expr(self.aux_mixture and self.nb > 0 and self.aux_launch):
-            AuxMixture(self.nb)(*args)
 
     @cute.jit
     def exchange(

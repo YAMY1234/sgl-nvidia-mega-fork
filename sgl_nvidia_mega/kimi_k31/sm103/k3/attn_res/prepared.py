@@ -58,7 +58,6 @@ def compile_consumer(
     deadline_ns,
     aux=False,
     mixture=False,
-    aux_launch=True,
 ):
     kernel = ClusterAttnRes(
         nb,
@@ -68,7 +67,6 @@ def compile_consumer(
         final=final,
         deadline_ns=deadline_ns,
         aux_mixture=mixture,
-        aux_launch=aux_launch,
     )
     args = _consumer_args(slots, cap, aux)
     return cute.compile(kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}")
@@ -98,10 +96,10 @@ class PreparedAttnRes:
             None  # (plain, ring) AuxMixture codes when it runs on a side stream
         )
 
-    def _compile(self, slots, cap, aux=False, mixture=False, aux_launch=True):
+    def _compile(self, slots, cap, aux=False, mixture=False):
         arch = architecture(self.device)
         return compile_consumer(
-            *self.key, slots, cap, arch, self.deadline_ns, aux, mixture, aux_launch
+            *self.key, slots, cap, arch, self.deadline_ns, aux, mixture
         )
 
     @classmethod
@@ -123,17 +121,20 @@ class PreparedAttnRes:
         shape = tuple(mailbox.shape[:2])
         self.ring = self._compile(*shape), to_cute(mailbox), shape
 
-    def bind_aux(self, *, mixture=False, side=False):
-        """Variants that also store the updated prefix rows (a stock aux stream). ``side``: a
-        mixture over saved blocks runs on a side stream after the main kernel (``join_aux``)."""
-        side = side and mixture and self.key[0] > 0
+    def bind_aux(self):
+        """Variants that also store the DFlash capture layer's aux row: the stock FP32 aux mixture
+        (AuxMixture) of the updated prefix row and the saved blocks. With saved blocks the mixture runs
+        on a side stream after the main kernel, since the next in-projection does not read it; it is
+        joined (``join_aux``) before the next writer of the rows it reads (the o-proj's fused AttnRes,
+        the next consumer) and at the end of the step. Same kernels and inputs: bitwise."""
+        side = self.key[0] > 0
         arch, ring, side_ring = architecture(self.device), None, None
         if self.ring is not None:
             slots, cap = self.ring[2]
-            ring = self._compile(slots, cap, True, mixture, not side)
+            ring = self._compile(slots, cap, True, True)
             if side:
                 side_ring = compile_aux_mixture(self.key[0], slots, cap, arch)
-        self.aux = self._compile(0, 0, True, mixture, not side), ring
+        self.aux = self._compile(0, 0, True, True), ring
         if side:
             self.aux_side = compile_aux_mixture(self.key[0], 0, 0, arch), side_ring
 

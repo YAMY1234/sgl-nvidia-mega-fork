@@ -25,7 +25,6 @@ from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.runtime_context import get_parallel
 
-from sgl_nvidia_mega.kimi_k31.k3.default_scope import best_default
 from sgl_nvidia_mega.kimi_k31.sm103.k3.common.host import fake, layout, stream, to_cute
 from sgl_nvidia_mega.kimi_k31.sm103.k3.mla.value import MlaValue
 
@@ -107,11 +106,11 @@ def _direct_query_state(group, device):
 
 
 @cache
-def _padded_value(
-    rows, heads, pitch, weight_layout, device, q, latent_heads=16, early=False
-):
+def _padded_value(rows, heads, pitch, weight_layout, device, q, latent_heads=16):
     """Read the real heads directly from the sparse core's ``latent_heads``-head output
-    (16: the padded DCP1 core; ``heads``: the merged DCP rows)."""
+    (16: the padded DCP1 core; ``heads``: the merged DCP rows). MlaValue releases its PDL
+    dependent (the o-proj) at entry, so the o-proj's whole weight preload overlaps the core
+    (bitwise: the o-proj still waits for MlaValue's grid)."""
     latent = fake((rows, heads, 512), (latent_heads * 512, 512, 1))
     weight = fake(*weight_layout)
     gate = fake((rows, heads * 128), (pitch, 1))
@@ -119,7 +118,7 @@ def _padded_value(
     output = fake((rows, heads * 128))
     with torch.accelerator.device_index(device):
         return cute.compile(
-            MlaValue(heads, rows, q, early_trigger=early),
+            MlaValue(heads, rows, q, early_trigger=True),
             latent,
             weight,
             gate,
@@ -200,19 +199,6 @@ _EARLY_QAG_LOGGED = []
 # multicast each rank's 12 FP8 heads directly into the core's 128-head layout.
 DSA_DIRECT_QAG = os.environ.get("K31MK_DSA_DIRECT_QAG", "0") == "1"
 _DIRECT_QAG_LOGGED = []
-# ``K31MK_MLAQ_AFTER_SCORING`` (off by default; 1 = on), DCP1 steps on the stock scoring only
-# (not DCP, not the context-split indexer): the MLA query waits for the indexer scoring (DeepGEMM paged logits) and
-# runs beside the top-k instead of beside the logits. The logits launch one persistent CTA per SM on a static schedule,
-# so the MLA query's resident CTAs held some of them back (on VR200 the logits ran slower beside it than alone); the
-# query is off the chain and ends before the top-k (a shorter span per layer). Same kernels and inputs: a
-# reorder; the MLA query still precedes the query copy and the sparse core in main's program order.
-MLAQ_AFTER_SCORING = os.environ.get("K31MK_MLAQ_AFTER_SCORING", "0") == "1"
-_MLAQ_AFTER_LOGGED = []
-# ``K31MK_MLA_VALUE_EARLY_TRIGGER`` (on by default in the GB300 BEST scope, kimi_k31/k3/default_scope.py; 0 = off): the sparse verify MlaValue releases its PDL dependent (the o-proj) at entry,
-# so the o-proj's whole weight preload overlaps the core instead of a part of it (bitwise: the o-proj still
-# waits for MlaValue's grid); 0 triggers after MlaValue's own wait.
-VALUE_EARLY_TRIGGER = best_default("K31MK_MLA_VALUE_EARLY_TRIGGER", "1", "0") != "0"
-_VALUE_TRIGGER_LOGGED = []
 
 
 def dcp_layout():
@@ -261,11 +247,10 @@ class VerifySelection:
         rows.view(b, q, pages).copy_(table.unsqueeze(1).expand(b, q, pages))
         return rows
 
-    def run(self, query, gates, cache, table, step, scored=None, collective_after=None):
-        """``scored``: an event recorded on the current stream once the scoring is enqueued, before the top-k (the
-        stock scoring only; the caller passes None on the context-split path). ``collective_after``: DCP only, an
-        event the cross-rank selection waits for after the scoring is enqueued (K31MK_DSA_EARLY_QAG: the query
-        all-gather on main), so every rank issues its DCP collectives in the same order."""
+    def run(self, query, gates, cache, table, step, collective_after=None):
+        """``collective_after``: DCP only, an event the cross-rank selection waits for after the scoring is enqueued
+        (K31MK_DSA_EARLY_QAG: the query all-gather on main), so every rank issues its DCP collectives in the same
+        order."""
         import deep_gemm
         from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
             _restore_row_stride,
@@ -294,8 +279,6 @@ class VerifySelection:
             clean_logits=False,
         )
         scores = _restore_row_stride(scores)
-        if scored is not None:
-            scored.record()
         if step.dcp_size > 1:
             if collective_after is not None:
                 torch.cuda.current_stream(scores.device).wait_event(collective_after)
@@ -367,7 +350,6 @@ class PreparedSparseVerifyMla:
         self.sparse_values = {}
         self.index_cache = None
         self.step = None
-        self._scored = torch.cuda.Event() if MLAQ_AFTER_SCORING else None
         # DCP: every rank's core runs all TP x heads over the keys it owns, then the rows
         # LSE-merge back to their head owners (built when the attention group is DCP).
         self.dcp_size = dcp_layout()[0]
@@ -407,19 +389,6 @@ class PreparedSparseVerifyMla:
     def __getattr__(self, name):
         return getattr(self.base, name)
 
-    def _query_after_scoring(self, mq, query_args, s):
-        """K31MK_MLAQ_AFTER_SCORING: the MLA query on the main stream behind the scoring's event, so it runs beside the
-        top-k; it still precedes the query copy and the sparse core (and its KV rows the core reads) in main's program
-        order."""
-        torch.cuda.current_stream(self.base.device).wait_event(self._scored)
-        mq(*query_args, s)
-        if not _MLAQ_AFTER_LOGGED:  # use-time, once per process
-            _MLAQ_AFTER_LOGGED.append(True)
-            logger.info(
-                "NVIDIA megakernel: K31MK_MLAQ_AFTER_SCORING engaged (the MLA query waits for the indexer "
-                "scoring and runs beside the top-k; DCP1 sparse verify)"
-            )
-
     @property
     def latent(self):
         if self.step is not None and self.step.sparse:
@@ -441,15 +410,7 @@ class PreparedSparseVerifyMla:
                 layout(self.base.weights[4]),
                 self.base.device.index,
                 q,
-                early=VALUE_EARLY_TRIGGER,
             )
-            if (
-                VALUE_EARLY_TRIGGER and not _VALUE_TRIGGER_LOGGED
-            ):  # once per process, not per layer
-                _VALUE_TRIGGER_LOGGED.append(True)
-                logger.info(
-                    "NVIDIA megakernel: sparse verify MlaValue releases the o-proj at entry (opt-in)"
-                )
             if self.cp_mla is not None:  # the merged rows hold this rank's heads only
                 self.cp_values[rows, q] = _padded_value(
                     rows,
@@ -459,7 +420,6 @@ class PreparedSparseVerifyMla:
                     self.base.device.index,
                     q,
                     latent_heads=self.base.heads,
-                    early=VALUE_EARLY_TRIGGER,
                 )
         return self
 
@@ -570,14 +530,7 @@ class PreparedSparseVerifyMla:
         # The packed writer runs ahead of the index query on the index stream; otherwise the gate stream writes the gate.
         if not self.packed_index_gate:
             self.index_stream.wait_stream(self.gate_stream)
-        # DCP and the context-split indexer keep today's order (their collectives and gathers are untouched).
-        after = (
-            MLAQ_AFTER_SCORING
-            and not dcp
-            and not (self.selection.split is not None and step.split)
-        )
-        if not after:
-            mq(*args, *b.query_views, s)
+        mq(*args, *b.query_views, s)
         early = dcp and self.early_gather(rows)
         if early:  # main: right behind the MLA query it gathers; overlaps the indexer chain below
             self.gather_query(b.query_scratch[:rows], rows)
@@ -594,7 +547,6 @@ class PreparedSparseVerifyMla:
                 self.index_cache,
                 block_table,
                 step,
-                scored=self._scored if after else None,
                 collective_after=self._q_gathered if early else None,
             )
             if dcp and not early:
@@ -602,8 +554,6 @@ class PreparedSparseVerifyMla:
                 # collective at a time (no concurrent NCCL fallbacks on the group).
                 self.index_stream.wait_stream(main)
                 self.gather_query(b.query_scratch[:rows], rows)
-        if after:  # before the query copy below, which reads the MLA query's output
-            self._query_after_scoring(mq, (*args, *b.query_views), s)
         if not dcp:
             # Copy before joining the indexer, so this independent work overlaps it.
             self.mla.prepare_query(b.query_scratch[:rows])
@@ -777,12 +727,10 @@ class BuiltSparseVerify(BuiltK31Verify):
 
     def _build_split(self, device, context_length):
         """The context-split indexer (a collective: every TP rank builds the merge's symmetric buffer), or {}
-        (an empty split keeps every step on the replicated indexer): K31MK_INDEX_SPLIT_MIN=0, a context length
-        below it, and by default DCP or no usable 16-rank merge, which an explicit K31MK_INDEX_SPLIT_MIN refuses."""
+        (an empty split keeps every step on the replicated indexer): a context length below SPLIT_MIN, DCP (it
+        scores the replicated index-K cache) or no usable 16-rank merge."""
         from .split import SPLIT_MIN, LocalIndexer, SplitMerge
 
-        if not SPLIT_MIN:
-            return {}
         if context_length < SPLIT_MIN:  # no forward reaches it
             logger.info(
                 "NVIDIA megakernel: sparse verify context split off: context length %d < %d",
@@ -790,12 +738,7 @@ class BuiltSparseVerify(BuiltK31Verify):
                 SPLIT_MIN,
             )
             return {}
-        explicit = "K31MK_INDEX_SPLIT_MIN" in os.environ
         if dcp_layout()[0] > 1:
-            if explicit:
-                raise RuntimeError(
-                    "K31MK_INDEX_SPLIT_MIN needs the replicated index-K cache; it is set under DCP"
-                )
             logger.info(
                 "NVIDIA megakernel: sparse verify context split off: DCP (it scores the replicated "
                 "index-K cache)"
@@ -806,10 +749,6 @@ class BuiltSparseVerify(BuiltK31Verify):
         group = get_tp_group()
         merge = SplitMerge(group, max(self.widths))
         if not merge.usable(max(self.widths)):
-            if explicit:  # the arm must not run the replicated path unnoticed
-                raise RuntimeError(
-                    "K31MK_INDEX_SPLIT_MIN is set but the 16-rank DCP top-k merge is unavailable"
-                )
             logger.info(
                 "NVIDIA megakernel: sparse verify context split off: the 16-rank DCP top-k merge is "
                 "unavailable (TP %d)",

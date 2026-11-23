@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""K3.1 DFlash2 draft layers on the megakernel chain in serving (stage 1; ``SGLANG_K31_DRAFT_MK``).
+"""K3.1 DFlash2 draft layers on the megakernel chain in serving (stage 1, with M1b).
 
-Stage 1 with M1b is on by default in the GB300 BEST scope (kimi_k31/k3/default_scope.py), off elsewhere;
-``SGLANG_K31_DRAFT_MK`` set to 0 / 1 turns it off / on. With it, the chain also builds the head (2a) and the aux
-(2b) for the K3.1 DFlash runtime, unless ``K31MK_DFLASH_RUNTIME=0`` (no runtime runs them). A stage the setup
-does not support declines with one INFO line.
+The chain also builds the head (2a) and the aux (2b) for the K3.1 DFlash runtime, unless
+``K31MK_DFLASH_RUNTIME=0`` (no runtime runs them). A stage the setup does not support declines with one INFO
+line.
 
 The draft graph's forward of one B1 x 8-row TARGET_VERIFY block runs ``DraftChain`` (chain.py) in place of
 SGLang's decoder layers; the chain's attention hook (M1a) is SGLang's own MLA sublayer up to W_UV, so the
 block's KV write, RoPE and sliding window stay SGLang's. Every other draft forward (other widths, prefill)
-runs SGLang's. ``SGLANG_K31_DRAFT_MK=0``: ``max_rows`` 0, so SGLang never wraps the draft's forward.
+runs SGLang's.
 
 M1b: the attention sublayer runs on MK blocks as well (``DraftAttention``:
 fused_a, DraftMlaQuery's FP8 query + the block's KV insert at its out_cache_loc slots, DraftMlaValue); only the
@@ -55,7 +54,6 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 
 from sgl_nvidia_mega.kimi_k31 import spec as target
 from sgl_nvidia_mega.kimi_k31.dflash.protocol import DRAFT_CHAINS, RUNTIME
-from sgl_nvidia_mega.kimi_k31.k3.default_scope import best_default
 
 # The SGLang names this module reads, by file under the sglang package; test/unit/test_contract.py pins them.
 SGLANG_READS = {
@@ -139,12 +137,9 @@ SGLANG_READS = {
 
 logger = logging.getLogger(__name__)
 
-ENV = "SGLANG_K31_DRAFT_MK"
-ENABLED = best_default(ENV, "1", "0") not in ("", "0")
-# Stage 2b: the worker's decode aux append (context features into the draft KV) on MK blocks too, and
-# stage 2a: the draft graph's proposal (candidate top-k over the target lm_head + the selector walk, greedy
+# Stage 2b (``RUNTIME``): the worker's decode aux append (context features into the draft KV) on MK blocks too,
+# and stage 2a: the draft graph's proposal (candidate top-k over the target lm_head + the selector walk, greedy
 # or sampled per request); both run through the K3.1 DFlash runtime, so both build with it.
-AUX = HEAD = ENABLED and RUNTIME
 ROWS = 8  # one DFlash block per request; stage 1 serves B1
 MLA_ROW = 576  # bytes per draft KV slot: 512 FP8 latent | 64 FP8 rotated k_pe
 
@@ -207,7 +202,7 @@ class DraftLayersOnChain:
         cos_sin = model.layers[0].self_attn.rotary_emb.cos_sin_cache
         if not INSTANCES:
             raise RuntimeError(
-                f"{ENV}: no K3.1 verify executor to check the draft mailboxes against"
+                "draft MK: no K3.1 verify executor to check the draft mailboxes against"
             )
         targets = (*INSTANCES, self._ar_fusion_buffers(), group.ca_comm)
         self.chain = DraftChain(
@@ -226,8 +221,7 @@ class DraftLayersOnChain:
         self._stream: Optional[int] = None
         self._layers = len(weights)
         logger.info(
-            "NVIDIA megakernel: DFlash2 draft layers on the MK chain (%s, B1 x %d rows, %d layers, TP%d)",
-            ENV,
+            "NVIDIA megakernel: DFlash2 draft layers on the MK chain (B1 x %d rows, %d layers, TP%d)",
             ROWS,
             self._layers,
             shapes.tp,
@@ -237,21 +231,20 @@ class DraftLayersOnChain:
             self.chain.target_buffers,
         )
         self.device = device
-        self.aux = self._build_aux(model, shapes, comm, cos_sin) if AUX else None
+        self.aux = self._build_aux(model, shapes, comm, cos_sin) if RUNTIME else None
         self.draft_aux_rows = (ROWS,) if self.aux is not None else ()
         self._pools: Optional[torch.Tensor] = None
         self._pool_ptrs: tuple[int, ...] = ()
         self._caches: Optional[list] = None
         self.draft_head_requests = (
-            (1,) if HEAD and self._head_serves(model) else ()
+            (1,) if RUNTIME and self._head_serves(model) else ()
         )  # the chain's head serves B1
-        self.m1b = ENABLED
+        self.m1b = True  # False once the draft KV pool declines (``_kv``)
         # The target's DFlash runtime (dflash/runtime.py) serves only a draft chain built here.
         DRAFT_CHAINS.append(self)
-        if self.m1b:
-            logger.info(
-                "NVIDIA megakernel: draft MK M1b: attention on MK blocks, core = SGLang's sliding-window MLA"
-            )
+        logger.info(
+            "NVIDIA megakernel: draft MK M1b: attention on MK blocks, core = SGLang's sliding-window MLA"
+        )
 
     @staticmethod
     def _head_serves(model):
@@ -387,7 +380,7 @@ class DraftLayersOnChain:
                 )
                 if state[1] != AttnForwardMethod.MLA:
                     raise RuntimeError(
-                        f"{ENV}: the draft attention runs {state[1]}, not MLA"
+                        f"draft MK: the draft attention runs {state[1]}, not MLA"
                     )
                 module.o_proj = _NoOproj()
                 return module.forward_core(state)
@@ -477,11 +470,11 @@ class DraftLayersOnChain:
                 self._stream = stream
             elif stream != self._stream:
                 raise RuntimeError(
-                    f"{ENV}: a draft hop from a second stream (all-reduce program order)"
+                    "draft MK: a draft hop from a second stream (all-reduce program order)"
                 )
         if input_embeds is None or input_embeds.shape != self.out.shape:
             raise RuntimeError(
-                f"{ENV}: input_embeds {None if input_embeds is None else tuple(input_embeds.shape)}"
+                f"draft MK: input_embeds {None if input_embeds is None else tuple(input_embeds.shape)}"
             )
         x0 = input_embeds
         # The head proposes from the block's rows 1..7; row 0 is the anchor (a no-copy view at B1).
@@ -603,8 +596,7 @@ SPEC = MegakernelSpec(
     ),
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     numerics=NUMERICS,
-    # 0 (unset flag): SGLang does not wrap the draft's forward
-    max_rows=ROWS if ENABLED else 0,
+    max_rows=ROWS,
     build=_build,
     api_version=target.SPEC.api_version,
 )

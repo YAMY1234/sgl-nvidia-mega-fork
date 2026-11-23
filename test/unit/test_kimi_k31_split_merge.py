@@ -86,6 +86,70 @@ class SplitMergeCompatibility(unittest.TestCase):
                 merge.run(None, None, None, None)
 
 
+class SplitArming(unittest.TestCase):
+    """``BuiltSparseVerify._build_split``: the split arms from the measured crossover on; below it, under DCP
+    and without a usable merge it declines (an empty split)."""
+
+    def build_split(self, context_length, dcp=1, usable=True):
+        node = next(
+            n
+            for n in ast.parse((ROOT / "verify.py").read_text()).body
+            if isinstance(n, ast.ClassDef) and n.name == "BuiltSparseVerify"
+        )
+        method = next(n for n in node.body if getattr(n, "name", "") == "_build_split")
+        from sgl_nvidia_mega.kimi_k31.dsa import split as real
+
+        built = []
+        split = types.ModuleType("split_test.dsa.split")
+        split.SPLIT_MIN = real.SPLIT_MIN
+        split.LocalIndexer = lambda device, **kw: built.append(kw) or "local"
+        merge = types.SimpleNamespace(usable=lambda rows: usable)
+        split.SplitMerge = lambda group, rows: built.append(rows) or merge
+        group = types.SimpleNamespace(world_size=16, rank_in_group=3)
+        host = types.ModuleType("sglang.srt.distributed.parallel_state")
+        host.get_tp_group = lambda: group
+        scope = {
+            "__package__": "split_test.dsa",
+            "logger": types.SimpleNamespace(info=lambda *a: None),
+            "dcp_layout": lambda: (dcp, 0),
+        }
+        exec(
+            compile(ast.Module(body=[method], type_ignores=[]), "verify.py", "exec"),
+            scope,
+        )
+        owner = types.SimpleNamespace(widths=(8, 16), query_width=8)
+        modules = {
+            "split_test": types.ModuleType("split_test"),
+            "split_test.dsa": types.ModuleType("split_test.dsa"),
+            split.__name__: split,
+            host.__name__: host,
+        }
+        with patch.dict(sys.modules, modules):
+            return scope["_build_split"](owner, "cuda:0", context_length), built
+
+    def test_the_threshold_is_the_measured_crossover(self):
+        from sgl_nvidia_mega.kimi_k31.dsa.split import SPLIT_MIN
+
+        self.assertEqual(SPLIT_MIN, 320000)
+
+    def test_it_arms_from_the_crossover_and_declines_where_it_cannot_run(self):
+        armed, built = self.build_split(320000)
+        self.assertEqual(sorted(armed), [8, 16])
+        self.assertEqual(armed[8][0], "local")
+        self.assertEqual(built[0], 16)  # the merge is sized for the widest step
+        self.assertEqual(
+            [(kw["requests"], kw["world"], kw["rank"]) for kw in built[1:]],
+            [(1, 16, 3), (2, 16, 3)],
+        )
+        for name, args in {
+            "below the crossover": (319999,),
+            "DCP": (320000, 8),
+            "no usable merge": (320000, 1, False),
+        }.items():
+            with self.subTest(name):
+                self.assertEqual(self.build_split(*args)[0], {})
+
+
 if __name__ == "__main__":
     unittest.main()
 

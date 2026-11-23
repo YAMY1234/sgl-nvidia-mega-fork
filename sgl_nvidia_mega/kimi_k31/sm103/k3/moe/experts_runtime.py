@@ -23,14 +23,12 @@ from .experts import (
     ExpertsGroupKernel,
     ExpertsKernel,
     ExpertsPlanKernel,
-    cooperative,
     fc2_pairs,
     plan_b8,
 )
 
 logger = logging.getLogger(__name__)
 _PLAN_B8_LOGGED = []
-_NONCOOP_LOGGED = []
 _PREWAIT_LOGGED = []
 
 
@@ -223,9 +221,6 @@ class PersistentExperts:
         if planned_b8 and not _PLAN_B8_LOGGED:  # once, not per layer
             _PLAN_B8_LOGGED.append(True)
             logger.info("NVIDIA megakernel: TP8 B8 routed experts read the plan")
-        if not cooperative() and not _NONCOOP_LOGGED:  # engagement tag for A/B runs
-            _NONCOOP_LOGGED.append(True)
-            logger.info("NVIDIA megakernel: routed experts launch non-cooperatively")
         if not grouped and not _PREWAIT_LOGGED:
             _PREWAIT_LOGGED.append(True)
             logger.info(

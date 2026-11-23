@@ -9,8 +9,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int8, Int16, Int32, Int64, Uint8, Uint32, Uint64
 
-from sgl_nvidia_mega.kimi_k31.k3.default_scope import best_default
-
 from ..common.primitives import (
     acquire_tensormap,
     alloc,
@@ -183,18 +181,6 @@ def plan_b8(tp, batch):
     return tp == 8 and batch == 8
 
 
-# vLLM's copy of this engine (nightly e4a5b55) launches without the cooperative attribute
-# to keep the PDL prologue overlap ("1-2% decode at B4-B8" in its docstring); the grid
-# must still be co-resident, which ``PersistentExperts.prepare`` checks. Read when a
-# kernel is compiled; dropped by default in the GB300 BEST scope (default_scope.py), ``K31MK_EXPERTS_COOPERATIVE=1``
-# keeps it.
-COOPERATIVE = "K31MK_EXPERTS_COOPERATIVE"
-
-
-def cooperative():
-    return best_default(COOPERATIVE, "0", "1") != "0"
-
-
 @cute.jit
 def plan_chunk(plan, token, chunk, words, fp32: cutlass.Constexpr = False):
     """Write 8-element ``chunk`` (four BF16x2 ``words``) of ``token`` as MXFP8 into
@@ -330,9 +316,10 @@ def fc2_pairs(tp, capacity, streamed):
 
 class ExpertsKernel(ExpertsGeometry):
     """The engine for one capacity and persistent grid. CTAs wait on other clusters'
-    partials (``load_hidden``, ``partials``, ``finalize``), so the grid launches
-    cooperatively (unless ``COOPERATIVE`` is 0) and ``PersistentExperts.prepare`` checks
-    it is co-resident.
+    partials (``load_hidden``, ``partials``, ``finalize``), so ``PersistentExperts.prepare``
+    checks the grid is co-resident. It launches without the cooperative attribute, as vLLM's
+    copy of this engine (nightly e4a5b55) does, to keep the PDL prologue overlap; a co-resident
+    grid cannot deadlock on those waits.
     ``publish`` stages FC2 rows for ``finalize``: routing weights replace the output
     arg, and (latent multicast, parity, rank) follow the SiTU scalars; ``"twoshot"``:
     (receive slots [3 x TP, 64, 3584/TP], their owners' bases, parity x TP + rank) of
@@ -362,7 +349,6 @@ class ExpertsKernel(ExpertsGeometry):
         self.grain, self.zone, self.victims = (1 if self.paired else 3, 8, 3)
         self.threads = 384
         self.capacity, self.experts, self.grid = (capacity, experts, grid)
-        self.launch_options = {"cooperative": True} if cooperative() else {}
         self.publish = publish
         assert not self.grouped or grid >= capacity <= 64
         # CTAs [0, MAX_CTAS - grid) also advance entries [grid, MAX_CTAS) of the per-CTA
@@ -1504,7 +1490,7 @@ class ExpertsKernel(ExpertsGeometry):
 
     @cute.jit
     def __call__(self, *args):
-        launch(self.kernel, args, self.grid, 384, cluster=1, **self.launch_options)
+        launch(self.kernel, args, self.grid, 384, cluster=1)
 
     @cute.jit
     def initialize(self, sm, maps, batch):

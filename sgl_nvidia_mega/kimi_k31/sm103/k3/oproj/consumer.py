@@ -5,10 +5,11 @@ rank slots, group 0 sums in rank order into the AttnRes) and TP16 fused producer
 consumer. With ``twoshot`` the mailbox is the one-slot gather row of
 ``common.twoshot``: the threads owning this rank's columns first reduce their
 receive slots into it (args 11-13: receive view, gather multicast address, rank).
-With ``norm_fold`` (``K31MK_OPROJ_NORM_FOLD``, AttnRes layers) the
-final RMS norm comes from exchange 1 instead of its own cluster exchange: exchange 1
-also carries |mix|^2 and <mix, prefix>, and |final|^2 = a^2 |mix|^2 + 2 a e <mix, prefix>
-+ e^2 |prefix|^2 for final = a mix + e prefix (exact in real arithmetic, not bitwise)."""
+With saved blocks (nb > 0) the final RMS norm comes from exchange 1 instead of its own
+cluster exchange: exchange 1 also carries |mix|^2 and <mix, prefix>, and |final|^2 =
+a^2 |mix|^2 + 2 a e <mix, prefix> + e^2 |prefix|^2 for final = a mix + e prefix (exact in
+real arithmetic, not bitwise). The fold is per token within the 7-CTA cluster, so it holds
+for any TP."""
 
 import cutlass
 import cutlass.cute as cute
@@ -42,7 +43,6 @@ from ..common.primitives import (
 )
 from ..common.primitives import wait_phase_zero_cluster as wait_phase_zero
 from ..common.primitives import (
-    warp_sum,
     zeros,
 )
 from ..common.twoshot import reduce
@@ -122,7 +122,6 @@ class OprojConsumer:
         groups=4,
         twoshot=False,
         deadline_ns=0,
-        norm_fold=False,
     ):
         if not 0 <= nb <= 8:
             raise ValueError("Output-projection AttnRes supports zero to eight blocks")
@@ -130,8 +129,7 @@ class OprojConsumer:
         self.groups, self.twoshot = groups, twoshot
         self.deadline_ns = deadline_ns
         self.kpre = 1 << max(0, (2 * nb - 1).bit_length())
-        self.norm_fold = norm_fold and nb > 0  # nb == 0 has no second exchange
-        self.npost = 4 if self.norm_fold else 2 if nb > 0 else 1
+        self.npost = 4 if nb > 0 else 1
 
     @cute.jit
     def wait_exchange(self, barrier):
@@ -145,18 +143,15 @@ class OprojConsumer:
         blk = alloc(smem, Float32, 16)
         post = alloc(smem, Float32, (7, 4, 4))
         total = alloc(smem, Float32, 4)
-        bars = alloc(smem, cutlass.Uint64, 3, 8)
+        bars = alloc(smem, cutlass.Uint64, 2, 8)
         parts = alloc(smem, Float32, (max(1, self.groups - 1), 2, 128, 4))
         lean = self.groups == 1  # above B8: rows for this nb only (co-residency)
         pf = alloc(smem, Uint32, (4 + self.nb if lean else 12, 128, 4))
-        norm_post = alloc(smem, Float32, (7, 4))
-        norm_total = alloc(smem, Float32, 1)
-        return wpre, pre, blk, post, total, bars, parts, pf, norm_post, norm_total
+        return wpre, pre, blk, post, total, bars, parts, pf
 
     @cute.jit
     def setup(self, bars):
-        final_norm = self.nb > 0 and not self.norm_fold
-        arm_exchanges(bars, (2 * self.nb, 4 * self.npost, 4 if final_norm else 0))
+        arm_exchanges(bars, (2 * self.nb, 4 * self.npost))
         cute.arch.cluster_arrive_relaxed()
 
     @cute.jit
@@ -303,8 +298,7 @@ class OprojConsumer:
     @cute.jit
     def post(self, args, state, block_mix, rank, token):
         mailbox, prefix, _, _, _, _, output, xmoe, hints, eps, out_eps = args[:11]
-        _, _, _, post, total, bars, parts, pf = state[:8]
-        norm_post, norm_total = state[8:]
+        _, _, _, post, total, bars, parts, pf = state
         mix, maximum, exponent_sum, qpart = block_mix
         thread, _, _ = cute.arch.thread_idx()
         group, tid = thread // 128, thread % 128
@@ -361,9 +355,8 @@ class OprojConsumer:
                 weight = self.combined_weight(pf, tid)
                 partial[0] = dot8(prefix_value, prefix_value)
                 partial[1] = dot8(prefix_value, weight)
-                if cutlass.const_expr(self.norm_fold):
-                    partial[2] = qpart  # dot8(mix, mix) from ``pre``
-                    partial[3] = dot8(mix, prefix_value)
+                partial[2] = qpart  # dot8(mix, mix) from ``pre``
+                partial[3] = dot8(mix, prefix_value)
             else:
                 partial[0] = dot8(prefix_value, prefix_value)
             idx = reduce_scatter(partial, self.npost, lane)
@@ -398,32 +391,12 @@ class OprojConsumer:
                     p = pair_op((ep, ep), two(prefix_value, j), op="mul")
                     value = pair_op((alpha, alpha), two(mix, j), p, op="fma")
                     final[2 * j], final[2 * j + 1] = value[0], value[1]
-                if cutlass.const_expr(self.norm_fold):
-                    # |a mix + e prefix|^2 from exchange 1's cluster sums; clamped at 0
-                    # (rounding under strong mix / prefix cancellation).
-                    cross = mul_rn(Float32(2), mul_rn(alpha, ep))
-                    quad = fma(cross, total[3], mul_rn(mul_rn(ep, ep), total[0]))
-                    quad = fma(mul_rn(alpha, alpha), total[2], quad)
-                    norm_sq = cute.arch.fmax(quad, Float32(0))
-                else:
-                    square = warp_sum(dot8(final, final))
-                    if lane == 0:
-                        for peer in cutlass.range_constexpr(7):
-                            push_float(
-                                at(norm_post, rank, warp),
-                                square,
-                                bars.iterator + 2,
-                                peer,
-                            )
-                    self.wait_exchange(bars.iterator + 2)
-                    if tid == 0:
-                        sums = [Float32(0)] * 4
-                        for peer in cutlass.range_constexpr(7):
-                            for w in cutlass.range_constexpr(4):
-                                sums[w] = add_rn(sums[w], norm_post[peer, w])
-                        norm_total[0] = tree_reduce(sums, add_rn)
-                    named_barrier()
-                    norm_sq = norm_total[0]
+                # |a mix + e prefix|^2 from exchange 1's cluster sums; clamped at 0
+                # (rounding under strong mix / prefix cancellation).
+                cross = mul_rn(Float32(2), mul_rn(alpha, ep))
+                quad = fma(cross, total[3], mul_rn(mul_rn(ep, ep), total[0]))
+                quad = fma(mul_rn(alpha, alpha), total[2], quad)
+                norm_sq = cute.arch.fmax(quad, Float32(0))
                 inverse = cute.arch.rcp_approx(den)
                 scale = mul_rn(
                     inverse,
@@ -460,10 +433,10 @@ class OprojConsumer:
 
 
 class OprojFused:
-    def __init__(self, nb, *, has_delta=True, norm_fold=False):
+    def __init__(self, nb, *, has_delta=True):
         self.producer = OprojProducer(768, staged_blocks=0)
         # TP16 requires prefix/blocks to be ready at launch.
-        self.consumer = OprojConsumer(nb, has_delta=has_delta, norm_fold=norm_fold)
+        self.consumer = OprojConsumer(nb, has_delta=has_delta)
 
     @cute.jit
     def __call__(self, *args):

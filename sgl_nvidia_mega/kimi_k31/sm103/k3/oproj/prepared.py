@@ -7,10 +7,9 @@ by layer) and the consumer sums and re-arms them. TP16 B<=8 fuses producer and c
 At ``twoshot_batches``, given ``TwoShot`` buffers, the all-reduce is ``common.twoshot``
 (chunks pushed to their column owner, owner sums + multicasts, all Lamport-polled), so
 each GPU receives ~2 x 14 KB per token instead of TP x 14 KB.
-``K31MK_OPROJ_NORM_FOLD=1`` (TP16; default off, not bitwise) folds AttnRes's final-norm
-cluster exchange into the first one (``OprojConsumer``'s norm_fold)."""
+The consumers fold AttnRes's final-norm cluster exchange into the first one (not bitwise;
+``consumer``'s docstring)."""
 
-import logging
 from functools import cache
 from typing import Any
 
@@ -19,8 +18,6 @@ import cutlass.cute as cute
 import torch
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass.cute.runtime import make_fake_stream
-
-from sgl_nvidia_mega.kimi_k31.k3.default_scope import best_default
 
 from ..common.host import dynamic_fake, dynamic_view, fake, stream, to_cute
 from ..common.policy import batch_table
@@ -79,33 +76,6 @@ def staged_blocks(batch, tp, mla):
     return 4 if mla or batch == 1 else 8
 
 
-logger = logging.getLogger(__name__)
-_ENGAGED = set()
-
-
-def _engaged(key, text):
-    """The engagement line of an opt-in knob, once per process (not per layer)."""
-    if key not in _ENGAGED:
-        _ENGAGED.add(key)
-        logger.info(text)
-
-
-# On by default in the GB300 BEST scope, kimi_k31/k3/default_scope.py (0 = off), not bitwise: the AttnRes final norm from exchange 1.
-OPROJ_NORM_FOLD = "K31MK_OPROJ_NORM_FOLD"
-
-
-def norm_fold(tp):
-    """Whether the consumers fold the final-norm exchange (``OPROJ_NORM_FOLD``; TP16)."""
-    on = best_default(OPROJ_NORM_FOLD, "1", "0") not in ("", "0") and tp == 16
-    if on:
-        _engaged(
-            "fold",
-            "NVIDIA megakernel: o-proj AttnRes final norm folded into exchange 1 "
-            "(K31MK_OPROJ_NORM_FOLD, not bitwise)",
-        )
-    return on
-
-
 def producer(k, batch, tp, mla, twoshot=False, kind=None):
     """B<=8: one mma.sync pass staging ``staged_blocks`` of the K blocks in SMEM. Above
     B8 (``kind`` overrides ``engine``): the tcgen05 engine, or 2-tile warps over 8 K
@@ -132,12 +102,10 @@ def compile_oproj(
     cap=64,
     twoshot=False,
     deadline_ns=0,
-    fold=False,
 ):
     """Producer, consumer or fused kernel over a [TP, cap, 7168] parity view;
     ``front``: the consumer also publishes x_moe [1, 4, 7168] and the epoch hint.
-    ``twoshot``: the two-shot pair (arguments as ``TwoShot.views``). ``fold``: the
-    consumers' final-norm fold (``norm_fold``), a compile key like every other knob."""
+    ``twoshot``: the two-shot pair (arguments as ``TwoShot.views``)."""
     box = fake((1 if twoshot else tp, cap, 7168), (cap * 7168, 7168, 1))
     x, w = fake((batch, k), (k, 1)), fake((7168, k), (k, 1))
     mc, slot, eps = cutlass.Int64(0), cutlass.Int32(0), cutlass.Float32(1e-6)
@@ -158,12 +126,11 @@ def compile_oproj(
             groups=groups,
             twoshot=twoshot,
             deadline_ns=deadline_ns,
-            norm_fold=fold,
             **options,
         )
         extra = (recv, mc, slot) if twoshot else ()
         return cute.compile(kernel, box, *rows, *extra, make_fake_stream())
-    kernel = OprojFused(nb, has_delta=has_delta, norm_fold=fold)
+    kernel = OprojFused(nb, has_delta=has_delta)
     return cute.compile(kernel, x, w, box, mc, slot, *rows, make_fake_stream())
 
 
@@ -218,7 +185,6 @@ class PreparedOproj:
                     64,
                     twoshot,
                     deadline_ns,
-                    norm_fold(tp) and kind != "producer",
                 )
                 for kind in kinds
             )

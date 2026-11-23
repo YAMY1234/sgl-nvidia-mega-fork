@@ -17,6 +17,10 @@ kernels inside the draft-decode and draft-extend CUDA graphs.
 * the draft top-1 runs as a distributed argmax over each rank's logit shard (one cooperative kernel that exchanges a
   (value, index) candidate per row through a symmetric-memory mailbox) instead of the logits all-gather; the stock
   ``draft_topk1_postprocess`` then reads a one-hot logits row, so the token it picks is unchanged;
+* ``SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_LM_HEAD=mxfp8`` (default off): the draft's LM head (draft decode and draft
+  extend, one row per request) reads an MXFP8 copy of this rank's vocabulary shard (``sm103/draft/lm_head_mxfp8``)
+  instead of SGLang's BF16 matmul. Only the draft's proposals change (the target verifies with the BF16 head), so
+  the gate is the acceptance length, not identity.
 * slot ``draft_rowselect``: in the draft extend the layer keeps only the ``select_index`` rows (one per request:
   the rows its LM head reads) after the post-attention norm, so the MLP, its all-reduce and the final norm run on
   one row per request (the attention still writes every row's KV and indexer key).
@@ -31,6 +35,7 @@ elsewhere); eager steps run SGLang's draft forward (the parity switch excepted, 
 from __future__ import annotations
 
 import logging
+import os
 from functools import partial
 from typing import TYPE_CHECKING, Optional
 
@@ -210,6 +215,10 @@ EH_NORM_OPTIONS = dict(
 # draft extend: torch.argmax (NaN is the maximum, the first NaN wins)
 NAN_REPLACEMENT_BITS = 0xF149F2CA
 ONE_HOT_FILL = -torch.finfo(torch.float32).max
+# the draft LM head's MXFP8 stream (off unless set to "mxfp8"), and the row bounds of its built variants (one row per
+# request in draft decode and in the row-selected draft extend)
+DRAFT_LM_HEAD_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_LM_HEAD"
+LM_HEAD_MAX_ROWS = (2, 4, 8)
 # lanes per candidate of SGLang's draft top-1 partials (kernels/ops/speculative/topk1.py:
 # DRAFT_TOPK1_PARTIAL_LANES)
 PARTIAL_LANES = 4
@@ -260,6 +269,9 @@ class FusedDraft:
         self.binding = binding
         # the top-1 wait bound: TOP1_TIMEOUT_S within SGLang's wait deadline
         self.top1_timeout_ns = int(min(TOP1_TIMEOUT_S, deadline_s) * 1e9)
+        # the draft LM head's MXFP8 copy (DRAFT_LM_HEAD_ENV), or None: SGLang's head
+        self.lm_head_q = None
+        self._lm_head_why = "off"
         self._arm(nextn)
 
     def _arm(self, nextn) -> None:
@@ -304,6 +316,7 @@ class FusedDraft:
             mailbox = _symm_mailbox(spec[0].mailbox_words(self.world), tp, dev)
             ctrl = torch.zeros(spec[0].CTRL_WORDS, dtype=torch.int32, device=dev)
             self._top1[name] = (spec[0], _compile(*spec), mailbox, ctrl)
+        self._arm_lm_head(nextn)
         torch.cuda.synchronize(dev)
         # every rank has built the same draft kernels (also the barrier before any
         # rank's first use of the mailboxes)
@@ -313,6 +326,7 @@ class FusedDraft:
                 TOP1_DECODE_ROWS,
                 TOP1_EXTEND_ROWS,
                 self._attn_family is not None,
+                self.lm_head_q is not None,
             ),
             what="GLM-5.3 / GLM-5.2 draft kernels built",
         )
@@ -327,7 +341,80 @@ class FusedDraft:
             + ("MLA prologue + extend q_a / kv_a GEMM" if self._attn_family else "no")
             + "; draft-extend MLP on the select_index rows: "
             + ("yes" if self.row_select else "no")
+            + "; draft LM head: "
+            + (
+                f"MXFP8 stream at 1-{LM_HEAD_MAX_ROWS[-1]} rows (copy "
+                f"{(self.lm_head_q.codes.numel() + self.lm_head_q.scales.numel()) / 2**20:.1f}"
+                " MiB)"
+                if self.lm_head_q is not None
+                else f"SGLang's ({self._lm_head_why})"
+            )
         )
+
+    def _arm_lm_head(self, nextn) -> None:
+        """The MXFP8 copy of the draft's LM head shard and its stream kernels, when
+        ``DRAFT_LM_HEAD_ENV`` asks for it and every rank can serve it (else every rank
+        keeps SGLang's head)."""
+        mode = os.environ.get(DRAFT_LM_HEAD_ENV, "").strip().lower()
+        if mode in ("", "0", "off", "bf16"):
+            return
+        if mode != "mxfp8":
+            raise ValueError(
+                f"NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: {DRAFT_LM_HEAD_ENV}={mode!r} "
+                "(expected mxfp8 or unset)"
+            )
+        from sgl_nvidia_mega.glm5_3.sm103.draft import lm_head_mxfp8 as lh
+
+        w = getattr(nextn.lm_head, "weight", None)
+        q, why = None, ""
+        if w is None:
+            why = "the draft's lm_head has no weight"
+        else:
+            why = lh.unsupported_reason(w, LM_HEAD_MAX_ROWS[-1])
+        if not why:
+            q = lh.quantize(w.detach())
+            why = lh.scale_reason(q)
+        if not why:
+            n, k = q.shape
+            probe = torch.zeros(1, k, dtype=torch.bfloat16, device=w.device)
+            for max_rows in LM_HEAD_MAX_ROWS:
+                lh.precompile(n, k, w.device, max_rows=max_rows)
+                lh.matmul(probe, q, max_rows=max_rows)  # module load outside capture
+        whys = runtime.tp_gather([why] if why else [])
+        if any(whys):
+            self._lm_head_why = "MXFP8 declined: " + runtime.per_rank(whys)
+            if self.rank == 0:
+                logger.warning(
+                    "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: LM head stays SGLang's: %s",
+                    self._lm_head_why,
+                )
+            return
+        self.lm_head_q = q
+        if self.rank == 0:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: LM head on an MXFP8 copy "
+                "of the shard %s (rows 1-%d)",
+                tuple(q.shape),
+                LM_HEAD_MAX_ROWS[-1],
+            )
+
+    def lm_head_logits(self, x: torch.Tensor, lm_head) -> Optional[torch.Tensor]:
+        """This rank's draft logits shard [rows, N] from the MXFP8 copy, or None (SGLang's
+        head): only inside a captured draft step, at 1-8 BF16 rows (the same decision on
+        every rank)."""
+        q = self.lm_head_q
+        if q is None or not self.engaged():
+            return None
+        from sgl_nvidia_mega.glm5_3.sm103.draft import lm_head_mxfp8 as lh
+
+        w = getattr(lm_head, "weight", None)
+        if w is None or tuple(w.shape) != q.shape:
+            return None
+        rows = x.shape[0]
+        max_rows = next((m for m in LM_HEAD_MAX_ROWS if rows <= m), None)
+        if max_rows is None or lh.x_reason(x, q.shape[1], max_rows):
+            return None
+        return lh.matmul(x, q, max_rows=max_rows)
 
     def _arm_attention(self, nextn) -> None:
         """Build and compile the draft layer's attention kernels; a reason on any rank
@@ -805,7 +892,10 @@ def draft_logits(
         meta,
     )
     lm_head = nextn.lm_head
-    shard = lp._compute_lm_head(pruned, lm_head, None)
+    # DRAFT_LM_HEAD_ENV: the MXFP8 copy's stream, else SGLang's head
+    shard = fd.lm_head_logits(pruned, lm_head)
+    if shard is None:
+        shard = lp._compute_lm_head(pruned, lm_head, None)
     si = lm_head.shard_indices
     extend = meta.forward_mode.is_draft_extend_v2()
     served = (

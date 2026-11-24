@@ -264,18 +264,21 @@ class Nvfp4MoeSmallM16:
       tiles per iteration (3, 4: two, three);
     * ``trace`` (measurement only): per-CTA wait and phase times into the error
       buffer's tail (``TRACE_OFF``);
-    * ``localize`` = w (>= 1, with ``fasttab`` and the shared expert, no ``xtma``): the die-local
-      form. ``sched`` points at the layer's locality block (``constants.LOC_*``) instead
-      of a schedule table. Crank 0 of each cluster reads its SM's locality domain d,
-      claims a rank r among domain d's clusters (one atomic on the block's claim word;
-      the launch's last claimer resets it) and pushes the virtual slot to its peers:
-      (d, r) while r < n_d, else (1 - d, N - 1 - r) (n_0 from the block, n_1 = N - n_0),
-      so the slots 0..N-1 are each taken exactly once for any SM placement. Slots 0
-      and 1 of domain d run shared quarters 2d, 2d + 1 (schedule weight w); the routed
-      units of domain d's experts (ids < 128 in domain 0) are dealt over domain d's
-      slots by the shared rule, and the excess of the busier domain (its single-request
-      tail) goes to the other domain's slots. A unit's arithmetic does not depend on
-      the cluster that runs it, so every output bit is the stock engine's.
+    * ``localize`` = w (>= 1, with ``fasttab`` and the shared expert, no ``xtma``): the
+      die-local form (``_localize``). ``sched`` points at the layer's locality block
+      (``constants.LOC_*``) instead of a schedule table. The scale-factor warp's lane 0
+      of crank 0 reads its SM's locality domain d, claims a rank r among domain d's
+      clusters (one atomic on domain d's claim word, homed on domain d) and pushes the
+      virtual slot to its peers: (d, r) while r < n_d, else (1 - d, N - 1 - r) (n_0 from
+      the block, n_1 = N - n_0), so the slots 0..N-1 are each taken exactly once for any
+      SM placement; a total word then finds the launch's last claimer, which resets the
+      words. Slots 0 and 1 of domain d run shared quarters 2d, 2d + 1 (schedule weight
+      w; their first chunks issue from the scale-factor warp once the slot is known).
+      Domain d's routed units (experts < 128 in domain 0, class order) fill its routed
+      slots up to the per-slot cap; the busier domain's tail goes to the other domain's
+      spare routed slots first, then to the shared slots. The producer waits for the
+      slot only after its id loads. A unit's arithmetic does not depend on the cluster
+      that runs it, so every output bit is the stock engine's.
     """
 
     def __init__(

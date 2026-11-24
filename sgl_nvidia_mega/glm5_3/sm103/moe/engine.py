@@ -546,9 +546,7 @@ class Nvfp4MoeSmallM:
         self.ring_tail(misc, it)
 
     @cute.jit
-    def local_slot(
-        self, shpack, base, misc, crank, ncl, sready, pre, incl, d, lane, err, gsh, policy
-    ):
+    def local_slot(self, misc, ncl, pre, incl, d, lane, err, gsh):
         """``localize``, after the id loads: wait for the slot (a shared slot's first
         ring chunks were issued by the scale-factor warp), write the unit records.
         Returns (units, chunks already in the ring)."""
@@ -617,7 +615,6 @@ class Nvfp4MoeSmallM:
     ):
         g = self.g
         policy = C.l2_policy("evict_first")
-        sready = None
         if cutlass.const_expr(self.localize != 0):
             pre = Int32(0)  # a shared slot's chunks: the scale-factor warp
         else:
@@ -662,9 +659,7 @@ class Nvfp4MoeSmallM:
         self.write_elist(misc, word, incl - cnt, lane, word, word, 1)
         cute.arch.sync_warp()
         if cutlass.const_expr(self.localize != 0):
-            nunits, pre = self.local_slot(
-                shpack, base, misc, crank, lc, sready, pre, incl, d, lane, err, 0, policy
-            )
+            nunits, pre = self.local_slot(misc, lc, pre, incl, d, lane, err, 0)
         else:
             self.wait_schedule(misc)
             row = misc + g.m_stab + 2 * g.sched_row * d
@@ -747,7 +742,6 @@ class Nvfp4MoeSmallM:
         g = self.g
         mb = rows - ma
         policy = C.l2_policy("evict_first")
-        sready = None
         if cutlass.const_expr(self.localize != 0):
             pre = Int32(0)  # a shared slot's chunks: the scale-factor warp
         else:
@@ -857,9 +851,7 @@ class Nvfp4MoeSmallM:
             gsh = Int32(1)
             if mb > 0:
                 gsh = Int32(3)
-            nunits, pre = self.local_slot(
-                shpack, base, misc, crank, lc, sready, pre, incl, d, lane, err, gsh, policy
-            )
+            nunits, pre = self.local_slot(misc, lc, pre, incl, d, lane, err, gsh)
             if lane < nunits:
                 gmu = Int32(C.ld_shared_u32(misc + g.m_units + lane * g.unit_bytes + g.u_gm))
         else:

@@ -153,19 +153,6 @@ def slot_entry(vd, vr, n0, ncl, sw, u0, u1, k):
 
 
 @cute.jit
-def slot_ready(stab):
-    """1 if the slot word has arrived (never suspends)."""
-    return P.mbarrier_test_wait_parity(stab + L_BCLAIM, 0)
-
-
-@cute.jit
-def read_slot(stab):
-    """(vd, vr, n_0) of a slot word known to have arrived."""
-    w = Int32(C.ld_shared_u32(stab + L_MCLAIM))
-    return w & 1, (w >> 8) & 0xFF, (w >> 16) & 0xFF
-
-
-@cute.jit
 def wait_slot(stab):
     """The slot word (every thread of the CTA, once published)."""
     C.mbarrier_wait_parity(stab + L_BCLAIM, 0)
@@ -173,4 +160,4 @@ def wait_slot(stab):
     return w & 1, (w >> 8) & 0xFF, (w >> 16) & 0xFF
 
 
-__all__ = ["L_BCLAIM", "L_MCLAIM", "claim_issue", "claim_publish", "read_slot", "slot_entry", "slot_ready", "wait_slot"]
+__all__ = ["L_BCLAIM", "L_MCLAIM", "claim_issue", "claim_publish", "slot_entry", "wait_slot"]

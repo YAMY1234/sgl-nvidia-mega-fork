@@ -202,17 +202,6 @@ def atom_add_u64(address, value):
 
 
 @ptx_op(Int32)
-def mbarrier_test_wait_parity(bar, parity):
-    """1 if the phase with ``parity`` has completed, else 0 (``test_wait``: never
-    suspends)."""
-    code = (
-        "{ .reg .pred P; mbarrier.test_wait.parity.shared::cta.b64 P, [$1], $2; "
-        "selp.u32 $0, 1, 0, P; }"
-    )
-    return code, "=r,r,r", (Int32(bar), Int32(parity))
-
-
-@ptx_op(Int32)
 def atom_add_u32(address, value):
     """Relaxed GPU-scope ``atom.add.u32``; returns the old value."""
     return (

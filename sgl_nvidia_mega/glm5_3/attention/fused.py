@@ -176,6 +176,16 @@ _PROLOGUE_F32X2 = os.environ.get(PROLOGUE_F32X2_ENV, "0").strip() not in ("", "0
 # cluster-scope release arrive after them. Same outputs. Read at build.
 PROLOGUE8_EARLY_ARM_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE8_EARLY_ARM"
 _PROLOGUE8_EARLY_ARM = os.environ.get(PROLOGUE8_EARLY_ARM_ENV, "0").strip() not in ("", "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_ROW_NORM=1 (with PROLOGUE16_OVERLAP): the 16-row prologue's head CTAs load
+# each q row on the warp that sums it, in the strided-sum lane layout, and normalize it from registers (no shared-memory
+# round trip for the sums, no CTA-wide normalize phase; MlaPrologue row_norm).
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_EARLY_ARM=1 (with PROLOGUE16_OVERLAP and PROLOGUE_PUSH): the 16-row prologue
+# arms its QN barrier with a CTA-scope arrive before the weight bulk copies, not with a cluster-scope release after
+# them (which waited for the copies before the PDL wait; MlaPrologue early_arm). Same outputs. Read at build.
+PROLOGUE16_ROW_NORM_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_ROW_NORM"
+PROLOGUE16_EARLY_ARM_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_EARLY_ARM"
+_PROLOGUE16_ROW_NORM = os.environ.get(PROLOGUE16_ROW_NORM_ENV, "0").strip() not in ("", "0")
+_PROLOGUE16_EARLY_ARM = os.environ.get(PROLOGUE16_EARLY_ARM_ENV, "0").strip() not in ("", "0")
 
 
 def _env_bytes(name: str, default: int, full: int) -> int:
@@ -768,6 +778,8 @@ class AttentionGlue:
             prologue_push=_PROLOGUE_PUSH,
             prologue_f32x2=_PROLOGUE_F32X2,
             prologue8_early_arm=_PROLOGUE8_EARLY_ARM,
+            prologue16_row_norm=_PROLOGUE16_ROW_NORM,
+            prologue16_early_arm=_PROLOGUE16_EARLY_ARM,
         )
         if _PROLOGUE16_OVERLAP and "prologue.16" in specs:
             logger.info(
@@ -808,6 +820,16 @@ class AttentionGlue:
                     "(%s=1)",
                     what,
                     forms,
+                    env,
+                )
+        for key_name, env, what in (
+            ("row_norm", PROLOGUE16_ROW_NORM_ENV, "q rows summed and normalized by their loading warp"),
+            ("early_arm", PROLOGUE16_EARLY_ARM_ENV, "QN barrier armed before the weight copies"),
+        ):
+            if "prologue.16" in specs and specs["prologue.16"][1].get(key_name):
+                logger.info(
+                    "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 16-row MLA prologue: %s (%s=1)",
+                    what,
                     env,
                 )
         self.sparse_ll = self._sparse_ll_plan(rows)

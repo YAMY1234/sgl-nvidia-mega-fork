@@ -168,7 +168,9 @@ class HopFamily:
         small = any(m <= SMALL_ROWS for m in rows)
         big = any(m > SMALL_ROWS for m in rows)
         names = set()
-        specs = list(self.api.unit_specs())
+        # SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS: the 9..16-row routing producer
+        rows16 = big and self.api.hop16_router_rows()
+        specs = list(self.api.unit_specs(router_rows16=rows16))
         if small:
             names |= {"allreduce_norm", "o_proj_produce", "o_proj_consume"}
             names |= {"o_proj_produce_router", "o_proj_consume_router"}
@@ -254,6 +256,13 @@ class HopFamily:
                 "(split / cluster-free deferred-norm split row limits %s)",
                 ",".join(sorted(kernels.form)),
                 kernels.fold_limits()[:2],
+            )
+        # (the store form changes no address or value: ranks need not agree on it)
+        if rows16:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 9-16-row o_proj hop stores its "
+                "router partials row-contiguous (%s=1)",
+                self.api.HOP16_ROUTER_ROWS_ENV,
             )
         self.kernels = kernels
 

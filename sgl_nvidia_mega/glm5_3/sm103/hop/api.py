@@ -16,6 +16,11 @@
 * ``oproj_async_min_rows()`` / ``oproj_async_specs()``: the opt-in o_proj producer
   forms that stage the activations with ``cp.async`` up to 8 rows, awaited inside the
   epoch read (same outputs), and the row count from which ``HopKernels`` serves them.
+
+``SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS=1`` (read by ``unit_specs``, i.e. at
+build): the 9..16-row routing o_proj producer (mailbox instance B) stores its router
+partials row-contiguous (``o_proj_rc.OProjArProduceRc``); the same outputs, bitwise.
+Instance A (up to 8 rows) keeps the served unit.
 """
 
 import os
@@ -39,6 +44,7 @@ from .moe_fold import (
     RmsnormFromBlockSums,
 )
 from .o_proj import ROUTER_K, OProjArConsume, OProjArProduce, router_partial_bytes
+from .o_proj_rc import OProjArProduceRc
 from .transport import ErrorRecord, HopMailbox
 
 MIN_PTX_ISA = (9, 2)
@@ -101,6 +107,21 @@ def oproj_async_min_rows() -> int:
     if not 0 <= value <= 8:
         raise ValueError(f"{OPROJ_ASYNC_STAGE_MIN_ROWS_ENV}={value}: expected 0..8")
     return value
+
+
+HOP16_ROUTER_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS"
+
+
+def hop16_router_rows(value=None) -> bool:
+    """Whether the 9..16-row routing o_proj producer stores its router partials
+    row-contiguous, from ``value`` (default: the
+    ``SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS`` environment value; ``1`` on,
+    empty / ``0`` off)."""
+    raw = os.environ.get(HOP16_ROUTER_ROWS_ENV, "") if value is None else value
+    raw = raw.strip()
+    if raw not in ("", "0", "1"):
+        raise ValueError(f"{HOP16_ROUTER_ROWS_ENV}={raw!r}: expected 0 or 1")
+    return raw == "1"
 
 
 @dataclass(frozen=True)
@@ -216,14 +237,21 @@ def _args_apply():
 
 
 def unit_specs(
-    *, plain_allreduce: bool = False, allreduce_rmsnorm: bool = False, form=None
+    *,
+    plain_allreduce: bool = False,
+    allreduce_rmsnorm: bool = False,
+    form=None,
+    router_rows16=None,
 ):
     """The compile units of the forward hops (instance A: up to 8 rows; instance B:
     9..16). ``plain_allreduce``: also the plain all-reduce (the draft's eh gather);
     ``allreduce_rmsnorm``: also the residual-free all-reduce + RMSNorm (the draft's
     row-parallel eh_proj sum with the draft layer's input norm); ``form``: the opt-in
-    fold forms (default: ``fold_form()``)."""
+    fold forms (default: ``fold_form()``). ``router_rows16``: the 9..16-row routing
+    producer with row-contiguous router-partial stores (default:
+    ``hop16_router_rows()``); the unit name stays."""
     fu = fold_units(form)
+    rows16 = hop16_router_rows() if router_rows16 is None else bool(router_rows16)
     specs = [
         UnitSpec(
             "allreduce_norm", AllreduceNormHop(residual=True, norm=True), _args_ar()
@@ -236,7 +264,7 @@ def unit_specs(
         UnitSpec("moe_fold_plain", fu["moe_fold_plain"], _args_fold()),
         UnitSpec(
             "o_proj_produce_router16",
-            OProjArProduce(router=True, max_rows=16),
+            OProjArProduceRc() if rows16 else OProjArProduce(router=True, max_rows=16),
             _args_produce(),
         ),
         UnitSpec(

@@ -546,32 +546,15 @@ class Nvfp4MoeSmallM:
         self.ring_tail(misc, it)
 
     @cute.jit
-    def local_pre(self, shpack, base, misc, crank, lane, policy):
-        """``localize``, before the dependency wait: (pre-issued shared chunks, slot
-        known): a shared slot's pre-issue if the slot has already arrived (else it
-        issues after the id loads, ``local_slot``)."""
-        pre = Int32(0)
-        stab = misc + self.g.m_stab
-        sready = cute.arch.shuffle_sync(LZ.slot_ready(stab), 0)
-        if sready != 0:
-            svd, svr, _ = LZ.read_slot(stab)
-            if svr < 2:
-                pre = self.pre_issue(
-                    shpack, base, misc, crank, 2 * svd + svr, Int32(1), lane, policy
-                )
-        return pre, sready
-
-    @cute.jit
     def local_slot(
         self, shpack, base, misc, crank, ncl, sready, pre, incl, d, lane, err, gsh, policy
     ):
-        """``localize``, after the id loads: wait for the slot, issue a shared slot's
-        first chunks if not yet issued, write the unit records. Returns (units, pre)."""
+        """``localize``, after the id loads: wait for the slot (a shared slot's first
+        ring chunks were issued by the scale-factor warp), write the unit records.
+        Returns (units, chunks already in the ring)."""
         vd, vr, vn0 = LZ.wait_slot(misc + self.g.m_stab)
-        if (vr < 2) & (sready == 0):
-            pre = self.pre_issue(
-                shpack, base, misc, crank, 2 * vd + vr, Int32(1), lane, policy
-            )
+        if vr < 2:
+            pre = Int32(RING)
         return self.local_units(misc, (vd, vr, vn0, ncl), incl, d, lane, err, gsh), pre
 
     @cute.jit
@@ -636,7 +619,7 @@ class Nvfp4MoeSmallM:
         policy = C.l2_policy("evict_first")
         sready = None
         if cutlass.const_expr(self.localize != 0):
-            pre, sready = self.local_pre(shpack, base, misc, crank, lane, policy)
+            pre = Int32(0)  # a shared slot's chunks: the scale-factor warp
         else:
             pre = self.pre_issue(shpack, base, misc, crank, cl, my_sh, lane, policy)
         if cutlass.const_expr(not self.localize):
@@ -766,7 +749,7 @@ class Nvfp4MoeSmallM:
         policy = C.l2_policy("evict_first")
         sready = None
         if cutlass.const_expr(self.localize != 0):
-            pre, sready = self.local_pre(shpack, base, misc, crank, lane, policy)
+            pre = Int32(0)  # a shared slot's chunks: the scale-factor warp
         else:
             pre = self.pre_issue(shpack, base, misc, crank, cl, my_sh, lane, policy)
         if cutlass.const_expr(not self.localize):
@@ -2129,6 +2112,20 @@ class Nvfp4MoeSmallM:
                         sched, ncl, claim, ldie, ln0, misc + g.m_stab, CLUSTER
                     )
                 cute.arch.sync_warp()
+                # a shared slot's first chunks issue as soon as the slot is known, from
+                # this warp (idle until the unit table), whatever the dependency wait
+                vd, vr, _ = LZ.wait_slot(misc + g.m_stab)
+                if vr < 2:
+                    self.pre_issue(
+                        shpack,
+                        base,
+                        misc,
+                        crank,
+                        2 * vd + vr,
+                        Int32(1),
+                        lane,
+                        C.l2_policy("evict_first"),
+                    )
         elif cl < SH_CLUSTERS:
             my_sh = Int32(1)
         if warp == 0:

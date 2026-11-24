@@ -914,9 +914,9 @@ class Nvfp4MoeSmallM16:
 
     @cute.jit
     def shared_issue(self, shpack, base, misc, crank, sq, lane, policy):
-        """``localize``: shared quarter ``sq``'s first ring chunks (lane 0) and the L2
-        prefetch of the rest (a lane each), as the stock shared clusters' pre-issue;
-        returns the chunks issued."""
+        """``localize`` (scale-factor warp): shared quarter ``sq``'s first ring chunks
+        (lane 0) and the L2 prefetch of the rest (a lane each), as the stock shared
+        clusters' pre-issue; returns the chunks issued."""
         src = shpack + (Int64(sq) * 4 + Int64(crank)) * SH_RECORD
         if lane == 0:
             for c in cutlass.range_constexpr(RING_SH):
@@ -961,18 +961,12 @@ class Nvfp4MoeSmallM16:
     ):
         """``lc``: the grid's cluster count N in a ``localize`` build: no schedule
         table is staged; the slot (and so ``cl``, ``my_sh``, ``nring``) comes from the
-        claim, the shared quarter's first chunks issue before the dependency wait if
-        the slot is already known, else after the id loads."""
+        claim, which the producer waits for after the id loads; a shared slot's first
+        chunks are issued by the scale-factor warp as soon as the slot is known."""
         policy = C.l2_policy("evict_first")
         pre = Int32(0)
-        sready = None
         if cutlass.const_expr(self.localize != 0):
-            stab = misc + self.M_STAB
-            sready = cute.arch.shuffle_sync(LZ.slot_ready(stab), 0)
-            if sready != 0:
-                svd, svr, _ = LZ.read_slot(stab)
-                if svr < 2:
-                    pre = self.shared_issue(shpack, base, misc, crank, 2 * svd + svr, lane, policy)
+            pass  # a shared slot's first chunks are issued by the scale-factor warp
         elif cutlass.const_expr(self.shared):  # noqa: SIM102
             if my_sh != 0:
                 src = shpack + (Int64(cl) * 4 + Int64(crank)) * SH_RECORD
@@ -1102,8 +1096,7 @@ class Nvfp4MoeSmallM16:
                     self.tr_after(err, block, TR_CLAIM, t0k, vd + vr)
             if vr < 2:
                 nring = Int32(RING_SH)
-                if sready == 0:
-                    pre = self.shared_issue(shpack, base, misc, crank, 2 * vd + vr, lane, policy)
+                pre = Int32(RING_SH)
             pre0, nunits, nx = self.table_local(
                 tmap_ptr,
                 sf13,
@@ -2804,6 +2797,19 @@ class Nvfp4MoeSmallM16:
                     if cutlass.const_expr(self.trace):
                         self.tr_since(err, block, TR_CLAIMP, t0k)
                 cute.arch.sync_warp()
+                # a shared slot's first chunks issue as soon as the slot is known, from
+                # this warp (idle until the unit table), whatever the dependency wait
+                vd, vr, _ = LZ.wait_slot(misc + self.M_STAB)
+                if vr < 2:
+                    self.shared_issue(
+                        shpack,
+                        base,
+                        misc,
+                        crank,
+                        2 * vd + vr,
+                        lane,
+                        C.l2_policy("evict_first"),
+                    )
         elif cutlass.const_expr(self.shared):  # noqa: SIM102
             if (nclusters >= 2 * SH_CLUSTERS) & (cl < SH_CLUSTERS):
                 my_sh = Int32(1)

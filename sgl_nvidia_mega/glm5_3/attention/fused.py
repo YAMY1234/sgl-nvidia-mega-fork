@@ -148,6 +148,29 @@ _SPARSE_MT_MIN_ROWS = int(os.environ.get(SPARSE_MT_MIN_ROWS_ENV, "0") or "0")
 if _SPARSE_LL_MIN_ROWS <= 0 and _SPARSE_MT_MIN_ROWS > 0:
     _SPARSE_LL_MIN_ROWS = max(_SPARSE_MT_MIN_ROWS, 9)
 _SPARSE_LL_ONE_TILE_MAX = int(os.environ.get(SPARSE_LL_ONE_TILE_MAX_ENV, "0") or "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_OVERLAP=1: the 16-row MLA prologue (9-16 verify rows) issues every load of
+# a phase before that phase's stores (MlaPrologue overlap16), so its row slots' latencies overlap. Same outputs.
+# Read at build.
+PROLOGUE16_OVERLAP_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_OVERLAP"
+_PROLOGUE16_OVERLAP = os.environ.get(PROLOGUE16_OVERLAP_ENV, "0").strip() not in ("", "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_KV_SPLIT=1: the 9-16-row prologue writes the MLA / index-K rows 8..15 on
+# their own CTAs of the kv cluster (CTAs 2 / 3, idle with the target's top-k width 0) beside rows 0..7, instead of a
+# second pass of the same warps; the same outputs. Read at build.
+PROLOGUE16_KV_SPLIT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_KV_SPLIT"
+_PROLOGUE16_KV_SPLIT = os.environ.get(PROLOGUE16_KV_SPLIT_ENV, "0").strip() == "1"
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE8_OVERLAP=1: the 8-row MLA prologue (1-8 verify rows) issues each phase's loads
+# before that phase's stores and stores its q_pe bytes after the hand-off (MlaPrologue overlap8). Same outputs.
+# Read at build.
+PROLOGUE8_OVERLAP_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE8_OVERLAP"
+_PROLOGUE8_OVERLAP = os.environ.get(PROLOGUE8_OVERLAP_ENV, "0").strip() not in ("", "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE_PUSH=1: the overlapped prologues (PROLOGUE8 / PROLOGUE16_OVERLAP) hand the
+# q_nope rows to the head cluster by st.async pushes completing on each rank's mbarrier, instead of a release
+# cluster barrier + remote gather. SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE_F32X2=1: their q_a normalize branch-free
+# with packed f32x2 multiplies. Same outputs. Read at build.
+PROLOGUE_PUSH_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE_PUSH"
+PROLOGUE_F32X2_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE_F32X2"
+_PROLOGUE_PUSH = os.environ.get(PROLOGUE_PUSH_ENV, "0").strip() not in ("", "0")
+_PROLOGUE_F32X2 = os.environ.get(PROLOGUE_F32X2_ENV, "0").strip() not in ("", "0")
 
 
 def _env_bytes(name: str, default: int, full: int) -> int:
@@ -734,7 +757,47 @@ class AttentionGlue:
             prologue_end=self.target,
             qkv_a_shared=shared,
             qkv_a_shared_dn=bool(shared) and "dnorm" in SLOTS,
+            prologue16_overlap=_PROLOGUE16_OVERLAP,
+            prologue16_kv_split=_PROLOGUE16_KV_SPLIT,
+            prologue8_overlap=_PROLOGUE8_OVERLAP,
+            prologue_push=_PROLOGUE_PUSH,
+            prologue_f32x2=_PROLOGUE_F32X2,
         )
+        if _PROLOGUE16_OVERLAP and "prologue.16" in specs:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 16-row MLA prologue in the "
+                "overlapped issue order (%s=1)",
+                PROLOGUE16_OVERLAP_ENV,
+            )
+        if _PROLOGUE16_KV_SPLIT and "prologue.16" in specs:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: the 9-16-row prologue writes the "
+                "kv rows 8-15 on their own CTAs (%s)",
+                "target" if self.target else "draft",
+            )
+        if _PROLOGUE8_OVERLAP and "prologue.8" in specs:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 8-row MLA prologue in the "
+                "overlapped issue order (%s=1)",
+                PROLOGUE8_OVERLAP_ENV,
+            )
+        for on, env, what in (
+            (_PROLOGUE_PUSH, PROLOGUE_PUSH_ENV, "pushed q_nope hand-off"),
+            (_PROLOGUE_F32X2, PROLOGUE_F32X2_ENV, "packed branch-free normalize"),
+        ):
+            forms = [
+                c
+                for c, flag in ((8, _PROLOGUE8_OVERLAP), (16, _PROLOGUE16_OVERLAP))
+                if on and flag and f"prologue.{c}" in specs
+            ]
+            if forms:
+                logger.info(
+                    "NVIDIA megakernel: GLM-5.3 / GLM-5.2: MLA prologue %s at max rows %s "
+                    "(%s=1)",
+                    what,
+                    forms,
+                    env,
+                )
         self.sparse_ll = self._sparse_ll_plan(rows)
         for name, (kernel, key, args) in specs.items():
             fn = compile_cached(

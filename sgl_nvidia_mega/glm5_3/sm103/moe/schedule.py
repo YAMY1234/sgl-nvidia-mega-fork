@@ -113,9 +113,17 @@ G4_BLOCK_BYTES = G4_D * G4_ROW * 2  # 4896
 G4_SHARED_WEIGHT = 4
 
 
-def g4_table(nclusters: int, shared: bool) -> torch.Tensor:
+def g4_table(
+    nclusters: int,
+    shared: bool,
+    shared_weight: int = G4_SHARED_WEIGHT,
+    fill_shared: bool = False,
+) -> torch.Tensor:
     """int16 [nclusters][G4_BLOCK_BYTES / 2]: the G1 assignment rule over D <= 128
-    entries with the shared quarter weighted as 4 units and a 17-unit cluster cap."""
+    entries with the shared quarter weighted as ``shared_weight`` units (default 4)
+    and a 17-unit cluster cap. ``fill_shared``: the shared clusters also take up to
+    cap - shared_weight routed units each (the list's last units), the routed clusters
+    the rest, so fewer routed clusters carry the cap."""
     nc = nclusters
     with_shared = shared and nc >= 2 * SH_CLUSTERS
     tab = torch.zeros(nc, G4_D, G4_ROW, dtype=torch.int16)
@@ -128,9 +136,12 @@ def g4_table(nclusters: int, shared: bool) -> torch.Tensor:
         else:
             routed_clusters = nc - SH_CLUSTERS
             cap = min(
-                (units + G4_SHARED_WEIGHT * SH_CLUSTERS + nc - 1) // nc, G4_MAX_UNITS
+                (units + shared_weight * SH_CLUSTERS + nc - 1) // nc, G4_MAX_UNITS
             )
             lim = min(units, routed_clusters * cap)
+            if fill_shared:
+                lim = min(lim, units - SH_CLUSTERS * max(cap - shared_weight, 0))
+                lim = max(lim, 0)
             for cl in range(SH_CLUSTERS):
                 lists[cl].append(-1)
             for u in range(lim):

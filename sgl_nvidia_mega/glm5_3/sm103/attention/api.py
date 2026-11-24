@@ -57,6 +57,11 @@ def compile_specs(
     prologue_end: bool = False,
     qkv_a_shared: int | None = None,
     qkv_a_shared_dn: bool = False,
+    prologue16_overlap: bool = False,
+    prologue16_kv_split: bool = False,
+    prologue8_overlap: bool = False,
+    prologue_push: bool = False,
+    prologue_f32x2: bool = False,
 ) -> dict[str, tuple]:
     """The attention units for row capacities ``caps`` and sparse-MLA warp counts
     ``warps``. ``numerics`` is the engine's ``PrologueNumerics`` value table and
@@ -65,10 +70,19 @@ def compile_specs(
     ``qkv_a = (n_rows, n_main)`` adds the skinny q_a / kv_a (+ indexer key) projection
     at 8 rows on ``grid`` CTAs (default: the current device's multiprocessor count).
     ``prologue_end`` adds ``prologue_end.<cap>``: the prologue that triggers its
-    dependents after its last output store. ``qkv_a_shared = n_rows`` adds
+    dependents after its last output store.
+    ``prologue16_overlap`` builds the 16-row prologues in the overlapped issue order
+    (``MlaPrologue(overlap16=True)``: same outputs). ``qkv_a_shared = n_rows`` adds
     ``qkv_a_shared.8``: the skinny projection of the q_a / kv_a rows alone (the layers
     without their own indexer), at 8 rows on ``grid`` CTAs; ``qkv_a_shared_dn`` adds
-    its epilogue-scaled form ``qkv_a_shared_dn.8`` (deferred input norm)."""
+    its epilogue-scaled form ``qkv_a_shared_dn.8`` (deferred input norm).
+    ``prologue16_kv_split`` builds ``prologue[_end].16`` with the kv cluster's rows
+    8..15 on their own CTAs (same outputs).
+    ``prologue8_overlap`` builds the 8-row prologues in the overlapped issue order
+    (``MlaPrologue(overlap8=True)``: same outputs).
+    ``prologue_push`` / ``prologue_f32x2`` add the pushed q_nope hand-off / the packed
+    branch-free normalize to the overlapped forms (``MlaPrologue(push=True)`` /
+    ``f32x2=True``; same outputs)."""
     from .indexer_q_proj import IndexerQProj
     from .mla_prologue import MlaPrologue
     from .mla_uv_proj import MlaUvProj
@@ -88,6 +102,21 @@ def compile_specs(
         }
         if index_scale_ue8m0x4:
             key["index_scale_ue8m0x4"] = True
+        overlap16 = prologue16_overlap and cap == 16
+        if overlap16:
+            key["overlap16"] = True
+        kvs = bool(prologue16_kv_split and cap == 16)
+        if kvs:
+            key["kv_split"] = True
+        overlap8 = prologue8_overlap and cap == 8
+        if overlap8:
+            key["overlap8"] = True
+        ov = overlap8 or overlap16
+        push, f32x2 = bool(prologue_push and ov), bool(prologue_f32x2 and ov)
+        if push:
+            key["push"] = True
+        if f32x2:
+            key["f32x2"] = True
         specs[f"prologue.{cap}"] = (
             MlaPrologue(
                 cap,
@@ -95,6 +124,11 @@ def compile_specs(
                 rope_cache_fp32,
                 index_rope_cache_fp32,
                 index_scale_ue8m0x4,
+                overlap16=overlap16,
+                kv_split=kvs,
+                overlap8=overlap8,
+                push=push,
+                f32x2=f32x2,
             ),
             key,
             args["prologue"],
@@ -108,6 +142,11 @@ def compile_specs(
                     index_rope_cache_fp32,
                     index_scale_ue8m0x4,
                     trigger_at_end=True,
+                    overlap16=overlap16,
+                    kv_split=kvs,
+                    overlap8=overlap8,
+                    push=push,
+                    f32x2=f32x2,
                 ),
                 {**key, "trigger_at_end": True},
                 args["prologue"],

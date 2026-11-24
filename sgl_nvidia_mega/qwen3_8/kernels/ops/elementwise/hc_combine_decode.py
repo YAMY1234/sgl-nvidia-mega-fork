@@ -5,6 +5,8 @@ The decode specialization accepts four branches of 2560 BF16 values. Gate
 partials belong to each invocation, so overlapping sublayers never reuse them.
 """
 
+from typing import Optional
+
 import torch
 
 from sgl_nvidia_mega.qwen3_8._jit import cache_once, load_jit

@@ -3061,7 +3061,6 @@ class TestQsaIndexerStreams(unittest.TestCase):
     ):
         """A step with the PDL-index branch's conditions met unless changed."""
         from sgl_nvidia_mega.qwen3_8.runtime import (
-            attention,
             bf16_gemm_pins,
             capture_fork,
         )

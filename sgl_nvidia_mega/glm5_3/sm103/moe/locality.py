@@ -446,6 +446,9 @@ def _chase_map(banks: Banks, mod: _Module, sm_count: int, device: torch.device) 
     f = mod.fn("chase", PROBE_SMEM)
     ring = torch.zeros(1024, dtype=torch.int32, device=device)
     ring[0::32] = ((torch.arange(32, device=device) + 7) % 32 * 32).int()
+    # HBM latency, not L2: a write of 4x the L2 before each launch evicts the rings
+    l2 = torch.cuda.get_device_properties(device).L2_cache_size
+    flush = torch.empty(max(4 * l2, 256 << 20), dtype=torch.uint8, device=device)
     cyc = []
     tensors = []
     for d in range(2):
@@ -457,6 +460,7 @@ def _chase_map(banks: Banks, mod: _Module, sm_count: int, device: torch.device) 
         best = None
         for _ in range(3):
             out.zero_()
+            flush.zero_()
             mod.launch(
                 f,
                 sm_count,
@@ -479,7 +483,7 @@ def _chase_map(banks: Banks, mod: _Module, sm_count: int, device: torch.device) 
         ratios.append(far)
         if far >= 1.25:
             sm_to_die[s] = near
-    del tensors
+    del tensors, flush
     return {
         "sm_to_die": sm_to_die,
         "measured": sum(1 for s in range(MAX_SMID) if cyc[0][s] > 0),

@@ -198,11 +198,14 @@ class _Raw:
 
 # ------------------------------------------------------------------ banks
 class Banks:
-    """VMM allocations homed on locality domains, one virtual range per tensor."""
+    """VMM allocations homed on locality domains, one virtual range per tensor.
+    ``interleaved`` (measurement only): plain device VMM allocations (the driver's
+    default placement over both dies) with the same granularity and mapping."""
 
-    def __init__(self, device_index: int, ndom: int = 2):
+    def __init__(self, device_index: int, ndom: int = 2, interleaved: bool = False):
         cu = _cu()
         self.cu, self.dev, self.ndom = cu, int(device_index), ndom
+        self.interleaved = interleaved
         self.loc_type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN
         flag = cu.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM
         self.gran = max(
@@ -221,8 +224,12 @@ class Banks:
         cu = self.cu
         p = cu.CUmemAllocationProp()
         p.type = cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        p.location.type = self.loc_type
-        p.location.id = self.dev | (d << 8)
+        if self.interleaved:
+            p.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+            p.location.id = self.dev
+        else:
+            p.location.type = self.loc_type
+            p.location.id = self.dev | (d << 8)
         return p
 
     def page_dies(self, nbytes: int, split: int) -> List[int]:
@@ -277,8 +284,10 @@ class Banks:
         attribute at the first and last page."""
         split = nbytes // 2 if split is None else split
         dies = self.page_dies(nbytes, split)
+        if self.interleaved:
+            dies = [0] * len(dies)
         va = self.alloc(nbytes, dies)
-        for p in (0, len(dies) - 1):
+        for p in () if self.interleaved else (0, len(dies) - 1):
             got = self.ordinal(va + p * self.gran)
             if got != dies[p]:
                 raise Unavailable(

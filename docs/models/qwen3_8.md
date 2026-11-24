@@ -17,8 +17,15 @@ Each op runs its slot's kernel where that kernel serves the step's width, and SG
 module everywhere else. The log records which implementation each op ran, once per new set
 for each (mode, width): `NVIDIA megakernel engagement: ...`.
 
-`SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) lists the slots to run. Unset or empty
-runs every op on SGLang's module.
+Every slot below runs by default, so `--enable-nvidia-megakernel` is the only setting the
+model needs. A slot whose kernel cannot serve a setup (for example `qsa_pool_fp8` needs an
+FP8 KV pool) leaves that step to SGLang's module and logs the reason. At TP1 the executor
+runs each layer's HC read, mixer, HC write-back and MoE itself (the S1 layers, which `hc`,
+`hc_wide`, `moe_finalize` and the PLE add need); at larger TP the layers go through SGLang's
+stage boundaries.
+
+`SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) replaces the shipped list, for tests and
+bisecting. An empty value runs every op on SGLang's module.
 
 | Slot | Runs | Numerics against SGLang's module |
 | --- | --- | --- |
@@ -27,7 +34,7 @@ runs every op on SGLang's module.
 | `gdn_native_pdl` | the GDN target verify on the circular ReplaySSM rings, as a PDL launch | within SGLang's own run-to-run variation |
 | `qsa_indexer` | the QSA indexer's fold, scorer and top-k in verify, decode and draft extend | the same blocks, except on ties |
 | `qsa_pool` | TP1 QSA sparse attention of up to 64 verify / decode rows on split-K pool kernels | rounding |
-| `qsa_pool_fp8` | TP1 QSA sparse attention of 56 to 576 target-verify rows on an FP8 E4M3 KV pool: the new K/V cast in the pool write, each request's token union, the warp-specialized attention (PDL) and the merge; `SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_UNION_MIN_ROWS` and `..._QSA_UNION_SPLITS` (default 56 and 2) tune it | rounding |
+| `qsa_pool_fp8` | TP1 QSA sparse attention of 56 to 576 target-verify rows on an FP8 E4M3 KV pool: the new K/V cast in the pool write, each request's token union, the warp-specialized attention (PDL) and the merge | rounding |
 | `moe_finalize` | the TP1 MoE finalize with the gated shared expert in one ordered kernel; from 1024 rows (prefill and extend, in breakable prefill graphs too) the extend-size stream order and a register-capped PDL launch, plus a FlashInfer tuning pass of the routed experts at prefill sizes that applies the prefill table of `SGLANG_FLASHINFER_TACTIC_PIN_FILE` | rounding |
 | `gdn_prefill` | the GDN prefill on FlashInfer's chunked kernel: split conv, retiled gating, l2norm and norm, one-launch state copies | bitwise |
 | `qsa_prefill` | QSA prefill: row-group union attention, row pack, fast top-k select, TMA prefill | union: rounding; the rest bitwise |
@@ -35,9 +42,6 @@ runs every op on SGLang's module.
 
 Switches:
 
-- **`SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_DECOMPOSE=1`** runs the S1 layers: the executor calls
-  each layer's HC read, mixer, HC write-back and MoE itself, instead of going through the
-  stage boundaries. It needs TP1. `hc`, `hc_wide`, `moe_finalize` and the PLE add need it.
 - **`SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_UCACHE=1`** turns on the GDN u-cache target verify, a
   deferred-fold ReplaySSM.
   - The executor owns the rings, keyed by request row with an fp16 key ring. It allocates
@@ -50,3 +54,6 @@ Switches:
 - **`SGLANG_NVIDIA_MEGAKERNEL_PARITY=layer|control`** is test only. It runs SGLang's forward
   beside the executor on every covered step, restoring the recurrent state between the two,
   and logs the steps, layers and logits that differ (`qwen3_8/tools/parity.py`).
+- **`SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_OPCHECK=1`** is test only. On eager steps it also runs
+  SGLang's attention on the same q / k / v and selected indices, and logs how far the pool
+  kernel's output is from it, per row.

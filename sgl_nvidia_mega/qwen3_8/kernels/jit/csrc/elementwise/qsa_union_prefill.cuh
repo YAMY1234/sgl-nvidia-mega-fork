@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+// All rights reserved.
 // Token unions for the QSA union prefill attention (opt-in, SGLANG_QSA_UNION_PREFILL; see
 // srt/layers/attention/qsa/union_prefill.py).
 //

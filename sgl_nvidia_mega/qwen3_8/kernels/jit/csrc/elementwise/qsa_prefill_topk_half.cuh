@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+// All rights reserved.
 // qsa_prefill_topk.cuh's sampled select on 512-thread blocks, four per SM instead
 // of two 1024-thread blocks, with the same output: the same winners in the same
 // slots for every row.

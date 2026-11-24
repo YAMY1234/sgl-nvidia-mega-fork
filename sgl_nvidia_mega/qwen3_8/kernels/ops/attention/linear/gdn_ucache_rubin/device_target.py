@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Per-device compile target and launch policy for the GDN CuTe-DSL kernels.
 
 The DSL resolves its default ``GPUArch`` from ``CUTE_DSL_ARCH`` or CUDA device 0, so

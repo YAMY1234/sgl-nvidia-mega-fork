@@ -18,9 +18,8 @@ TP1, MTP:
   SGLANG_NVIDIA_MEGAKERNEL_E2E_PERF_TOLERANCE; an arm whose middle three rounds spread
   more than PERF_NOISE fails as too noisy to judge, not as a regression.
 
-Two more servers check the stock step: with no slot on, each layer through SGLang's
-own stage functions (S0) or decomposed by the executor (S1), every covered step
-against SGLang's forward, bit for bit (SGLANG_NVIDIA_MEGAKERNEL_PARITY=1), in SGLang's
+One more server checks the stock step: with no slot on, each layer decomposed by the
+executor (S1), every covered step against SGLang's forward, bit for bit (SGLANG_NVIDIA_MEGAKERNEL_PARITY=1), in SGLang's
 deterministic inference: target and draft prefill, single- and multi-request verify,
 draft decode and draft extend."""
 
@@ -37,7 +36,7 @@ from pathlib import Path
 
 import requests
 import torch
-from qwen3_8_server import ARGS, ENV, MODEL, SLOTS
+from qwen3_8_server import ARGS, MODEL
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -47,7 +46,7 @@ from sglang.test.test_utils import (
 from sglang.utils import download_and_cache_file
 
 from sgl_nvidia_mega.plugin import FLAG_CLI
-from sgl_nvidia_mega.qwen3_8.runtime import DECOMPOSE_ENV, PARITY_ENV, SLOTS_ENV
+from sgl_nvidia_mega.qwen3_8.runtime import PARITY_ENV, SLOTS_ENV
 
 LAUNCH_TIMEOUT = 3600
 URL = DEFAULT_URL_FOR_TEST
@@ -76,9 +75,9 @@ NEEDS = "Qwen3.8's megakernel is qualified on a Rubin GPU (SM107) only"
 
 
 def _launch(extra_env, args, logs):
+    # the product configuration: every slot the package ships, not a caller's override
     env = {
         **{k: v for k, v in os.environ.items() if k not in (SLOTS_ENV, PARITY_ENV)},
-        **ENV,
         **extra_env,
     }
     return popen_launch_server(
@@ -179,7 +178,7 @@ def _server(name, workload):
     rows = _gsm8k_rows()
     logs = tuple(tempfile.NamedTemporaryFile("w+", suffix=s) for s in (".out", ".err"))
     process = _launch(
-        {**({SLOTS_ENV: SLOTS} if mega else {}), **(PERF_ENV if perf else {})},
+        PERF_ENV if perf else {},
         ARGS + ([FLAG_CLI] if mega else []),
         logs,
     )
@@ -290,16 +289,15 @@ PARITY = re.compile(
 )
 
 
-class _StockStep(CustomTestCase):
-    DECOMPOSE = "0"
-
+@unittest.skipUnless(SM107, NEEDS)
+class TestStockStepIsSGLangs(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.logs = tuple(
             tempfile.NamedTemporaryFile("w+", suffix=s) for s in (".out", ".err")
         )
         cls.process = _launch(
-            {SLOTS_ENV: "", PARITY_ENV: "1", DECOMPOSE_ENV: cls.DECOMPOSE},
+            {SLOTS_ENV: "", PARITY_ENV: "1"},
             ARGS + DETERMINISTIC_ARGS + [FLAG_CLI],
             cls.logs,
         )
@@ -321,7 +319,7 @@ class _StockStep(CustomTestCase):
         )
         r.raise_for_status()
 
-    def check(self):
+    def test_every_covered_step_is_bitwise(self):
         for i in range(4):
             self._generate(i)
         with cf.ThreadPoolExecutor(8) as pool:
@@ -354,22 +352,6 @@ class _StockStep(CustomTestCase):
         differ = [line for line in checked if int(line[5]) or int(line[6])]
         self.assertEqual(differ, [], f"{len(differ)} parity lines differ")
         self.assertGreater(sum(int(line[7]) for line in checked), 0)
-
-
-@unittest.skipUnless(SM107, NEEDS)
-class TestStockStepS0IsSGLangs(_StockStep):
-    DECOMPOSE = "0"
-
-    def test_every_covered_step_is_bitwise(self):
-        self.check()
-
-
-@unittest.skipUnless(SM107, NEEDS)
-class TestStockStepS1IsSGLangs(_StockStep):
-    DECOMPOSE = "1"
-
-    def test_every_covered_step_is_bitwise(self):
-        self.check()
 
 
 if __name__ == "__main__":

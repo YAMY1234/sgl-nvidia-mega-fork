@@ -43,6 +43,7 @@ from cutlass.memory import SmemAllocator
 from ..primitives import ptx_core as C
 from ..primitives import ptx_tc as T
 from . import _core_ptx as P
+from . import _localize as LZ
 from .constants import HIDDEN, NUM_EXPERTS, TOP_K
 from .engine import (
     BIG,
@@ -224,6 +225,8 @@ TR_SYNC0, TR_CLS, TR_SCHED, TR_DEC, TR_XBAR, TR_MMA_X = 32, 33, 34, 35, 36, 37
 TR_LFULL_ABS = 38
 TR_XQ1 = 39  # ``xtma`` = 2: first staged block quantized (since entry)
 TR_CLK = 40  # SM cycles from entry to exit (with TR_DUR: the SM clock)
+# ``localize``: the producer has the slot (since entry); crank 0 pushed it (since entry)
+TR_CLAIM, TR_CLAIMP = 41, 42
 TR_ABS = (TR_ENTRY, TR_EXIT, TR_PDL_ABS, TR_FIRST_ABS, TR_SEND_ABS, TR_LFULL_ABS)
 TRACE_WORDS = 64  # u64 words per CTA
 
@@ -260,7 +263,22 @@ class Nvfp4MoeSmallM16:
       4 blocks, conflict-free shared-memory loads and stores), ``xtma`` - 1 independent
       tiles per iteration (3, 4: two, three);
     * ``trace`` (measurement only): per-CTA wait and phase times into the error
-      buffer's tail (``TRACE_OFF``).
+      buffer's tail (``TRACE_OFF``);
+    * ``localize`` = w (>= 1, with ``fasttab`` and the shared expert, no ``xtma``): the
+      die-local form (``_localize``). ``sched`` points at the layer's locality block
+      (``constants.LOC_*``) instead of a schedule table. The scale-factor warp's lane 0
+      of crank 0 reads its SM's locality domain d, claims a rank r among domain d's
+      clusters (one atomic on domain d's claim word, homed on domain d) and pushes the
+      virtual slot to its peers: (d, r) while r < n_d, else (1 - d, N - 1 - r) (n_0 from
+      the block, n_1 = N - n_0), so the slots 0..N-1 are each taken exactly once for any
+      SM placement; a total word then finds the launch's last claimer, which resets the
+      words. Slots 0 and 1 of domain d run shared quarters 2d, 2d + 1 (schedule weight
+      w; their first chunks issue from the scale-factor warp once the slot is known).
+      Domain d's routed units (experts < 128 in domain 0, class order) fill its routed
+      slots up to the per-slot cap; the busier domain's tail goes to the other domain's
+      spare routed slots first, then to the shared slots. The producer waits for the
+      slot only after its id loads. A unit's arithmetic does not depend on the cluster
+      that runs it, so every output bit is the stock engine's.
     """
 
     def __init__(
@@ -275,8 +293,12 @@ class Nvfp4MoeSmallM16:
         xgate: bool = False,
         xtma: int = 0,
         trace: bool = False,
+        localize: int = 0,
     ):
         self.shared = shared
+        self.localize = int(localize)
+        if self.localize < 0 or (self.localize and (not fasttab or not shared or xtma)):
+            raise ValueError("engine16: localize needs fasttab and the shared expert, no xtma")
         self.xpipe = bool(xpipe)
         self.pre = int(pre)
         self.fasttab = bool(fasttab)
@@ -297,8 +319,9 @@ class Nvfp4MoeSmallM16:
             raise ValueError("engine16: xpipe needs recv_bufs >= 4")
 
     def knobs(self) -> dict:
-        """The build-time choices (compile-cache key)."""
-        return {
+        """The build-time choices (compile-cache key; ``localize`` only when set, so
+        the stock forms keep their keys)."""
+        k = {
             "xpipe": self.xpipe,
             "recv_bufs": self.RECV_BUFS,
             "lookahead": self.LOOKAHEAD,
@@ -308,6 +331,9 @@ class Nvfp4MoeSmallM16:
             "xtma": self.xtma,
             "trace": self.trace,
         }
+        if self.localize:
+            k["localize"] = self.localize
+        return k
 
     # ------------------------------------------------------------ trace (measurement)
     @cute.jit
@@ -751,6 +777,165 @@ class Nvfp4MoeSmallM16:
         cute.arch.sync_warp()
         return pre0, nunits, nx
 
+    @cute.jit
+    def table_local(
+        self,
+        tmap_ptr,
+        sf13,
+        misc,
+        base,
+        crank,
+        lc,
+        gall,
+        err,
+        wq,
+        wcls,
+        cincl,
+        lane,
+        policy,
+        block,
+        t0k,
+    ):
+        """``localize``: this cluster's unit list from its virtual slot (vd, vr) and the
+        per-domain class counts (lanes 0..3 hold domain 0's expert words, 4..7 domain
+        1's), lane u decoding unit u. List order: domain 0's experts by class (>= 3, 2,
+        1 requests; ascending ids within a class), then domain 1's. Same records and
+        unit-0 issue as ``table_fast``. Returns (pre0, nunits, exchanges)."""
+        vd, vr, n0, ncl = lc
+        # per-domain class totals and domain-local inclusive scans (10 bits per class)
+        t0 = [cute.arch.shuffle_sync(cincl[c], 3) for c in range(3)]
+        t1 = [cute.arch.shuffle_sync(cincl[c], 7) - t0[c] for c in range(3)]
+        l0 = cincl[0]
+        l1 = cincl[1]
+        l2 = cincl[2]
+        if lane >= 4:
+            l0 = cincl[0] - t0[0]
+            l1 = cincl[1] - t0[1]
+            l2 = cincl[2] - t0[2]
+        packed = l0 | (l1 << 10) | (l2 << 20)
+        nraw, cdie, u = LZ.slot_entry(
+            vd,
+            vr,
+            n0,
+            ncl,
+            self.localize,
+            4 * (t0[0] + t0[1] + t0[2]),
+            4 * (t1[0] + t1[1] + t1[2]),
+            lane,
+        )
+        nunits = min(nraw, MAX_UNITS)
+        if (lane == 0) & (nraw > MAX_UNITS):
+            P.atom_or_global(err, ERR_UNIT_CAP)
+        qj = u & 3
+        r = u >> 2
+        # class within domain cdie, then the domain's expert word holding rank r
+        b1 = t0[0]
+        b2 = t0[0] + t0[1]
+        if cdie != 0:
+            b1 = t1[0]
+            b2 = t1[0] + t1[1]
+        cls = Int32(0)
+        rr = r
+        if r >= b2:
+            cls = Int32(2)
+            rr = r - b2
+        elif r >= b1:
+            cls = Int32(1)
+            rr = r - b1
+        wsel = Int32(0)
+        excl = Int32(0)
+        for w4 in cutlass.range_constexpr(NUM_EXPERTS // 64):
+            incl = (cute.arch.shuffle_sync(packed, 4 * cdie + w4) >> (10 * cls)) & 1023
+            if incl <= rr:
+                wsel = Int32(w4 + 1)
+                excl = incl
+        if wsel > NUM_EXPERTS // 64 - 1:
+            wsel = Int32(NUM_EXPERTS // 64 - 1)
+        word = 4 * cdie + wsel
+        cw = Uint32(cute.arch.shuffle_sync(Int32(wcls[0]), word))
+        cw1 = Uint32(cute.arch.shuffle_sync(Int32(wcls[1]), word))
+        cw2 = Uint32(cute.arch.shuffle_sync(Int32(wcls[2]), word))
+        if cls == 1:
+            cw = cw1
+        if cls == 2:
+            cw = cw2
+        bit = P.fns(cw, 0, rr - excl + 1) & 31
+        eu = 32 * word + bit
+        gmu = Int32(0)
+        for q in cutlass.range_constexpr(GROUPS):
+            wqq = Uint32(cute.arch.shuffle_sync(Int32(wq[q]), word))
+            gmu = gmu | Int32(((wqq >> Uint32(bit)) & Uint32(1)) << Uint32(q))
+        # unit 0's first chunks (a routed slot's unit 0 is routed: empty ring)
+        e0 = cute.arch.shuffle_sync(eu, 0)
+        j0 = cute.arch.shuffle_sync(qj, 0)
+        pre0 = Int32(0)
+        if (lane == 0) & (nunits > 0) & (vr >= 2):
+            if cutlass.const_expr(self.trace):
+                self.tr_after(err, block, TR_DEC, t0k, e0 + gmu)
+            if cutlass.const_expr(self.xgate):
+                C.mbarrier_wait_parity(misc + B_XBAR, 0)
+            for c in cutlass.range_constexpr(self.pre):
+                C.mbarrier_arrive_expect_tx(misc + B_FULL + 8 * c, BIG)
+                self.fc1_chunk(
+                    tmap_ptr,
+                    sf13,
+                    base + OFF_RING + c * BIG,
+                    e0,
+                    j0,
+                    crank,
+                    c,
+                    misc + B_FULL + 8 * c,
+                    policy,
+                )
+            pre0 = Int32(self.pre)
+        pre0 = cute.arch.shuffle_sync(pre0, 0)
+        if cutlass.const_expr(self.trace):
+            if lane == 0:
+                self.tr_since(err, block, TR_PRE0, t0k)
+        if lane < nunits:
+            unit = misc + self.M_UNITS + lane * UNIT_BYTES
+            if (vr < 2) & (lane == 0):
+                C.st_shared_u32(unit + U_E, Int32(-1))
+                C.st_shared_u32(unit + U_J, 2 * vd + vr)
+                C.st_shared_u32(unit + U_SH, Int32(1))
+                gmu = gall
+            else:
+                C.st_shared_u32(unit + U_E, eu)
+                C.st_shared_u32(unit + U_J, qj)
+                C.st_shared_u32(unit + U_SH, Int32(0))
+            C.st_shared_u32(unit + U_GM, gmu)
+        else:
+            gmu = Int32(0)
+        nx = P.popc(gmu)
+        for o in (16, 8, 4, 2, 1):
+            nx = nx + cute.arch.shuffle_sync_bfly(nx, o)
+        if lane == 0:
+            C.st_shared_u32(misc + self.M_NEX, nx)
+            C.st_shared_u32(misc + self.M_NUNITS, nunits)
+        cute.arch.sync_warp()
+        return pre0, nunits, nx
+
+    @cute.jit
+    def shared_issue(self, shpack, base, misc, crank, sq, lane, policy):
+        """``localize`` (scale-factor warp): shared quarter ``sq``'s first ring chunks
+        (lane 0) and the L2 prefetch of the rest (a lane each), as the stock shared
+        clusters' pre-issue; returns the chunks issued."""
+        src = shpack + (Int64(sq) * 4 + Int64(crank)) * SH_RECORD
+        if lane == 0:
+            for c in cutlass.range_constexpr(RING_SH):
+                C.mbarrier_arrive_expect_tx(misc + B_FULL + 8 * c, SH_CHUNK)
+                C.bulk_copy_g2s(
+                    base + OFF_RING + c * BIG,
+                    src + c * SH_CHUNK,
+                    SH_CHUNK,
+                    misc + B_FULL + 8 * c,
+                    policy,
+                )
+        c = RING_SH + lane
+        if c < SH_CHUNKS:
+            C.bulk_prefetch_l2(src + Int64(c) * SH_CHUNK, SH_CHUNK)
+        return Int32(RING_SH)
+
     # ------------------------------------------------ warp 0: union, schedule, producer
     @cute.jit
     def producer(
@@ -775,10 +960,17 @@ class Nvfp4MoeSmallM16:
         lane,
         block,
         t0k,
+        lc=None,
     ):
+        """``lc``: the grid's cluster count N in a ``localize`` build: no schedule
+        table is staged; the slot (and so ``cl``, ``my_sh``, ``nring``) comes from the
+        claim, which the producer waits for after the id loads; a shared slot's first
+        chunks are issued by the scale-factor warp as soon as the slot is known."""
         policy = C.l2_policy("evict_first")
         pre = Int32(0)
-        if cutlass.const_expr(self.shared):  # noqa: SIM102
+        if cutlass.const_expr(self.localize != 0):
+            pass  # a shared slot's first chunks are issued by the scale-factor warp
+        elif cutlass.const_expr(self.shared):  # noqa: SIM102
             if my_sh != 0:
                 src = shpack + (Int64(cl) * 4 + Int64(crank)) * SH_RECORD
                 if lane == 0:
@@ -795,15 +987,16 @@ class Nvfp4MoeSmallM16:
                 c = RING_SH + lane
                 if c < SH_CHUNKS:
                     C.bulk_prefetch_l2(src + Int64(c) * SH_CHUNK, SH_CHUNK)
-        if lane == 0:
-            C.mbarrier_arrive_expect_tx(misc + B_SBAR, SCHED_BYTES)
-            C.bulk_copy_g2s(
-                misc + self.M_STAB,
-                sched + Int64(cl) * SCHED_BYTES,
-                SCHED_BYTES,
-                misc + B_SBAR,
-                C.l2_policy("evict_last"),
-            )
+        if cutlass.const_expr(not self.localize):
+            if lane == 0:
+                C.mbarrier_arrive_expect_tx(misc + B_SBAR, SCHED_BYTES)
+                C.bulk_copy_g2s(
+                    misc + self.M_STAB,
+                    sched + Int64(cl) * SCHED_BYTES,
+                    SCHED_BYTES,
+                    misc + B_SBAR,
+                    C.l2_policy("evict_last"),
+                )
         C.st_shared_u32(misc + self.M_BM + 4 * lane, Uint32(0))
         cute.arch.sync_warp()
         C.pdl_wait()
@@ -899,7 +1092,32 @@ class Nvfp4MoeSmallM16:
         if cutlass.const_expr(self.trace):
             if lane == 0:
                 self.tr_after(err, block, TR_CLS, t0k, d0)
-        if cutlass.const_expr(self.fasttab):
+        if cutlass.const_expr(self.localize != 0):
+            vd, vr, vn0 = LZ.wait_slot(misc + self.M_STAB)
+            if cutlass.const_expr(self.trace):
+                if lane == 0:
+                    self.tr_after(err, block, TR_CLAIM, t0k, vd + vr)
+            if vr < 2:
+                nring = Int32(RING_SH)
+                pre = Int32(RING_SH)
+            pre0, nunits, nx = self.table_local(
+                tmap_ptr,
+                sf13,
+                misc,
+                base,
+                crank,
+                (vd, vr, vn0, lc),
+                gall,
+                err,
+                wq,
+                wcls,
+                cincl,
+                lane,
+                policy,
+                block,
+                t0k,
+            )
+        elif cutlass.const_expr(self.fasttab):
             pre0, nunits, nx = self.table_fast(
                 tmap_ptr,
                 sf13,
@@ -1096,6 +1314,10 @@ class Nvfp4MoeSmallM16:
     def mma_warp(self, base, misc, nring, err, block, lane, t0k):
         lead = T.elect_leader()
         C.mbarrier_wait_parity(misc + B_TREADY, 0)
+        if cutlass.const_expr(self.localize != 0):
+            _, svr, _ = LZ.wait_slot(misc + self.M_STAB)
+            if svr < 2:
+                nring = Int32(RING_SH)
         nunits = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + self.M_NUNITS)), 0)
         tm = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + self.M_TMEM)), 0)
         if nunits > 0:
@@ -1359,6 +1581,10 @@ class Nvfp4MoeSmallM16:
     def sf_warp(self, base, misc, nring):
         lead = T.elect_leader()
         C.mbarrier_wait_parity(misc + B_TREADY, 0)
+        if cutlass.const_expr(self.localize != 0):
+            _, svr, _ = LZ.wait_slot(misc + self.M_STAB)
+            if svr < 2:
+                nring = Int32(RING_SH)
         nunits = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + self.M_NUNITS)), 0)
         tm = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + self.M_TMEM)), 0)
         if nunits > 0:
@@ -2185,6 +2411,10 @@ class Nvfp4MoeSmallM16:
         # rows
         self.order_scale_rows()
         self.wait_inputs()
+        if cutlass.const_expr(self.localize != 0):
+            _, svr, _ = LZ.wait_slot(misc + self.M_STAB)
+            if svr < 2:
+                my_sh = Int32(1)
         self.quantize_x(
             x, gs1, mqs, rbs, base, misc, crank, my_sh, et, lane, err, block, t0k
         )
@@ -2496,6 +2726,15 @@ class Nvfp4MoeSmallM16:
         # other shape
         P.trap_if(Int32(cute.arch.cluster_size() != CLUSTER))
         C.pdl_launch_dependents()
+        claim = Int32(0)
+        ldie = Int32(0)
+        ln0 = Int32(0)
+        if cutlass.const_expr(self.localize != 0):
+            # crank 0: this SM's locality domain, then one claim on the layer's word
+            # (issued before the barrier set-up; its result is used after it)
+            # (the scale-factor warp's lane 0 claims: it is idle until the unit table)
+            if (tid == 32 * SF_WARP) & (crank == 0):
+                claim, ldie, ln0 = LZ.claim_issue(sched, nclusters)
         if tid == 0:
             for s in cutlass.range_constexpr(RING):
                 C.mbarrier_init(misc + B_FULL + 8 * s, 1)
@@ -2520,7 +2759,12 @@ class Nvfp4MoeSmallM16:
                 C.mbarrier_init(misc + self.B_PRECV + 8 * p, 1)
                 C.mbarrier_init(misc + self.B_PFREE + 8 * p, 3)
                 C.mbarrier_init(misc + self.B_CONSUMED + 8 * p, 4)
+            if cutlass.const_expr(self.localize != 0):
+                C.mbarrier_init(misc + self.M_STAB + LZ.L_BCLAIM, 1)
             C.fence_mbarrier_init_release_cluster()
+            if cutlass.const_expr(self.localize != 0):
+                if crank != 0:
+                    C.mbarrier_arrive_expect_tx(misc + self.M_STAB + LZ.L_BCLAIM, 16)
         if warp == 1:
             T.tmem_alloc(misc + self.M_TMEM, 512)
         T.tc_fence_before()
@@ -2541,7 +2785,35 @@ class Nvfp4MoeSmallM16:
                 gall = gall | (1 << q)
         my_sh = Int32(0)
         nring = Int32(RING)
-        if cutlass.const_expr(self.shared):  # noqa: SIM102
+        lc = None
+        if cutlass.const_expr(self.localize != 0):
+            # the slot arrives while the warps start: the producer, MMA, scale-factor
+            # and epilogue warps each wait for it only where they need it
+            lc = nclusters
+            if warp == SF_WARP:
+                # the peers' barriers are initialized (fence + arrive above)
+                cute.arch.cluster_wait()
+                if (lane == 0) & (crank == 0):
+                    LZ.claim_publish(
+                        sched, nclusters, claim, ldie, ln0, misc + self.M_STAB, CLUSTER
+                    )
+                    if cutlass.const_expr(self.trace):
+                        self.tr_since(err, block, TR_CLAIMP, t0k)
+                cute.arch.sync_warp()
+                # a shared slot's first chunks issue as soon as the slot is known, from
+                # this warp (idle until the unit table), whatever the dependency wait
+                vd, vr, _ = LZ.wait_slot(misc + self.M_STAB)
+                if vr < 2:
+                    self.shared_issue(
+                        shpack,
+                        base,
+                        misc,
+                        crank,
+                        2 * vd + vr,
+                        lane,
+                        C.l2_policy("evict_first"),
+                    )
+        elif cutlass.const_expr(self.shared):  # noqa: SIM102
             if (nclusters >= 2 * SH_CLUSTERS) & (cl < SH_CLUSTERS):
                 my_sh = Int32(1)
                 nring = Int32(RING_SH)
@@ -2567,6 +2839,7 @@ class Nvfp4MoeSmallM16:
                 lane,
                 block,
                 t0k,
+                lc,
             )
         elif warp == 1:
             self.mma_warp(base, misc, nring, err, block, lane, t0k)
@@ -2603,7 +2876,11 @@ class Nvfp4MoeSmallM16:
                 err,
                 t0k,
             )
-        if (warp < 2) | (warp == SF_WARP):
+        if cutlass.const_expr(self.localize != 0):
+            # the scale-factor warp waited before the claim push
+            if warp < 2:
+                cute.arch.cluster_wait()
+        elif (warp < 2) | (warp == SF_WARP):
             cute.arch.cluster_wait()
         T.tc_fence_before()
         cute.arch.sync_threads()

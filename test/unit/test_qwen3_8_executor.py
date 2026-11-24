@@ -1718,19 +1718,16 @@ class TestOwnUcache(unittest.TestCase):
             speculative_num_draft_tokens=4,
             max_running_requests=8,
         )
-        env = runtime.UCACHE_ENV
-        old = runtime.os.environ.get(env)
-        runtime.os.environ[env] = "1"
-        try:
-            self.assertEqual(runtime.config_reasons(cfg, None), [])
-            cfg.mamba_ssm_dtype = "bfloat16"
-            cfg.max_running_requests = 512  # 512 x 4 rows > MAX_ROWS
-            self.assertEqual(len(runtime.config_reasons(cfg, None)), 2)
-        finally:
-            if old is None:
-                del runtime.os.environ[env]
-            else:
-                runtime.os.environ[env] = old
+        self.assertEqual(runtime.config_reasons(cfg, None), [])
+        self.assertEqual(runtime.ucache_reasons(cfg), [])
+        cfg.mamba_ssm_dtype = "bfloat16"
+        cfg.max_running_requests = 512  # 512 x 4 rows > MAX_ROWS
+        self.assertEqual(runtime.config_reasons(cfg, None), [])
+        self.assertEqual(len(runtime.ucache_reasons(cfg)), 2)
+        cfg.mamba_ssm_dtype = "float16"
+        cfg.max_running_requests = 8
+        cfg.enable_linear_replayssm_spec = True
+        self.assertEqual(len(runtime.ucache_reasons(cfg)), 1)
 
 
 class TestSpecs(unittest.TestCase):
@@ -1998,21 +1995,85 @@ class TestPrefillBody(unittest.TestCase):
         out, _ = self.run_draft(ex, mode=_Mode.DRAFT_EXTEND_V2)
         self.assertEqual((lm.calls, out.hidden_states), ([], "hc2"))
 
+    def test_build_picks_the_u_cache_from_the_resolved_server_args(self):
+        """The TP worker's build decides: nothing set in the launching process reaches it."""
+        from unittest import mock
+
+        from sgl_nvidia_mega.qwen3_8.runtime import executor as executor_module
+        from sgl_nvidia_mega.qwen3_8.runtime import gdn_ucache_state
+
+        cfg = SimpleNamespace(
+            mamba_ssm_dtype="float16",
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy="extra_buffer_lazy",
+            speculative_algorithm="NEXTN",
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+            max_running_requests=8,
+        )
+        import sglang.srt.arg_groups.model_override_base as views
+        import sglang.srt.runtime_context as context
+
+        ctx = SimpleNamespace(widths=(4, 8), binding=None, tokens_per_request=4)
+        env = {
+            k: v for k, v in runtime.os.environ.items() if not k.startswith("SGLANG_")
+        }
+        env[runtime.SLOTS_ENV] = ""
+        with (
+            mock.patch.object(
+                context, "get_parallel", lambda: SimpleNamespace(tp_size=1)
+            ),
+            mock.patch.object(context, "get_exec", lambda: SimpleNamespace(mamba=None)),
+            mock.patch.object(context, "get_server_args", lambda: cfg),
+            mock.patch.object(views, "resolved_view", lambda args: args),
+            mock.patch.dict(runtime.os.environ, env, clear=True),
+            mock.patch.object(runtime, "prefill_graphs_on", return_value=False),
+            mock.patch.object(
+                gdn_ucache_state,
+                "UcacheState",
+                type(
+                    "State",
+                    (gdn_ucache_state.UcacheState,),
+                    {"__init__": lambda self, *args, **kw: None},
+                ),
+            ),
+        ):
+            with self.assertLogs(runtime.logger, "INFO") as logs:
+                built = runtime.build(_model(), None, ctx)
+            self.assertIsInstance(built, executor_module.Qwen3_8UcacheExecutor)
+            self.assertTrue(built.verify_required)
+            self.assertTrue(
+                any("u-cache: used for the target verify" in m for m in logs.output)
+            )
+            cfg.mamba_ssm_dtype = "bfloat16"
+            with self.assertLogs(runtime.logger, "INFO") as logs:
+                built = runtime.build(_model(), None, ctx)
+            self.assertNotIsInstance(built, executor_module.Qwen3_8UcacheExecutor)
+            self.assertTrue(
+                any("u-cache: not used" in m and "float16" in m for m in logs.output)
+            )
+
     def test_build_sets_the_body_on_target_and_draft(self):
         from unittest import mock
 
         context = types.ModuleType("sglang.srt.runtime_context")
         context.get_parallel = lambda: SimpleNamespace(tp_size=1)
         context.get_exec = lambda: SimpleNamespace(mamba=None)
+        context.get_server_args = lambda: SimpleNamespace()
+        views = types.ModuleType("sglang.srt.arg_groups.model_override_base")
+        views.resolved_view = lambda args: args
         ctx = SimpleNamespace(widths=(4, 8), binding=None, tokens_per_request=4)
         env = {
             k: v for k, v in runtime.os.environ.items() if not k.startswith("SGLANG_")
         }
         env[runtime.SLOTS_ENV] = ""  # no slot: the build runs no kernel check
         with (
-            mock.patch.dict(sys.modules, {context.__name__: context}),
+            mock.patch.dict(
+                sys.modules, {context.__name__: context, views.__name__: views}
+            ),
             mock.patch.dict(runtime.os.environ, env, clear=True),
             mock.patch.object(runtime, "gdn_graph_tables", return_value=True),
+            mock.patch.object(runtime, "ucache_reasons", return_value=["no u-cache"]),
         ):
             for on in (False, True):
                 with mock.patch.object(runtime, "prefill_graphs_on", return_value=on):

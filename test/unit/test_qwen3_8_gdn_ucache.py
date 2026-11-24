@@ -398,8 +398,7 @@ class TestOptions(unittest.TestCase):
             ),
             (True, True, True, True),
         )
-        self.assertFalse(U.HIGH_CONCURRENCY.fused_conv)
-        self.assertTrue(U.HIGH_CONCURRENCY_FUSED_CONV.fused_conv)
+        self.assertTrue(U.HIGH_CONCURRENCY.fused_conv)
         self.assertEqual(U.HIGH_CONCURRENCY.fused_norm_max_batch, 48)
         self.assertIs(U.DEFAULT, U.HIGH_CONCURRENCY)
         flush = U.PLAIN.flush_options()
@@ -416,31 +415,18 @@ class TestOptions(unittest.TestCase):
             self.assertIs(uv.options, U.DEFAULT)
             self.assertEqual(uv._flush_kernel.__name__, "flush")
             self.assertTrue(uv.fused_conv_capable)
-            self.assertFalse(uv.fused_conv_enabled)
+            self.assertTrue(uv.fused_conv_enabled)
             self.assertTrue(uv.fused_norm_enabled)
-            self.assertTrue(
-                _verifier(options=U.HIGH_CONCURRENCY_FUSED_CONV).fused_conv_enabled
-            )
             # the fused prologue / epilogue ride on the strided, dependent launch
             uv = _verifier(options=U.Options(pdl=False, fused_conv=True))
             self.assertFalse(uv.fused_conv_enabled or uv.fused_norm_enabled)
 
-    def test_recipe_switch_selects_the_fused_conv(self):
-        for capability, value, want in (
-            ((10, 7), "1", U.HIGH_CONCURRENCY_FUSED_CONV),
-            ((10, 7), "0", U.DEFAULT),
-            ((10, 7), None, U.DEFAULT),
-            ((10, 0), "1", U.PLAIN),
-        ):
-            env = {} if value is None else {U.FUSED_CONV_ENV: value}
-            with _Env(capability), mock.patch.dict(os.environ, env):
-                if value is None:
-                    os.environ.pop(U.FUSED_CONV_ENV, None)
+    def test_sm107_takes_the_fused_conv_and_sm100_the_plain_options(self):
+        for capability, want in (((10, 7), U.DEFAULT), ((10, 0), U.PLAIN)):
+            with _Env(capability):
                 uv = _verifier()
-                self.assertIs(uv.options, want, (capability, value))
-                self.assertEqual(
-                    uv.fused_conv_enabled, want is U.HIGH_CONCURRENCY_FUSED_CONV
-                )
+                self.assertIs(uv.options, want)
+                self.assertEqual(uv.fused_conv_enabled, want is U.DEFAULT)
 
     def test_sm100_takes_flashinfer_without_options(self):
         for capability in ((10, 0), (10, 3)):
@@ -588,6 +574,7 @@ class TestVerify(unittest.TestCase):
         tokens=T,
         **kw,
     ):
+        options = options or U.Options(fused_conv=False)  # the separate conv
         buffers = buffers or _buffers()
         view = _view(buffers, batch=batch, dedup_window=kw.pop("dedup_window", True))
         uv = _verifier(
@@ -667,13 +654,13 @@ class TestVerify(unittest.TestCase):
             self.assertEqual(st.ran_ops, [("gdn", "ucache+norm")])
 
     def test_separate_norm_where_the_fused_one_does_not_apply(self):
-        stock = U.Options(verify_norm_retile=False)
+        stock = U.Options(fused_conv=False, verify_norm_retile=False)
         cases = (
             dict(env=dict(rows_per_block=1)),  # B < 3: one row per program
             dict(env=dict(norm_reason="z layout")),
             dict(kw=dict(batch=49)),  # above fused_norm_max_batch
             dict(kw=dict(activation="swish")),
-            dict(kw=dict(options=U.Options(fused_norm=False))),
+            dict(kw=dict(options=U.Options(fused_conv=False, fused_norm=False))),
         )
         for case in cases:
             with self.subTest(case=case), _Env(**case.get("env", {})) as env:
@@ -699,7 +686,7 @@ class TestVerify(unittest.TestCase):
             dict(env=dict(norm_reason="z layout")),
             dict(kw=dict(batch=49)),  # above fused_norm_max_batch
             dict(kw=dict(activation="swish")),
-            dict(kw=dict(options=U.Options(fused_norm=False))),
+            dict(kw=dict(options=U.Options(fused_conv=False, fused_norm=False))),
             dict(env=dict(rows_per_block=4), kw=dict(batch=64)),
         )
         for case in cases:
@@ -738,7 +725,11 @@ class TestVerify(unittest.TestCase):
             dict(norm=dict(bias=torch.zeros(VD, dtype=BF16))),
             dict(norm=dict(group_size=64)),
             dict(
-                kw=dict(options=U.Options(verify_norm_retile=False, fused_norm=False))
+                kw=dict(
+                    options=U.Options(
+                        fused_conv=False, verify_norm_retile=False, fused_norm=False
+                    )
+                )
             ),
         )
         for case in cases:
@@ -781,7 +772,7 @@ class TestVerify(unittest.TestCase):
 
     def test_hoisted_conv_without_the_retile(self):
         with _Env() as env:
-            self.run_verify(env, options=U.Options(conv_retile=False))
+            self.run_verify(env, options=U.Options(fused_conv=False, conv_retile=False))
             ((*_, ckw),) = [c for c in env.calls if c[0] == "front_conv"]
             self.assertEqual(
                 ckw,
@@ -795,8 +786,15 @@ class TestVerify(unittest.TestCase):
 
     def test_stock_conv_without_the_hoisted_layout(self):
         for kw in (
-            dict(dedup_window=False, options=U.Options(conv_retile=False)),
-            dict(options=U.Options(hoisted_conv=False, conv_retile=False)),
+            dict(
+                dedup_window=False,
+                options=U.Options(fused_conv=False, conv_retile=False),
+            ),
+            dict(
+                options=U.Options(
+                    fused_conv=False, hoisted_conv=False, conv_retile=False
+                )
+            ),
         ):
             with self.subTest(kw=kw), _Env() as env:
                 out, gdn, st, view = self.run_verify(env, **kw)
@@ -814,9 +812,7 @@ class TestVerify(unittest.TestCase):
 
     def test_fused_conv(self):
         with _Env() as env:
-            out, gdn, st, view = self.run_verify(
-                env, options=U.HIGH_CONCURRENCY_FUSED_CONV
-            )
+            out, gdn, st, view = self.run_verify(env, options=U.HIGH_CONCURRENCY)
             self.assertNotIn("front_conv", env.names())
             self.assertNotIn("stock_conv", env.names())
             (kw,) = env.flushes()
@@ -839,9 +835,7 @@ class TestVerify(unittest.TestCase):
             dict(kw=dict(bias=torch.zeros(D, dtype=BF16))),
         ):
             with self.subTest(case=case), _Env(**case.get("env", {})) as env:
-                self.run_verify(
-                    env, options=U.HIGH_CONCURRENCY_FUSED_CONV, **case.get("kw", {})
-                )
+                self.run_verify(env, options=U.HIGH_CONCURRENCY, **case.get("kw", {}))
                 self.assertIn("front_conv", env.names())
                 self.assertNotIn("fused_conv", env.flushes()[0])
 

@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 # The SGLang names this package's build and checks read (test/unit/test_contract.py)
 SGLANG_READS = {
-    "srt/runtime_context.py": ("get_exec", "get_parallel"),
+    "srt/runtime_context.py": ("get_exec", "get_parallel", "get_server_args"),
+    "srt/arg_groups/model_override_base.py": ("resolved_view",),
     "srt/kernel_plugins/nvidia/binding.py": ("megakernel_agree",),
     "srt/models/qwen4_exp.py": (
         "Qwen4ExpAttentionDecoderLayer",
@@ -112,12 +113,29 @@ MAX_ROWS = 1024
 PARITY_ENV = "SGLANG_NVIDIA_MEGAKERNEL_PARITY"
 # The GDN u-cache target verify: the target executor allocates the rings in prepare,
 # resets them and commits each verify (runtime/gdn_ucache_state.py), with request
-# rings and an fp16 key ring. Needs --mamba-ssm-dtype float16.
-UCACHE_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_UCACHE"
+# rings and an fp16 key ring. It runs by default wherever UcacheState.config_reasons
+# is empty (--mamba-ssm-dtype float16, SM107, no --enable-linear-replayssm-spec, ...);
+# build decides it from the resolved server arguments and logs the choice.
 
 
-def ucache_requested() -> bool:
-    return os.environ.get(UCACHE_ENV) == "1"
+def ucache_reasons(cfg) -> list[str]:
+    """Why the GDN u-cache does not serve this setup (empty: it does)."""
+    from sgl_nvidia_mega.qwen3_8.runtime.gdn_ucache_state import (
+        UcacheState,
+        max_draft_tokens,
+    )
+
+    reasons = UcacheState.config_reasons(cfg)
+    # SGLang has no u-cache verify of its own: the executor must cover every
+    # target verify, so its widest one must fit the built widths.
+    tokens = int(max_draft_tokens(cfg) or 0)
+    running = int(getattr(cfg, "max_running_requests", 0) or 0)
+    if tokens and running and tokens * running > MAX_ROWS:
+        reasons.append(
+            f"a verify of {running} requests x {tokens} rows exceeds the "
+            f"executor's {MAX_ROWS} rows"
+        )
+    return reasons
 
 
 def decompose_supported(parallel) -> bool:
@@ -178,22 +196,6 @@ def config_reasons(cfg, hf_config) -> list[str]:
             "--enable-layernorm-sp is not supported: the executor's layers and PLE "
             "do not shard token rows"
         )
-    if ucache_requested():
-        from sgl_nvidia_mega.qwen3_8.runtime.gdn_ucache_state import (
-            UcacheState,
-            max_draft_tokens,
-        )
-
-        reasons += [f"{UCACHE_ENV}=1: {r}" for r in UcacheState.config_reasons(cfg)]
-        # SGLang has no u-cache verify of its own: the executor must cover every
-        # target verify, so its widest one must fit the built widths.
-        tokens = int(max_draft_tokens(cfg) or 0)
-        running = int(getattr(cfg, "max_running_requests", 0) or 0)
-        if tokens and running and tokens * running > MAX_ROWS:
-            reasons.append(
-                f"the GDN u-cache: a verify of {running} requests x "
-                f"{tokens} rows exceeds the executor's {MAX_ROWS} rows"
-            )
     prefill = _prefill_backend(getattr(cfg, "cuda_graph_config", None))
     if prefill == "breakable" and prefill_graph_supported():
         # the executor's prefill body is captured (Qwen3_8Executor.plan_body)
@@ -277,7 +279,19 @@ def build(model, hf_config, ctx):
     # S1: the executor runs each layer's HC read / mixer / HC write / MoE itself
     # instead of through the stage boundaries, wherever those do no collective
     decompose = decompose_supported(get_parallel())
-    own_ucache = not draft and ucache_requested()
+    own_ucache = False
+    if not draft:
+        from sglang.srt.arg_groups.model_override_base import resolved_view
+        from sglang.srt.runtime_context import get_server_args
+
+        why = ucache_reasons(resolved_view(get_server_args()))
+        own_ucache = not why
+        logger.info(
+            "GDN u-cache: %s",
+            "used for the target verify"
+            if own_ucache
+            else "not used, the verify stays SGLang's: " + "; ".join(why),
+        )
     executor = (Qwen3_8UcacheExecutor if own_ucache else Qwen3_8Executor)(
         model,
         widths=widths,

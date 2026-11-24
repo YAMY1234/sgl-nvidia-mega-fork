@@ -271,8 +271,7 @@ def select(
     """What ``layer._compute_qsa_topk_indices(hidden_states, positions, st.fb)``
     returns. ``executor.qsa_indexer``: the built ``IndexerKernels``, or None.
     ``step``, ``projected_qk``: a step ``prepare`` made and ``index_qk_proj`` of its rows,
-    launched ahead by the caller (the source's ``projected_qk``,
-    SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_INDEX)."""
+    launched ahead by the caller (the source's ``projected_qk``)."""
     kernels = executor.qsa_indexer
     fb = st.fb
     if step is None and kernels is not None:

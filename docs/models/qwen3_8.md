@@ -42,15 +42,19 @@ bisecting. An empty value runs every op on SGLang's module.
 
 Switches:
 
-- **`SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_UCACHE=1`** turns on the GDN u-cache target verify, a
-  deferred-fold ReplaySSM.
+- **The GDN u-cache target verify** (a deferred-fold ReplaySSM) is chosen from the server
+  arguments; there is no switch.
+  - It runs when its needs hold: `--mamba-ssm-dtype float16`, a linear NEXTN / EAGLE chain of
+    1 to 8 draft tokens, SM107, and no `--enable-linear-replayssm-spec`. Without
+    `--disable-radix-cache` it also needs `--mamba-radix-cache-strategy extra_buffer` or
+    `extra_buffer_lazy`.
+  - The default configuration (BF16 state, ReplaySSM) does not meet them and is unchanged.
+  - The startup log says which verify runs and, when the u-cache is not used, every reason.
   - The executor owns the rings, keyed by request row with an fp16 key ring. It allocates
-    them in the spec's `prepare`, resets them, and commits each verify.
-  - It does so through SGLang's `SupportsStateSlotReset` and `SupportsRecurrentCommit`.
-  - Needs: `--mamba-ssm-dtype float16`, `--linear-attn-decode-backend triton`, a linear
-    NEXTN / EAGLE chain of 1 to 8 draft tokens, and SM107.
-  - Incompatible with `--enable-linear-replayssm-spec`.
-  - The server stops at startup otherwise, naming the reason.
+    them in the spec's `prepare`, resets them, and commits each verify, through SGLang's
+    `SupportsStateSlotReset` and `SupportsRecurrentCommit`.
+  - The published FP16 high-concurrency recipes use it. FP16 state with Triton verify and no
+    u-cache has no recipe and has not been tested.
 - **`SGLANG_NVIDIA_MEGAKERNEL_PARITY=layer|control`** is test only. It runs SGLang's forward
   beside the executor on every covered step, restoring the recurrent state between the two,
   and logs the steps, layers and logits that differ (`qwen3_8/tools/parity.py`).

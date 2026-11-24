@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import os
 from typing import Optional
 
 import torch
@@ -132,9 +131,9 @@ class Options:
     pdl: bool = True
     # SGLANG_OPT_GDN_UCACHE_FLUSH_FIRST: the folding rows first in the launch (SM107)
     flush_first: bool = True
-    # SGLANG_OPT_GDN_UCACHE_FUSED_CONV: the verify conv of a linear chain in the flush's
-    # prologue, at batches with one CTA per (key head, row); needs strided_qkv and pdl
-    fused_conv: bool = False
+    # The verify conv of a linear chain in the flush's prologue, at batches with one CTA
+    # per (key head, row); needs strided_qkv and pdl. Bitwise the separate conv.
+    fused_conv: bool = True
     # SGLANG_OPT_GDN_UCACHE_FUSED_NORM: the gated RMSNorm in the flush's epilogue, for
     # T <= 4 and 3 <= B <= fused_norm_max_batch; needs strided_qkv and pdl
     fused_norm: bool = True
@@ -162,18 +161,12 @@ class Options:
 
 
 # The high-concurrency tuning: every u-cache option
-# but the fused conv
 HIGH_CONCURRENCY = Options()
-# The same with the fused conv: all of them
-HIGH_CONCURRENCY_FUSED_CONV = Options(fused_conv=True)
 # SM100 / SM103: FlashInfer's flush takes none of the options
 PLAIN = Options(
     strided_qkv=False, pdl=False, flush_first=False, fused_conv=False, fused_norm=False
 )
 DEFAULT = HIGH_CONCURRENCY
-# The recipe's switch for HIGH_CONCURRENCY_FUSED_CONV on SM107 (the source reads
-# SGLANG_ENABLE_GDN_UCACHE_FUSED_CONV: 1 in its c128 recipe, 0 in its c176 one)
-FUSED_CONV_ENV = "SGLANG_OPT_GDN_UCACHE_FUSED_CONV"
 
 
 def _kernels():
@@ -193,11 +186,7 @@ def _rubin():
 def default_options(device) -> Options:
     if torch.cuda.get_device_capability(device) != SM107:
         return PLAIN
-    return (
-        HIGH_CONCURRENCY_FUSED_CONV
-        if os.environ.get(FUSED_CONV_ENV) == "1"
-        else DEFAULT
-    )
+    return DEFAULT
 
 
 class UcacheVerify:

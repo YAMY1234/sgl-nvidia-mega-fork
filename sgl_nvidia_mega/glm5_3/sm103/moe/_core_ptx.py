@@ -172,6 +172,45 @@ def st_shared_v2_u32(addr, a, b):
     )
 
 
+# ------------------------------------------- die-local schedule claim (side-effecting)
+
+
+@ptx_op(Int32)
+def smid():
+    """``%smid`` of the executing SM."""
+    return "mov.u32 $0, %smid;", "=r", ()
+
+
+@ptx_op(Int32)
+def ld_nc_u8(address):
+    """Non-coherent byte load of a table written before the launch (zero-extended)."""
+    return (
+        "{ .reg .b16 h; ld.global.nc.u8 h, [$1]; cvt.u32.u16 $0, h; }",
+        "=r,l",
+        (Int64(address),),
+    )
+
+
+@ptx_op(Uint64)
+def atom_add_u64(address, value):
+    """Relaxed GPU-scope ``atom.add.u64``; returns the old value."""
+    return (
+        "atom.global.add.u64 $0, [$1], $2;",
+        "=l,l,l",
+        (Int64(address), Uint64(value)),
+    )
+
+
+@ptx_op()
+def atom_exch_u64(address, value):
+    """Relaxed GPU-scope ``atom.exch.b64`` (the old value is discarded)."""
+    return (
+        "{ .reg .b64 o; atom.global.exch.b64 o, [$0], $1; }",
+        "l,l",
+        (Int64(address), Uint64(value)),
+    )
+
+
 # ------------------------------------------------------------- control (side-effecting)
 
 

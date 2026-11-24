@@ -362,7 +362,7 @@ def _split_group(cu, dev, d: int, supplemental: bool, sm_count: int):
         return grp, int(grp.sm.smCount)
 
     grp, n = attempt(0)  # discovery mode
-    if grp is None or n == 0:
+    if (grp is None or n == 0) and not supplemental:
         for count in range(sm_count, 0, -1):
             grp, n = attempt(count)
             if grp is not None:
@@ -377,8 +377,13 @@ def _green_map(cu, dev, ndom: int, sm_count: int, cubin: bytes) -> Dict:
     sets, per = [], []
     try:
         for d in range(ndom):
-            _, stable = _split_group(cu, dev, d, False, sm_count)
+            # with the supplemental SMs where the driver accepts it (a 13.4 user-mode
+            # driver refused it on GB300: T95), else the stable domain only (the
+            # pointer chase places the remaining SMs)
+            sgrp, stable = _split_group(cu, dev, d, False, sm_count)
             grp, full = _split_group(cu, dev, d, True, sm_count)
+            if grp is None or full == 0:
+                grp, full = sgrp, 0
             seen = set()
             if grp is not None:
                 desc = _ck(cu.cuDevResourceGenerateDesc([grp], 1), "desc")

@@ -26,8 +26,8 @@ NVFP4 weight processing passes the engine's layout self-test.
 With ``SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_LOCALIZE=1`` on a GPU with two locality domains
 (``sm103/moe/locality.py``) the routed FC1 weights and scales are re-bound to copies homed
 per domain (experts 0..127 on domain 0; the originals are freed, net memory unchanged),
-the FC2 records and shared packs are made on the domains' banks, and the four-request
-engine runs its die-local form (same output bits). Otherwise the build is the stock one;
+the FC2 records and shared packs are made on the domains' banks, and the engines run
+their die-local forms (same output bits). Otherwise the build is the stock one;
 a device with one domain, or a failed topology probe, logs why and stays stock.
 """
 
@@ -433,10 +433,9 @@ def _localize_topology(api, dev):
     try:
         nclusters = api.default_clusters(dev)
         topo = LOC.probe(dev, (nclusters, min(nclusters, 32)))
-        # the slot rule covers every unit once within the 17-unit cap at this grid
-        LOC.check_schedule(
-            nclusters, topo.n0[nclusters], max(1, api.g4_schedule_knobs()["shared_weight"])
-        )
+        # the slot rule covers every unit once within each engine's unit cap
+        for n, n0, sw, cap, max_d in api.schedule_checks(nclusters, topo.n0):
+            LOC.check_schedule(n, n0, sw, cap, max_d)
     except Exception as e:  # noqa: BLE001 (any probe failure keeps the stock form)
         logger.warning(
             "NVIDIA megakernel: GLM-5.3 / GLM-5.2: %s=1 but the die-local MoE is off "

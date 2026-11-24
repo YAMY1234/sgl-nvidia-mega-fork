@@ -655,13 +655,16 @@ def slot_list(vd: int, vr: int, n0: int, nclusters: int, sw: int, d0: int, d1: i
     return out
 
 
-def check_schedule(nclusters: int, n0: int, sw: int, max_units: int = 17) -> Dict:
-    """Every (d0, d1) with d0, d1 <= 128 and d0 + d1 <= 128: every unit of both domains
-    and the four shared quarters in exactly one slot list, no list longer than
-    ``max_units``; also the claim rule's exact cover for every physical split."""
+def check_schedule(
+    nclusters: int, n0: int, sw: int, max_units: int = 17, max_d: int = 128
+) -> Dict:
+    """Every (d0, d1) with d0 + d1 <= ``max_d`` distinct experts (d0 of them in domain
+    0): every unit of both domains and the four shared quarters in exactly one slot
+    list, no list longer than ``max_units``; also the claim rule's exact cover for every
+    physical split."""
     worst = 0
-    for d0 in range(129):
-        for d1 in range(129 - d0):
+    for d0 in range(max_d + 1):
+        for d1 in range(max_d + 1 - d0):
             seen = Counter()
             for vd in (0, 1):
                 for vr in range(n0 if vd == 0 else nclusters - n0):

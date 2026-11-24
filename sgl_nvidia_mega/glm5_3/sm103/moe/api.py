@@ -81,6 +81,29 @@ def g4_knobs(localize: bool = False) -> dict:
     return k
 
 
+# the die-local g1 / g2 forms' shared-quarter weight (the stock tables' cap rule counts
+# a shared quarter as three routed units)
+G12_SHARED_WEIGHT = 3
+
+
+def schedule_checks(nclusters: int, n0: dict) -> list:
+    """(N, n_0, shared weight, unit cap, max distinct experts) of every die-local grid:
+    g4 at N, g2 at N, g1 at N and at min(N, 32) (one-row steps)."""
+    from .engine import _Geometry
+
+    sw4 = max(1, g4_schedule_knobs()["shared_weight"])
+    g1, g2 = _Geometry("g1"), _Geometry("g2")
+    out = [
+        (nclusters, n0[nclusters], sw4, 17, 128),
+        (nclusters, n0[nclusters], G12_SHARED_WEIGHT, g2.max_units, g2.max_list),
+        (nclusters, n0[nclusters], G12_SHARED_WEIGHT, g1.max_units, g1.max_list),
+    ]
+    n32 = min(nclusters, 32)
+    if n32 != nclusters:
+        out.append((n32, n0[n32], G12_SHARED_WEIGHT, g1.max_units, g1.max_list))
+    return out
+
+
 def g4_schedule_knobs() -> dict:
     """The g4 schedule's choices from the environment: shared-quarter weight, shared
     fill and snake order (``schedule.g4_table`` keywords)."""
@@ -206,7 +229,7 @@ def compile_specs(
     shared: bool = True, localize: bool = False
 ) -> dict[str, tuple[object, tuple]]:
     """The served compile units: name -> (kernel object, example arguments for
-    ``cute.compile``); ``localize``: the die-local g4 form."""
+    ``cute.compile``); ``localize``: the die-local forms."""
     from cutlass import Float32, Int32, Int64
     from cutlass.cute.runtime import make_fake_stream
 
@@ -244,9 +267,10 @@ def compile_specs(
             make_fake_stream(),
         )
 
+    lw = G12_SHARED_WEIGHT if localize else 0
     return {
-        "g1": (Nvfp4MoeSmallM("g1", shared), eng(4, 4)),
-        "g2": (Nvfp4MoeSmallM("g2", shared), eng(8, 4)),
+        "g1": (Nvfp4MoeSmallM("g1", shared, localize=lw), eng(4, 4)),
+        "g2": (Nvfp4MoeSmallM("g2", shared, localize=lw), eng(8, 4)),
         "g4": (
             Nvfp4MoeSmallM16(shared, **g4_knobs(localize)),
             eng(16, pack_rows((4, 4, 4, 4))),
@@ -269,8 +293,8 @@ class SmallMMoe:
     ``nclusters``: the engine grid in 4-CTA clusters (at least 31; with fewer, the
     schedule tables do not fit and the constructor raises ``ValueError``; the
     co-resident maximum from the occupancy query is the fast one). ``localize``: the
-    g4 function is the die-local form, which reads each layer's locality block
-    (``LayerTensors.loc``) in place of the schedule table."""
+    engines are the die-local forms, which read each layer's locality block
+    (``LayerTensors.loc``) in place of the schedule tables."""
 
     def __init__(
         self,
@@ -331,7 +355,7 @@ class SmallMMoe:
                 "small-M MoE: x bf16 [M, 6144], ids int32 [M, 8], "
                 "weights fp32 [M, 8], contiguous"
             )
-        if self.localize and mode == "g4" and layer.loc is None:
+        if self.localize and layer.loc is None:
             raise ValueError("small-M MoE: the die-local engine needs the layer's loc")
         if self.shared and layer.shared_pack is None:
             raise ValueError(
@@ -373,11 +397,7 @@ class SmallMMoe:
                 Int32(m),
                 Int32(split),
                 p(sc.err),
-                p(
-                    layer.loc
-                    if self.localize and mode == "g4"
-                    else self.tables[(mode, nc)]
-                ),
+                p(layer.loc if self.localize else self.tables[(mode, nc)]),
                 p(sc.shared_partials),
                 p(sc.partials),
                 p(sc.slot_ids),

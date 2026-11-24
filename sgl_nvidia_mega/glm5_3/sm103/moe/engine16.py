@@ -43,14 +43,8 @@ from cutlass.memory import SmemAllocator
 from ..primitives import ptx_core as C
 from ..primitives import ptx_tc as T
 from . import _core_ptx as P
-from .constants import (
-    HIDDEN,
-    LOC_CTR,
-    LOC_DIE,
-    LOC_N0,
-    NUM_EXPERTS,
-    TOP_K,
-)
+from . import _localize as LZ
+from .constants import HIDDEN, NUM_EXPERTS, TOP_K
 from .engine import (
     BIG,
     CLUSTER,
@@ -167,10 +161,6 @@ U_E, U_J, U_SH, U_GM, U_G1, U_TOK = 0, 4, 8, 12, 16, 20
 U_SLOT = U_TOK + 4 * N
 UNIT_BYTES = U_SLOT + N
 assert OFF_MISC + M_UNITS + MAX_UNITS * UNIT_BYTES + 1024 <= SMEM
-# ``localize``: the schedule-table space (no table is staged) holds the slot claim: its
-# mbarrier and the 16-byte claim word crank 0 pushes to its peers
-L_BCLAIM = 0
-L_MCLAIM = 16
 
 
 def g4_layout(recv_bufs: int = RECV_BUFS, lookahead: int = LOOKAHEAD) -> dict:
@@ -807,7 +797,6 @@ class Nvfp4MoeSmallM16:
         1 requests; ascending ids within a class), then domain 1's. Same records and
         unit-0 issue as ``table_fast``. Returns (pre0, nunits, exchanges)."""
         vd, vr, n0, ncl = lc
-        sw = self.localize
         # per-domain class totals and domain-local inclusive scans (10 bits per class)
         t0 = [cute.arch.shuffle_sync(cincl[c], 3) for c in range(3)]
         t1 = [cute.arch.shuffle_sync(cincl[c], 7) - t0[c] for c in range(3)]
@@ -819,57 +808,19 @@ class Nvfp4MoeSmallM16:
             l1 = cincl[1] - t0[1]
             l2 = cincl[2] - t0[2]
         packed = l0 | (l1 << 10) | (l2 << 20)
-        u0 = 4 * (t0[0] + t0[1] + t0[2])
-        u1 = 4 * (t1[0] + t1[1] + t1[2])
-        # slot weights: per-slot cap c over all N slots; a domain's load above its
-        # slots' capacity (its tail units) moves to the other domain's slots
-        m0 = n0
-        m1 = ncl - n0
-        cap = (u0 + u1 + 4 * sw + ncl - 1) // ncl
-        x0 = u0 + 2 * sw - m0 * cap
-        if x0 < 0:
-            x0 = Int32(0)
-        x1 = u1 + 2 * sw - m1 * cap
-        if x1 < 0:
-            x1 = Int32(0)
-        md = m0
-        ud = u0
-        xd = x0
-        uo = u1
-        xo = x1
-        if vd != 0:
-            md = m1
-            ud = u1
-            xd = x1
-            uo = u0
-            xo = x0
-        own = ud - xd
-        tot = own + xo
-        nr = md - 2
-        lim = nr * cap
-        if tot < lim:
-            lim = tot
-        # entry ``lane`` of this slot's list (routed index idx into the domain list)
-        idx = (vr - 2) + nr * lane
-        nraw = Int32(0)
-        if vr >= 2:
-            if lim > vr - 2:
-                nraw = (lim - (vr - 2) + nr - 1) // nr
-        else:
-            idx = lim + vr + 2 * (lane - 1)
-            nraw = Int32(1)
-            if tot - lim - vr > 0:
-                nraw = 1 + (tot - lim - vr + 1) // 2
+        nraw, cdie, u = LZ.slot_entry(
+            vd,
+            vr,
+            n0,
+            ncl,
+            self.localize,
+            4 * (t0[0] + t0[1] + t0[2]),
+            4 * (t1[0] + t1[1] + t1[2]),
+            lane,
+        )
         nunits = min(nraw, MAX_UNITS)
         if (lane == 0) & (nraw > MAX_UNITS):
             P.atom_or_global(err, ERR_UNIT_CAP)
-        cdie = vd
-        u = idx
-        if idx >= own:
-            cdie = 1 - vd
-            u = (uo - xo) + (idx - own)
-        if u < 0:
-            u = Int32(0)
         qj = u & 3
         r = u >> 2
         # class within domain cdie, then the domain's expert word holding rank r
@@ -2733,12 +2684,7 @@ class Nvfp4MoeSmallM16:
             # crank 0: this SM's locality domain, then one claim on the layer's word
             # (issued before the barrier set-up; its result is used after it)
             if (tid == 0) & (crank == 0):
-                ldie = P.ld_nc_u8(sched + LOC_DIE + Int64(P.smid())) & 1
-                ln0 = P.ld_nc_u8(sched + LOC_N0 + Int64(nclusters))
-                claim = P.atom_add_u64(
-                    sched + LOC_CTR,
-                    (Uint64(1) << Uint64(32)) | (Uint64(1) << Uint64(16 * ldie)),
-                )
+                claim, ldie, ln0 = LZ.claim_issue(sched, nclusters)
         if tid == 0:
             for s in cutlass.range_constexpr(RING):
                 C.mbarrier_init(misc + B_FULL + 8 * s, 1)
@@ -2764,11 +2710,11 @@ class Nvfp4MoeSmallM16:
                 C.mbarrier_init(misc + self.B_PFREE + 8 * p, 3)
                 C.mbarrier_init(misc + self.B_CONSUMED + 8 * p, 4)
             if cutlass.const_expr(self.localize != 0):
-                C.mbarrier_init(misc + self.M_STAB + L_BCLAIM, 1)
+                C.mbarrier_init(misc + self.M_STAB + LZ.L_BCLAIM, 1)
             C.fence_mbarrier_init_release_cluster()
             if cutlass.const_expr(self.localize != 0):
                 if crank != 0:
-                    C.mbarrier_arrive_expect_tx(misc + self.M_STAB + L_BCLAIM, 16)
+                    C.mbarrier_arrive_expect_tx(misc + self.M_STAB + LZ.L_BCLAIM, 16)
         if warp == 1:
             T.tmem_alloc(misc + self.M_TMEM, 512)
         T.tc_fence_before()
@@ -2791,48 +2737,16 @@ class Nvfp4MoeSmallM16:
         nring = Int32(RING)
         lc = None
         if cutlass.const_expr(self.localize != 0):
-            bclaim = misc + self.M_STAB + L_BCLAIM
-            mclaim = misc + self.M_STAB + L_MCLAIM
             if warp == 0:
                 # the peers' barriers are initialized (fence + arrive above)
                 cute.arch.cluster_wait()
                 if (lane == 0) & (crank == 0):
-                    # domain-local rank -> virtual slot (vd, vr): own domain while
-                    # r < n_d, else the other domain's slot N - 1 - r (exact cover)
-                    rk = Int32((claim >> Uint64(16 * ldie)) & Uint64(0xFFFF))
-                    before = Int32((claim >> Uint64(32)) & Uint64(0xFFFF))
-                    # a stale or shared claim word (a launch that overlaps another
-                    # launch of the same layer) cannot give an exact cover: fail closed
-                    P.trap_if(Int32((before >= nclusters) | (ln0 < 3)))
-                    P.trap_if(Int32(nclusters - ln0 < 3))
-                    if before == nclusters - 1:
-                        P.atom_exch_u64(sched + LOC_CTR, Uint64(0))
-                    nd = ln0
-                    if ldie != 0:
-                        nd = nclusters - ln0
-                    cvd = ldie
-                    cvr = rk
-                    if rk >= nd:
-                        cvd = 1 - ldie
-                        cvr = nclusters - 1 - rk
-                    cword = cvd | (cvr << 8) | (ln0 << 16)
-                    C.st_shared_u32(mclaim, cword)
-                    for pr in cutlass.range_constexpr(1, CLUSTER):
-                        P.st_async_v4_b32(
-                            C.mapa_shared_cluster(mclaim, pr),
-                            C.mapa_shared_cluster(bclaim, pr),
-                            cword,
-                            0,
-                            0,
-                            0,
-                        )
-                    C.mbarrier_arrive(bclaim)
+                    LZ.claim_publish(
+                        sched, nclusters, claim, ldie, ln0, misc + self.M_STAB, CLUSTER
+                    )
                 cute.arch.sync_warp()
-            C.mbarrier_wait_parity(bclaim, 0)
-            word = Int32(C.ld_shared_u32(mclaim))
-            vd = word & 1
-            vr = (word >> 8) & 0xFF
-            lc = (vd, vr, (word >> 16) & 0xFF, nclusters)
+            vd, vr, vn0 = LZ.wait_slot(misc + self.M_STAB)
+            lc = (vd, vr, vn0, nclusters)
             if vr < 2:
                 my_sh = Int32(1)
                 nring = Int32(RING_SH)

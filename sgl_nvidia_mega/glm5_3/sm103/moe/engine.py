@@ -56,6 +56,7 @@ from cutlass.memory import SmemAllocator
 from ..primitives import ptx_core as C
 from ..primitives import ptx_tc as T
 from . import _core_ptx as P
+from . import _localize as LZ
 from .constants import HIDDEN, NUM_EXPERTS, TOP_K
 
 # --------------------------------------------------------- geometry shared by the modes
@@ -221,13 +222,33 @@ class Nvfp4MoeSmallM:
     split, err, schedule, shared_partials, partials, slot_ids, slot_weights,
     slot_scales, w13_scales, fc2_records, nclusters, stream)``; addresses are device
     pointers, ``gs1`` / ``gs2`` the FC1 / FC2 activation global scales (1 / input
-    scale), ``split`` the rows of the first request (g2; ignored by g1)."""
+    scale), ``split`` the rows of the first request (g2; ignored by g1).
 
-    def __init__(self, mode: str = "g1", shared: bool = True, merge: bool = True):
+    ``localize`` = w (>= 1, with the shared expert; g2 merged): the die-local form
+    (``_localize``): ``schedule`` points at the layer's locality block, the cluster's
+    virtual slot comes from the claim, and its unit list from the ascending expert list
+    (domain 0's experts, ids < 128, first) by the slot rule with shared weight w; same
+    output bits."""
+
+    def __init__(
+        self,
+        mode: str = "g1",
+        shared: bool = True,
+        merge: bool = True,
+        localize: int = 0,
+    ):
         self.mode = mode
         self.g = _Geometry(mode)
         self.shared = shared
         self.merge = merge
+        self.localize = int(localize)
+        if self.localize < 0 or (self.localize and (not shared or not merge)):
+            raise ValueError("small-M MoE: localize needs the shared expert (and merge)")
+
+    def knobs(self) -> dict:
+        """Build-time choices beyond the unit name (compile-cache key; empty for the
+        stock form, so its key is unchanged)."""
+        return {"localize": self.localize} if self.localize else {}
 
     @cute.jit
     def __call__(
@@ -524,6 +545,44 @@ class Nvfp4MoeSmallM:
                             it = it + 1
         self.ring_tail(misc, it)
 
+    @cute.jit
+    def local_units(self, misc, lc, incl, d, lane, err, gsh):
+        """``localize``: this cluster's unit records from its virtual slot (``lc`` = (vd,
+        vr, n_0, N)) over the ascending expert list (``incl``: inclusive expert counts
+        of words 0..7 in lanes 0..7; domain 0 = words 0..3), lane k writing entry k; g2
+        also the group mask (``gsh`` for the shared quarter). Returns the unit count."""
+        g = self.g
+        vd, vr, n0, ncl = lc
+        d0 = cute.arch.shuffle_sync(incl, 3)
+        if d0 > d:
+            d0 = d
+        u0 = 4 * d0
+        nraw, cdie, u = LZ.slot_entry(vd, vr, n0, ncl, self.localize, u0, 4 * (d - d0), lane)
+        nunits = min(nraw, g.max_units)
+        if (lane == 0) & (nraw > g.max_units):
+            P.atom_or_global(err, ERR_UNIT_CAP)
+        if lane < nunits:
+            unit = misc + g.m_units + lane * g.unit_bytes
+            if (vr < 2) & (lane == 0):
+                C.st_shared_u32(unit + g.u_e, Int32(-1))
+                C.st_shared_u32(unit + g.u_j, 2 * vd + vr)
+                C.st_shared_u32(unit + g.u_sh, Int32(1))
+                if cutlass.const_expr(g.two):
+                    C.st_shared_u32(unit + g.u_gm, gsh)
+            else:
+                code = u0 * cdie + u
+                C.st_shared_u32(
+                    unit + g.u_e, C.ld_shared_u32(misc + g.m_elist + 4 * (code >> 2))
+                )
+                C.st_shared_u32(unit + g.u_j, code & 3)
+                C.st_shared_u32(unit + g.u_sh, Int32(0))
+                if cutlass.const_expr(g.two):
+                    C.st_shared_u32(
+                        unit + g.u_gm,
+                        C.ld_shared_u32(misc + g.m_egm + 4 * (code >> 2)),
+                    )
+        return nunits
+
     # ------------------------------------------------ warp 0: dedup, schedule, producer
     @cute.jit
     def producer_g1(
@@ -542,19 +601,21 @@ class Nvfp4MoeSmallM:
         cl,
         my_sh,
         lane,
+        lc=None,
     ):
         g = self.g
         policy = C.l2_policy("evict_first")
         pre = self.pre_issue(shpack, base, misc, crank, cl, my_sh, lane, policy)
-        if lane == 0:
-            C.mbarrier_arrive_expect_tx(misc + g.b_sbar, g.sched_bytes)
-            C.bulk_copy_g2s(
-                misc + g.m_stab,
-                sched + Int64(cl) * g.sched_bytes,
-                g.sched_bytes,
-                misc + g.b_sbar,
-                C.l2_policy("evict_last"),
-            )
+        if cutlass.const_expr(not self.localize):
+            if lane == 0:
+                C.mbarrier_arrive_expect_tx(misc + g.b_sbar, g.sched_bytes)
+                C.bulk_copy_g2s(
+                    misc + g.m_stab,
+                    sched + Int64(cl) * g.sched_bytes,
+                    g.sched_bytes,
+                    misc + g.b_sbar,
+                    C.l2_policy("evict_last"),
+                )
         C.pdl_wait()
         nid = rows * TOP_K
         e = Int32(0x7FFFFFFF)
@@ -584,22 +645,26 @@ class Nvfp4MoeSmallM:
         d = min(d_raw, TOP_K * rows)
         self.write_elist(misc, word, incl - cnt, lane, word, word, 1)
         cute.arch.sync_warp()
-        self.wait_schedule(misc)
-        row = misc + g.m_stab + 2 * g.sched_row * d
-        nunits = P.ld_shared_s16(row)
-        if lane < nunits:
-            code = P.ld_shared_s16(row + 2 + 2 * lane)
-            unit = misc + g.m_units + lane * g.unit_bytes
-            if code < 0:
-                C.st_shared_u32(unit + g.u_e, Int32(-1))
-                C.st_shared_u32(unit + g.u_j, cl)
-                C.st_shared_u32(unit + g.u_sh, Int32(1))
-            else:
-                C.st_shared_u32(
-                    unit + g.u_e, C.ld_shared_u32(misc + g.m_elist + 4 * (code >> 2))
-                )
-                C.st_shared_u32(unit + g.u_j, code & 3)
-                C.st_shared_u32(unit + g.u_sh, Int32(0))
+        if cutlass.const_expr(self.localize != 0):
+            nunits = self.local_units(misc, lc, incl, d, lane, err, 0)
+        else:
+            self.wait_schedule(misc)
+            row = misc + g.m_stab + 2 * g.sched_row * d
+            nunits = P.ld_shared_s16(row)
+            if lane < nunits:
+                code = P.ld_shared_s16(row + 2 + 2 * lane)
+                unit = misc + g.m_units + lane * g.unit_bytes
+                if code < 0:
+                    C.st_shared_u32(unit + g.u_e, Int32(-1))
+                    C.st_shared_u32(unit + g.u_j, cl)
+                    C.st_shared_u32(unit + g.u_sh, Int32(1))
+                else:
+                    C.st_shared_u32(
+                        unit + g.u_e,
+                        C.ld_shared_u32(misc + g.m_elist + 4 * (code >> 2)),
+                    )
+                    C.st_shared_u32(unit + g.u_j, code & 3)
+                    C.st_shared_u32(unit + g.u_sh, Int32(0))
         cute.arch.sync_warp()
         pre0 = Int32(0)
         if lane == 0:
@@ -659,20 +724,22 @@ class Nvfp4MoeSmallM:
         cl,
         my_sh,
         lane,
+        lc=None,
     ):
         g = self.g
         mb = rows - ma
         policy = C.l2_policy("evict_first")
         pre = self.pre_issue(shpack, base, misc, crank, cl, my_sh, lane, policy)
-        if lane == 0:
-            C.mbarrier_arrive_expect_tx(misc + g.b_sbar, g.sched_bytes)
-            C.bulk_copy_g2s(
-                misc + g.m_stab,
-                sched + Int64(cl) * g.sched_bytes,
-                g.sched_bytes,
-                misc + g.b_sbar,
-                C.l2_policy("evict_last"),
-            )
+        if cutlass.const_expr(not self.localize):
+            if lane == 0:
+                C.mbarrier_arrive_expect_tx(misc + g.b_sbar, g.sched_bytes)
+                C.bulk_copy_g2s(
+                    misc + g.m_stab,
+                    sched + Int64(cl) * g.sched_bytes,
+                    g.sched_bytes,
+                    misc + g.b_sbar,
+                    C.l2_policy("evict_last"),
+                )
         C.pdl_wait()
         # lane l holds (token l >> 3, slot l & 7) of request A and of request B
         ea = Int32(0x7FFFFFFF)
@@ -714,7 +781,7 @@ class Nvfp4MoeSmallM:
         incl = self.scan8(cnt, lane)
         d0 = cute.arch.shuffle_sync(incl, 7)
         pre0 = Int32(0)
-        if cutlass.const_expr(self.merge):
+        if cutlass.const_expr(self.merge and not self.localize):
             # unit 0 resolved from the schedule row and the union bitmap; its first
             # copies issue now
             self.wait_schedule(misc)
@@ -763,31 +830,40 @@ class Nvfp4MoeSmallM:
             P.atom_or_global(err, ERR_BAD_ID)
         d = min(d, g.max_list)
         cute.arch.sync_warp()
-        self.wait_schedule(misc)
-        row = misc + g.m_stab + 2 * g.sched_row * d
-        nraw = P.ld_shared_s16(row)
-        nunits = min(nraw, g.max_units)
-        if (lane == 0) & (nraw > g.max_units):
-            P.atom_or_global(err, ERR_UNIT_CAP)
         gmu = Int32(0)
-        if lane < nunits:
-            code = P.ld_shared_s16(row + 2 + 2 * lane)
-            unit = misc + g.m_units + lane * g.unit_bytes
-            if code < 0:
-                C.st_shared_u32(unit + g.u_e, Int32(-1))
-                C.st_shared_u32(unit + g.u_j, cl)
-                C.st_shared_u32(unit + g.u_sh, Int32(1))
-                gmu = Int32(1)
-                if mb > 0:
-                    gmu = Int32(3)
-            else:
-                C.st_shared_u32(
-                    unit + g.u_e, C.ld_shared_u32(misc + g.m_elist + 4 * (code >> 2))
-                )
-                C.st_shared_u32(unit + g.u_j, code & 3)
-                C.st_shared_u32(unit + g.u_sh, Int32(0))
-                gmu = Int32(C.ld_shared_u32(misc + g.m_egm + 4 * (code >> 2)))
-            C.st_shared_u32(unit + g.u_gm, gmu)
+        if cutlass.const_expr(self.localize != 0):
+            gsh = Int32(1)
+            if mb > 0:
+                gsh = Int32(3)
+            nunits = self.local_units(misc, lc, incl, d, lane, err, gsh)
+            if lane < nunits:
+                gmu = Int32(C.ld_shared_u32(misc + g.m_units + lane * g.unit_bytes + g.u_gm))
+        else:
+            self.wait_schedule(misc)
+            row = misc + g.m_stab + 2 * g.sched_row * d
+            nraw = P.ld_shared_s16(row)
+            nunits = min(nraw, g.max_units)
+            if (lane == 0) & (nraw > g.max_units):
+                P.atom_or_global(err, ERR_UNIT_CAP)
+            if lane < nunits:
+                code = P.ld_shared_s16(row + 2 + 2 * lane)
+                unit = misc + g.m_units + lane * g.unit_bytes
+                if code < 0:
+                    C.st_shared_u32(unit + g.u_e, Int32(-1))
+                    C.st_shared_u32(unit + g.u_j, cl)
+                    C.st_shared_u32(unit + g.u_sh, Int32(1))
+                    gmu = Int32(1)
+                    if mb > 0:
+                        gmu = Int32(3)
+                else:
+                    C.st_shared_u32(
+                        unit + g.u_e,
+                        C.ld_shared_u32(misc + g.m_elist + 4 * (code >> 2)),
+                    )
+                    C.st_shared_u32(unit + g.u_j, code & 3)
+                    C.st_shared_u32(unit + g.u_sh, Int32(0))
+                    gmu = Int32(C.ld_shared_u32(misc + g.m_egm + 4 * (code >> 2)))
+                C.st_shared_u32(unit + g.u_gm, gmu)
         # exchanges of this cluster (one per (unit, group)), the same in its four CTAs
         nx = P.popc(gmu)
         for o in (16, 8, 4, 2, 1):
@@ -1950,6 +2026,15 @@ class Nvfp4MoeSmallM:
         # other shape
         P.trap_if(Int32(cute.arch.cluster_size() != CLUSTER))
         C.pdl_launch_dependents()
+        claim = Uint64(0)
+        ldie = Int32(0)
+        ln0 = Int32(0)
+        ncl = Int32(0)
+        if cutlass.const_expr(self.localize != 0):
+            gx, _, _ = cute.arch.grid_dim()
+            ncl = Int32(gx) // CLUSTER
+            if (tid == 0) & (crank == 0):
+                claim, ldie, ln0 = LZ.claim_issue(sched, ncl)
         if tid == 0:
             for s in cutlass.range_constexpr(RING):
                 C.mbarrier_init(misc + g.b_full + 8 * s, 1)
@@ -1975,7 +2060,12 @@ class Nvfp4MoeSmallM:
                 C.mbarrier_init(misc + g.b_pfree + 8 * p, g.pfree_count)
                 if cutlass.const_expr(g.two):
                     C.mbarrier_init(misc + g.b_consumed + 8 * p, 4)
+            if cutlass.const_expr(self.localize != 0):
+                C.mbarrier_init(misc + g.m_stab + LZ.L_BCLAIM, 1)
             C.fence_mbarrier_init_release_cluster()
+            if cutlass.const_expr(self.localize != 0):
+                if crank != 0:
+                    C.mbarrier_arrive_expect_tx(misc + g.m_stab + LZ.L_BCLAIM, 16)
         if warp == 1:
             T.tmem_alloc(misc + g.m_tmem, 512)
         T.tc_fence_before()
@@ -1985,7 +2075,22 @@ class Nvfp4MoeSmallM:
         # TMEM base, read by every thread once the allocation is visible
         tm = Int32(C.ld_shared_u32(misc + g.m_tmem))
         my_sh = Int32(0)
-        if cl < SH_CLUSTERS:
+        lc = None
+        if cutlass.const_expr(self.localize != 0):
+            if warp == 0:
+                # the peers' barriers are initialized (fence + arrive above)
+                cute.arch.cluster_wait()
+                if (lane == 0) & (crank == 0):
+                    LZ.claim_publish(
+                        sched, ncl, claim, ldie, ln0, misc + g.m_stab, CLUSTER
+                    )
+                cute.arch.sync_warp()
+            vd, vr, vn0 = LZ.wait_slot(misc + g.m_stab)
+            lc = (vd, vr, vn0, ncl)
+            if vr < 2:
+                my_sh = Int32(1)
+                cl = 2 * vd + vr
+        elif cl < SH_CLUSTERS:
             my_sh = Int32(1)
         if warp == 0:
             if cutlass.const_expr(g.two):
@@ -2005,6 +2110,7 @@ class Nvfp4MoeSmallM:
                     cl,
                     my_sh,
                     lane,
+                    lc,
                 )
             else:
                 self.producer_g1(
@@ -2022,6 +2128,7 @@ class Nvfp4MoeSmallM:
                     cl,
                     my_sh,
                     lane,
+                    lc,
                 )
         elif warp == 1:
             self.mma_warp(base, misc)
@@ -2080,7 +2187,11 @@ class Nvfp4MoeSmallM:
                     lane,
                     tid,
                 )
-        if (warp < 2) | (warp == SF_WARP):
+        if cutlass.const_expr(self.localize != 0):
+            # warp 0 waited before the claim push
+            if (warp == 1) | (warp == SF_WARP):
+                cute.arch.cluster_wait()
+        elif (warp < 2) | (warp == SF_WARP):
             cute.arch.cluster_wait()
         T.tc_fence_before()
         cute.arch.sync_threads()

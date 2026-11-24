@@ -30,7 +30,10 @@ head CTA issues each phase's loads before that phase's stores and keeps its glob
 q_pe stores out of the hand-off; same outputs), ``kv_split`` (16 rows only: the
 kv cluster's rows 8..15 run on CTAs 2 (MLA rows) and 3 (index-K rows) beside rows 0..7 on
 CTAs 0 and 1, instead of a second pass of the same warps; the top-k fill moves to CTAs
-4..7; per row the same operations, so the same outputs), ``numerics``
+4..7; per row the same operations, so the same outputs), with ``overlap8`` and ``push``:
+``early_arm8`` (the 8-row head CTA's QN barrier is armed by a CTA-scope arrive before the
+weight bulk copies are issued, instead of a cluster-scope release arrive after them,
+which waits for the copies before the PDL wait; same outputs), ``numerics``
 (``PrologueNumerics``: the sum orders, rounding points and scale rule, each named by
 the arithmetic it selects), ``rope_cache_fp32`` and ``index_rope_cache_fp32`` (cos /
 sin caches FP32, else BF16; layout [positions, 64] = cos | sin),
@@ -288,6 +291,7 @@ class MlaPrologue:
         probe: bool = False,
         push: bool = False,
         f32x2: bool = False,
+        early_arm8: bool = False,
     ):
         if max_rows not in (8, 16):
             raise ValueError(f"max_rows must be 8 or 16, got {max_rows}")
@@ -310,6 +314,10 @@ class MlaPrologue:
         self.push = push
         # f32x2: the q_a normalize branch-free with packed f32x2 multiplies
         self.f32x2 = f32x2
+        if early_arm8 and not (overlap8 and push):
+            raise ValueError("early_arm8 applies to overlap8 with push")
+        # early_arm8: the 8-row QN barrier armed (CTA scope) before the weight bulk copies
+        self.early_arm8 = early_arm8
         self.num = numerics
         self.rope_cache_fp32 = rope_cache_fp32
         self.index_rope_cache_fp32 = index_rope_cache_fp32
@@ -909,6 +917,13 @@ class MlaPrologue:
                 ptx.mbarrier_init(qbar, 1)
             ptx.fence_mbarrier_init_release_cluster()
             ptx.fence_proxy_async_shared_cta()
+            if cutlass.const_expr(self.early_arm8):
+                # every q_nope rank's rows of this CTA: 6 x rows x 64 bytes. A CTA-scope
+                # arrive before the copies: the waiters acquire the peers' pushes (their
+                # complete_tx), not this thread's prior writes, so no cluster-scope release
+                # (which waits for the copies in flight); the co-start barrier still
+                # orders the init before any push
+                ptx.mbarrier_arrive_expect_tx(qbar, (NOPE // 32) * 64 * rows)
             ptx.mbarrier_arrive_expect_tx(bar, WQB_BYTES + WUK_BYTES)
             src_qb = w_qb + Int64(h * 16 + 2 * r) * ((Q_LORA // 32) * 1024)
             src_uk = w_uk + Int64(h * 32 + 4 * r) * ((NOPE // 32) * 1024)
@@ -920,7 +935,7 @@ class MlaPrologue:
                     bar,
                 )
             ptx.bulk_copy_g2s(base + off["wuk"], src_uk, WUK_BYTES, bar)
-            if cutlass.const_expr(self.push):
+            if cutlass.const_expr(self.push and not self.early_arm8):
                 # every q_nope rank's rows of this CTA: 6 x rows x 64 bytes
                 ptx.mbarrier_arrive_expect_tx(
                     qbar, (NOPE // 32) * 64 * rows, ".release.cluster"

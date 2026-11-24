@@ -171,6 +171,11 @@ PROLOGUE_PUSH_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE_PUSH"
 PROLOGUE_F32X2_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE_F32X2"
 _PROLOGUE_PUSH = os.environ.get(PROLOGUE_PUSH_ENV, "0").strip() not in ("", "0")
 _PROLOGUE_F32X2 = os.environ.get(PROLOGUE_F32X2_ENV, "0").strip() not in ("", "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE8_EARLY_ARM=1 (with PROLOGUE8_OVERLAP and PROLOGUE_PUSH): the 8-row prologue's
+# head CTA arms its QN barrier with a CTA-scope arrive before the weight copies (MlaPrologue early_arm8), not with a
+# cluster-scope release arrive after them. Same outputs. Read at build.
+PROLOGUE8_EARLY_ARM_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE8_EARLY_ARM"
+_PROLOGUE8_EARLY_ARM = os.environ.get(PROLOGUE8_EARLY_ARM_ENV, "0").strip() not in ("", "0")
 
 
 def _env_bytes(name: str, default: int, full: int) -> int:
@@ -762,6 +767,7 @@ class AttentionGlue:
             prologue8_overlap=_PROLOGUE8_OVERLAP,
             prologue_push=_PROLOGUE_PUSH,
             prologue_f32x2=_PROLOGUE_F32X2,
+            prologue8_early_arm=_PROLOGUE8_EARLY_ARM,
         )
         if _PROLOGUE16_OVERLAP and "prologue.16" in specs:
             logger.info(
@@ -774,6 +780,12 @@ class AttentionGlue:
                 "NVIDIA megakernel: GLM-5.3 / GLM-5.2: the 9-16-row prologue writes the "
                 "kv rows 8-15 on their own CTAs (%s)",
                 "target" if self.target else "draft",
+            )
+        if "prologue.8" in specs and getattr(specs["prologue.8"][0], "early_arm8", False):
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 8-row MLA prologue's QN barrier "
+                "armed before its weight copies (%s=1)",
+                PROLOGUE8_EARLY_ARM_ENV,
             )
         if _PROLOGUE8_OVERLAP and "prologue.8" in specs:
             logger.info(

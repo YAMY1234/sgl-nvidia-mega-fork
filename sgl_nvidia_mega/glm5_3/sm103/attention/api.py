@@ -62,6 +62,7 @@ def compile_specs(
     prologue8_overlap: bool = False,
     prologue_push: bool = False,
     prologue_f32x2: bool = False,
+    prologue8_early_arm: bool = False,
 ) -> dict[str, tuple]:
     """The attention units for row capacities ``caps`` and sparse-MLA warp counts
     ``warps``. ``numerics`` is the engine's ``PrologueNumerics`` value table and
@@ -82,7 +83,9 @@ def compile_specs(
     (``MlaPrologue(overlap8=True)``: same outputs).
     ``prologue_push`` / ``prologue_f32x2`` add the pushed q_nope hand-off / the packed
     branch-free normalize to the overlapped forms (``MlaPrologue(push=True)`` /
-    ``f32x2=True``; same outputs)."""
+    ``f32x2=True``; same outputs). ``prologue8_early_arm`` arms the 8-row overlapped
+    pushed form's QN barrier before its weight copies (``early_arm8=True``; same
+    outputs; only with ``prologue8_overlap`` and ``prologue_push``)."""
     from .indexer_q_proj import IndexerQProj
     from .mla_prologue import MlaPrologue
     from .mla_uv_proj import MlaUvProj
@@ -117,6 +120,9 @@ def compile_specs(
             key["push"] = True
         if f32x2:
             key["f32x2"] = True
+        arm8 = bool(prologue8_early_arm and overlap8 and push)
+        if arm8:
+            key["early_arm8"] = True
         specs[f"prologue.{cap}"] = (
             MlaPrologue(
                 cap,
@@ -129,6 +135,7 @@ def compile_specs(
                 overlap8=overlap8,
                 push=push,
                 f32x2=f32x2,
+                early_arm8=arm8,
             ),
             key,
             args["prologue"],
@@ -147,6 +154,7 @@ def compile_specs(
                     overlap8=overlap8,
                     push=push,
                     f32x2=f32x2,
+                    early_arm8=arm8,
                 ),
                 {**key, "trigger_at_end": True},
                 args["prologue"],

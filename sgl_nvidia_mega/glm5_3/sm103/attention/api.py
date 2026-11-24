@@ -32,6 +32,7 @@ def example_args() -> dict[str, tuple]:
         "index_q": (z,) * 8 + (f, one, z, z, z, z, s),
         "qkv_a": (z, z, z, one, z, z, z, z, s),
         "qkv_a_dn": (z, z, z, one, z, z, z, z, z, f, s),
+        "front": (z,) * 7 + (one, z, f, z, z, f) + (z,) * 5 + (z, z, s),
         "prologue": (z,) * 11
         + (one, one)
         + (z,) * 4
@@ -65,6 +66,7 @@ def compile_specs(
     prologue8_early_arm: bool = False,
     prologue16_row_norm: bool = False,
     prologue16_early_arm: bool = False,
+    idx_front: bool = False,
 ) -> dict[str, tuple]:
     """The attention units for row capacities ``caps`` and sparse-MLA warp counts
     ``warps``. ``numerics`` is the engine's ``PrologueNumerics`` value table and
@@ -92,7 +94,11 @@ def compile_specs(
     the 16-row prologues with the q rows summed and normalized by the warp that loads
     them (``MlaPrologue(row_norm=True)``); ``prologue16_early_arm`` (with
     ``prologue16_overlap`` and ``prologue_push``) arms their QN barrier before the weight
-    copies (``MlaPrologue(early_arm=True)``). Same outputs."""
+    copies (``MlaPrologue(early_arm=True)``). Same outputs.
+    ``idx_front`` adds ``front.<cap>``: the indexer's share of the prologue as its own
+    launch (``IndexerFront``: the q_a norm out and the index-K rows, the prologue's
+    arithmetic), for the indexer-layer prologue split."""
+    from .indexer_front import IndexerFront
     from .indexer_q_proj import IndexerQProj
     from .mla_prologue import MlaPrologue
     from .mla_uv_proj import MlaUvProj
@@ -179,6 +185,19 @@ def compile_specs(
                 ),
                 {**key, "trigger_at_end": True},
                 args["prologue"],
+            )
+        if idx_front:
+            fkey = {
+                "max_rows": cap,
+                **dataclasses.asdict(numerics),
+                "index_rope_cache_fp32": index_rope_cache_fp32,
+            }
+            if index_scale_ue8m0x4:
+                fkey["index_scale_ue8m0x4"] = True
+            specs[f"front.{cap}"] = (
+                IndexerFront(cap, numerics, index_rope_cache_fp32, index_scale_ue8m0x4),
+                fkey,
+                args["front"],
             )
         key = {
             "max_rows": cap,

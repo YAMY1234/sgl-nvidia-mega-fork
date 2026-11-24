@@ -420,7 +420,23 @@ def build(model, derived) -> Optional[MoeGlue]:
             banks.bytes_by_die[0] / 2**30,
             banks.bytes_by_die[1] / 2**30,
         )
+        if rank_zero():
+            logger.warning(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: die-local MoE: the re-bound FC1 "
+                "weights hold experts 0..127 on one die; a MoE step this plugin does not "
+                "cover (more rows than its verify widths, prefill) runs SGLang's MoE on "
+                "them, which can read one die's memory at a time (the stock engine "
+                "schedule on this placement measured 17-43%% slower on GB300). Use it on "
+                "servers whose decode steps are all covered (--max-running-requests <= "
+                "the covered requests)."
+            )
     return MoeGlue(api, layers, specs, localize=loc, nclusters=nclusters)
+
+
+def rank_zero() -> bool:
+    import torch.distributed as dist
+
+    return not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
 
 
 def _localize_topology(api, dev):

@@ -91,7 +91,7 @@ SGLANG_READS = {
         "kv_pool",
         "trtllm_attn",
         "request_window",
-        "pool",
+        "get_swa_key_layout",
     ),
 }
 
@@ -188,8 +188,7 @@ def start(view, fb, rows: int, runs_flashmla) -> list[_Job]:
         or view.kv_pool.request_window is not None
     ):
         return []
-    # KvPoolView has no layout getter, and V41 / V41_NEW share their bytes per token
-    interleaved = view.kv_pool.pool.get_swa_key_layout().is_interleaved
+    interleaved = view.kv_pool.get_swa_key_layout().is_interleaved
     device = fb.positions.device
     # one query per row (s_q 1), as SGLang's lazy build sizes it
     num_sm_parts = max(_num_sms(device.index), 1)

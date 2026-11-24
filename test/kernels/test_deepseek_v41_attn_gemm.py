@@ -870,9 +870,7 @@ def _view(core: _Core) -> SimpleNamespace:
         trtllm_attn=False,
         kv_pool=SimpleNamespace(
             request_window=None,
-            pool=SimpleNamespace(
-                get_swa_key_layout=lambda: SimpleNamespace(is_interleaved=False)
-            ),
+            get_swa_key_layout=lambda: SimpleNamespace(is_interleaved=False),
         ),
     )
 

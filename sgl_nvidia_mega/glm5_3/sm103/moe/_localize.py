@@ -3,11 +3,13 @@
 """Device side of the engines' die-local form (``localize``; host side: ``locality.py``).
 
 Slot claim, per launch: crank 0 of each cluster reads its SM's locality domain d from
-the layer's locality block and claims a domain-local rank r with one atomic on the
-block's claim word (the launch's last claimer resets the word); the virtual slot is
+the layer's locality block and claims a domain-local rank r with one atomic on domain
+d's claim word (homed on domain d's memory, so the atomic stays on the die); the
+virtual slot is
 (d, r) while r < n_d, else (1 - d, N - 1 - r) (n_0 from the block, n_1 = N - n_0), which
 takes every slot exactly once whatever the SM placement. Crank 0 pushes the slot to its
-peers' shared memory (one 16-byte ``st.async`` each).
+peers' shared memory (one 16-byte ``st.async`` each), then counts the claim on the
+launch's total word: the launch's last claimer resets the three words.
 
 Slot list (``slot_entry``, the Python model ``locality.slot_list``): slots 0, 1 of domain
 d run shared quarters 2d, 2d + 1 first (schedule weight ``sw``); domain d's routed units
@@ -24,7 +26,7 @@ from cutlass import Int32, Int64, Uint64
 
 from ..primitives import ptx_core as C
 from . import _core_ptx as P
-from .constants import LOC_CTR, LOC_DIE, LOC_N0
+from .constants import LOC_CTR, LOC_DIE, LOC_N0, LOC_PAGE, LOC_TOT
 
 L_BCLAIM = 0  # mbarrier, in the (unused) schedule-table space
 L_MCLAIM = 16  # the 16-byte slot word
@@ -32,28 +34,22 @@ L_MCLAIM = 16  # the 16-byte slot word
 
 @cute.jit
 def claim_issue(loc, nclusters):
-    """(claim word, domain, n_0) of the calling thread's cluster (one thread per
-    cluster): the domain load, then the atomic."""
+    """(domain-local rank, domain, n_0) of the calling thread's cluster (one thread
+    per cluster): the domain load, then the atomic on the domain's own word."""
     die = P.ld_nc_u8(loc + LOC_DIE + Int64(P.smid())) & 1
     n0 = P.ld_nc_u8(loc + LOC_N0 + Int64(nclusters))
-    claim = P.atom_add_u64(
-        loc + LOC_CTR, (Uint64(1) << Uint64(32)) | (Uint64(1) << Uint64(16 * die))
-    )
-    return claim, die, n0
+    rank = P.atom_add_u32(loc + LOC_CTR + Int64(die) * LOC_PAGE, 1)
+    return rank, die, n0
 
 
 @cute.jit
-def claim_publish(loc, nclusters, claim, die, n0, stab, cluster: cutlass.Constexpr[int]):
+def claim_publish(loc, nclusters, rk, die, n0, stab, cluster: cutlass.Constexpr[int]):
     """Crank 0, one lane, after the cluster barrier: the virtual slot word (vd | vr << 8
     | n_0 << 16) into this CTA's and the peers' slot words (``stab``: the schedule-table
-    space). A claim word that already counted N claims (a launch overlapping another
-    launch of the same layer) or a block without this grid size traps."""
-    rk = Int32((claim >> Uint64(16 * die)) & Uint64(0xFFFF))
-    before = Int32((claim >> Uint64(32)) & Uint64(0xFFFF))
-    P.trap_if(Int32((before >= nclusters) | (n0 < 3)))
-    P.trap_if(Int32(nclusters - n0 < 3))
-    if before == nclusters - 1:
-        P.atom_exch_u64(loc + LOC_CTR, Uint64(0))
+    space), then the claim on the total word. A block without this grid size, a rank
+    or total that already reached N (a launch overlapping another launch of the same
+    layer) traps; the launch's last claimer resets the claim words."""
+    P.trap_if(Int32((rk >= nclusters) | (n0 < 3) | (nclusters - n0 < 3)))
     nd = n0
     if die != 0:
         nd = nclusters - n0
@@ -74,6 +70,12 @@ def claim_publish(loc, nclusters, claim, die, n0, stab, cluster: cutlass.Constex
             0,
         )
     C.mbarrier_arrive(stab + L_BCLAIM)
+    before = P.atom_add_u32(loc + LOC_TOT, 1)
+    P.trap_if(Int32(before >= nclusters))
+    if before == nclusters - 1:
+        P.atom_exch_u32(loc + LOC_CTR, 0)
+        P.atom_exch_u32(loc + LOC_CTR + LOC_PAGE, 0)
+        P.atom_exch_u32(loc + LOC_TOT, 0)
 
 
 @cute.jit

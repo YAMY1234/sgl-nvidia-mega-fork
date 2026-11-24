@@ -212,6 +212,26 @@ def mbarrier_test_wait_parity(bar, parity):
     return code, "=r,r,r", (Int32(bar), Int32(parity))
 
 
+@ptx_op(Int32)
+def atom_add_u32(address, value):
+    """Relaxed GPU-scope ``atom.add.u32``; returns the old value."""
+    return (
+        "atom.global.add.u32 $0, [$1], $2;",
+        "=r,l,r",
+        (Int64(address), Uint32(value)),
+    )
+
+
+@ptx_op()
+def atom_exch_u32(address, value):
+    """Relaxed GPU-scope ``atom.exch.b32`` (the old value is discarded)."""
+    return (
+        "{ .reg .b32 o; atom.global.exch.b32 o, [$0], $1; }",
+        "l,r",
+        (Int64(address), Uint32(value)),
+    )
+
+
 @ptx_op()
 def atom_exch_u64(address, value):
     """Relaxed GPU-scope ``atom.exch.b64`` (the old value is discarded)."""

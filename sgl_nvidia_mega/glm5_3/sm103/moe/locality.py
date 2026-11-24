@@ -38,7 +38,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .constants import LOC_BYTES, LOC_DIE, LOC_N0
+from .constants import LOC_BYTES, LOC_DIE, LOC_N0, LOC_PAGE
 
 logger = logging.getLogger(__name__)
 
@@ -592,20 +592,43 @@ def probe(device: torch.device, grids: Tuple[int, ...]) -> Topology:
 
 # ------------------------------------------------------------------ locality blocks
 class LocBlocks:
-    """One ``LOC_BYTES`` block per layer: zero claim word, n_0 per grid size and the
-    ``%smid`` -> domain table (unknown SMs as domain 0)."""
+    """One ``LOC_BYTES`` block per layer on a domain-0 page: zero claim words (domain
+    0's and the total), n_0 per grid size and the ``%smid`` -> domain table (unknown
+    SMs as domain 0); domain 1's claim word of block i sits ``LOC_PAGE`` further, on
+    a domain-1 page (each cluster's claim atomic stays on its die)."""
 
-    def __init__(self, topo: Topology, nlayers: int, device: torch.device):
+    def __init__(self, topo: Topology, nlayers: int, device: torch.device, banks=None):
+        if nlayers * LOC_BYTES > LOC_PAGE:
+            raise Unavailable(f"{nlayers} locality blocks exceed a page")
         blk = torch.zeros(LOC_BYTES, dtype=torch.uint8)
         for n, n0 in topo.n0.items():
             blk[LOC_N0 + n] = n0
         blk[LOC_DIE : LOC_DIE + MAX_SMID] = torch.tensor(
             [max(0, d) for d in topo.sm_to_die], dtype=torch.uint8
         )
-        self.blocks = blk.repeat(nlayers, 1).to(device).contiguous()
+        index = torch.device(device).index
+        self.banks = banks if banks is not None else Banks(
+            torch.cuda.current_device() if index is None else index
+        )
+        span = self.banks.tensor(2 * LOC_PAGE, split=LOC_PAGE)
+        span.zero_()
+        self.span = span
+        self.blocks = span[: nlayers * LOC_BYTES].view(nlayers, LOC_BYTES)
+        self.blocks.copy_(blk.to(device).expand(nlayers, LOC_BYTES))
+        # the domain-1 claim words (one per block, at the same offset one page on)
+        self.ctr1 = span[LOC_PAGE : LOC_PAGE + nlayers * LOC_BYTES].view(
+            nlayers, LOC_BYTES
+        )[:, :4]
 
     def __getitem__(self, i: int) -> torch.Tensor:
         return self.blocks[i]
+
+    def claims_clean(self) -> bool:
+        """Every claim word (domain 0, domain 1, total) is zero."""
+        return (
+            int(self.blocks[:, :12].count_nonzero().item()) == 0
+            and int(self.ctr1.count_nonzero().item()) == 0
+        )
 
 
 # ------------------------------------------------------------------ relocation

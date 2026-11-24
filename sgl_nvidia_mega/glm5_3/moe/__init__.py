@@ -364,8 +364,8 @@ def build(model, derived) -> Optional[MoeGlue]:
         from sgl_nvidia_mega.glm5_3.sm103.moe import locality as LOC
 
         banks = LOC.Banks(dev.index if dev.index is not None else 0)
-        blocks = LOC.LocBlocks(topo, len(moe_layers), dev)
-        derived.add("moe.loc_blocks", blocks.blocks)
+        blocks = LOC.LocBlocks(topo, len(moe_layers), dev, banks)
+        derived.add("moe.loc_blocks", blocks.span)
         loc = (topo, banks, blocks)
         relocated = 0
     for li, layer in enumerate(moe_layers):

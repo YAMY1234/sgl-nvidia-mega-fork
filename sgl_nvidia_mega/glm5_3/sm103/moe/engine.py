@@ -2067,7 +2067,7 @@ class Nvfp4MoeSmallM:
         # other shape
         P.trap_if(Int32(cute.arch.cluster_size() != CLUSTER))
         C.pdl_launch_dependents()
-        claim = Uint64(0)
+        claim = Int32(0)
         ldie = Int32(0)
         ln0 = Int32(0)
         ncl = Int32(0)

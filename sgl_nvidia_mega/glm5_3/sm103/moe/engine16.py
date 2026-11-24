@@ -225,6 +225,8 @@ TR_SYNC0, TR_CLS, TR_SCHED, TR_DEC, TR_XBAR, TR_MMA_X = 32, 33, 34, 35, 36, 37
 TR_LFULL_ABS = 38
 TR_XQ1 = 39  # ``xtma`` = 2: first staged block quantized (since entry)
 TR_CLK = 40  # SM cycles from entry to exit (with TR_DUR: the SM clock)
+# ``localize``: the producer has the slot (since entry); crank 0 pushed it (since entry)
+TR_CLAIM, TR_CLAIMP = 41, 42
 TR_ABS = (TR_ENTRY, TR_EXIT, TR_PDL_ABS, TR_FIRST_ABS, TR_SEND_ABS, TR_LFULL_ABS)
 TRACE_WORDS = 64  # u64 words per CTA
 
@@ -1095,6 +1097,9 @@ class Nvfp4MoeSmallM16:
                 self.tr_after(err, block, TR_CLS, t0k, d0)
         if cutlass.const_expr(self.localize != 0):
             vd, vr, vn0 = LZ.wait_slot(misc + self.M_STAB)
+            if cutlass.const_expr(self.trace):
+                if lane == 0:
+                    self.tr_after(err, block, TR_CLAIM, t0k, vd + vr)
             if vr < 2:
                 nring = Int32(RING_SH)
                 if sready == 0:
@@ -2725,7 +2730,7 @@ class Nvfp4MoeSmallM16:
         # other shape
         P.trap_if(Int32(cute.arch.cluster_size() != CLUSTER))
         C.pdl_launch_dependents()
-        claim = Uint64(0)
+        claim = Int32(0)
         ldie = Int32(0)
         ln0 = Int32(0)
         if cutlass.const_expr(self.localize != 0):
@@ -2796,6 +2801,8 @@ class Nvfp4MoeSmallM16:
                     LZ.claim_publish(
                         sched, nclusters, claim, ldie, ln0, misc + self.M_STAB, CLUSTER
                     )
+                    if cutlass.const_expr(self.trace):
+                        self.tr_since(err, block, TR_CLAIMP, t0k)
                 cute.arch.sync_warp()
         elif cutlass.const_expr(self.shared):  # noqa: SIM102
             if (nclusters >= 2 * SH_CLUSTERS) & (cl < SH_CLUSTERS):

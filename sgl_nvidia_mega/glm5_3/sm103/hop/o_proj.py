@@ -10,6 +10,15 @@ slice is loaded into registers before ``griddepcontrol.wait`` (static weights on
 then the activations are staged, ``mma.sync.m16n8k16`` accumulates per K quarter (tokens
 on n8), and the four quarters are summed in a fixed order.
 
+Launch order: the CTAs are dispatched in block order (the synchronization CTA, then
+the GEMV CTAs, then the router CTAs). ``router_pos`` (opt-in, router producer up to 8
+rows) puts the 16 router CTAs at blocks ``router_pos`` .. ``router_pos + 15`` after the
+synchronization CTA instead of after all 128 GEMV CTAs (the served work order rotated;
+0 puts them first). Under a predecessor that leaves too few SMs free for every producer
+CTA, the last-dispatched CTAs start late and load their weights after the wait; the
+position decides which work they carry. Every CTA computes the same rows or experts in
+the same order wherever it is dispatched.
+
 Router (``router=True``, MoE layers): the router logits are computed through the o_proj
 hop. With ``W' = W_router * diag(gamma)`` and ``Q_r = W' W_o^(r)`` (fp32, split into
 bf16 hi + lo), ``logits[m] = rstd_m * sum_r (Q_r a_r + W'[:, slice r] residual_m[slice
@@ -98,11 +107,20 @@ class OProjArProduce(Transport):
         max_rows: int = 8,
         async_stage: bool = False,
         epoch_overlap: bool = False,
+        router_pos: int = GEMV_CTAS,
     ):
         if max_rows not in (8, 16) or (max_rows == 16 and not router):
             raise ValueError(
                 "provided for up to 8 rows, or up to 16 rows with the router"
             )
+        if router_pos != GEMV_CTAS:
+            if not router or max_rows != 8 or not 0 <= router_pos < GEMV_CTAS:
+                raise ValueError(
+                    "router_pos: 0..127, the router producer up to 8 rows"
+                )
+            # opt-in form: the router CTAs are dispatched after the first router_pos
+            # GEMV CTAs (the served forms keep their attributes)
+            self.router_pos = router_pos
         self.router, self.max_rows = router, max_rows
         # rows 9..16: a second n8 token tile per mma (same A fragments, same k order),
         # and the
@@ -118,6 +136,7 @@ class OProjArProduce(Transport):
             self.epoch_overlap = True
 
     epoch_overlap = False
+    router_pos = GEMV_CTAS
 
     def smem_bytes(self):
         gemv = (
@@ -277,12 +296,17 @@ class OProjArProduce(Transport):
                 sys_ops.exit_thread()
         cta = bx - self.sync_ctas
         pol = sys_ops.create_policy_evict_first()
-        if cutlass.const_expr(self.router):  # noqa: SIM102
-            if cta >= GEMV_CTAS:
+        if cutlass.const_expr(self.router_pos != GEMV_CTAS):
+            # the served work order (GEMV CTAs 0..127, router CTAs 0..15) rotated so
+            # that the router CTAs sit at blocks router_pos..router_pos + 15
+            nwork: cutlass.Constexpr = GEMV_CTAS + ROUTER_CTAS
+            rot: cutlass.Constexpr = (GEMV_CTAS - self.router_pos) % nwork
+            wk = (cta + rot) % nwork
+            if wk >= GEMV_CTAS:
                 self.router_cta(
                     mb,
                     base,
-                    cta - GEMV_CTAS,
+                    wk - GEMV_CTAS,
                     x,
                     qh,
                     ql,
@@ -292,7 +316,24 @@ class OProjArProduce(Transport):
                     pol,
                 )
                 sys_ops.exit_thread()
-        self.gemv_cta(mb, base, cta, x, w, rows, pol)
+            self.gemv_cta(mb, base, wk, x, w, rows, pol)
+        else:
+            if cutlass.const_expr(self.router):  # noqa: SIM102
+                if cta >= GEMV_CTAS:
+                    self.router_cta(
+                        mb,
+                        base,
+                        cta - GEMV_CTAS,
+                        x,
+                        qh,
+                        ql,
+                        residual,
+                        rows,
+                        (q0, q1, q2, q3, q4, q5, q6, q7),
+                        pol,
+                    )
+                    sys_ops.exit_thread()
+            self.gemv_cta(mb, base, cta, x, w, rows, pol)
 
     @cute.jit
     def pdl_edge(self, rows: Int32):

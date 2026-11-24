@@ -29,6 +29,7 @@ and initialized before the first capture.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 import torch
@@ -184,6 +185,24 @@ class HopFamily:
                     "NVIDIA megakernel: GLM-5.3 / GLM-5.2: o_proj producer stages "
                     "its activations with cp.async from %d rows",
                     n_as,
+                )
+            remap = {m: p for m, p in self.api.oproj_remap().items() if m in rows}
+            if remap:
+                # opt-in (env): the router producer's launch order at these rows
+                rf = self.api.oproj_remap_specs(
+                    remap.values(),
+                    [p for m, p in remap.items() if n_as and m >= n_as],
+                )
+                specs += rf
+                names |= {sp.name for sp in rf}
+                # engagement line (the T90a in-job gate reads it)
+                logger.info(
+                    "NVIDIA megakernel: GLM-5.3 / GLM-5.2: o_proj router producer "
+                    "launch order %s: router CTAs after GEMV CTA position by rows %s "
+                    "(units %s)",
+                    os.environ.get(self.api.OPROJ_REMAP_ENV, ""),
+                    dict(sorted(remap.items())),
+                    ",".join(sp.name for sp in rf),
                 )
             names |= {"moe_fold_split", "moe_fold_plain"}
             if self.dnorm_layers:

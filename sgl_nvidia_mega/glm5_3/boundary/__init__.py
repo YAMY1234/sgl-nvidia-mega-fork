@@ -168,9 +168,21 @@ class HopFamily:
         small = any(m <= SMALL_ROWS for m in rows)
         big = any(m > SMALL_ROWS for m in rows)
         names = set()
+        specs = list(self.api.unit_specs())
         if small:
             names |= {"allreduce_norm", "o_proj_produce", "o_proj_consume"}
             names |= {"o_proj_produce_router", "o_proj_consume_router"}
+            n_as = self.api.oproj_async_min_rows()
+            if n_as and any(n_as <= m <= SMALL_ROWS for m in rows):
+                # opt-in (env): the producer forms that stage with cp.async
+                specs += self.api.oproj_async_specs()
+                names |= {"o_proj_produce_as", "o_proj_produce_router_as"}
+                # engagement line (the T90a in-job gate reads it)
+                logger.info(
+                    "NVIDIA megakernel: GLM-5.3 / GLM-5.2: o_proj producer stages "
+                    "its activations with cp.async from %d rows",
+                    n_as,
+                )
             names |= {"moe_fold_split", "moe_fold_plain"}
             if self.dnorm_layers:
                 names |= {"moe_fold_split_dn", "moe_fold_plain_dn"}
@@ -183,7 +195,7 @@ class HopFamily:
         if not reason:
             import cutlass.cute as cute
 
-            for spec in (s for s in self.api.unit_specs() if s.name in names):
+            for spec in (s for s in specs if s.name in names):
                 compiled[spec.name] = compile_cached(
                     spec.obj,
                     spec.constexprs,

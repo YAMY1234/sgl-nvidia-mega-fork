@@ -7,9 +7,6 @@ No PDL trigger: the top-k consumer waits for this kernel's full completion.
 """
 
 import math
-import os
-
-_SHORT_Q4 = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_SCORE_SHORT32", "0") == "1"
 
 import tilelang
 import torch
@@ -159,19 +156,6 @@ def score_mk(
     score_scale=None,
     min_scored_len=512,
 ):
-    if _SHORT_Q4:
-        from .qsa_score_short import score_mk as short_score
-
-        return short_score(
-            q,
-            k_cache,
-            page_table,
-            lengths,
-            max_model_len,
-            req_pool_indices,
-            score_scale,
-            min_scored_len,
-        )
     logits = torch.empty((4, max_model_len), dtype=torch.float32, device=q.device)
     request_dtype = {torch.int32: "int32", torch.int64: "int64"}[req_pool_indices.dtype]
     _mk_score_kernel(

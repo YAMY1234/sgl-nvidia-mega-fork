@@ -5,63 +5,32 @@ The decode specialization accepts four branches of 2560 BF16 values. Gate
 partials belong to each invocation, so overlapping sublayers never reuse them.
 """
 
-import os
-from typing import Optional
-
 import torch
-from sglang.srt.environ import EnvBool
 
 from sgl_nvidia_mega.qwen3_8._jit import cache_once, load_jit
 
-_cluster_m4only = EnvBool(False)
-_cluster_m4only.name = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_CLUSTER_M4ONLY"
-_HC_CLUSTER_M4ONLY = _cluster_m4only.get()
-_HC_DISABLE_CLUSTER = (
-    os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_DISABLE_CLUSTER", "0") == "1"
-)
-_HC_PARTS_OVERRIDE = int(
-    os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_PARTS", "0")
-)
-_HC_P2_M16_GATE = (
-    os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_P2_M16_GATE", "0") == "1"
-)
-_HC_P2_M4_ONLY = (
-    os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_HC_P2_M4_ONLY", "0") == "1"
-)
-
 
 @cache_once
-def _jit_module(parts: int = 2, use_override: bool = True, force_cluster: bool = False):
-    if use_override and _HC_PARTS_OVERRIDE:
-        parts = _HC_PARTS_OVERRIDE
+def _jit_module(parts: int = 2):
     if parts not in (1, 2, 4):
         raise ValueError("HC combine parts must be 1, 2 or 4")
-    cluster_m4only = _HC_CLUSTER_M4ONLY and not force_cluster
-    m4only = str(cluster_m4only).lower()
-    disable_cluster = use_override and _HC_DISABLE_CLUSTER and not force_cluster
-    no_cluster = str(disable_cluster).lower()
+    # The cluster launch is taken for 4 rows only (M4ONLY), as the recipes run it
     return load_jit(
-        f"hc_combine_decode_p{parts}_m4only{int(cluster_m4only)}_nocluster{int(disable_cluster)}",
+        f"hc_combine_decode_p{parts}_m4only1_nocluster0",
         cuda_files=["elementwise/hc_combine_decode.cuh"],
         cuda_wrappers=[
             ("gate", "HcCombineDecode::gate"),
             ("apply", "HcCombineDecode::apply"),
             (
                 "apply_norm",
-                f"HcCombineNormDecode<{parts}, {m4only}, {no_cluster}>::run",
+                f"HcCombineNormDecode<{parts}, true, false>::run",
             ),
             (
                 "shared_apply_norm",
-                f"HcSharedCombineNormDecode<{parts}, {m4only}, {no_cluster}>::run",
+                f"HcSharedCombineNormDecode<{parts}, true, false>::run",
             ),
         ],
     )
-
-
-def _module_for_rows(parts: int, rows: int):
-    if _HC_P2_M16_GATE:
-        return _jit_module(2, rows <= 16, force_cluster=rows > 16)
-    return _jit_module(parts, not _HC_P2_M4_ONLY or rows == 4)
 
 
 def hc_combine_gate(normed: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -90,7 +59,7 @@ def hc_combine_apply_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     combined = torch.empty_like(residual)
     normalized = torch.empty_like(residual)
-    _module_for_rows(parts, block.shape[0]).apply_norm(
+    _jit_module(parts).apply_norm(
         block, residual, partials, weight, combined, normalized, eps
     )
     return combined, normalized
@@ -101,7 +70,7 @@ def hc_shared_combine_apply_norm(
 ):
     combined = torch.empty_like(residual)
     normalized = torch.empty_like(residual)
-    _module_for_rows(parts, hidden.shape[0]).shared_apply_norm(
+    _jit_module(parts).shared_apply_norm(
         hidden,
         shared,
         routed,

@@ -196,8 +196,6 @@ class Options:
     score: bool = True  # SGLANG_QSA_SPLIT_TOPK=1 + SCORER_V2 defaults (mid), grouped4
     select: bool = True  # split v1 (mid), SGLANG_QSA_VERIFY_TOPK=sampled (high)
     mk_score: bool = True  # SGLANG_QSA_MK_SCORE=1, SGLANG_QSA_Q4_SCORE=1 (mid)
-    # SGLANG_QSA_MK_SCORE_SHORT32 / SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_SCORE_SHORT32: unset in every recipe
-    short32: bool = False
     grouped4: bool = True  # SGLANG_ENABLE_QSA_GROUPED4_VERIFY(_CHAIN)=1 (high)
     grouped4_ctas: int = 128  # SGLANG_QSA_GROUPED4_VERIFY_CHAIN_CTAS=128 (high)
     # SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES=2 (high): 2 -> v7, 0 -> v6
@@ -331,7 +329,7 @@ def choose(
             and heads == 4
             and row_requests
         ):
-            score = "v3" if options.short32 else "v0"
+            score = "v0"
         elif rows <= SPLIT_ROWS:
             score = "v4" if verify4 else "v5"
         elif (
@@ -673,7 +671,7 @@ class IndexerKernels:
         scores = torch.empty((rows, width), dtype=torch.float32, device=q.device)
         scale = float(math.sqrt(indexer.index_head_dim))
         table, lengths = table.to(torch.int32), lengths.to(torch.int32)
-        if step.score in ("v0", "v3"):
+        if step.score == "v0":
             requests = step.metadata.req_pool_indices
             kernel = self._score_kernel(step.score, rows, 0, q.device, requests.dtype)
             kernel(q, cache, table, lengths, requests, scores, scale)
@@ -685,7 +683,7 @@ class IndexerKernels:
         return scores
 
     def _score_kernel(self, variant, rows, heads, device, request_dtype):
-        if variant in ("v0", "v3"):
+        if variant == "v0":
             key = (variant, request_dtype)
         elif variant == "v4":
             key = (variant, heads, grouped_ctas(rows))
@@ -791,8 +789,7 @@ class IndexerKernels:
                     variant = "v7" if o.grouped4_stages == 2 else "v6"
                     self._score_kernel(variant, GROUPED4_ROWS, heads, device, None)
                 if o.mk_score:
-                    variant = "v3" if o.short32 else "v0"
-                    self._score_kernel(variant, 4, heads, device, torch.int32)
+                    self._score_kernel("v0", 4, heads, device, torch.int32)
         if o.select:
             from sgl_nvidia_mega.qwen3_8.qsa import prefill_select
 
@@ -871,15 +868,11 @@ def _score_factory(key):
     """The TileLang scorer of a ``_score_kernel`` key, as ``_providers/sparse.py``
     builds it (BF16, 16-key pages, rows of at most 512 blocks unscored)."""
     variant = key[0]
-    if variant in ("v0", "v3"):
-        if variant == "v3":
-            from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.qsa_score_short import (
-                _perf_score_kernel as factory,
-            )
-        else:
-            from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.qsa_score import (
-                _mk_score_kernel as factory,
-            )
+    if variant == "v0":
+        from sgl_nvidia_mega.qwen3_8.kernels.ops.attention.qsa_score import (
+            _mk_score_kernel as factory,
+        )
+
         request_dtype = {torch.int32: "int32", torch.int64: "int64"}[key[1]]
         return factory(
             min_scored_len=BLOCK_TOPK,

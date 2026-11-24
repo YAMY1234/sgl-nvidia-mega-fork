@@ -183,7 +183,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         positions: [T] token positions, or [3, T] mrope rows (temporal, height, width)
         mrope_axis_map: [rotary_dim // 2] — the axis owning each rotary lane, from
             MRotaryEmbedding
-        qsa_pdl_fix: SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_PDL_FIX
+        qsa_pdl_fix: launch with PDL and wait for the QKV in-kernel
     """
     assert positions.dim() in (1, 2), f"want [T] or [3, T], got {positions.shape}"
     mrope = positions.dim() == 2

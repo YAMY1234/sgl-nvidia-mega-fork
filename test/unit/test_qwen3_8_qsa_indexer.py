@@ -324,12 +324,8 @@ class TestDispatch(unittest.TestCase):
         self.assertEqual(_choose("target_verify", 96, tokens=1), ("stock", "stock"))
 
     def test_draft_extend(self):
-        # one 4-row request: the MK scorer (v3 with the short-row variant)
+        # one 4-row request: the MK scorer
         self.assertEqual(_choose("draft_extend", 4, requests=1), ("v0", "v1"))
-        short = dict(short32=True)
-        self.assertEqual(
-            _choose("draft_extend", 4, requests=1, options=short), ("v3", "v1")
-        )
         no_mk = dict(mk_score=False)
         self.assertEqual(
             _choose("draft_extend", 4, requests=1, options=no_mk), ("v5", "v1")
@@ -392,7 +388,6 @@ class TestDispatch(unittest.TestCase):
             "SGLANG_QSA_SCORER_V2_TARGET": "64",
             "SGLANG_QSA_SPLIT_TOPK": "0",
             "SGLANG_QSA_QPF": "0",
-            "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_SCORE_SHORT32": "1",
             "SGLANG_QSA_GROUPED4_VERIFY_CHAIN_CTAS": "512",
         }
         cases = [("target_verify", r) for r in (16, 128, 1024)] + [
@@ -408,7 +403,6 @@ class TestDispatch(unittest.TestCase):
                 [qi.split_config(r, w) for r in (1, 16, 64) for w in (512, 65536)],
                 configs,
             )
-            self.assertEqual(qi.Options(), qi.Options(short32=False))
             self.assertEqual(qi.grouped_ctas(16), 1024)
 
     def test_split_config_is_the_sources_default(self):

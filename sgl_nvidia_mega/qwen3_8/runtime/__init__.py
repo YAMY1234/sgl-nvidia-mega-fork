@@ -47,10 +47,9 @@ SGLANG_READS = {
     "srt/environ.py": ("envs", "SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND"),
 }
 
-# Comma-separated kernel slots; unset or "" runs every op on its stock step
-# function. No slot ships on by default yet.
+# For tests and bisecting: comma-separated kernel slots replace the shipped list; "" runs
+# every op on its stock step function.
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
-SHIPPED_SLOTS: tuple[str, ...] = ()
 # hc: the HC write-back kernel for up to 32 rows (runtime/hc.py); needs the S1 layers
 # hc_wide: HC reads / write-backs of more than 32 rows (runtime/hc_wide.py)
 # gdn_native_pdl: the GDN target verify's ReplaySSM core as the plugin's PDL launch
@@ -61,8 +60,7 @@ SHIPPED_SLOTS: tuple[str, ...] = ()
 # (runtime/gdn.py)
 # qsa_indexer: the QSA indexer's fold, scorer and select (runtime/qsa_indexer.py)
 # qsa_pool: the TP1 QSA verify's sparse attention as split-K pool kernels (<= 64 rows)
-# on a BF16 KV pool; with SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1=1 (the source
-# branch's tcgen05-core switch), a one-request verify on its tcgen05 core
+# on a BF16 KV pool; a one-request verify on the source's tcgen05 core
 # qsa_pool_fp8: the TP1 QSA verify's sparse attention on an FP8 E4M3 KV pool as the
 # union kernels, warp-specialized (56-576 rows; runtime/attention.py), and the MTP
 # draft extend's (four rows a request) the same way
@@ -107,15 +105,11 @@ KNOWN_SLOTS: tuple[str, ...] = (
     "qsa_draft",
     "draft_fold",
 )
-# A node-local directory for the JIT sources some kernels write before compiling.
-SOURCE_DIR_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_SOURCE_DIR"
+SHIPPED_SLOTS: tuple[str, ...] = KNOWN_SLOTS
 # The widest covered step: 4 rows a request x 256 requests.
 MAX_ROWS = 1024
 # Test only: compare every covered step with SGLang's forward (tools/parity.py)
 PARITY_ENV = "SGLANG_NVIDIA_MEGAKERNEL_PARITY"
-# S1 (test switch until it is the default): run each layer's HC read / mixer /
-# HC write / MoE from the executor instead of through the stage boundaries.
-DECOMPOSE_ENV = "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_DECOMPOSE"
 # The GDN u-cache target verify: the target executor allocates the rings in prepare,
 # resets them and commits each verify (runtime/gdn_ucache_state.py), with request
 # rings and an fp16 key ring. Needs --mamba-ssm-dtype float16.
@@ -280,9 +274,9 @@ def build(model, hf_config, ctx):
         from sgl_nvidia_mega.qwen3_8.tools import parity
 
         checker = parity.Parity(model, draft=draft) if parity.ENABLED else None
-    decompose = os.environ.get(DECOMPOSE_ENV) == "1" and decompose_supported(
-        get_parallel()
-    )
+    # S1: the executor runs each layer's HC read / mixer / HC write / MoE itself
+    # instead of through the stage boundaries, wherever those do no collective
+    decompose = decompose_supported(get_parallel())
     own_ucache = not draft and ucache_requested()
     executor = (Qwen3_8UcacheExecutor if own_ucache else Qwen3_8Executor)(
         model,
@@ -416,7 +410,7 @@ def _build_hc(model, decompose) -> bool:
     from sgl_nvidia_mega.qwen3_8.runtime import hc
 
     m = model.model
-    reason = "" if decompose else f"needs the S1 layers ({DECOMPOSE_ENV}=1 at TP1)"
+    reason = "" if decompose else "needs the S1 layers (TP1, no DP / CP / EP)"
     for i in range(m.start_layer, m.end_layer):
         reason = reason or hc.layer_supported(m.layers[i])
     reason = reason or hc.build()
@@ -432,7 +426,7 @@ def _build_hc_wide(model, decompose, limits) -> bool:
     from sgl_nvidia_mega.qwen3_8.runtime import hc, hc_wide
 
     m = model.model
-    reason = "" if decompose else f"needs the S1 layers ({DECOMPOSE_ENV}=1 at TP1)"
+    reason = "" if decompose else "needs the S1 layers (TP1, no DP / CP / EP)"
     for i in range(m.start_layer, m.end_layer):
         reason = reason or hc.layer_supported(m.layers[i])
     reason = reason or hc_wide.build(limits=limits)
@@ -508,9 +502,7 @@ def _build_qsa_indexer(model):
 
     from sgl_nvidia_mega.qwen3_8.runtime import qsa_indexer
 
-    source_dir = os.environ.get(SOURCE_DIR_ENV) or os.path.join(
-        tempfile.gettempdir(), "qwen3_8-megakernel-sources"
-    )
+    source_dir = os.path.join(tempfile.gettempdir(), "qwen3_8-megakernel-sources")
     os.makedirs(source_dir, exist_ok=True)
     kernels = qsa_indexer.IndexerKernels()
     reason = qsa_indexer.build(model, kernels, source_dir=os.path.abspath(source_dir))
@@ -568,21 +560,17 @@ def _build_qsa_pool(model) -> bool:
 
 def _build_qsa_core():
     """Slot qsa_pool's tcgen05 core (attention.CoreKernels) where
-    SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1=1 asks for it and it builds on every
-    rank, else None."""
+    it builds on every rank, else None."""
     from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
 
     from sgl_nvidia_mega.qwen3_8.runtime import attention
 
-    if not attention.ATTN_CORE_V1:
-        return None
     reason = attention.core_build()
     megakernel_agree(reason, what="Qwen3.8 slot qsa_pool tcgen05 core")
     if reason:
         logger.info(
             "NVIDIA megakernel: Qwen3.8 slot qsa_pool: "
-            "SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_ATTN_CORE_V1 is set but the tcgen05 core "
-            "does not run (%s); the pool kernels serve",
+            "the tcgen05 core does not run (%s); the pool kernels serve",
             reason,
         )
         return None
@@ -612,7 +600,7 @@ def _build_moe_finalize(model, decompose) -> bool:
     from sgl_nvidia_mega.qwen3_8.runtime import moe
 
     m = model.model
-    reason = "" if decompose else f"needs the S1 layers ({DECOMPOSE_ENV}=1 at TP1)"
+    reason = "" if decompose else "needs the S1 layers (TP1, no DP / CP / EP)"
     for i in range(m.start_layer, m.end_layer):
         reason = reason or moe.layer_reasons(m.layers[i])
     reason = reason or moe.build(get_parallel())

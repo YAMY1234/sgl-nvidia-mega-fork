@@ -778,32 +778,26 @@ class TestQkvGate(_Gemm):
 
         self.layer.num_heads, self.layer.num_kv_heads = 24, 2
         with mock.patch.object(plugin, "fused_qk_gemma_rmsnorm_rope_gate", fused):
-            with mock.patch.object(self.attention, "QSA_PDL_FIX", True):
-                for routed in (False, True):
-                    if routed:
-                        bp.enable_routes()
-                    q, k, v, gate = self.attention._qkv_gate(
-                        self.layer, _x(4, k=16), torch.arange(4), "fb"
-                    )
-                    self.assertEqual(launches[-1], (4, (24, 2), True))
-                    self.assertEqual(tuple(gate.shape), (4, 8))
-                self.layer._prepare_qkv_gate.assert_not_called()
-                self.assertEqual(self.fused, [])
-                # 6 rows (pins on): SGLang's launcher
-                self.attention._qkv_gate(self.layer, _x(6, k=16), torch.arange(6), "fb")
-                self.assertEqual(len(self.fused), 1)
-                bp._routed = False
-                for rows, heads in ((6, (24, 2)), (4, (6, 1))):
-                    self.layer.num_heads, self.layer.num_kv_heads = heads
-                    got = self.attention._qkv_gate(
-                        self.layer, _x(rows, k=16), torch.arange(rows), "fb"
-                    )
-                    self.assertEqual(got, "sglang", (rows, heads))
-            self.layer.num_heads, self.layer.num_kv_heads = 24, 2
-            got = self.attention._qkv_gate(
-                self.layer, _x(4, k=16), torch.arange(4), "fb"
-            )
-            self.assertEqual(got, "sglang")  # switch off
+            for routed in (False, True):
+                if routed:
+                    bp.enable_routes()
+                q, k, v, gate = self.attention._qkv_gate(
+                    self.layer, _x(4, k=16), torch.arange(4), "fb"
+                )
+                self.assertEqual(launches[-1], (4, (24, 2), True))
+                self.assertEqual(tuple(gate.shape), (4, 8))
+            self.layer._prepare_qkv_gate.assert_not_called()
+            self.assertEqual(self.fused, [])
+            # 6 rows (pins on): SGLang's launcher
+            self.attention._qkv_gate(self.layer, _x(6, k=16), torch.arange(6), "fb")
+            self.assertEqual(len(self.fused), 1)
+            bp._routed = False
+            for rows, heads in ((6, (24, 2)), (4, (6, 1))):
+                self.layer.num_heads, self.layer.num_kv_heads = heads
+                got = self.attention._qkv_gate(
+                    self.layer, _x(rows, k=16), torch.arange(rows), "fb"
+                )
+                self.assertEqual(got, "sglang", (rows, heads))
         self.assertEqual(len(launches), 2)
 
 
@@ -980,7 +974,7 @@ class TestGatedMix(_Gemm):
         self.addCleanup(patcher.stop)
         os.environ.pop(hc_mix_tuned.ENV, None)
         for slots, macro, tp, route in (
-            (None, None, 1, "sglang"),
+            (None, None, 1, "tuned"),  # slot hc ships on
             ("", None, 1, "sglang"),
             ("hc_wide,ple", None, 1, "sglang"),
             ("hc", "0", 1, "sglang"),

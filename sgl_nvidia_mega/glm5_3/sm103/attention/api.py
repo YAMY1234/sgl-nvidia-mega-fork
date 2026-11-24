@@ -62,6 +62,8 @@ def compile_specs(
     prologue8_overlap: bool = False,
     prologue_push: bool = False,
     prologue_f32x2: bool = False,
+    prologue16_row_norm: bool = False,
+    prologue16_early_arm: bool = False,
 ) -> dict[str, tuple]:
     """The attention units for row capacities ``caps`` and sparse-MLA warp counts
     ``warps``. ``numerics`` is the engine's ``PrologueNumerics`` value table and
@@ -82,7 +84,12 @@ def compile_specs(
     (``MlaPrologue(overlap8=True)``: same outputs).
     ``prologue_push`` / ``prologue_f32x2`` add the pushed q_nope hand-off / the packed
     branch-free normalize to the overlapped forms (``MlaPrologue(push=True)`` /
-    ``f32x2=True``; same outputs)."""
+    ``f32x2=True``; same outputs).
+    ``prologue16_row_norm`` (with ``prologue16_overlap`` and the strided q_a sums) builds
+    the 16-row prologues with the q rows summed and normalized by the warp that loads
+    them (``MlaPrologue(row_norm=True)``); ``prologue16_early_arm`` (with
+    ``prologue16_overlap`` and ``prologue_push``) arms their QN barrier before the weight
+    copies (``MlaPrologue(early_arm=True)``). Same outputs."""
     from .indexer_q_proj import IndexerQProj
     from .mla_prologue import MlaPrologue
     from .mla_uv_proj import MlaUvProj
@@ -117,6 +124,16 @@ def compile_specs(
             key["push"] = True
         if f32x2:
             key["f32x2"] = True
+        row_norm = bool(
+            prologue16_row_norm
+            and overlap16
+            and numerics.norm_order == "strided_8x256"
+        )
+        early_arm = bool(prologue16_early_arm and overlap16 and push)
+        if row_norm:
+            key["row_norm"] = True
+        if early_arm:
+            key["early_arm"] = True
         specs[f"prologue.{cap}"] = (
             MlaPrologue(
                 cap,
@@ -129,6 +146,8 @@ def compile_specs(
                 overlap8=overlap8,
                 push=push,
                 f32x2=f32x2,
+                row_norm=row_norm,
+                early_arm=early_arm,
             ),
             key,
             args["prologue"],
@@ -147,6 +166,8 @@ def compile_specs(
                     overlap8=overlap8,
                     push=push,
                     f32x2=f32x2,
+                    row_norm=row_norm,
+                    early_arm=early_arm,
                 ),
                 {**key, "trigger_at_end": True},
                 args["prologue"],

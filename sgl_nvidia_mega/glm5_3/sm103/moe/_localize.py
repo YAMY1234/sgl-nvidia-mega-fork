@@ -14,9 +14,10 @@ launch's total word: the launch's last claimer resets the three words.
 Slot list (``slot_entry``, the Python model ``locality.slot_list``): slots 0, 1 of domain
 d run shared quarters 2d, 2d + 1 first (schedule weight ``sw``); domain d's routed units
 (its experts' four quarters, the domain's list order) go round-robin over its other
-slots up to a per-slot cap, the rest to its two shared slots; the units of the busier
-domain beyond its slots' capacity (its list tail) are dealt after the other domain's
-own units."""
+(routed) slots up to a per-slot cap; the busier domain's units beyond that (its list
+tail) go first to the other domain's spare routed capacity (dealt after that domain's
+own units), only then to the shared slots (own domain first, up to cap - sw each), so
+a shared slot takes routed units only when every routed slot is full."""
 
 from __future__ import annotations
 
@@ -79,51 +80,73 @@ def claim_publish(loc, nclusters, rk, die, n0, stab, cluster: cutlass.Constexpr[
 
 
 @cute.jit
+def _imin(a, b):
+    r = a
+    if b < a:
+        r = b
+    return r
+
+
+@cute.jit
 def slot_entry(vd, vr, n0, ncl, sw, u0, u1, k):
     """Entry k of virtual slot (vd, vr)'s list for u0 / u1 routed units in domain 0 /
     1: (list length, entry domain, entry's unit index in that domain's list); for a
-    shared slot entry 0 is its shared quarter (the returned unit is then meaningless)."""
-    m0 = n0
-    m1 = ncl - n0
+    shared slot entry 0 is its shared quarter (the returned unit is then meaningless).
+    The counts are ``locality.slot_plan``'s."""
+    r0 = n0 - 2
+    r1 = ncl - n0 - 2
     cap = (u0 + u1 + 4 * sw + ncl - 1) // ncl
-    x0 = u0 + 2 * sw - m0 * cap
-    if x0 < 0:
-        x0 = Int32(0)
-    x1 = u1 + 2 * sw - m1 * cap
-    if x1 < 0:
-        x1 = Int32(0)
-    md = m0
-    ud = u0
-    xd = x0
-    uo = u1
-    xo = x1
+    k0 = _imin(u0, r0 * cap)
+    k1 = _imin(u1, r1 * cap)
+    mv0 = _imin(u0 - k0, r1 * cap - k1)
+    mv1 = _imin(u1 - k1, r0 * cap - k0)
+    q2 = 2 * (cap - sw)
+    if q2 < 0:
+        q2 = Int32(0)
+    a0 = _imin(u0 - k0 - mv0, q2)
+    a1 = _imin(u1 - k1 - mv1, q2)
+    m20 = _imin(u0 - k0 - mv0 - a0, q2 - a1)
+    m21 = _imin(u1 - k1 - mv1 - a1, q2 - a0)
+    # this domain (d) and the other (e)
+    rd = r0
+    kd = k0
+    ke = k1
+    mvd = mv0
+    mve = mv1
+    ad = a0
+    ae = a1
+    m2e = m21
     if vd != 0:
-        md = m1
-        ud = u1
-        xd = x1
-        uo = u0
-        xo = x0
-    own = ud - xd
-    tot = own + xo
-    nr = md - 2
-    lim = nr * cap
-    if tot < lim:
-        lim = tot
-    idx = (vr - 2) + nr * k
+        rd = r1
+        kd = k1
+        ke = k0
+        mvd = mv1
+        mve = mv0
+        ad = a1
+        ae = a0
+        m2e = m20
     nraw = Int32(0)
-    if vr >= 2:
-        if lim > vr - 2:
-            nraw = (lim - (vr - 2) + nr - 1) // nr
-    else:
-        idx = lim + vr + 2 * (k - 1)
-        nraw = Int32(1)
-        if tot - lim - vr > 0:
-            nraw = 1 + (tot - lim - vr + 1) // 2
     cdie = vd
-    u = idx
-    if idx >= own:
-        cdie = 1 - vd
-        u = (uo - xo) + (idx - own)
+    u = Int32(0)
+    if vr >= 2:
+        lr = kd + mve
+        if lr > vr - 2:
+            nraw = (lr - (vr - 2) + rd - 1) // rd
+        idx = (vr - 2) + rd * k
+        u = idx
+        if idx >= kd:
+            cdie = 1 - vd
+            u = ke + idx - kd
+    else:
+        ls = ad + m2e
+        nraw = Int32(1)
+        if ls - vr > 0:
+            nraw = 1 + (ls - vr + 1) // 2
+        idx = vr + 2 * (k - 1)
+        u = kd + mvd + idx
+        if idx >= ad:
+            cdie = 1 - vd
+            u = ke + mve + ae + idx - ad
     if u < 0:
         u = Int32(0)
     return nraw, cdie, u

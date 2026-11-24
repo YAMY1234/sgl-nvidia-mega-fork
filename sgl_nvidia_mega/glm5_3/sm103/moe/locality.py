@@ -673,26 +673,44 @@ def virtual_slot(die: int, rank: int, n0: int, nclusters: int) -> Tuple[int, int
     return 1 - die, nclusters - 1 - rank
 
 
+def slot_plan(n0: int, nclusters: int, sw: int, u0: int, u1: int):
+    """The slot rule's per-domain counts for u0 / u1 routed units: (R, cap, k, mv, a,
+    mv2), each a per-domain pair: R routed slots; k own units kept on the routed
+    slots (at most R x cap); mv of the excess moved to the other domain's spare
+    routed capacity; a of the rest on the own two shared slots (up to cap - sw each);
+    mv2 on the other domain's shared slots."""
+    u = (u0, u1)
+    r_ = (n0 - 2, nclusters - n0 - 2)
+    cap = (u0 + u1 + 4 * sw + nclusters - 1) // nclusters
+    k = tuple(min(u[d], r_[d] * cap) for d in (0, 1))
+    spare = tuple(r_[d] * cap - k[d] for d in (0, 1))
+    mv = (min(u[0] - k[0], spare[1]), min(u[1] - k[1], spare[0]))
+    rest = (u[0] - k[0] - mv[0], u[1] - k[1] - mv[1])
+    q = max(cap - sw, 0)
+    a = (min(rest[0], 2 * q), min(rest[1], 2 * q))
+    mv2 = (min(rest[0] - a[0], 2 * q - a[1]), min(rest[1] - a[1], 2 * q - a[0]))
+    return r_, cap, k, mv, a, mv2
+
+
 def slot_list(vd: int, vr: int, n0: int, nclusters: int, sw: int, d0: int, d1: int):
-    """Python model of ``engine16.table_local``: the virtual slot's unit list, each entry
-    ("sh", quarter) or (domain, unit index in that domain's class-ordered list)."""
-    u = (4 * d0, 4 * d1)
-    m = (n0, nclusters - n0)
-    cap = (u[0] + u[1] + 4 * sw + nclusters - 1) // nclusters
-    x = tuple(max(0, u[d] + 2 * sw - m[d] * cap) for d in (0, 1))
-    md, ud, xd, uo, xo = m[vd], u[vd], x[vd], u[1 - vd], x[1 - vd]
-    own = ud - xd
-    tot = own + xo
-    nr = md - 2
-    lim = min(tot, nr * cap)
+    """Python model of ``_localize.slot_entry``: the virtual slot's unit list, each
+    entry ("sh", quarter) or (domain, unit index in that domain's list). Domain d's
+    list: [0, k) on its routed slots, [k, k + mv) on the other domain's routed slots,
+    then a on its shared slots, then mv2 on the other domain's shared slots."""
+    r_, cap, k, mv, a, mv2 = slot_plan(n0, nclusters, sw, 4 * d0, 4 * d1)
+    d, e = vd, 1 - vd
     out = []
     if vr >= 2:
-        idxs = range(vr - 2, lim, nr)
+        for idx in range(vr - 2, k[d] + mv[e], r_[d]):
+            out.append((d, idx) if idx < k[d] else (e, k[e] + idx - k[d]))
     else:
-        out.append(("sh", 2 * vd + vr))
-        idxs = range(lim + vr, tot, 2)
-    for idx in idxs:
-        out.append((vd, idx) if idx < own else (1 - vd, uo - xo + idx - own))
+        out.append(("sh", 2 * d + vr))
+        for idx in range(vr, a[d] + mv2[e], 2):
+            out.append(
+                (d, k[d] + mv[d] + idx)
+                if idx < a[d]
+                else (e, k[e] + mv[e] + a[e] + idx - a[d])
+            )
     return out
 
 

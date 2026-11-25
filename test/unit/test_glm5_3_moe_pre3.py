@@ -51,6 +51,9 @@ def test_engine_forms():
 @pytest.mark.parametrize("localize", [False, True])
 def test_compile_specs(monkeypatch, on, localize):
     pytest.importorskip("cutlass")
+    # the served four-request knobs (the die-local g4 form needs fasttab)
+    for k, v in (("FASTTAB", "1"), ("PRE", "2"), ("XGATE", "1"), ("SHARED_WEIGHT", "2")):
+        monkeypatch.setenv(api.MOE16_ENV + k, v)
     if on:
         monkeypatch.setenv(api.MOE_PRE3_ENV, "1")
     else:

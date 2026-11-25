@@ -11,8 +11,7 @@ MoERunner signature (``get_cache_key_extras``) below. Any other version, archite
 or signature, and any bucket the table lacks, asks the autotuner as before. Only the
 routed body reads the table; every other op keeps its own tuning.
 
-``ENV`` switches the table; unset, it follows ``PARENT_ENV``, SGLang's switch of the
-megakernel runtime optimizations.
+``ENV=0`` turns the table off; it is on by default.
 """
 
 from __future__ import annotations
@@ -24,7 +23,6 @@ from typing import Optional, Union
 logger = logging.getLogger(__name__)
 
 ENV = "SGLANG_NVIDIA_MEGAKERNEL_MOE_TACTICS"
-PARENT_ENV = "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION"
 
 FLASHINFER_VERSION = "0.7.1"
 ARCH = "sm103"
@@ -66,10 +64,7 @@ _TRUE = ("1", "true", "yes", "on")
 
 
 def enabled() -> bool:
-    raw = os.environ.get(ENV)
-    if raw is None:
-        raw = os.environ.get(PARENT_ENV, "")
-    return raw.strip().lower() in _TRUE
+    return os.environ.get(ENV, "1").strip().lower() in _TRUE
 
 
 def mismatch(version: str, arch: str, signature: tuple) -> str:
@@ -89,7 +84,7 @@ def lookup(
     """The table's tactic at ``bucket`` (-1 or [tile_n, config]), or None: the
     caller asks the autotuner. Logs the tactic's source either way."""
     if not enabled():
-        reason = f"{ENV} / {PARENT_ENV} off"
+        reason = f"{ENV} off"
     else:
         reason = mismatch(version, arch, signature)
         if not reason and bucket not in TACTICS:

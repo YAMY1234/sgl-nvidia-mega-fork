@@ -592,7 +592,7 @@ BUILT = _built_classes()
 @pytest.mark.parametrize("name", sorted(BUILT))
 def test_every_built_object_defines_speculative_runtime_hooks(name):
     # SGLang's BuiltMegakernel requires the member (None without a factory) and
-    # reads it unguarded under SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.
+    # reads it unguarded.
     assert "speculative_runtime_hooks" in BUILT[name], name
 
 

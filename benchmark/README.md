@@ -116,8 +116,7 @@ python3 benchmark/ab_step_times.py run --job <jobid> --topology tp4 --node 0 \
 python3 benchmark/ab_step_times.py analyze <dir>          # numpy; --fixed off runs use the covariate
 ```
 
-Each launch: `ab_serve.sh` (fresh server, forced acceptance 3.51, batch 1,
-`SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1` unless `--runtime-opt off`) and
+Each launch: `ab_serve.sh` (fresh server, forced acceptance 3.51, batch 1) and
 `ab_client.sh` (a warm-up pass, then static_table.py passes). `analyze` takes per request
 the median verify-step period (after dropping host-stall steps and slow-episode
 requests, both counted), a launch as the mean over its requests, and reports B - A with

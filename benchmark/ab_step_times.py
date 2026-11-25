@@ -132,7 +132,6 @@ def cmd_run(a) -> None:
         "fixed": a.fixed,
         "passes": a.passes,
         "image": os.path.basename(a.image),
-        "runtime_opt": a.runtime_opt,
         "isl": a.isl,
         "osl": a.osl,
     }
@@ -164,7 +163,7 @@ def cmd_run(a) -> None:
         export = (
             f"--export=ALL,AB_TOPO={a.topology},AB_SRC={a.src},AB_MODEL=/ab_model,"
             f"HEAD_ADDR={head},DIST_PORT={29000 + (os.getpid() + i) % 900},"
-            f"AB_ENVFILE={d / 'arm.env'},AB_RUNTIME_OPT={1 if a.runtime_opt == 'on' else 0}"
+            f"AB_ENVFILE={d / 'arm.env'}"
         )
         sel = ["-N2", "--ntasks-per-node=1"] if want == 2 else ["-N1", "-n1"]
         print(f"{time.strftime('%F %T')} launch {tag} on {hosts}: {ab_env}", flush=True)
@@ -455,7 +454,6 @@ def cmd_analyze(a) -> None:
         ).mean(0)
     print(
         f"# {root}  topology {topo}  fixed routing {meta.get('fixed')!r}  order {' '.join(meta['order'])}"
-        f"  runtime optimization {meta.get('runtime_opt', 'off (not recorded)')}"
     )
     print(
         f"# steps kept: pass >= 1, step >= {a.skip_head} from a request's start, >= {a.skip_tail} from its end"
@@ -716,12 +714,6 @@ def main() -> None:
         "--fixed",
         default="synth",
         help="fixed routing for both arms: synth[:...], table:<npz>, off",
-    )
-    r.add_argument(
-        "--runtime-opt",
-        choices=("on", "off"),
-        default="on",
-        help="SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1 for both arms (default on)",
     )
     r.add_argument(
         "--ids", action="store_true", help="also record raw expert ids (rank 0)"

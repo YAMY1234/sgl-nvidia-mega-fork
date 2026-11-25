@@ -107,7 +107,6 @@ Listing `sm148` admits the 148 SMs of a B300 instead of the 152 required otherwi
 On two GB300 trays of one NVLink domain the spec admits one more layout: attention TP8 with the MoE at TP4 x EP2 (`--tp 8 --ep-size 2`). Each EP half holds 192 of the 384 routed experts and the shared expert is split over all 8 ranks, as SGLang loads them; every other (tp, ep) pair, TP4 over several nodes, a non-trivial expert placement and `SGLANG_SHARED_EXPERT_TP1` are refused at startup. The recommended launch, on each tray (`--node-rank 0` and `1`):
 
 ```bash
-SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1 \
 SGLANG_SPEC_TP_SYNC=rng,-dspark-accept-sample \
 NCCL_CUMEM_ENABLE=1 NCCL_MNNVL_ENABLE=1 \
 python -m sglang.launch_server \
@@ -122,7 +121,7 @@ python -m sglang.launch_server \
   --enable-nvidia-megakernel
 ```
 
-The default slot list serves this layout; `SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1` turns on SGLang's own DSpark runtime optimizations for megakernel serving (fused accept tail, deferred draft KV store and others in SGLang's `environ.py`); the TP8 numbers on this page were measured with it. Each rank keeps its own Engram host table (`per_rank`), as at TP4.
+The default slot list serves this layout. SGLang runs its own DSpark runtime optimizations (fused accept tail, deferred draft KV store and others) by default; the TP8 numbers on this page were measured with them. Each rank keeps its own Engram host table (`per_rank`), as at TP4.
 
 `swapab_h8` and `wo_a_g1` change the arithmetic against stock SGLang at TP8, which runs the decode attention as FlashMLA with the 8 local heads padded to 64 and wo_a as inverse RoPE, a BF16 einsum and wo_b's MXFP8 quantize. The two slots run TP4's kernels instead: swap-AB on the 8 local heads and the fused wo_a on the 1 local group, each bit for bit the TP4 kernel on the same heads or group. The fused wo_a writes the same MXFP8 codes as stock TP8 at 1 and 6 rows; at 16 rows 0.012 % of codes move by at most one eighth of a block step. GSM8K with the two slots matched stock TP8. Without them TP8 still serves, on SGLang's FlashMLA and einsum, at about 4.0 ms per verify step instead of 3.2 ms (one request, DSpark acceptance length forced to 3.51).
 

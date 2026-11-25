@@ -13,7 +13,6 @@ KEY = (tactics.FLASHINFER_VERSION, tactics.ARCH, tactics.SIGNATURE)
 @pytest.fixture(autouse=True)
 def switch(monkeypatch):
     monkeypatch.delenv(tactics.ENV, raising=False)
-    monkeypatch.setenv(tactics.PARENT_ENV, "1")
 
 
 def test_a_bucket_in_the_table_takes_its_tactic():
@@ -42,15 +41,10 @@ def test_anything_else_asks_the_autotuner(version, arch, signature, bucket):
     assert tactics.lookup(bucket, bucket, version, arch, signature) is None
 
 
-def test_the_switch_follows_the_runtime_optimizations_unless_set(monkeypatch):
+def test_the_table_is_on_unless_switched_off(monkeypatch):
     assert tactics.enabled()
     monkeypatch.setenv(tactics.ENV, "0")
     assert not tactics.enabled()
     assert tactics.lookup(100, 128, *KEY) is None
-    monkeypatch.setenv(tactics.PARENT_ENV, "0")
     monkeypatch.setenv(tactics.ENV, "1")
     assert tactics.lookup(100, 128, *KEY) == [16, 309]
-    monkeypatch.delenv(tactics.ENV)
-    assert not tactics.enabled()
-    monkeypatch.delenv(tactics.PARENT_ENV)
-    assert not tactics.enabled()

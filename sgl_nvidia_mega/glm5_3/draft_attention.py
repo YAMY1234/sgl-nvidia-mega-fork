@@ -70,6 +70,8 @@ SGLANG_READS = {
     "srt/layers/layer_boundary/residual/access.py": ("buffer",),
     # slot draft_rowselect: the residual stream of the draft forward
     "srt/layers/layer_boundary/residual/batch.py": ("stream_of",),
+    # draft_step DRAFT_MOE_TAIL_ENV: the MoE hands its finalize over in this scope
+    "srt/runtime_context.py": ("get_forward", "defer_moe_finalize"),
     "srt/layers/layer_boundary/residual/stream.py": (
         "residual",
         "pending",
@@ -289,6 +291,14 @@ class PreparedInput(NamedTuple):
     residual: torch.Tensor
 
 
+class FinalNormed(NamedTuple):
+    """The draft layer's output already through the residual add and the final norm
+    (``shared_head.norm``): the MoE tail hop (``draft_step`` DRAFT_MOE_TAIL_ENV) ran the
+    MoE's finalize, its all-reduce and the terminal add + norm in one launch."""
+
+    norm: torch.Tensor
+
+
 def select_rows(hidden_states: torch.Tensor, forward_batch, index: torch.Tensor):
     """Keep only the ``index`` rows of a prepared MLP input and of the residual its
     prepare wrote (slot draft_rowselect: the draft extend reads the layer output on
@@ -335,6 +345,7 @@ def decoder_layer_forward(
     view=None,
     ffn_rows: Optional[torch.Tensor] = None,
     prepared: bool = False,
+    moe_tail=None,
 ):
     """``DeepseekV2DecoderLayer.forward`` (main af856717) for the draft layer,
     with ``self.self_attn(...)`` replaced by the step group's ``forward`` and
@@ -345,7 +356,11 @@ def decoder_layer_forward(
     ``prepared``: ``hidden_states`` is already the normalized attention input and the
     stream holds its written residual (``PreparedInput``), so the attention prepare is
     skipped; only with an ``attention`` step group, which sets the attention inputs
-    itself. Returns ``(hidden_states, topk_indices)`` as the stock layer does."""
+    itself. ``moe_tail`` (``draft_step`` DRAFT_MOE_TAIL_ENV): a callable ``(handoff,
+    residual) -> normed`` that takes the MoE's deferred finalize and the written residual
+    and applies the all-reduce, the residual add and the final norm; the layer then
+    returns ``FinalNormed`` (the caller skips the stream's add + final norm). Returns
+    ``(hidden_states, topk_indices)`` as the stock layer does."""
     if prepared and attention is None:
         # SGLang's self_attn reads the attention inputs that the skipped prepare sets
         raise RuntimeError(
@@ -423,6 +438,23 @@ def decoder_layer_forward(
     else:
         mlp_ctx = nullcontext()
 
+    if moe_tail is not None:
+        # the MoE hands its finalize over (no all-reduce); the tail hop sums it with
+        # the residual the FFN prepare wrote, then applies the final norm
+        from sglang.srt.layers.layer_boundary.residual.batch import stream_of
+        from sglang.srt.runtime_context import get_forward
+
+        stream = stream_of(forward_batch)
+        residual = stream.residual
+        if stream.pending is not None or not isinstance(residual, torch.Tensor):
+            raise RuntimeError(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: the MoE tail hop needs a "
+                "written residual after the FFN prepare (got pending "
+                f"{stream.pending is not None}, residual {type(residual).__name__})"
+            )
+        with get_forward().scoped(defer_moe_finalize=True), mlp_ctx:
+            handoff = layer.mlp(hidden_states, forward_batch, None)
+        return FinalNormed(moe_tail(handoff, residual)), topk_indices
     with layer.ffn_boundary.exit(forward_batch) as ffn_exit, mlp_ctx:
         hidden_states = layer.mlp(hidden_states, forward_batch, None)
     hidden_states = ffn_exit.finish(hidden_states)

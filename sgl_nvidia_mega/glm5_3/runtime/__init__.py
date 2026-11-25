@@ -595,7 +595,11 @@ def _hops_for_draft(model, family) -> None:
     registered for the draft under the shared embedding table."""
     import cutlass.cute as cute
 
-    from sgl_nvidia_mega.glm5_3.draft_step import SITE_NAMES, draft_front_mode
+    from sgl_nvidia_mega.glm5_3.draft_step import (
+        SITE_NAMES,
+        draft_front_mode,
+        draft_moe_tail_requested,
+    )
     from sgl_nvidia_mega.glm5_3.runtime.compile import compile_cached
     from sgl_nvidia_mega.glm5_3.sm103.hop import api as hop_api
 
@@ -608,6 +612,11 @@ def _hops_for_draft(model, family) -> None:
             plain_allreduce=True, allreduce_rmsnorm="allreduce_rmsnorm" in names
         )
     }
+    # DRAFT_MOE_TAIL_ENV=1: the draft MoE tail hop (finalize + shared add + all-reduce +
+    # residual + RMSNorm), one unit per routing-weight dtype
+    if draft_moe_tail_requested():
+        units.update({s.name: s for s in hop_api.moe_tail_specs()})
+        names = names + tuple(s.name for s in hop_api.moe_tail_specs())
     for name in names:
         unit = units[name]
         family.kernels.compiled.setdefault(

@@ -40,6 +40,7 @@ from cutlass import Float32, Int32, Int64
 from .. import launch as L
 from .allreduce_norm import AllreduceNormHop
 from .constants import CONSUMER_THREADS, ELEMS_PER_CTA, HIDDEN, WORLD
+from .moe_tail import MoeTailNormHop
 from .moe_fold import (
     MoeFoldArBsum,
     MoeFoldArNorm,
@@ -276,6 +277,34 @@ def _args_bsum():
 
 def _args_apply():
     return (*[_z()] * 4, Float32(1e-5), Int32(1), cu.CUstream(0))
+
+
+def _args_tail():
+    return (
+        *[_z()] * 8,
+        Int32(6144),
+        Float32(1e-5),
+        Int32(1),
+        *[_z()] * 8,
+        Int32(0),
+        _z(),
+        Int32(0),
+        cu.CUstream(0),
+    )
+
+
+def moe_tail_unit(weights_dtype) -> str:
+    """The draft MoE tail hop's unit for the routing weights' dtype (fp32 or bf16)."""
+    return "moe_tail_norm_w32" if weights_dtype == torch.float32 else "moe_tail_norm_w16"
+
+
+def moe_tail_specs():
+    """The draft MoE tail hop units (``MoeTailNormHop``: the deferred finalize + shared
+    add + all-reduce + residual + RMSNorm), one per routing-weight dtype."""
+    return [
+        UnitSpec("moe_tail_norm_w32", MoeTailNormHop(weights_f32=True), _args_tail()),
+        UnitSpec("moe_tail_norm_w16", MoeTailNormHop(weights_f32=False), _args_tail()),
+    ]
 
 
 def unit_specs(
@@ -646,6 +675,44 @@ class HopKernels:
             _p(out_norm),
             Float32(self.eps),
             Int32(partial.shape[0]),
+            *self._rot(mb.peers, mb.rank),
+            *self._tail(mb, site),
+        )
+
+    def moe_tail_norm(
+        self,
+        gemm2,
+        perm,
+        weights,
+        shared,
+        residual,
+        gamma,
+        out_res,
+        out_norm,
+        eps,
+        site=0,
+    ):
+        """The draft MoE tail (``MoeTailNormHop``) for ``residual.shape[0]`` <= 8 rows on
+        mailbox instance A: ``out_norm`` = RMSNorm(residual + allreduce(bf16(finalize +
+        shared))) * gamma. ``gemm2`` [*, ld] bf16 (unit column stride), ``perm`` /
+        ``weights`` [rows, TOPK] contiguous (int32; fp32 or bf16), ``shared``
+        [rows, 6144] bf16. Needs ``moe_tail_specs()``'s unit for the weights' dtype."""
+        rows = residual.shape[0]
+        if rows > 8:
+            raise ValueError("the draft MoE tail serves at most 8 rows per call")
+        mb = self.mbox_a
+        self.compiled[moe_tail_unit(weights.dtype)](
+            _p(gemm2),
+            _p(perm),
+            _p(weights),
+            _p(shared),
+            _p(residual),
+            _p(gamma),
+            _p(out_res),
+            _p(out_norm),
+            Int32(gemm2.stride(0)),
+            Float32(eps),
+            Int32(rows),
             *self._rot(mb.peers, mb.rank),
             *self._tail(mb, site),
         )

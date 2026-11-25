@@ -71,7 +71,7 @@ SGLANG_READS = {
     # slot draft_rowselect: the residual stream of the draft forward
     "srt/layers/layer_boundary/residual/batch.py": ("stream_of",),
     # draft_step DRAFT_MOE_TAIL_ENV: the MoE hands its finalize over in this scope
-    "srt/runtime_context.py": ("get_forward", "defer_moe_finalize"),
+    "srt/runtime_context.py": ("get_forward", "\"defer_moe_finalize\""),
     "srt/layers/layer_boundary/residual/stream.py": (
         "residual",
         "pending",

@@ -128,7 +128,7 @@ SGLANG_READS = {
         "clear",
     ),
     # SGLANG_SPEC_DRAFT_TOPK1_SINK: the draft-decode step's sink in the forward flags
-    "srt/runtime_context.py": ("get_forward", "draft_topk1_sink"),
+    "srt/runtime_context.py": ("get_forward", "\"draft_topk1_sink\""),
     "kernels/ops/speculative/topk1.py": (
         "DraftTopk1Sink",
         "topk_p",

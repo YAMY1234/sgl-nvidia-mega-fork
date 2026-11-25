@@ -54,6 +54,12 @@ ENGINE_SMEM = {"g1": 227440, "g2": 229968, "g4": 223664}
 # (``engine16`` ``localize``, the shared-quarter weight as its schedule weight) over
 # weights homed per locality domain; the glue decides at build whether the device can.
 MOE16_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE16_"
+# Opt-in form of the one- and two-request engines (modes g1 / g2), read at build; the
+# default is the served form and the form leaves each output bit unchanged.
+#   SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_PRE3=1  unit 0's three FC1 chunks issue as soon as
+#                                            unit 0 is resolved (engine ``pre`` = 3); the
+#                                            die-local g1 / g2 forms ignore it
+MOE_PRE3_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_PRE3"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -112,6 +118,22 @@ def g4_schedule_knobs() -> dict:
         "fill_shared": _env_int("SHARED_FILL", 0) != 0,
         "snake": _env_int("SNAKE", 0) != 0,
     }
+
+
+def g12_pre3_requested() -> bool:
+    """``SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_PRE3`` is 1 (0 or unset: no; else ValueError)."""
+    raw = os.environ.get(MOE_PRE3_ENV, "").strip()
+    if raw not in ("", "0", "1"):
+        raise ValueError(f"{MOE_PRE3_ENV}={raw!r}: expected 0 or 1")
+    return raw == "1"
+
+
+def g12_knobs(localize: bool = False) -> dict:
+    """The g1 / g2 engines' build-time choices from the environment (default: served):
+    ``pre`` 3 with ``SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_PRE3=1``, else 1; the die-local
+    forms (``localize``) keep 1 (their unit 0 comes from the claimed slot, after the
+    table)."""
+    return {"pre": 3 if g12_pre3_requested() and not localize else 1}
 
 
 G12_SHARED_WEIGHT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_SHARED_WEIGHT_G"
@@ -282,9 +304,10 @@ def compile_specs(
         )
 
     lw = G12_SHARED_WEIGHT if localize else 0
+    k12 = g12_knobs(localize)
     return {
-        "g1": (Nvfp4MoeSmallM("g1", shared, localize=lw), eng(4, 4)),
-        "g2": (Nvfp4MoeSmallM("g2", shared, localize=lw), eng(8, 4)),
+        "g1": (Nvfp4MoeSmallM("g1", shared, localize=lw, **k12), eng(4, 4)),
+        "g2": (Nvfp4MoeSmallM("g2", shared, localize=lw, **k12), eng(8, 4)),
         "g4": (
             Nvfp4MoeSmallM16(shared, **g4_knobs(localize)),
             eng(16, pack_rows((4, 4, 4, 4))),

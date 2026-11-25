@@ -13,8 +13,20 @@
 * ``HopKernels``: the compiled units with the mailboxes of one tensor-parallel group,
   called with torch tensors; it chooses the fold form for a row count from the
   cooperative occupancy.
+* ``oproj_async_min_rows()`` / ``oproj_async_specs()``: the opt-in o_proj producer
+  forms that stage the activations with ``cp.async`` up to 8 rows, awaited inside the
+  epoch read (same outputs), and the row count from which ``HopKernels`` serves them.
+* ``oproj_remap()`` / ``oproj_remap_specs()``: the opt-in router-producer forms that
+  dispatch their 16 router CTAs at another position among the GEMV CTAs up to 8 rows
+  (same outputs), and the rows at which ``HopKernels`` serves each position.
+
+``SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS=1`` (read by ``unit_specs``, i.e. at
+build): the 9..16-row routing o_proj producer (mailbox instance B) stores its router
+partials row-contiguous (``o_proj_rc.OProjArProduceRc``); the same outputs, bitwise.
+Instance A (up to 8 rows) keeps the served unit.
 """
 
+import os
 import tempfile
 from dataclasses import dataclass, field
 from typing import Any
@@ -28,6 +40,7 @@ from cutlass import Float32, Int32, Int64
 from .. import launch as L
 from .allreduce_norm import AllreduceNormHop
 from .constants import CONSUMER_THREADS, ELEMS_PER_CTA, HIDDEN, WORLD
+from .moe_tail import MoeTailNormHop
 from .moe_fold import (
     MoeFoldArBsum,
     MoeFoldArNorm,
@@ -35,12 +48,123 @@ from .moe_fold import (
     RmsnormFromBlockSums,
 )
 from .o_proj import ROUTER_K, OProjArConsume, OProjArProduce, router_partial_bytes
+from .o_proj_rc import OProjArProduceRc
 from .transport import ErrorRecord, HopMailbox
 
 MIN_PTX_ISA = (9, 2)
 # The split fold serves 1..6 rows (the plain fold above): the rows it is tested at.
 SPLIT_MAX_ROWS = 6
 MIN_PTX_COMPILER = (13, 2)
+# Opt-in fold forms, a comma list (unset / empty: the served units, unchanged):
+#   split8dn  the deferred-norm fold runs its split form without clusters (unit
+#             moe_fold_split_dn_nc) from SPLIT8DN_MIN_ROWS rows up to the rows whose
+#             16 * rows + 8 CTAs are co-resident (4..8 on GB300); fewer rows keep the
+#             served cluster split (T90a k2 foldbench, fold -> q_a: -0.2 us at 4 rows,
+#             -1.3 at 7, -0.9 at 8, but +0.5 at 1..2 rows)
+#   late8     the normed fold above the split limit (7..8 rows) triggers its dependent
+#             after part 1
+# Outputs are bitwise those of the served forms.
+FOLD_FORM_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_FOLD_FORM"
+FOLD_FORMS = ("split8dn", "late8")
+SPLIT8_MAX_ROWS = 8
+SPLIT8DN_MIN_ROWS = 4
+
+
+def fold_form(raw=None) -> frozenset:
+    """The opt-in fold forms of ``FOLD_FORM_ENV`` (or ``raw``)."""
+    import os
+
+    if raw is None:
+        raw = os.environ.get(FOLD_FORM_ENV, "")
+    toks = frozenset(x.strip().lower() for x in raw.split(",") if x.strip())
+    bad = sorted(toks - set(FOLD_FORMS))
+    if bad:
+        raise ValueError(f"{FOLD_FORM_ENV}={raw!r}: unknown forms {bad} (of {FOLD_FORMS})")
+    return toks
+
+
+def fold_units(form=None) -> dict:
+    """The fold units up to 8 rows (served names -> kernel objects) for the opt-in
+    forms ``form`` (default: ``fold_form()``); the served objects when empty."""
+    form = fold_form() if form is None else frozenset(form)
+    units = {
+        "moe_fold_split": MoeFoldArNorm(split=True),
+        "moe_fold_plain": MoeFoldArNorm(split=False, trigger_late="late8" in form),
+        "moe_fold_split_dn": MoeFoldArNormDn(split=True),
+        "moe_fold_plain_dn": MoeFoldArNormDn(split=False),
+    }
+    if "split8dn" in form:
+        units["moe_fold_split_dn_nc"] = MoeFoldArNormDn(split=True, nocluster=True)
+    return units
+# From this row count on (up to 8 rows; unset or 0: off), the o_proj hop's producer is
+# the form that stages its activations with cp.async (every copy of a thread in flight
+# at once, awaited after the epoch read's control loads are issued; the same bytes, the
+# same outputs): units o_proj_produce[_router]_as.
+OPROJ_ASYNC_STAGE_MIN_ROWS_ENV = (
+    "SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ_ASYNC_STAGE_MIN_ROWS"
+)
+
+
+def oproj_async_min_rows() -> int:
+    """The row count from which the async-staging producer forms serve (0: off)."""
+    value = int(os.environ.get(OPROJ_ASYNC_STAGE_MIN_ROWS_ENV, "0") or "0")
+    if not 0 <= value <= 8:
+        raise ValueError(f"{OPROJ_ASYNC_STAGE_MIN_ROWS_ENV}={value}: expected 0..8")
+    return value
+
+
+HOP16_ROUTER_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS"
+
+
+def hop16_router_rows(value=None) -> bool:
+    """Whether the 9..16-row routing o_proj producer stores its router partials
+    row-contiguous, from ``value`` (default: the
+    ``SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS`` environment value; ``1`` on,
+    empty / ``0`` off)."""
+    raw = os.environ.get(HOP16_ROUTER_ROWS_ENV, "") if value is None else value
+    raw = raw.strip()
+    if raw not in ("", "0", "1"):
+        raise ValueError(f"{HOP16_ROUTER_ROWS_ENV}={raw!r}: expected 0 or 1")
+    return raw == "1"
+
+
+# The router o_proj producer's launch order (MoE layers, up to 8 rows; unset or empty:
+# the served order, router CTAs after the 128 GEMV CTAs): a comma list of
+# ``rows[@pos]``, ``rows`` = ``lo-hi`` or ``n`` (= n-8), ``pos`` (default 0) = the GEMV
+# CTAs dispatched before the 16 router CTAs (units o_proj_produce_router[_as]_rp<pos>;
+# the same CTA work in another block order, the same outputs). Under a predecessor that
+# occupies SMs past the producer's launch (the ll.sparse_mla_fd -> uv chain on GB300),
+# the last-dispatched CTAs start after the uv grid ends and load their weights after the
+# wait; served last, the router CTAs were the producer's last CTAs to finish.
+OPROJ_REMAP_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ8_REMAP"
+REMAP_MAX_POS = 127
+
+
+def oproj_remap(raw=None) -> dict:
+    """``{rows: router position}`` for rows 1..8 from ``OPROJ_REMAP_ENV`` (or ``raw``);
+    empty when unset."""
+    if raw is None:
+        raw = os.environ.get(OPROJ_REMAP_ENV, "")
+    out = {}
+    for item in (x.strip() for x in raw.split(",")):
+        if not item:
+            continue
+        rng, _, pos = item.partition("@")
+        try:
+            lo, _, hi = rng.partition("-")
+            lo, hi = int(lo), int(hi) if hi else 8
+            pos = int(pos) if pos else 0
+        except ValueError:
+            raise ValueError(f"{OPROJ_REMAP_ENV}={raw!r}: bad item {item!r}") from None
+        if not (1 <= lo <= hi <= 8 and 0 <= pos <= REMAP_MAX_POS):
+            raise ValueError(
+                f"{OPROJ_REMAP_ENV}={raw!r}: {item!r} (rows 1..8, position 0..127)"
+            )
+        for m in range(lo, hi + 1):
+            if m in out:
+                raise ValueError(f"{OPROJ_REMAP_ENV}={raw!r}: rows {m} twice")
+            out[m] = pos
+    return out
 
 
 @dataclass(frozen=True)
@@ -155,9 +279,59 @@ def _args_apply():
     return (*[_z()] * 4, Float32(1e-5), Int32(1), cu.CUstream(0))
 
 
-def unit_specs(*, plain_allreduce: bool = False):
+def _args_tail():
+    return (
+        *[_z()] * 8,
+        Int32(6144),
+        Float32(1e-5),
+        Int32(1),
+        *[_z()] * 8,
+        Int32(0),
+        _z(),
+        Int32(0),
+        cu.CUstream(0),
+    )
+
+
+def moe_tail_unit(weights_dtype) -> str:
+    """The draft MoE tail hop's unit for the routing weights' dtype (fp32 or bf16)."""
+    return "moe_tail_norm_w32" if weights_dtype == torch.float32 else "moe_tail_norm_w16"
+
+
+def moe_tail_specs(trigger_late: bool = False):
+    """The draft MoE tail hop units (``MoeTailNormHop``: the deferred finalize + shared
+    add + all-reduce + residual + RMSNorm), one per routing-weight dtype; with
+    ``trigger_late`` the form without an early launch_dependents (same unit names)."""
+    return [
+        UnitSpec(
+            "moe_tail_norm_w32",
+            MoeTailNormHop(weights_f32=True, trigger_late=trigger_late),
+            _args_tail(),
+        ),
+        UnitSpec(
+            "moe_tail_norm_w16",
+            MoeTailNormHop(weights_f32=False, trigger_late=trigger_late),
+            _args_tail(),
+        ),
+    ]
+
+
+def unit_specs(
+    *,
+    plain_allreduce: bool = False,
+    allreduce_rmsnorm: bool = False,
+    form=None,
+    router_rows16=None,
+):
     """The compile units of the forward hops (instance A: up to 8 rows; instance B:
-    9..16)."""
+    9..16). ``plain_allreduce``: also the plain all-reduce (the draft's eh gather);
+    ``allreduce_rmsnorm``: also the residual-free all-reduce + RMSNorm (the draft's
+    row-parallel eh_proj sum with the draft layer's input norm); ``form``: the opt-in
+    fold forms (default: ``fold_form()``). ``router_rows16``: the 9..16-row routing
+    producer with row-contiguous router-partial stores (default:
+    ``hop16_router_rows()``); the unit name stays."""
+    fu = fold_units(form)
+    rows16 = hop16_router_rows() if router_rows16 is None else bool(router_rows16)
     specs = [
         UnitSpec(
             "allreduce_norm", AllreduceNormHop(residual=True, norm=True), _args_ar()
@@ -166,11 +340,11 @@ def unit_specs(*, plain_allreduce: bool = False):
         UnitSpec("o_proj_consume", OProjArConsume(), _args_consume()),
         UnitSpec("o_proj_produce_router", OProjArProduce(router=True), _args_produce()),
         UnitSpec("o_proj_consume_router", OProjArConsume(router=True), _args_consume()),
-        UnitSpec("moe_fold_split", MoeFoldArNorm(split=True), _args_fold()),
-        UnitSpec("moe_fold_plain", MoeFoldArNorm(split=False), _args_fold()),
+        UnitSpec("moe_fold_split", fu["moe_fold_split"], _args_fold()),
+        UnitSpec("moe_fold_plain", fu["moe_fold_plain"], _args_fold()),
         UnitSpec(
             "o_proj_produce_router16",
-            OProjArProduce(router=True, max_rows=16),
+            OProjArProduceRc() if rows16 else OProjArProduce(router=True, max_rows=16),
             _args_produce(),
         ),
         UnitSpec(
@@ -179,9 +353,14 @@ def unit_specs(*, plain_allreduce: bool = False):
             _args_consume(),
         ),
         UnitSpec("moe_fold_block_sums16", MoeFoldArBsum(), _args_bsum()),
-        UnitSpec("moe_fold_split_dn", MoeFoldArNormDn(split=True), _args_fold_dn()),
-        UnitSpec("moe_fold_plain_dn", MoeFoldArNormDn(split=False), _args_fold_dn()),
+        UnitSpec("moe_fold_split_dn", fu["moe_fold_split_dn"], _args_fold_dn()),
+        UnitSpec("moe_fold_plain_dn", fu["moe_fold_plain_dn"], _args_fold_dn()),
         UnitSpec("rmsnorm_from_block_sums16", RmsnormFromBlockSums(), _args_apply()),
+        *[
+            UnitSpec(name, fu[name], _args_fold_dn())
+            for name in ("moe_fold_split_dn_nc",)
+            if name in fu
+        ],
     ]
     if plain_allreduce:
         specs.append(
@@ -189,6 +368,59 @@ def unit_specs(*, plain_allreduce: bool = False):
                 "allreduce", AllreduceNormHop(residual=False, norm=False), _args_ar()
             )
         )
+    if allreduce_rmsnorm:
+        specs.append(
+            UnitSpec(
+                "allreduce_rmsnorm",
+                AllreduceNormHop(residual=False, norm=True),
+                _args_ar(),
+            )
+        )
+    return specs
+
+
+def oproj_async_specs():
+    """The opt-in producer forms (up to 8 rows) that stage the activations with
+    ``cp.async``, awaited inside the epoch read: ``o_proj_produce_as`` and
+    ``o_proj_produce_router_as``."""
+    return [
+        UnitSpec(
+            "o_proj_produce_as",
+            OProjArProduce(async_stage=True, epoch_overlap=True),
+            _args_produce(),
+        ),
+        UnitSpec(
+            "o_proj_produce_router_as",
+            OProjArProduce(router=True, async_stage=True, epoch_overlap=True),
+            _args_produce(),
+        ),
+    ]
+
+
+def oproj_remap_specs(positions, async_stage=()):
+    """The opt-in router-producer forms (up to 8 rows) that dispatch the router CTAs
+    after the first ``pos`` GEMV CTAs, for each ``pos`` of ``positions``:
+    ``o_proj_produce_router_rp<pos>`` and, for each ``pos`` of ``async_stage``,
+    ``o_proj_produce_router_as_rp<pos>`` (the async-staging form of
+    ``oproj_async_specs``)."""
+    specs = [
+        UnitSpec(
+            f"o_proj_produce_router_rp{p}",
+            OProjArProduce(router=True, router_pos=p),
+            _args_produce(),
+        )
+        for p in sorted(set(positions))
+    ]
+    specs += [
+        UnitSpec(
+            f"o_proj_produce_router_as_rp{p}",
+            OProjArProduce(
+                router=True, async_stage=True, epoch_overlap=True, router_pos=p
+            ),
+            _args_produce(),
+        )
+        for p in sorted(set(async_stage))
+    ]
     return specs
 
 
@@ -268,6 +500,14 @@ class HopKernels:
     eps: float
     rscale: float
     split_max_rows: int = 0
+    # rows up to which the cluster-free deferred-norm split serves ("split8dn"; from
+    # SPLIT8DN_MIN_ROWS rows; 0: not served)
+    split8dn_rows: int = 0
+    form: frozenset = frozenset()
+    # the async-staging producer forms serve from this row count on (0: off)
+    async_min_rows: int = 0
+    # the router producer's launch order: {rows: router position} (empty: served order)
+    remap: dict = field(default_factory=dict)
     _peers: dict = field(default_factory=dict)
 
     @classmethod
@@ -310,7 +550,41 @@ class HopKernels:
             self.split_max_rows = self._split_rows(
                 device_index, probe or compiled["moe_fold_split"]
             )
+        self.form = fold_form()
+        if "split8dn" in self.form and "moe_fold_split_dn_nc" in compiled:
+            self.split8dn_rows = _split8_rows(device_index)
+        self.async_min_rows = oproj_async_min_rows()
+        self.remap = oproj_remap()
         return self
+
+    def fold_limits(self):
+        """What every rank must agree on: the split-fold row limit (served forms), or
+        (it, the cluster-free deferred-norm split limit, the forms) with an opt-in
+        form."""
+        if not self.form:
+            return self.split_max_rows
+        return (self.split_max_rows, self.split8dn_rows, tuple(sorted(self.form)))
+
+    def dn_fold_unit(self, rows: int) -> str:
+        """The deferred-norm fold unit at ``rows`` (<= 8)."""
+        if SPLIT8DN_MIN_ROWS <= rows <= self.split8dn_rows:
+            return "moe_fold_split_dn_nc"
+        if rows <= self.split_max_rows:
+            return "moe_fold_split_dn"
+        return "moe_fold_plain_dn"
+
+    def _producer(self, name, rows):
+        """The producer unit ``name`` serves ``rows``: its async-staging form from
+        ``async_min_rows`` up to 8 rows, when compiled; of the router producer, that
+        unit's form with the router CTAs at ``remap[rows]``, when compiled."""
+        unit = name
+        if 1 <= self.async_min_rows <= rows <= 8 and f"{name}_as" in self.compiled:
+            unit = f"{name}_as"
+        if name == "o_proj_produce_router" and rows in self.remap:
+            rp = f"{unit}_rp{self.remap[rows]}"
+            if rp in self.compiled:
+                unit = rp
+        return self.compiled[unit]
 
     def reset(self):
         """Collective. Re-initialize the mailboxes and zero the router-partial words
@@ -394,12 +668,70 @@ class HopKernels:
             *self._tail(mb, site),
         )
 
+    def allreduce_rmsnorm(self, partial, gamma, out_res, out_norm, site=0):
+        """Residual-free all-reduce + RMSNorm of ``partial`` [rows <= 8, 6144] bf16:
+        ``out_res`` = the rank-order fp32 sum rounded once to bf16, ``out_norm`` =
+        RMSNorm(out_res) * gamma (the hop's norm arithmetic), on mailbox instance A.
+        Needs ``unit_specs(allreduce_rmsnorm=True)``'s unit."""
+        if partial.shape[0] > 8:
+            raise ValueError("the all-reduce + RMSNorm serves at most 8 rows per call")
+        mb = self.mbox_a
+        self.compiled["allreduce_rmsnorm"](
+            _p(partial),
+            Int64(0),
+            _p(gamma),
+            _p(out_res),
+            _p(out_norm),
+            Float32(self.eps),
+            Int32(partial.shape[0]),
+            *self._rot(mb.peers, mb.rank),
+            *self._tail(mb, site),
+        )
+
+    def moe_tail_norm(
+        self,
+        gemm2,
+        perm,
+        weights,
+        shared,
+        residual,
+        gamma,
+        out_res,
+        out_norm,
+        eps,
+        site=0,
+    ):
+        """The draft MoE tail (``MoeTailNormHop``) for ``residual.shape[0]`` <= 8 rows on
+        mailbox instance A: ``out_norm`` = RMSNorm(residual + allreduce(bf16(finalize +
+        shared))) * gamma. ``gemm2`` [*, ld] bf16 (unit column stride), ``perm`` /
+        ``weights`` [rows, TOPK] contiguous (int32; fp32 or bf16), ``shared``
+        [rows, 6144] bf16. Needs ``moe_tail_specs()``'s unit for the weights' dtype."""
+        rows = residual.shape[0]
+        if rows > 8:
+            raise ValueError("the draft MoE tail serves at most 8 rows per call")
+        mb = self.mbox_a
+        self.compiled[moe_tail_unit(weights.dtype)](
+            _p(gemm2),
+            _p(perm),
+            _p(weights),
+            _p(shared),
+            _p(residual),
+            _p(gamma),
+            _p(out_res),
+            _p(out_norm),
+            Int32(gemm2.stride(0)),
+            Float32(eps),
+            Int32(rows),
+            *self._rot(mb.peers, mb.rank),
+            *self._tail(mb, site),
+        )
+
     def o_proj(self, x, w_o, residual, gamma, out_res, out_norm, site=0):
         mb = self.mbox_a
         rows = Int32(x.shape[0])
         pr = self._rot(mb.peers, mb.rank)
         z = Int64(0)
-        self.compiled["o_proj_produce"](
+        self._producer("o_proj_produce", x.shape[0])(
             _p(x), _p(w_o), z, z, z, rows, *pr, *[z] * WORLD, *self._tail(mb, site)
         )
         self.compiled["o_proj_consume"](
@@ -427,7 +759,7 @@ class HopKernels:
         assert mb is not None, "hop mailbox instance B (9..16 rows) was not built"
         sfx = "16" if big else ""
         pr = self._rot(mb.peers, mb.rank)
-        self.compiled["o_proj_produce_router" + sfx](
+        self._producer("o_proj_produce_router" + sfx, rows)(
             _p(x),
             _p(w_o),
             _p(qh),
@@ -524,10 +856,7 @@ class HopKernels:
         rows = int(out_res.shape[0])
         assert rows <= 8, "the deferred-norm fold serves up to 8 rows"
         mb = self.mbox_a
-        unit = (
-            "moe_fold_split_dn" if rows <= self.split_max_rows else "moe_fold_plain_dn"
-        )
-        self.compiled[unit](
+        self.compiled[self.dn_fold_unit(rows)](
             _p(pq),
             _p(shp),
             _p(ids),
@@ -552,6 +881,14 @@ def _fold_smem():
     """Dynamic shared memory of the fold units (consumer block + y[8][768] + sh[768]
     fp32)."""
     return 21664 + 4 * (8 * ELEMS_PER_CTA + ELEMS_PER_CTA)
+
+
+def _split8_rows(device_index) -> int:
+    """Rows up to which the cluster-free split fold (``16 * rows + 8`` CTAs, at least
+    one per SM: the unit launches) is co-resident."""
+    sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    rows = [r for r in range(1, SPLIT8_MAX_ROWS + 1) if 16 * r + 8 <= sms]
+    return max(rows, default=0)
 
 
 @dataclass

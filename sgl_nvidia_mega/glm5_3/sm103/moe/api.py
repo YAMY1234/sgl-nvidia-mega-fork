@@ -19,6 +19,7 @@ output). With bit 1 clear the scratch buffers are the output (the fold ABI: ``pa
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -33,6 +34,120 @@ REQUEST_ROWS = 4
 SHARED_PARTS = 4
 MIN_CLUSTERS_SHARED = 8
 ENGINE_SMEM = {"g1": 227440, "g2": 229968, "g4": 223664}
+
+# Opt-in forms of the four-request engine (mode g4, 9..16 rows), read at build; the
+# defaults are the served form. Every form leaves each output bit unchanged.
+#   ..._MOE16_XPIPE=1         per unit, push all groups' K-split partials before waiting
+#   ..._MOE16_RECV_BUFS=n     exchange receive buffers (default 5)
+#   ..._MOE16_LOOKAHEAD=n     FC2(k) after FC1(k + n) (default 2)
+#   ..._MOE16_PRE=n           unit 0's first n FC1 chunks issue before the unit table
+#                             is built (1..3, default 1)
+#   ..._MOE16_FASTTAB=1       lane-parallel unit table (batched id loads, no union list)
+#   ..._MOE16_XGATE=1         (with FASTTAB) unit 0's first chunks wait for the x loads' issue
+#   ..._MOE16_SHARED_WEIGHT=w schedule weight of the shared quarter in units (default 4)
+#   ..._MOE16_SHARED_FILL=1   the shared clusters also take up to cap - weight routed units
+#   ..._MOE16_XTMA=n          (with FASTTAB, no XGATE) routed clusters stage x with bulk copies
+#                             in ring slot 3 right after the id loads; n = 1: unrolled
+#                             quantization, n = 2..4: rolled, n - 1 warp tiles per iteration
+#   ..._MOE16_SNAKE=1         snake order of the routed experts over the routed clusters
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_LOCALIZE=1 (``locality.py``): the die-local g4 form
+# (``engine16`` ``localize``, the shared-quarter weight as its schedule weight) over
+# weights homed per locality domain; the glue decides at build whether the device can.
+MOE16_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE16_"
+# Opt-in form of the one- and two-request engines (modes g1 / g2), read at build; the
+# default is the served form and the form leaves each output bit unchanged.
+#   SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_PRE3=1  unit 0's three FC1 chunks issue as soon as
+#                                            unit 0 is resolved (engine ``pre`` = 3); the
+#                                            die-local g1 / g2 forms ignore it
+MOE_PRE3_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_PRE3"
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(MOE16_ENV + name, "").strip()
+    return int(raw) if raw else default
+
+
+def g4_knobs(localize: bool = False) -> dict:
+    """The g4 engine's build-time choices from the environment (defaults: served);
+    ``localize``: the die-local form, its slot weight the shared-quarter weight."""
+    from .engine import LOOKAHEAD
+    from .engine16 import RECV_BUFS
+
+    k = {
+        "xpipe": _env_int("XPIPE", 0) != 0,
+        "recv_bufs": _env_int("RECV_BUFS", RECV_BUFS),
+        "lookahead": _env_int("LOOKAHEAD", LOOKAHEAD),
+        "pre": _env_int("PRE", 1),
+        "fasttab": _env_int("FASTTAB", 0) != 0,
+        "xgate": _env_int("XGATE", 0) != 0,
+        "xtma": _env_int("XTMA", 0),
+    }
+    if localize:
+        k["localize"] = max(1, g4_schedule_knobs()["shared_weight"])
+    return k
+
+
+# the die-local g1 / g2 forms' shared-quarter weight (the stock tables' cap rule counts
+# a shared quarter as three routed units)
+G12_SHARED_WEIGHT = 3
+
+
+def schedule_checks(nclusters: int, n0: dict) -> list:
+    """(N, n_0, shared weight, unit cap, max distinct experts) of every die-local grid:
+    g4 at N, g2 at N, g1 at N and at min(N, 32) (one-row steps)."""
+    from .engine import _Geometry
+
+    sw4 = max(1, g4_schedule_knobs()["shared_weight"])
+    g1, g2 = _Geometry("g1"), _Geometry("g2")
+    out = [
+        (nclusters, n0[nclusters], sw4, 17, 128),
+        (nclusters, n0[nclusters], G12_SHARED_WEIGHT, g2.max_units, g2.max_list),
+        (nclusters, n0[nclusters], G12_SHARED_WEIGHT, g1.max_units, g1.max_list),
+    ]
+    n32 = min(nclusters, 32)
+    if n32 != nclusters:
+        out.append((n32, n0[n32], G12_SHARED_WEIGHT, g1.max_units, g1.max_list))
+    return out
+
+
+def g4_schedule_knobs() -> dict:
+    """The g4 schedule's choices from the environment: shared-quarter weight, shared
+    fill and snake order (``schedule.g4_table`` keywords)."""
+    return {
+        "shared_weight": _env_int("SHARED_WEIGHT", S.G4_SHARED_WEIGHT),
+        "fill_shared": _env_int("SHARED_FILL", 0) != 0,
+        "snake": _env_int("SNAKE", 0) != 0,
+    }
+
+
+def g12_pre3_requested() -> bool:
+    """``SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_PRE3`` is 1 (0 or unset: no; else ValueError)."""
+    raw = os.environ.get(MOE_PRE3_ENV, "").strip()
+    if raw not in ("", "0", "1"):
+        raise ValueError(f"{MOE_PRE3_ENV}={raw!r}: expected 0 or 1")
+    return raw == "1"
+
+
+def g12_knobs(localize: bool = False) -> dict:
+    """The g1 / g2 engines' build-time choices from the environment (default: served):
+    ``pre`` 3 with ``SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_PRE3=1``, else 1; the die-local
+    forms (``localize``) keep 1 (their unit 0 comes from the claimed slot, after the
+    table)."""
+    return {"pre": 3 if g12_pre3_requested() and not localize else 1}
+
+
+G12_SHARED_WEIGHT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_SHARED_WEIGHT_G"
+
+
+def g12_schedule_knobs(mode: str) -> dict:
+    """The g1 / g2 schedule's shared-quarter weight in routed units from
+    ``SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_SHARED_WEIGHT_G1`` / ``..._G2`` (default: served,
+    ``schedule.G12_SHARED_WEIGHT``); only the unit-to-cluster assignment changes."""
+    raw = os.environ.get(G12_SHARED_WEIGHT_ENV + mode[1:], "").strip()
+    w = int(raw) if raw else S.G12_SHARED_WEIGHT
+    if not 0 <= w <= 8:
+        raise ValueError(f"{G12_SHARED_WEIGHT_ENV}{mode[1:]}={raw!r}: expected 0..8")
+    return {"shared_weight": w}
 
 
 @dataclass
@@ -51,6 +166,8 @@ class LayerTensors:
     g2_alpha: torch.Tensor  # FP32 [256]
     gs1: float  # 1 / FC1 input scale
     gs2: float  # 1 / FC2 input scale
+    # uint8 [LOC_BYTES]: the layer's locality block (die-local g4 form only)
+    loc: torch.Tensor | None = None
 
     def check(self) -> None:
         def need(ok: bool, what: str) -> None:
@@ -144,9 +261,11 @@ def default_clusters(device: torch.device | None = None) -> int:
     return int(cutlass.utils.HardwareInfo(index).get_max_active_clusters(4))
 
 
-def compile_specs(shared: bool = True) -> dict[str, tuple[object, tuple]]:
+def compile_specs(
+    shared: bool = True, localize: bool = False
+) -> dict[str, tuple[object, tuple]]:
     """The served compile units: name -> (kernel object, example arguments for
-    ``cute.compile``)."""
+    ``cute.compile``); ``localize``: the die-local forms."""
     from cutlass import Float32, Int32, Int64
     from cutlass.cute.runtime import make_fake_stream
 
@@ -184,11 +303,13 @@ def compile_specs(shared: bool = True) -> dict[str, tuple[object, tuple]]:
             make_fake_stream(),
         )
 
+    lw = G12_SHARED_WEIGHT if localize else 0
+    k12 = g12_knobs(localize)
     return {
-        "g1": (Nvfp4MoeSmallM("g1", shared), eng(4, 4)),
-        "g2": (Nvfp4MoeSmallM("g2", shared), eng(8, 4)),
+        "g1": (Nvfp4MoeSmallM("g1", shared, localize=lw, **k12), eng(4, 4)),
+        "g2": (Nvfp4MoeSmallM("g2", shared, localize=lw, **k12), eng(8, 4)),
         "g4": (
-            Nvfp4MoeSmallM16(shared),
+            Nvfp4MoeSmallM16(shared, **g4_knobs(localize)),
             eng(16, pack_rows((4, 4, 4, 4))),
         ),
         "finalize": (
@@ -208,7 +329,9 @@ class SmallMMoe:
     ``compiled``: name -> compiled callable for the names of ``compile_specs``;
     ``nclusters``: the engine grid in 4-CTA clusters (at least 31; with fewer, the
     schedule tables do not fit and the constructor raises ``ValueError``; the
-    co-resident maximum from the occupancy query is the fast one)."""
+    co-resident maximum from the occupancy query is the fast one). ``localize``: the
+    engines are the die-local forms, which read each layer's locality block
+    (``LayerTensors.loc``) in place of the schedule tables."""
 
     def __init__(
         self,
@@ -216,6 +339,7 @@ class SmallMMoe:
         nclusters: int,
         device: torch.device,
         shared: bool = True,
+        localize: bool = False,
     ) -> None:
         if shared and nclusters < MIN_CLUSTERS_SHARED:
             raise ValueError(
@@ -226,11 +350,14 @@ class SmallMMoe:
         self.nclusters = nclusters
         self.shared = shared
         self.device = device
+        self.localize = localize
         self.scratch = Scratch(device)
+        sk = g4_schedule_knobs()
         self.tables = {}
         for mode, build in (("g1", S.g1_table), ("g2", S.g2_table), ("g4", S.g4_table)):
+            kw = sk if mode == "g4" else g12_schedule_knobs(mode)
             for nc in sorted({nclusters, min(nclusters, 32)}):
-                self.tables[(mode, nc)] = build(nc, shared).to(device)
+                self.tables[(mode, nc)] = build(nc, shared, **kw).to(device)
 
     def clusters(self, mode: str, rows: int) -> int:
         return min(self.nclusters, 32) if mode == "g1" and rows == 1 else self.nclusters
@@ -265,6 +392,8 @@ class SmallMMoe:
                 "small-M MoE: x bf16 [M, 6144], ids int32 [M, 8], "
                 "weights fp32 [M, 8], contiguous"
             )
+        if self.localize and layer.loc is None:
+            raise ValueError("small-M MoE: the die-local engine needs the layer's loc")
         if self.shared and layer.shared_pack is None:
             raise ValueError(
                 "small-M MoE: this launcher runs the shared expert; "
@@ -305,7 +434,7 @@ class SmallMMoe:
                 Int32(m),
                 Int32(split),
                 p(sc.err),
-                p(self.tables[(mode, nc)]),
+                p(layer.loc if self.localize else self.tables[(mode, nc)]),
                 p(sc.shared_partials),
                 p(sc.partials),
                 p(sc.slot_ids),

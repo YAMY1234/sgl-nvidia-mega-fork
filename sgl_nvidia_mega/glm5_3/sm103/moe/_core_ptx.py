@@ -7,7 +7,7 @@ then import it from there."""
 
 from __future__ import annotations
 
-from cutlass import Float32, Int32, Int64, Uint16, Uint32
+from cutlass import Float32, Int32, Int64, Uint16, Uint32, Uint64
 
 from ..primitives.ptx_core import ptx_arith, ptx_op
 
@@ -172,6 +172,65 @@ def st_shared_v2_u32(addr, a, b):
     )
 
 
+# ------------------------------------------- die-local schedule claim (side-effecting)
+
+
+@ptx_op(Int32)
+def smid():
+    """``%smid`` of the executing SM."""
+    return "mov.u32 $0, %smid;", "=r", ()
+
+
+@ptx_op(Int32)
+def ld_nc_u8(address):
+    """Non-coherent byte load of a table written before the launch (zero-extended)."""
+    return (
+        "{ .reg .b16 h; ld.global.nc.u8 h, [$1]; cvt.u32.u16 $0, h; }",
+        "=r,l",
+        (Int64(address),),
+    )
+
+
+@ptx_op(Uint64)
+def atom_add_u64(address, value):
+    """Relaxed GPU-scope ``atom.add.u64``; returns the old value."""
+    return (
+        "atom.global.add.u64 $0, [$1], $2;",
+        "=l,l,l",
+        (Int64(address), Uint64(value)),
+    )
+
+
+@ptx_op(Int32)
+def atom_add_u32(address, value):
+    """Relaxed GPU-scope ``atom.add.u32``; returns the old value."""
+    return (
+        "atom.global.add.u32 $0, [$1], $2;",
+        "=r,l,r",
+        (Int64(address), Uint32(value)),
+    )
+
+
+@ptx_op()
+def atom_exch_u32(address, value):
+    """Relaxed GPU-scope ``atom.exch.b32`` (the old value is discarded)."""
+    return (
+        "{ .reg .b32 o; atom.global.exch.b32 o, [$0], $1; }",
+        "l,r",
+        (Int64(address), Uint32(value)),
+    )
+
+
+@ptx_op()
+def atom_exch_u64(address, value):
+    """Relaxed GPU-scope ``atom.exch.b64`` (the old value is discarded)."""
+    return (
+        "{ .reg .b64 o; atom.global.exch.b64 o, [$0], $1; }",
+        "l,l",
+        (Int64(address), Uint64(value)),
+    )
+
+
 # ------------------------------------------------------------- control (side-effecting)
 
 
@@ -251,4 +310,43 @@ def st_async_v4_f32(remote, remote_bar, a, b, c, d):
             Float32(c),
             Float32(d),
         ),
+    )
+
+
+# ------------------------------------------------ trace counters (side-effecting)
+
+
+@ptx_op(Uint64)
+def globaltimer():
+    """``%globaltimer`` (ns; trace builds only)."""
+    return "mov.u64 $0, %globaltimer;", "=l", ()
+
+
+@ptx_op(Uint64)
+def globaltimer_after(dep):
+    """``%globaltimer`` read after ``dep`` is computed (unused operand; trace builds
+    only)."""
+    return "mov.u64 $0, %globaltimer;", "=l,r", (Uint32(dep),)
+
+
+@ptx_op(Uint64)
+def clock64():
+    """``%clock64`` (SM cycles; trace builds only)."""
+    return "mov.u64 $0, %clock64;", "=l", ()
+
+
+@ptx_op()
+def red_add_u64(address, value):
+    """Relaxed GPU-scope ``red.add.u64`` into a global word (trace builds only)."""
+    return "red.global.add.u64 [$0], $1;", "l,l", (Int64(address), Uint64(value))
+
+
+@ptx_arith(Int32)
+def fns(mask, base, offset):
+    """Bit position of the ``offset``-th (1-based) set bit of ``mask`` from bit ``base``
+    upward (0xffffffff if none)."""
+    return (
+        "fns.b32 $0, $1, $2, $3;",
+        "=r,r,r,r",
+        (Uint32(mask), Uint32(base), Int32(offset)),
     )

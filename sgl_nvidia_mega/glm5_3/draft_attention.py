@@ -39,6 +39,7 @@ index-share carry) with either kernel.
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -54,6 +55,8 @@ from sgl_nvidia_mega.glm5_3.attention.fused import (
 )
 from sgl_nvidia_mega.glm5_3.attention.step import AttentionStep, StepContext
 from sgl_nvidia_mega.glm5_3.runtime import DerivedWeights
+
+logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -299,6 +302,37 @@ class FinalNormed(NamedTuple):
     norm: torch.Tensor
 
 
+_TAIL_LOGGED = set()
+
+
+def _log_tail_layout(handoff, residual, x, orig, forward_batch, dbg) -> None:
+    """T98 diagnostics: the MoE tail inputs' layout, once per (mode, rows) per rank."""
+    mode = str(forward_batch.forward_mode)
+    key = (mode, int(residual.shape[0]))
+    if key in _TAIL_LOGGED:
+        return
+    _TAIL_LOGGED.add(key)
+
+    def d(t):
+        if not isinstance(t, torch.Tensor):
+            return type(t).__name__
+        return f"{tuple(t.shape)}/{tuple(t.stride())}/{str(t.dtype)[6:]}@{t.data_ptr():#x}+{t.numel() * t.element_size()}"
+
+    logger.info(
+        "T98 tail dbg [%s] %s: g2 %s perm %s w %s shared %s m %s | residual %s x %s orig %s",
+        dbg,
+        key,
+        d(getattr(handoff, "routed_output", None)),
+        d(getattr(handoff, "permuted_indices", None)),
+        d(getattr(handoff, "expert_weights", None)),
+        d(getattr(handoff, "gated_shared_output", None)),
+        getattr(handoff, "m", None),
+        d(residual),
+        d(x),
+        d(orig),
+    )
+
+
 def select_rows(hidden_states: torch.Tensor, forward_batch, index: torch.Tensor):
     """Keep only the ``index`` rows of a prepared MLP input and of the residual its
     prepare wrote (slot draft_rowselect: the draft extend reads the layer output on
@@ -452,8 +486,17 @@ def decoder_layer_forward(
                 "written residual after the FFN prepare (got pending "
                 f"{stream.pending is not None}, residual {type(residual).__name__})"
             )
+        # T98 diagnostics (test-only, default off): DRAFT_MOE_TAIL_DBG = "noctx" (no MoE
+        # output buffer), "rescopy" (the residual copied before the MLP) or both, comma-separated
+        dbg = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_MOE_TAIL_DBG", "")
+        if "rescopy" in dbg:
+            residual = residual.clone()
+        if "noctx" in dbg:
+            mlp_ctx = nullcontext()
         with get_forward().scoped(defer_moe_finalize=True), mlp_ctx:
             handoff = layer.mlp(hidden_states, forward_batch, None)
+        if dbg and torch.cuda.is_current_stream_capturing():
+            _log_tail_layout(handoff, residual, hidden_states, hidden_states_orig, forward_batch, dbg)
         return FinalNormed(moe_tail(handoff, residual)), topk_indices
     with layer.ffn_boundary.exit(forward_batch) as ffn_exit, mlp_ctx:
         hidden_states = layer.mlp(hidden_states, forward_batch, None)

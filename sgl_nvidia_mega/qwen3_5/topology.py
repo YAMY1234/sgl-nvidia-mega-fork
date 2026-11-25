@@ -13,13 +13,7 @@ import msgspec
 
 SGLANG_READS = {
     "srt/runtime_context.py": ('"tp_size"', '"attn_dp_size"', '"moe_ep_size"'),
-    "srt/arg_groups/fields/*.py": (
-        "tp_size",
-        "attn_dp_size",
-        "ep_size",
-        "dp_size",
-        "enable_dp_attention",
-    ),
+    "srt/arg_groups/fields/*.py": ("tp_size", "attn_dp_size", "ep_size"),
 }
 
 TOPOLOGIES = frozenset({"tp2", "tp4", "tp8", "tep8", "dep8"})
@@ -199,12 +193,8 @@ def from_parallel(parallel) -> Topology:
 
 
 def from_config(cfg) -> Topology:
-    # Startup guards may run before legacy --dp-size/--enable-dp-attention is
-    # normalized to attn_dp_size; the published ParallelContext is already resolved.
-    attention_dp = cfg.attn_dp_size or 1
-    if cfg.enable_dp_attention:
-        attention_dp = max(attention_dp, cfg.dp_size or 1)
-    return Topology(cfg.tp_size, attention_dp, cfg.ep_size or 1)
+    # SGLang removed --enable-dp-attention; --attn-dp-size is the only attention DP.
+    return Topology(cfg.tp_size, cfg.attn_dp_size or 1, cfg.ep_size or 1)
 
 
 def select(requested: frozenset, topology: Topology) -> frozenset:

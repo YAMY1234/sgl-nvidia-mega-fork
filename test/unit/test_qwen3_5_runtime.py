@@ -188,8 +188,6 @@ def test_config_filter_derives_attention_tp_before_publication(monkeypatch):
         attn_cp_size=1,
         attn_dp_size=8,
         ep_size=8,
-        enable_dp_attention=True,
-        dp_size=8,
         disaggregation_mode="decode",
     )
 

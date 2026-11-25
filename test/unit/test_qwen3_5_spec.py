@@ -128,7 +128,7 @@ BREAKABLE = with_phase(
     [
         (dict(tp_size=1, nnodes=1), "tp_size 1"),
         (dict(pp_size=2), "pipeline parallelism is in use"),
-        (dict(enable_dp_attention=True, dp_size=4), "DP attention requires DEP8"),
+        (dict(attn_dp_size=4), "DP attention requires DEP8"),
         (dict(kv_cache_dtype="auto"), "kv_cache_dtype 'auto'"),
         (dict(speculative_algorithm=None), "speculative_algorithm None"),
         (dict(speculative_eagle_topk=4), "speculative_eagle_topk 4"),
@@ -695,8 +695,7 @@ def test_dep8_accepts_the_recipe_stock_moe_and_dp_lm_head(a2a):
     assert (
         _refusal(
             disaggregation_mode="decode",
-            enable_dp_attention=True,
-            dp_size=8,
+            attn_dp_size=8,
             ep_size=8,
             enable_dp_lm_head=True,
             moe_runner_backend="flashinfer_cutedsl",

@@ -88,7 +88,8 @@ def fc_input(parts, token_ids, hidden):
     rows ``hidden`` [rows, hidden] they follow."""
     lm = parts.lm
     _note_fc_cat()
-    return lm.fc(
+    # SGLang's ReplicatedLinear fc returns (output, bias)
+    out, _ = lm.fc(
         norms_into_cat(
             parts.embed(token_ids),
             hidden,
@@ -96,6 +97,7 @@ def fc_input(parts, token_ids, hidden):
             lm.pre_fc_norm_hidden,
         )
     )
+    return out
 
 
 def norms_into_cat(embeds, hidden, norm_embeds, norm_hidden):

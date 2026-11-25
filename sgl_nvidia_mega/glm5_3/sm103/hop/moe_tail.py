@@ -40,12 +40,22 @@ from .transport import ConsSmem, Consumer, Mbox
 class MoeTailNormHop(Consumer):
     """Draft MoE finalize + shared add + all-reduce + residual + RMSNorm (up to 8 rows)."""
 
-    def __init__(self, *, weights_f32: bool, has_shared: bool = True, max_rows: int = 8):
+    def __init__(
+        self,
+        *,
+        weights_f32: bool,
+        has_shared: bool = True,
+        max_rows: int = 8,
+        trigger_late: bool = False,
+    ):
         if max_rows != 8:
             raise ValueError("this hop is provided for up to 8 rows")
         self.weights_f32 = bool(weights_f32)
         self.has_shared = bool(has_shared)
         self.max_rows = max_rows
+        # no early griddepcontrol.launch_dependents: the dependent grid launches when this
+        # grid completes (as after SGLang's final RMSNorm kernel)
+        self.trigger_late = bool(trigger_late)
 
     @cute.jit
     def __call__(
@@ -143,7 +153,8 @@ class MoeTailNormHop(Consumer):
         if bx < nmain:
             self.cons_prologue(cs)
         cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.trigger_late):
+            cute.arch.griddepcontrol_launch_dependents()
         sys_ops.fence_proxy_async_global()  # inputs may come from an async-proxy writer
         if bx >= nmain:
             e = self.epoch_begin(mb, cs.es, False)

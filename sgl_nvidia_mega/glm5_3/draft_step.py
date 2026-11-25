@@ -808,6 +808,12 @@ class FusedDraft:
             DRAFT_MOE_TAIL_ENV,
             "the MoE finalize + shared add + all-reduce + final RMSNorm in one hop at "
             "1-8 MLP rows"
+            + (
+                " (late trigger)"
+                if os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_MOE_TAIL_LATE", "0")
+                == "1"
+                else ""
+            )
             if self._tail_ready
             else f"declined ({why}); SGLang's MoE tail serves",
             self.rank,

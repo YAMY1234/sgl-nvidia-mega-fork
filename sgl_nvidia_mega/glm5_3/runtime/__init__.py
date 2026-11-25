@@ -615,8 +615,10 @@ def _hops_for_draft(model, family) -> None:
     # DRAFT_MOE_TAIL_ENV=1: the draft MoE tail hop (finalize + shared add + all-reduce +
     # residual + RMSNorm), one unit per routing-weight dtype
     if draft_moe_tail_requested():
-        units.update({s.name: s for s in hop_api.moe_tail_specs()})
-        names = names + tuple(s.name for s in hop_api.moe_tail_specs())
+        late = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_MOE_TAIL_LATE", "0") == "1"
+        tail = hop_api.moe_tail_specs(trigger_late=late)
+        units.update({s.name: s for s in tail})
+        names = names + tuple(s.name for s in tail)
     for name in names:
         unit = units[name]
         family.kernels.compiled.setdefault(

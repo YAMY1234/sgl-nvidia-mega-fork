@@ -298,12 +298,21 @@ def moe_tail_unit(weights_dtype) -> str:
     return "moe_tail_norm_w32" if weights_dtype == torch.float32 else "moe_tail_norm_w16"
 
 
-def moe_tail_specs():
+def moe_tail_specs(trigger_late: bool = False):
     """The draft MoE tail hop units (``MoeTailNormHop``: the deferred finalize + shared
-    add + all-reduce + residual + RMSNorm), one per routing-weight dtype."""
+    add + all-reduce + residual + RMSNorm), one per routing-weight dtype; with
+    ``trigger_late`` the form without an early launch_dependents (same unit names)."""
     return [
-        UnitSpec("moe_tail_norm_w32", MoeTailNormHop(weights_f32=True), _args_tail()),
-        UnitSpec("moe_tail_norm_w16", MoeTailNormHop(weights_f32=False), _args_tail()),
+        UnitSpec(
+            "moe_tail_norm_w32",
+            MoeTailNormHop(weights_f32=True, trigger_late=trigger_late),
+            _args_tail(),
+        ),
+        UnitSpec(
+            "moe_tail_norm_w16",
+            MoeTailNormHop(weights_f32=False, trigger_late=trigger_late),
+            _args_tail(),
+        ),
     ]
 
 

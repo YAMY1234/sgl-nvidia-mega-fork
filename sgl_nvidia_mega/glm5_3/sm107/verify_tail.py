@@ -95,7 +95,9 @@ class VerifyTail:
             reasons.append("penalty")
         if si.logit_bias is not None:
             reasons.append("logit_bias")
-        if getattr(si, "sampling_seed", None) is not None:
+        # A greedy verify commits the argmax and draws nothing, so a seed changes nothing (SGLang's
+        # verify does not read it then); a seeded sampled request is refused, not served unseeded.
+        if getattr(si, "sampling_seed", None) is not None and not si.is_all_greedy:
             reasons.append("seed")
         if not si.is_all_greedy and (
             getattr(si, "need_top_k_sampling", False)

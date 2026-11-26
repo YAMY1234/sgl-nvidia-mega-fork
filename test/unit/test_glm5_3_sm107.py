@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import ast
+import dataclasses
 import hashlib
 import os
 import random
@@ -131,6 +132,25 @@ def test_the_runner_binds_before_its_graphs_once(mk, monkeypatch):
     draft_runner.is_draft_worker = True
     draft_runner.init_cuda_graphs()
     assert calls == ["target", "graphs", "draft", "graphs"]
+
+
+def test_the_fake_logits_output_has_every_logits_processor_output_field():
+    """The fused draft hands SGLang's stock draft-extend tail a stand-in for its
+    LogitsProcessorOutput; the tail reads fields a tree adds (next_token_argmax_partials
+    in the GLM-5.2 serving tree), so every field must read as the real object's."""
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+    from sgl_nvidia_mega.glm5_3.sm107.draft import _FakeLogits
+
+    logits, hidden = object(), object()
+    fake = _FakeLogits(logits, hidden)
+    real = LogitsProcessorOutput(next_token_logits=logits, hidden_states=hidden)
+    for f in dataclasses.fields(LogitsProcessorOutput):
+        assert hasattr(fake, f.name), f.name
+        assert getattr(fake, f.name) == getattr(real, f.name), f.name
+    fake.next_token_logits = None  # the tail reassigns fields after select_index
+    assert fake.next_token_logits is None
+    assert not hasattr(fake, "not_a_logits_processor_output_field")
 
 
 def test_the_context_must_be_one_request_of_eight_tokens(mk):

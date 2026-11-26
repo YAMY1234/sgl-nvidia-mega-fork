@@ -133,6 +133,41 @@ def test_the_runner_binds_before_its_graphs_once(mk, monkeypatch):
     assert calls == ["target", "graphs", "draft", "graphs"]
 
 
+def test_a_seed_is_refused_only_when_the_verify_samples():
+    """Evaluation clients send a seed with greedy requests: a greedy verify draws nothing,
+    so the seed is covered; a sampled request with a seed is still refused."""
+    from sgl_nvidia_mega.glm5_3.sm107.verify_tail import VerifyTail
+
+    def reasons(greedy, seed, **si):
+        fields = dict(
+            step_penalties=None,
+            logit_bias=None,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            need_top_p_sampling=False,
+        )
+        sampling_info = types.SimpleNamespace(
+            **{**fields, **si}, is_all_greedy=greedy, sampling_seed=seed
+        )
+        batch = types.SimpleNamespace(
+            seq_lens=[100],
+            has_grammar=False,
+            return_logprob=False,
+            sampling_info=sampling_info,
+        )
+        return VerifyTail.uncovered(
+            types.SimpleNamespace(draft_token_num=8, tree_topk=1), batch
+        )
+
+    seed = object()  # SamplingBatchInfo.sampling_seed: a tensor when set
+    assert reasons(greedy=True, seed=seed) == []
+    assert reasons(greedy=True, seed=None) == []
+    assert reasons(greedy=False, seed=seed, need_top_p_sampling=True) == ["seed"]
+    assert reasons(greedy=False, seed=None, need_top_p_sampling=True) == []
+    # what changes the greedy argmax stays refused with or without a seed
+    assert reasons(greedy=True, seed=seed, logit_bias=object()) == ["logit_bias"]
+
+
 def test_the_context_must_be_one_request_of_eight_tokens(mk):
     mk._check_context(types.SimpleNamespace(tokens_per_request=8, widths=(8, 16)))
     with pytest.raises(ValueError):

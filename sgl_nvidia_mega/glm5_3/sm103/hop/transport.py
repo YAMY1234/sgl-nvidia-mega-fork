@@ -179,11 +179,14 @@ class Transport:
         es: EpochSmem,
         check: cutlass.Constexpr[bool],
         rt0: cutlass.Constexpr[int] = 0,
+        async_wait: cutlass.Constexpr[bool] = False,
     ) -> Uint32:
         """Every thread, after ``griddepcontrol.wait``. Threads ``rt0 .. rt0 + 7`` read
         ``E`` and one row epoch each (rows ``max_rows`` > 8 use threads ``rt0 .. rt0 +
         max_rows - 1``), thread ``rt0`` the error word, and (``check``) acquire the
-        acknowledgement of rank ``t - rt0``; the CTA barrier publishes the snapshot."""
+        acknowledgement of rank ``t - rt0``; the CTA barrier publishes the snapshot
+        (``async_wait``: and the threads' ``cp.async`` copies, awaited just before
+        it)."""
         t = P.thread_index() - rt0
         nread: cutlass.Constexpr = max(WORLD, mb.max_rows)
         if t >= 0 and t < nread:
@@ -223,6 +226,9 @@ class Transport:
                                     t0 = now
                                 elif now - t0 > Uint64(self.timeout_ns):
                                     self.fail(mb, ERR_ACK_WAIT, 2, t, 0, e)
+        if cutlass.const_expr(async_wait):
+            # the caller's cp.async copies, which this barrier publishes
+            sys_ops.cp_async_wait_all()
         cute.arch.sync_threads()
         return es.e[0]
 
@@ -547,6 +553,10 @@ class Consumer(Transport):
     cluster-rank-order total, ``rsqrt(fma(total, rcp(HIDDEN), eps))``, ``y = bf16((x *
     inv) * (0 + g))``."""
 
+    # launched without clusters (only the deferred-norm consumer, which exchanges nothing
+    # in the cluster): no cluster barrier in the prologue / epilogue
+    nocluster = False
+
     @cute.jit
     def cons_prologue(self, cs: ConsSmem):
         """Initialize the mbarrier, then cluster arrive (before cluster accesses)."""
@@ -558,7 +568,8 @@ class Consumer(Transport):
         # the cluster-scope release arrive is issued by the idle epoch-warp thread
         if t == 512:
             P.mbar_arrive_expect_tx_release_cluster(cs.mbar_addr(), 8 * 4)
-        P.cluster_arrive_relaxed()
+        if cutlass.const_expr(not self.nocluster):
+            P.cluster_arrive_relaxed()
 
     def block_reduce(self, v0, v1, v2):
         """Block sum of the three warp sums: ``(w0 + w2) + w1``."""
@@ -675,7 +686,8 @@ class Consumer(Transport):
                         sys_ops.st_global_u32(row + Int64(4 * k), u)
                     sys_ops.fence_proxy_async_global()  # thread 0 is in group 0
                 # completes the cluster barrier phase the consumer prologue opened
-                P.cluster_wait()
+                if cutlass.const_expr(not self.nocluster):
+                    P.cluster_wait()
             else:
                 # cluster exchange of the 8 block sums (st.async + mbarrier complete_tx)
                 crank = Int32(cute.arch.block_idx_in_cluster())

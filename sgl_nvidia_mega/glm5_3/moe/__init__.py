@@ -22,6 +22,13 @@ at load and registered (226.5 MB + 9.4 MB per MoE layer and rank). ``build`` dec
 (``FamilyDeclined``; with slot ``moe`` requested the server stops) unless the engine API
 accepts the configuration, every MoE layer has the expected tensors and the server's own
 NVFP4 weight processing passes the engine's layout self-test.
+
+With ``SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_LOCALIZE=1`` on a GPU with two locality domains
+(``sm103/moe/locality.py``) the routed FC1 weights and scales are re-bound to copies homed
+per domain (experts 0..127 on domain 0; the originals are freed, net memory unchanged),
+the FC2 records and shared packs are made on the domains' banks, and the engines run
+their die-local forms (same output bits). Otherwise the build is the stock one;
+a device with one domain, or a failed topology probe, logs why and stays stock.
 """
 
 from __future__ import annotations
@@ -245,8 +252,13 @@ class MoeSteps(MlpSteps):
 class MoeGlue:
     """Derived MoE weights, compiled engines and per-row-count steps."""
 
-    def __init__(self, api, layers: Dict[int, object], specs) -> None:
+    def __init__(
+        self, api, layers: Dict[int, object], specs, localize=None, nclusters=None
+    ) -> None:
         self.api, self.specs, self.layers = api, specs, layers
+        # (topology, banks, locality blocks) of the die-local form, else None
+        self.localize = localize
+        self.nclusters = nclusters
         self.device = dev = next(iter(layers.values())).w13.device
         self.ids = torch.empty(16, TOP_K, dtype=torch.int32, device=dev)
         self.weights = torch.empty(16, TOP_K, dtype=torch.float32, device=dev)
@@ -259,13 +271,22 @@ class MoeGlue:
         modes = {self.api.mode_for(moe_split(m)) for m in rows if 1 <= m <= MAX_ROWS}
         for name in sorted({"route", "finalize"} | modes):
             kernel, args = self.specs[name]
+            constexprs = {"unit": name, "shared": True}
+            if hasattr(kernel, "knobs"):  # the engines' opt-in forms
+                constexprs.update(kernel.knobs())
             self.fn[name] = compile_cached(
                 kernel,
-                {"unit": name, "shared": True},
+                constexprs,
                 lambda k=kernel, a=args: cute.compile(k, *a),
             )
-        nclusters = self.api.default_clusters(self.device)
-        self.engine = self.api.SmallMMoe(self.fn, nclusters, self.device, shared=True)
+        nclusters = self.nclusters or self.api.default_clusters(self.device)
+        self.engine = self.api.SmallMMoe(
+            self.fn,
+            nclusters,
+            self.device,
+            shared=True,
+            localize=self.localize is not None,
+        )
 
     def records(self, m: int) -> MoeRecords:
         sc = self.engine.scratch
@@ -327,29 +348,43 @@ def build(model, derived) -> Optional[MoeGlue]:
         why = _layer_reason(layer.mlp)
         if why is not None:
             return stock(f"layer {layer.layer_id}: {why}")
+    dev = moe_layers[0].mlp.experts.w13_weight.device
+    topo, nclusters = _localize_topology(api, dev)
     try:
-        specs = api.compile_specs(shared=True)
+        specs = api.compile_specs(shared=True, localize=topo is not None)
     except ValueError as e:
         return stock(e)
-    dev = moe_layers[0].mlp.experts.w13_weight.device
     try:
         W.layout_self_test(_process_like_server, dev)
     except W.LayoutMismatch as e:
         return stock(f"layout self-test: {e}")
     layers = {}
-    for layer in moe_layers:
+    loc = None
+    if topo is not None:
+        from sgl_nvidia_mega.glm5_3.sm103.moe import locality as LOC
+
+        banks = LOC.Banks(dev.index if dev.index is not None else 0)
+        blocks = LOC.LocBlocks(topo, len(moe_layers), dev, banks)
+        derived.add("moe.loc_blocks", blocks.span)
+        loc = (topo, banks, blocks)
+        relocated = 0
+    for li, layer in enumerate(moe_layers):
         ex, sh = layer.mlp.experts, layer.mlp.shared_experts
-        records = derived.add(
-            "moe.fc2_records",
-            W.fc2_records(
-                _u8(ex.w2_weight.data).reshape(EXPERTS, HIDDEN, INTER // 2),
-                _u8(ex.w2_weight_scale.data).reshape(EXPERTS, -1),
-            ),
+        records = W.fc2_records(
+            _u8(ex.w2_weight.data).reshape(EXPERTS, HIDDEN, INTER // 2),
+            _u8(ex.w2_weight_scale.data).reshape(EXPERTS, -1),
         )
-        pack = derived.add(
-            "moe.shared_pack",
-            W.shared_pack(sh.gate_up_proj.weight.data, sh.down_proj.weight.data),
-        )
+        pack = W.shared_pack(sh.gate_up_proj.weight.data, sh.down_proj.weight.data)
+        if loc is not None:
+            # this layer's routed FC1 weights / scales re-bound to per-domain copies
+            # (the server's own MoE path reads the same tensors), FC2 records and
+            # shared pack made on the banks
+            relocated += LOC.relocate_param(ex, "w13_weight", banks)
+            relocated += LOC.relocate_param(ex, "w13_weight_scale", banks)
+            records, pack = LOC.to_banks(records, banks), LOC.to_banks(pack, banks)
+            torch.cuda.empty_cache()
+        records = derived.add("moe.fc2_records", records)
+        pack = derived.add("moe.shared_pack", pack)
         lt = api.LayerTensors(
             w13=ex.w13_weight.data,
             w13_scales=_u8(ex.w13_weight_scale.data).reshape(EXPERTS, -1),
@@ -359,10 +394,86 @@ def build(model, derived) -> Optional[MoeGlue]:
             g2_alpha=ex.g2_alphas.data,
             gs1=float(ex.w13_input_scale_quant.item()),
             gs2=float(ex.w2_input_scale_quant.item()),
+            loc=None if loc is None else blocks[li],
         )
         lt.check()
         layers[layer.layer_id] = lt
     logger.info(
         "NVIDIA megakernel: GLM-5.3 / GLM-5.2: MoE engine on %d layers", len(layers)
     )
-    return MoeGlue(api, layers, specs)
+    from sgl_nvidia_mega.glm5_3.sm103.moe import api as _moe_api
+
+    logger.info(
+        "NVIDIA megakernel: GLM-5.3 / GLM-5.2: four-request MoE engine form %s, schedule %s",
+        _moe_api.g4_knobs(loc is not None),
+        _moe_api.g4_schedule_knobs(),
+    )
+    logger.info(
+        "NVIDIA megakernel: GLM-5.3 / GLM-5.2: one- / two-request MoE engine schedule "
+        "shared weight g1 %d, g2 %d",
+        _moe_api.g12_schedule_knobs("g1")["shared_weight"],
+        _moe_api.g12_schedule_knobs("g2")["shared_weight"],
+    )
+    logger.info(
+        "NVIDIA megakernel: GLM-5.3 / GLM-5.2: one- / two-request MoE engine form pre %d%s",
+        _moe_api.g12_knobs(loc is not None)["pre"],
+        (
+            f" (die-local forms: {_moe_api.MOE_PRE3_ENV}=1 ignored)"
+            if loc is not None and _moe_api.g12_pre3_requested()
+            else ""
+        ),
+    )
+    if loc is not None:
+        torch.cuda.synchronize(dev)
+        logger.info(
+            "NVIDIA megakernel: GLM-5.3 / GLM-5.2: die-local MoE: %s; FC1 weights and "
+            "scales re-bound to per-domain copies (%.1f GiB, originals freed); banks "
+            "%.1f GiB on domain 0 / %.1f GiB on domain 1 (FC2 records and shared packs "
+            "counted in the derived copies)",
+            LOC.describe(topo),
+            relocated / 2**30,
+            banks.bytes_by_die[0] / 2**30,
+            banks.bytes_by_die[1] / 2**30,
+        )
+        if rank_zero():
+            logger.warning(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: die-local MoE: the re-bound FC1 "
+                "weights hold experts 0..127 on one die; a MoE step this plugin does not "
+                "cover (more rows than its verify widths, prefill) runs SGLang's MoE on "
+                "them, which can read one die's memory at a time (the stock engine "
+                "schedule on this placement measured 17-43%% slower on GB300). Use it on "
+                "servers whose decode steps are all covered (--max-running-requests <= "
+                "the covered requests)."
+            )
+    return MoeGlue(api, layers, specs, localize=loc, nclusters=nclusters)
+
+
+def rank_zero() -> bool:
+    import torch.distributed as dist
+
+    return not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+
+
+def _localize_topology(api, dev):
+    """(topology, engine clusters) when the die-local form is requested and this GPU
+    can run it, else (None, None) with the reason logged."""
+    from sgl_nvidia_mega.glm5_3.sm103.moe import locality as LOC
+
+    if not LOC.requested():
+        return None, None
+    try:
+        nclusters = api.default_clusters(dev)
+        topo = LOC.probe(dev, (nclusters, min(nclusters, 32)))
+        # the slot rule covers every unit once within each engine's unit cap
+        for n, n0, sw, cap, max_d in api.schedule_checks(nclusters, topo.n0):
+            LOC.check_schedule(n, n0, sw, cap, max_d)
+    except Exception as e:  # noqa: BLE001 (any probe failure keeps the stock form)
+        logger.warning(
+            "NVIDIA megakernel: GLM-5.3 / GLM-5.2: %s=1 but the die-local MoE is off "
+            "on this GPU (%s: %s); the stock engine serves",
+            LOC.LOCALIZE_ENV,
+            type(e).__name__,
+            str(e)[:300],
+        )
+        return None, None
+    return topo, nclusters

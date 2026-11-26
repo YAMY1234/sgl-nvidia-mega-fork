@@ -17,11 +17,18 @@ Stated limits of this spec:
   takes the branches the stock step copies; a reason on any rank stops every rank
   (``runtime/executor.py``).
 * TP4 at 3-6 tokens per request, up to 48 rows (``profile.UNITS``), runs the kernel
-  units composed per width (``runtime/composed.py``, ``registry``, ``units``); a width
-  no unit covers runs SGLang's forward. TP8 serves 4 or 6 tokens per request up to 16
+  units composed per width (``runtime/composed.py``, ``registry``, ``units``), on GB300
+  (SM103, measured plans) and Rubin (SM107, plans derived from GB300's: ``ll/device.py``);
+  a width no unit covers runs SGLang's forward. TP8 serves 4 or 6 tokens per request up to 16
   rows (``plan.py``).
-* PD disaggregation is served at the TP4 profiles' decode role (``pd_reasons``); the
-  prefill role runs without the flag.
+* PD disaggregation is served at the decode role of the TP4 profiles and of the TP8
+  envelope (``pd_reasons``); the prefill role runs without the flag.
+* TP16 on Rubin (SM107) at one request, EAGLE 7 steps / 8 draft tokens, runs
+  ``glm5_3/sm107``: its own kernels, server arguments and environment
+  (``sm107.config_reasons``), selected here by the TP size. The TP8 / TP4 server
+  arguments and environment (``SERVER_ARGS``, ``ENV``) are checked per TP size in
+  ``config_disable_reasons`` rather than in ``Requirements``, which one spec shares
+  across every TP size.
 """
 
 from __future__ import annotations
@@ -84,7 +91,9 @@ SGLANG_READS = {
         "MegakernelBinding",
     ),
     "srt/model_executor/cuda_graph_config.py": ("decode", "backend", '"disabled"'),
+    "srt/runtime_context.py": ("get_parallel", "tp_size"),
     "srt/environ.py": (
+        "envs",
         "SGLANG_DSA_FUSE_TOPK",
         "SGLANG_DSA_TOPK_BROADCAST",
         "SGLANG_EXPERIMENTAL_LORA_OPTI",
@@ -228,19 +237,50 @@ def decode_graph_backends() -> frozenset:
     return frozenset({"full", "disabled"} if parity.eager_steps_allowed() else {"full"})
 
 
+# glm5_3/sm107's TP size (sm107.TP_SIZE; the package is imported only at TP16)
+SM107_TP_SIZE = 16
+
 REQUIREMENTS = Requirements(
     # B300 / GB300 (SM103) and Rubin / VR NVL72 (SM107): the same kernels (the TP4
-    # kernel units are measured and served on SM103 only: on SM107 a TP4 build serves
-    # no width and stops, naming them)
+    # kernel units' plans are measured on SM103 and derived for SM107: ll/device.py);
+    # TP16 runs glm5_3/sm107, on SM107 only
     isas=frozenset({"sm_103", "sm_107"}),
-    tp_sizes=frozenset(tp for tp, _ in ACCEPTED),
+    tp_sizes=frozenset(tp for tp, _ in ACCEPTED) | {SM107_TP_SIZE},
     resident_blocks=RESIDENT_BLOCKS,
     dtypes=frozenset({"bfloat16"}),
     decode_graph_backends=decode_graph_backends(),
-    server_args=SERVER_ARGS,
+    # per TP size: SERVER_ARGS and ENV at TP8 / TP4, sm107's at TP16
+    # (_config_disable_reasons)
+    server_args={},
     hf_config={**HF_CONFIG, "model_type": MODEL_TYPE},
-    env=ENV,
+    env={},
 )
+
+
+def pinned_reasons(cfg, server_args, env) -> list[str]:
+    """The server arguments and environment a TP size pins, checked and worded as
+    SGLang checks a spec's Requirements.server_args and Requirements.env."""
+    from sglang.srt.environ import envs
+
+    reasons = [
+        f"{arg} {getattr(cfg, arg, None)!r} is not one of {sorted(map(str, allowed))}"
+        for arg, allowed in server_args.items()
+        if getattr(cfg, arg, None) not in allowed
+    ]
+    for name, want in env.items():
+        value = getattr(envs, name).get()
+        if value != want:
+            reasons.append(f"{name} {value!r} is not {want!r}")
+    return reasons
+
+
+def _tp_size() -> int:
+    """The TP size of this model process (at load and build), as SGLang's megakernel
+    layer reads it."""
+    from sglang.srt.runtime_context import get_parallel
+
+    return int(get_parallel().tp_size)
+
 
 # Per kernel output against SGLang's op (or an fp64 reference, where SGLang's own op
 # carries the same error) on the same GPU; each key names the test (test/kernels) that
@@ -434,26 +474,39 @@ def deadline_reasons(cfg) -> list[str]:
 
 
 def pd_reasons(cfg) -> list[str]:
-    """PD disaggregation is served at the TP4 kernel-unit profiles (their decode
-    role: KV arrives through the transfer backend into pool slots before a request's
-    first verify step, outside the covered step); the TP8 envelope keeps it
-    refused."""
-    from sgl_nvidia_mega.glm5_3.profile import UNITS, tokens_per_request
+    """PD disaggregation is served at the TP4 kernel-unit profiles and at the decode
+    role of the TP8 envelope: KV arrives through the transfer backend into pool slots
+    before a request's first verify step, outside the covered step, and the first
+    draft round reads the prefill instance's outputs through SGLang's draft input."""
+    from sgl_nvidia_mega.glm5_3.profile import TP8, UNITS, tokens_per_request
 
     mode = getattr(cfg, "disaggregation_mode", None) or "null"
     tp = int(getattr(cfg, "tp_size", None) or 1)
-    if mode == "null" or (tp, tokens_per_request(cfg)) in UNITS:
+    tokens = tokens_per_request(cfg)
+    if mode == "null" or (tp, tokens) in UNITS:
+        return []
+    if mode == "decode" and (tp, tokens) in TP8:
         return []
     return [
-        f"PD disaggregation ({mode} role) is served at the TP4 profiles only, not at "
-        f"TP{tp}"
+        f"PD disaggregation ({mode} role) is served at the TP4 profiles and at the "
+        f"decode role of the TP8 profiles, not at TP{tp} with {tokens} tokens per "
+        "request"
     ]
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
+    if cfg.tp_size == SM107_TP_SIZE:
+        from sgl_nvidia_mega.glm5_3 import sm107
+
+        return sm107.config_reasons(cfg, hf_config)
     from sgl_nvidia_mega.glm5_3 import runtime
 
-    reasons = toolchain_reasons() + binding_reasons() + runtime.slot_reasons()
+    reasons = (
+        pinned_reasons(cfg, SERVER_ARGS, ENV)
+        + toolchain_reasons()
+        + binding_reasons()
+        + runtime.slot_reasons()
+    )
     reasons += draft_capture_reasons() + deadline_reasons(cfg) + profile_reasons(cfg)
     reasons += pd_reasons(cfg)
     if (
@@ -468,12 +521,20 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
 
 
 def _model_disable_reasons(model, hf_config) -> list[str]:
+    if _tp_size() == SM107_TP_SIZE:
+        from sgl_nvidia_mega.glm5_3 import sm107
+
+        return sm107.model_reasons(model)
     from sgl_nvidia_mega.glm5_3 import runtime
 
     return runtime.model_disable_reasons(model)
 
 
 def _build(model, hf_config, ctx):
+    if _tp_size() == SM107_TP_SIZE:
+        from sgl_nvidia_mega.glm5_3 import sm107
+
+        return sm107.build_target(model, hf_config, ctx)
     from sgl_nvidia_mega.glm5_3 import runtime
 
     return runtime.build(model, ctx)
@@ -486,17 +547,18 @@ SPEC = MegakernelSpec(
         {
             # MTP verify steps
             Feature.SPECULATIVE_DECODING,
-            # TP8 spans the two 4-GPU trays of one NVL72 rack (GB300, Rubin)
+            # TP8 spans the two 4-GPU trays of one NVL72 rack (GB300, Rubin); TP16
+            # (glm5_3/sm107) four Rubin trays
             Feature.MULTI_NODE_TP,
             # HiCache: the covered steps read only the running requests' device KV pages
             Feature.KV_OFFLOAD,
-            # the TP4 decode role of a PD-disaggregated deployment (pd_reasons)
+            # the TP4 and TP8 decode roles of a PD-disaggregated deployment (pd_reasons)
             Feature.PD_DISAGGREGATION,
         }
     ),
     numerics=NUMERICS,
     # the widest verify step of any accepted profile: whole requests up to 16 verify
-    # rows at TP8 (plan.supported_rows), up to 48 at TP4 (profile.UNITS)
+    # rows at TP8 (plan.supported_rows), up to 48 at TP4 (profile.UNITS); 8 at TP16
     max_rows=SPEC_MAX_ROWS,
     build=_build,
     api_version=API_VERSION,

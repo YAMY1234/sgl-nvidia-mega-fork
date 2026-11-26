@@ -23,14 +23,24 @@ layer (the draft replica test checks it in both modes). With slot
 
 ``DraftFusedAttention`` serves the attention family's MLA prologue in every draft
 pass and its q_a / kv_a GEMM (with the indexer key / head-gate projection) in the
-draft extend at up to 8 rows; the indexer query, the indexer, the sparse MLA and
-the value up-projection stay stock. The draft layer has its own weights and KV
-pool, hence its own ``AttentionGlue``; compiled forms are shared with the target
-through the compile cache.
+draft extend at up to 8 rows; with ``SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_SPARSE_MLA=1``
+(default off) also its sparse MLA and value up-projection in every draft pass; the indexer query and the indexer stay
+stock. The draft layer has its own weights and KV pool, hence its own
+``AttentionGlue``; compiled forms are shared with the target through the compile
+cache.
+
+The family's sparse MLA reads the top-k ids as physical cache rows, as the stock
+call does (the fused top-k page table), and takes no cache lengths: the stock
+kernel's lengths only bound rows the ids already list (a -1 id is skipped by both),
+so the draft decode's full cache lengths and the draft extend's verify lengths read
+the same rows. A draft decode pass reuses the draft extend's top-k (the MTP
+index-share carry) with either kernel.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, NamedTuple, Optional
@@ -38,12 +48,15 @@ from typing import List, NamedTuple, Optional
 import torch
 
 from sgl_nvidia_mega.glm5_3.attention.fused import (
+    TOPK,
     AttentionGlue,
     FusedAttention,
     kernel_rows,
 )
 from sgl_nvidia_mega.glm5_3.attention.step import AttentionStep, StepContext
 from sgl_nvidia_mega.glm5_3.runtime import DerivedWeights
+
+logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -60,6 +73,8 @@ SGLANG_READS = {
     "srt/layers/layer_boundary/residual/access.py": ("buffer",),
     # slot draft_rowselect: the residual stream of the draft forward
     "srt/layers/layer_boundary/residual/batch.py": ("stream_of",),
+    # draft_step DRAFT_MOE_TAIL_ENV: the MoE hands its finalize over in this scope
+    "srt/runtime_context.py": ("get_forward", "\"defer_moe_finalize\""),
     "srt/layers/layer_boundary/residual/stream.py": (
         "residual",
         "pending",
@@ -109,6 +124,8 @@ SGLANG_MIRRORS = {
     "srt/layers/attention/dsa_backend.py:DeepseekSparseAttnBackend.forward_decode": (
         "52e50cfcdda18bea",
         "35f75d4c546f4c15",
+        # rt-s1 (local, not for upstream): SGLang 043cfc4d3a (+ Stack D overlay); served path unchanged for GLM-5.2 TP4 (results/T73)
+        "1b0d31693d82ffa9",
     ),
 }
 
@@ -188,20 +205,54 @@ def _check_decode_branches(attn, view) -> None:
         )
 
 
-class DraftFusedAttention(FusedAttention, DraftAttention):
-    """Draft attention with the MLA prologue on the family's kernel."""
+DRAFT_SPARSE_MLA_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_SPARSE_MLA"
 
-    # The draft rule: these steps stay stock in the draft layer (the sparse MLA
-    # with the draft's cache lengths, DraftAttention.sparse_mla_seq_lens).
+
+def draft_sparse_mla_on() -> bool:
+    """The draft layer's sparse MLA and value up-projection on the family's kernels
+    (``SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_SPARSE_MLA=1``; default off: SGLang's)."""
+    return os.environ.get(DRAFT_SPARSE_MLA_ENV, "0") == "1"
+
+
+class DraftFusedAttention(FusedAttention, DraftAttention):
+    """Draft attention with the MLA prologue on the family's kernel (and, opt-in, the
+    sparse MLA and the value up-projection)."""
+
+    # The draft rule: the indexer query stays stock in the draft layer
     index_q = AttentionStep.index_q
-    sparse_mla = AttentionStep.sparse_mla
-    uv_proj = AttentionStep.uv_proj
 
     def __init__(self, glue: AttentionGlue, rows: int) -> None:
+        from sgl_nvidia_mega.glm5_3.runtime import SLOTS
+
         super().__init__(glue, rows)
         # qkv_a (per forward): the family's GEMM in the draft extend, else the
         # stock fused-A GEMM (+ the indexer key / head-gate projection)
         self._qa_extend, self.qa = self.qa, None
+        # static per (mode, rows) and equal on every rank; opt-in (default off):
+        # SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_SPARSE_MLA=1 (needs slot draft)
+        self.fused_sparse = draft_sparse_mla_on() and "draft" in SLOTS
+
+    def sparse_mla(self, attn, q_fp8: torch.Tensor, topk_indices, step):
+        """The family's sparse MLA over the top-k cache rows when the ids are the
+        kernel's layout (int32 ``[rows, top-k]``, contiguous, a static fact of the
+        captured shape), else the stock call with the draft's cache lengths
+        (``DraftAttention.sparse_mla_seq_lens``)."""
+        if (
+            self.fused_sparse
+            and topk_indices is not None
+            and topk_indices.dtype == torch.int32
+            and topk_indices.dim() == 2
+            and topk_indices.shape[1] == TOPK
+            and topk_indices.shape[0] <= q_fp8.shape[0]
+            and topk_indices.is_contiguous()
+        ):
+            return FusedAttention.sparse_mla(self, attn, q_fp8, topk_indices, step)
+        return AttentionStep.sparse_mla(self, attn, q_fp8, topk_indices, step)
+
+    def uv_proj(self, attn, attn_output: torch.Tensor) -> torch.Tensor:
+        if self.fused_sparse:
+            return FusedAttention.uv_proj(self, attn, attn_output)
+        return AttentionStep.uv_proj(self, attn, attn_output)
 
     def runs_indexer(self, attn, step) -> bool:
         # The draft layer runs its own indexer in the forwards without a top-k
@@ -241,6 +292,45 @@ class PreparedInput(NamedTuple):
 
     norm: torch.Tensor
     residual: torch.Tensor
+
+
+class FinalNormed(NamedTuple):
+    """The draft layer's output already through the residual add and the final norm
+    (``shared_head.norm``): the MoE tail hop (``draft_step`` DRAFT_MOE_TAIL_ENV) ran the
+    MoE's finalize, its all-reduce and the terminal add + norm in one launch."""
+
+    norm: torch.Tensor
+
+
+_TAIL_LOGGED = set()
+
+
+def _log_tail_layout(handoff, residual, x, orig, forward_batch, dbg) -> None:
+    """T98 diagnostics: the MoE tail inputs' layout, once per (mode, rows) per rank."""
+    mode = str(forward_batch.forward_mode)
+    key = (mode, int(residual.shape[0]))
+    if key in _TAIL_LOGGED:
+        return
+    _TAIL_LOGGED.add(key)
+
+    def d(t):
+        if not isinstance(t, torch.Tensor):
+            return type(t).__name__
+        return f"{tuple(t.shape)}/{tuple(t.stride())}/{str(t.dtype)[6:]}@{t.data_ptr():#x}+{t.numel() * t.element_size()}"
+
+    logger.info(
+        "T98 tail dbg [%s] %s: g2 %s perm %s w %s shared %s m %s | residual %s x %s orig %s",
+        dbg,
+        key,
+        d(getattr(handoff, "routed_output", None)),
+        d(getattr(handoff, "permuted_indices", None)),
+        d(getattr(handoff, "expert_weights", None)),
+        d(getattr(handoff, "gated_shared_output", None)),
+        getattr(handoff, "m", None),
+        d(residual),
+        d(x),
+        d(orig),
+    )
 
 
 def select_rows(hidden_states: torch.Tensor, forward_batch, index: torch.Tensor):
@@ -289,6 +379,7 @@ def decoder_layer_forward(
     view=None,
     ffn_rows: Optional[torch.Tensor] = None,
     prepared: bool = False,
+    moe_tail=None,
 ):
     """``DeepseekV2DecoderLayer.forward`` (main af856717) for the draft layer,
     with ``self.self_attn(...)`` replaced by the step group's ``forward`` and
@@ -299,7 +390,11 @@ def decoder_layer_forward(
     ``prepared``: ``hidden_states`` is already the normalized attention input and the
     stream holds its written residual (``PreparedInput``), so the attention prepare is
     skipped; only with an ``attention`` step group, which sets the attention inputs
-    itself. Returns ``(hidden_states, topk_indices)`` as the stock layer does."""
+    itself. ``moe_tail`` (``draft_step`` DRAFT_MOE_TAIL_ENV): a callable ``(handoff,
+    residual) -> normed`` that takes the MoE's deferred finalize and the written residual
+    and applies the all-reduce, the residual add and the final norm; the layer then
+    returns ``FinalNormed`` (the caller skips the stream's add + final norm). Returns
+    ``(hidden_states, topk_indices)`` as the stock layer does."""
     if prepared and attention is None:
         # SGLang's self_attn reads the attention inputs that the skipped prepare sets
         raise RuntimeError(
@@ -377,6 +472,32 @@ def decoder_layer_forward(
     else:
         mlp_ctx = nullcontext()
 
+    if moe_tail is not None:
+        # the MoE hands its finalize over (no all-reduce); the tail hop sums it with
+        # the residual the FFN prepare wrote, then applies the final norm
+        from sglang.srt.layers.layer_boundary.residual.batch import stream_of
+        from sglang.srt.runtime_context import get_forward
+
+        stream = stream_of(forward_batch)
+        residual = stream.residual
+        if stream.pending is not None or not isinstance(residual, torch.Tensor):
+            raise RuntimeError(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: the MoE tail hop needs a "
+                "written residual after the FFN prepare (got pending "
+                f"{stream.pending is not None}, residual {type(residual).__name__})"
+            )
+        # T98 diagnostics (test-only, default off): DRAFT_MOE_TAIL_DBG = "noctx" (no MoE
+        # output buffer), "rescopy" (the residual copied before the MLP) or both, comma-separated
+        dbg = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_MOE_TAIL_DBG", "")
+        if "rescopy" in dbg:
+            residual = residual.clone()
+        if "noctx" in dbg:
+            mlp_ctx = nullcontext()
+        with get_forward().scoped(defer_moe_finalize=True), mlp_ctx:
+            handoff = layer.mlp(hidden_states, forward_batch, None)
+        if dbg and torch.cuda.is_current_stream_capturing():
+            _log_tail_layout(handoff, residual, hidden_states, hidden_states_orig, forward_batch, dbg)
+        return FinalNormed(moe_tail(handoff, residual)), topk_indices
     with layer.ffn_boundary.exit(forward_batch) as ffn_exit, mlp_ctx:
         hidden_states = layer.mlp(hidden_states, forward_batch, None)
     hidden_states = ffn_exit.finish(hidden_states)

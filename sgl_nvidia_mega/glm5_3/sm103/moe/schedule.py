@@ -14,6 +14,10 @@ import torch
 
 SH_CLUSTERS = 4
 
+# the shared quarter's weight in routed units in the G1 / G2 cap (served 3; T97: 2 measured faster at the D where
+# the table changes, bitwise identical: only the unit-to-cluster assignment moves)
+G12_SHARED_WEIGHT = 3
+
 # mode G1 (one request, M <= 4): D <= 32, at most 32 units per cluster
 G1_ROW = 34  # [0] units, [1..32] codes, [33] partial count (unused by the engine)
 G1_D = 33
@@ -21,7 +25,9 @@ G1_MAX_UNITS = 32
 G1_BLOCK_BYTES = 2256  # 33 x 34 int16 = 2244 B, padded to a multiple of 16
 
 
-def g1_table(nclusters: int, shared: bool) -> torch.Tensor:
+def g1_table(
+    nclusters: int, shared: bool, shared_weight: int = G12_SHARED_WEIGHT
+) -> torch.Tensor:
     """int16 [nclusters][G1_BLOCK_BYTES / 2]. Without the shared expert, unit u goes to
     cluster u % nclusters. With it (nclusters >= 8), clusters 0..3 run one shared
     quarter each first; routed units fill clusters 4.. round-robin up to a per-cluster
@@ -38,7 +44,9 @@ def g1_table(nclusters: int, shared: bool) -> torch.Tensor:
             parts = min(nc, units)
         else:
             routed_clusters = nc - SH_CLUSTERS
-            cap = min((units + 3 * SH_CLUSTERS + nc - 1) // nc, G1_MAX_UNITS)
+            cap = min(
+                (units + shared_weight * SH_CLUSTERS + nc - 1) // nc, G1_MAX_UNITS
+            )
             lim = min(units, routed_clusters * cap)
             for cl in range(SH_CLUSTERS):
                 lists[cl].append(-1)
@@ -70,7 +78,9 @@ G2_MAX_UNITS = 15
 G2_BLOCK_BYTES = G2_D * G2_ROW * 2  # 2080
 
 
-def g2_table(nclusters: int, shared: bool) -> torch.Tensor:
+def g2_table(
+    nclusters: int, shared: bool, shared_weight: int = G12_SHARED_WEIGHT
+) -> torch.Tensor:
     """int16 [nclusters][G2_BLOCK_BYTES / 2]: the G1 assignment rule over D <= 64
     entries with a 15-unit cluster cap."""
     nc = nclusters
@@ -84,7 +94,9 @@ def g2_table(nclusters: int, shared: bool) -> torch.Tensor:
                 lists[u % nc].append(u)
         else:
             routed_clusters = nc - SH_CLUSTERS
-            cap = min((units + 3 * SH_CLUSTERS + nc - 1) // nc, G2_MAX_UNITS)
+            cap = min(
+                (units + shared_weight * SH_CLUSTERS + nc - 1) // nc, G2_MAX_UNITS
+            )
             lim = min(units, routed_clusters * cap)
             for cl in range(SH_CLUSTERS):
                 lists[cl].append(-1)
@@ -113,9 +125,21 @@ G4_BLOCK_BYTES = G4_D * G4_ROW * 2  # 4896
 G4_SHARED_WEIGHT = 4
 
 
-def g4_table(nclusters: int, shared: bool) -> torch.Tensor:
+def g4_table(
+    nclusters: int,
+    shared: bool,
+    shared_weight: int = G4_SHARED_WEIGHT,
+    fill_shared: bool = False,
+    snake: bool = False,
+) -> torch.Tensor:
     """int16 [nclusters][G4_BLOCK_BYTES / 2]: the G1 assignment rule over D <= 128
-    entries with the shared quarter weighted as 4 units and a 17-unit cluster cap."""
+    entries with the shared quarter weighted as ``shared_weight`` units (default 4)
+    and a 17-unit cluster cap. ``fill_shared``: the shared clusters also take up to
+    cap - shared_weight routed units each (the list's last units), the routed clusters
+    the rest, so fewer routed clusters carry the cap. ``snake``: the routed units go to
+    the routed clusters expert by expert (an expert's four quarters to four adjacent
+    clusters), the direction reversed every round, so the class order's heavy experts
+    (most requests, most exchanges) do not all land on the same clusters."""
     nc = nclusters
     with_shared = shared and nc >= 2 * SH_CLUSTERS
     tab = torch.zeros(nc, G4_D, G4_ROW, dtype=torch.int16)
@@ -128,13 +152,23 @@ def g4_table(nclusters: int, shared: bool) -> torch.Tensor:
         else:
             routed_clusters = nc - SH_CLUSTERS
             cap = min(
-                (units + G4_SHARED_WEIGHT * SH_CLUSTERS + nc - 1) // nc, G4_MAX_UNITS
+                (units + shared_weight * SH_CLUSTERS + nc - 1) // nc, G4_MAX_UNITS
             )
             lim = min(units, routed_clusters * cap)
+            if fill_shared:
+                lim = min(lim, units - SH_CLUSTERS * max(cap - shared_weight, 0))
+                lim = max(lim, 0)
             for cl in range(SH_CLUSTERS):
                 lists[cl].append(-1)
+            groups = routed_clusters // 4
             for u in range(lim):
-                lists[SH_CLUSTERS + u % routed_clusters].append(u)
+                if snake and routed_clusters % 4 == 0:
+                    g = (u // 4) % groups
+                    if ((u // 4) // groups) % 2 == 1:
+                        g = groups - 1 - g
+                    lists[SH_CLUSTERS + 4 * g + u % 4].append(u)
+                else:
+                    lists[SH_CLUSTERS + u % routed_clusters].append(u)
             for u in range(lim, units):
                 lists[(u - lim) % SH_CLUSTERS].append(u)
         for cl in range(nc):

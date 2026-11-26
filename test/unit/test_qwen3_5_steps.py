@@ -225,7 +225,13 @@ def _moe_kernels(log):
 
 _NO_A2A = {
     name: (lambda: False)
-    for name in ("is_deepep", "is_deepep_v2", "is_mori", "is_ascend_fuseep")
+    for name in (
+        "is_deepep",
+        "is_deepep_v2",
+        "is_mori",
+        "is_ascend_ops",
+        "is_ascend_fuseep",
+    )
 }
 
 
@@ -2131,10 +2137,11 @@ def test_trt_lowm_takes_trts_gdn_tactics_and_refuses_an_unprepared_launch(
 def test_sglangs_verify_intermediate_rows_are_the_batch_rows(monkeypatch):
     """The TensorRT-LLM front writes a request's conv windows at its batch row, as SGLang's
     target verify indexes them (verify_intermediate_state_indices: request r, row r)."""
+    from sglang.srt.layers import dp_attention
     from sglang.srt.layers.attention.linear import utils
-    from sglang.srt.utils import common
 
-    monkeypatch.setattr(common, "get_eager_max_batch_size", lambda n: n)
+    monkeypatch.setattr(dp_attention, "get_eager_max_batch_size", lambda n: n)
+    monkeypatch.setattr(dp_attention, "get_cuda_graph_max_batch_size", lambda n: n)
     assert utils.build_verify_intermediate_state_indices(8, "cpu").tolist() == list(
         range(8)
     )

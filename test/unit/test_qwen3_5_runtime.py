@@ -188,8 +188,6 @@ def test_config_filter_derives_attention_tp_before_publication(monkeypatch):
         attn_cp_size=1,
         attn_dp_size=8,
         ep_size=8,
-        enable_dp_attention=True,
-        dp_size=8,
         disaggregation_mode="decode",
     )
 
@@ -1971,6 +1969,7 @@ def _gdn_prefill_state_case(monkeypatch, strided):
         state_checkpoint_cu_starts=None,
         num_state_checkpoints=None,
         state_checkpoint_every_n_tokens=None,
+        prefill_state_staging=None,
     )
     backend = SimpleNamespace(
         prefill_graph_metadata=None,
@@ -1980,11 +1979,24 @@ def _gdn_prefill_state_case(monkeypatch, strided):
         state_layer_cache=lambda _: SimpleNamespace(
             conv=(conv[0],), temporal=temporal[0]
         ),
-        kernel_dispatcher=SimpleNamespace(extend=recurrence),
+        kernel_dispatcher=SimpleNamespace(
+            extend=recurrence,
+            extend_kernel=SimpleNamespace(
+                defers_prefill_gates=False,
+                supports_track_state_snapshot=False,
+                extend_honors_slot_pitch=False,
+            ),
+        ),
         _prefill_gates=lambda *args: (torch.zeros(1, 4, 1), torch.zeros(1, 4, 1)),
     )
     backend._convolve_prefill = lambda *args: (
         gdn_backend.GDNAttnBackend._convolve_prefill(backend, *args)
+    )
+    backend._prefill_kernels_follow_slot_pitch = lambda *args: (
+        gdn_backend.GDNAttnBackend._prefill_kernels_follow_slot_pitch(backend, *args)
+    )
+    backend._prefill_state_staging = lambda: (
+        gdn_backend.GDNAttnBackend._prefill_state_staging(backend)
     )
 
     def native():

@@ -80,7 +80,7 @@ SGLANG_READS = {
 
 ARCHITECTURE = "Qwen3_5MoeForConditionalGeneration"
 # The SGLang megakernel contract this spec is written against.
-API_VERSION = 2
+API_VERSION = 3
 
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_100", "sm_103"}),

@@ -62,7 +62,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
 )
 from sglang.srt.model_executor.runner_utils.pool import graph_pool_replay_scope
 from sglang.srt.runtime_context import get_stream
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils.device import is_cuda
 
 from sgl_nvidia_mega.spec_step import switches
 from sgl_nvidia_mega.spec_step.child_graph_capture import ChildGraphCapture
@@ -93,7 +93,13 @@ SGLANG_READS = {
         "get_stream",
         "attn_dp_enabled_of",
     ),
-    "srt/utils/common.py": ("is_cuda",),
+    "srt/utils/device.py": ("is_cuda",),
+    "srt/sampling/sampling_batch_info.py": (
+        "step_penalties",
+        "logit_bias",
+        "watermark",
+        "sampling_mask_batch_indices",
+    ),
     "srt/managers/schedule_batch.py": ("ScheduleBatch",),
     "srt/managers/utils.py": ("GenerationBatchResult",),
     "srt/server_args.py": ("ServerArgs",),
@@ -692,14 +698,11 @@ class EagleStepCudaGraphRunner:
         sampling_info = batch.sampling_info
         if sampling_info.has_custom_logit_processor:
             return "custom logit processor"
-        if (
-            sampling_info.acc_additive_penalties is not None
-            or sampling_info.acc_scaling_penalties is not None
-        ):
+        if sampling_info.step_penalties is not None:
             return "penalties"
         if sampling_info.logit_bias is not None:
             return "logit bias"
-        if sampling_info.has_watermark_candidates:
+        if sampling_info.watermark is not None:
             return "watermark"
         if sampling_info.sampling_mask_batch_indices is not None:
             return "sampling masks requested"

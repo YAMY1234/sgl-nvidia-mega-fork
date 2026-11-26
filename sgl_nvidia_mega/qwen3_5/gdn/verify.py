@@ -136,33 +136,18 @@ SGLANG_MIRRORS = {
     # Without and with the early return of the GDN extend in breakable prefill graphs,
     # which target verify never takes; the first goes once all supported SGLangs have it
     # Upstream #48004 changes strided prefill staging, which target verify never takes.
-    "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": (
-        "ab7b048fafb07d0e",
-        "12a835fc4f78af33",
-        "6ed4eb6a818f7e20",
-        "bfd997695f32d409",
-    ),
+    "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": "6d141f9de947654f",
     # Importing the ReplaySSM kernel from fla/ and, after sgl-project/sglang#45112, from
     # linear/; the first goes once all supported SGLangs have the move
-    "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend._replayssm_target_verify": (
-        "28b89fa4b48b47ad",
-        "739e7115c370ac01",
-    ),
+    "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend._replayssm_target_verify": "2aec3b7168214c1d",
     "srt/layers/linear.py:RowParallelLinear.forward": (
         "b291a3c452e428a5",
         "1d5fb1eabbb87ec4",
     ),
     # The follow-up also accepts an already-quantized FP8 input, which is the path
     # _out_proj mirrors; the BF16 path remains the stock alternative.
-    "srt/layers/quantization/fp8_utils.py:apply_fp8_linear_bmm_flashinfer": (
-        "c66562e1de0008db",
-        "c94a4f1a622c2fe0",
-        "aaa39b9452d9df32",
-    ),
-    "srt/layers/quantization/modelopt_quant.py:ModelOptFp8LinearMethod.apply": (
-        "91b563cf074bff42",
-        "4f99db0f712ad24a",
-    ),
+    "srt/layers/quantization/fp8_utils.py:apply_fp8_linear_bmm_flashinfer": "e93235aca0ccff7a",
+    "srt/layers/quantization/modelopt_quant.py:ModelOptFp8LinearMethod.apply": "b047118af7d78abb",
 }
 
 RING_LENGTHS, MAX_DRAFT = (16, 32), 8  # aggregate and DEP8 ReplaySSM pools

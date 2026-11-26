@@ -119,7 +119,7 @@ SGLANG_READS = {
     "srt/arg_groups/fields/*.py": (
         "tp_size",
         "pp_size",
-        "enable_dp_attention",
+        "attn_dp_enabled",
         "enable_dp_lm_head",
         "speculative_eagle_topk",
         "speculative_use_rejection_sampling",
@@ -625,7 +625,7 @@ def check_draft_config(model) -> None:
         f"tensor parallel size {' or '.join(map(str, TP_SIZES))}",
     )
     need(getattr(par, "pp_size", 1) == 1, "pipeline parallel size 1")
-    need(not getattr(par, "enable_dp_attention", False), "no DP attention")
+    need(not par.attn_dp_enabled, "no DP attention")
     need(not getattr(par, "enable_dp_lm_head", False), "no DP lm_head")
     need(getattr(spec, "speculative_eagle_topk", 1) == 1, "MTP / EAGLE with topk 1")
     need(

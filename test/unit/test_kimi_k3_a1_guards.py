@@ -7,11 +7,11 @@ from __future__ import annotations
 import dataclasses
 import sys
 import unittest
+from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
-from msgspec.structs import replace
 
 try:
     from sglang.kernels.plugin_kernels.nvidia.spec import BuildContext
@@ -51,6 +51,11 @@ except ModuleNotFoundError as error:
         MlaPoolView,
         MlaStepView,
     )
+
+# MlaPoolView carries its dtypes as codes into this table
+from sglang.srt.kernel_plugins.nvidia.binding import _VIEW_DTYPES  # noqa: E402
+
+DTYPE_CODE = {dtype: code for code, dtype in _VIEW_DTYPES.items()}
 
 
 class _ContractTensor(torch.Tensor):
@@ -378,11 +383,11 @@ class TestKimiK3PoolGuards(unittest.TestCase):
         hybrid = HybridPoolView(
             mla=MlaPoolView(
                 reserved_capacity=128,
-                serving_capacity=lambda: 128,
+                serving_capacity=128,
                 post_capture_active=True,
                 page_size=64,
-                logical_dtype=torch.float8_e4m3fn,
-                storage_dtype=torch.uint8,
+                logical_dtype_code=DTYPE_CODE[torch.float8_e4m3fn],
+                storage_dtype_code=DTYPE_CODE[torch.uint8],
                 layer_mapping={1: 0},
                 caches={1: mla},
             ),
@@ -566,7 +571,6 @@ class TestKimiK3StepGuards(unittest.TestCase):
                 state_indices=_ContractTensor(
                     dtype=torch.int32, shape=(batch,), stride=(1,)
                 ),
-                track_decode_state=lambda layer_id: None,
             ),
         )
 

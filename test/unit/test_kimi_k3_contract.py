@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib
 import os
@@ -57,6 +58,11 @@ except ModuleNotFoundError as error:
         PreparationView,
     )
 
+# MlaPoolView carries its dtypes as codes into this table
+from sglang.srt.kernel_plugins.nvidia.binding import _VIEW_DTYPES  # noqa: E402
+
+DTYPE_CODE = {dtype: code for code, dtype in _VIEW_DTYPES.items()}
+
 BuildContext = registry.BuildContext
 Feature = registry.Feature
 NumericsKind = registry.NumericsKind
@@ -94,15 +100,15 @@ class TestKimiK3Contract(unittest.TestCase):
         registry_patch.start()
         self.addCleanup(registry_patch.stop)
 
-    def test_spec_is_exact_api2_tp8_sm100_sm103_surface(self):
+    def test_spec_is_exact_api3_tp8_sm100_sm103_surface(self):
         from sgl_nvidia_mega.kimi_k3.spec import (
             REQUIRED_MEGAKERNEL_API_VERSION,
             SPEC,
         )
 
-        self.assertEqual(REQUIRED_MEGAKERNEL_API_VERSION, 2)
-        self.assertEqual(SPEC.api_version, 2)
-        self.assertEqual(MEGAKERNEL_API_VERSION, 2)
+        self.assertEqual(REQUIRED_MEGAKERNEL_API_VERSION, 3)
+        self.assertEqual(SPEC.api_version, 3)
+        self.assertEqual(MEGAKERNEL_API_VERSION, 3)
         self.assertEqual(SPEC.requires.isas, frozenset({"sm_100", "sm_103"}))
         self.assertEqual(SPEC.requires.tp_sizes, frozenset({8}))
         self.assertEqual(SPEC.requires.dtypes, frozenset({"bfloat16"}))
@@ -193,7 +199,7 @@ class TestKimiK3Contract(unittest.TestCase):
                     for name in sys.modules
                 )
             )
-            for version in (1, 3):
+            for version in (2, 4):
                 with (
                     self.subTest(version=version),
                     patch.object(registry, "MEGAKERNEL_API_VERSION", version),
@@ -202,7 +208,7 @@ class TestKimiK3Contract(unittest.TestCase):
                         architectures=["KimiK3ForConditionalGeneration"], isa="sm_103"
                     )
                     self.assertIsNone(incompatible)
-                    self.assertIn("uses megakernel API version 2", reason)
+                    self.assertIn("uses megakernel API version 3", reason)
                     self.assertIn(f"requires version {version}", reason)
 
         self.assertIs(parent.kimi_k3, child)
@@ -424,11 +430,11 @@ class TestKimiK3TypedBinding(unittest.TestCase):
         hybrid = HybridPoolView(
             mla=MlaPoolView(
                 reserved_capacity=128,
-                serving_capacity=lambda: live[0],
+                serving_capacity=live[0],
                 post_capture_active=True,
                 page_size=64,
-                logical_dtype=torch.float8_e4m3fn,
-                storage_dtype=torch.uint8,
+                logical_dtype_code=DTYPE_CODE[torch.float8_e4m3fn],
+                storage_dtype_code=DTYPE_CODE[torch.uint8],
                 layer_mapping={1: 0},
                 caches={1: mla_cache},
             ),
@@ -497,8 +503,10 @@ class TestKimiK3TypedBinding(unittest.TestCase):
         ):
             SPEC.prepare(built, PreparationView(hybrid=hybrid))
             fingerprint = resources.binding_fingerprint
-            live[0] = 64
-            SPEC.prepare(built, PreparationView(hybrid=hybrid))
+            shrunk = dataclasses.replace(
+                hybrid, mla=dataclasses.replace(hybrid.mla, serving_capacity=64)
+            )
+            SPEC.prepare(built, PreparationView(hybrid=shrunk))
         self.assertEqual(resources.binding_fingerprint, fingerprint)
         self.assertIs(resources.attention[1].cache, mla)
         self.assertIs(resources.attention[0].caches[0], conv)
@@ -526,18 +534,11 @@ class TestKimiK3TypedBinding(unittest.TestCase):
             patch("sgl_nvidia_mega.kimi_k3.providers._validate_pool_tensor"),
         ):
             SPEC.prepare(built, PreparationView(hybrid=hybrid))
-            replaced = HybridPoolView(
-                mla=MlaPoolView(
-                    reserved_capacity=hybrid.mla.reserved_capacity,
-                    serving_capacity=lambda: hybrid.mla.serving_capacity,
-                    post_capture_active=hybrid.mla.post_capture_active,
-                    page_size=hybrid.mla.page_size,
-                    logical_dtype=hybrid.mla.logical_dtype,
-                    storage_dtype=hybrid.mla.storage_dtype,
-                    layer_mapping=hybrid.mla.layer_mapping,
-                    caches={1: hybrid.mla.cache(1).clone()},
+            replaced = dataclasses.replace(
+                hybrid,
+                mla=dataclasses.replace(
+                    hybrid.mla, caches={1: hybrid.mla.cache(1).clone()}
                 ),
-                kda=hybrid.kda,
             )
             with self.assertRaisesRegex(RuntimeError, "pool binding changed"):
                 SPEC.prepare(built, PreparationView(hybrid=replaced))
@@ -616,12 +617,16 @@ class TestKimiK3TypedStep(unittest.TestCase):
                 sequence_lengths=torch.ones(batch, dtype=torch.int32),
                 write_slots=torch.zeros(batch, dtype=torch.int64),
             ),
-            kda=KdaStepView(
-                state_indices=torch.zeros(batch, dtype=torch.int32),
-                track_decode_state=tracked.append,
-            ),
+            kda=KdaStepView(state_indices=torch.zeros(batch, dtype=torch.int32)),
         )
-        with patch("sgl_nvidia_mega.kimi_k3.executor._validate_step_inputs"):
+        with (
+            patch("sgl_nvidia_mega.kimi_k3.executor._validate_step_inputs"),
+            patch.object(
+                KdaStepView,
+                "track_decode_state",
+                lambda self, layer_id: tracked.append(layer_id),
+            ),
+        ):
             result = KimiK3MegakernelExecutor(resources).run(
                 torch.zeros(batch, dtype=torch.int64), torch.zeros(batch, width), view
             )

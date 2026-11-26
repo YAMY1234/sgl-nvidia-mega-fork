@@ -74,9 +74,9 @@ SGLANG_READS = {
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock.forward": "633ff9a686d3ea28",
+    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock.forward": "80c4b54b62df6e29",
     "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock.forward_normal_dual_stream": "afae959064cc8cd7",
-    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_router_experts": "32d09f01b77d76b5",
+    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_router_experts": "251e3d343aec92fe",
 }
 
 

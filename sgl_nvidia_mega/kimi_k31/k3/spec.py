@@ -31,9 +31,17 @@ if TYPE_CHECKING:
 
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 # Keep this independent of the host constant so find_spec rejects incompatibility: the
-# built objects offer API 2's optional EAGLE entries and graph_variants (all None), so
-# a host with that contract (it defines ENTRIES) gets 2, an older one 1.
-REQUIRED_MEGAKERNEL_API_VERSION = 2 if hasattr(_host_spec, "ENTRIES") else 1
+# built objects offer API 2's optional EAGLE entries and graph_variants (all None) and
+# read no verify sampling penalties (API 3 changed only those), so a host with API 3
+# (it defines VerifyPenaltiesView) gets 3, one with API 2 (it defines ENTRIES) gets 2,
+# an older one 1.
+REQUIRED_MEGAKERNEL_API_VERSION = (
+    3
+    if hasattr(_host_spec, "VerifyPenaltiesView")
+    else 2
+    if hasattr(_host_spec, "ENTRIES")
+    else 1
+)
 
 # Names read from SGLang internals. A contract test checks these before GPU use.
 SGLANG_READS = {

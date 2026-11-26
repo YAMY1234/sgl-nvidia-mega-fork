@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
 """Focused q6 handoff, borrowed-state and replay-metadata regressions (CPU)."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from msgspec.structs import replace
 from test_kimi_k3_contract import (
+    DTYPE_CODE,
     HybridPoolView,
     HybridStepView,
     KdaPoolView,
@@ -130,7 +131,6 @@ def test_verify_metadata_separates_token_rows_from_request_rows(q):
         ),
         kda=KdaStepView(
             state_indices=_MetadataTensor((requests,), torch.int32),
-            track_decode_state=Mock(),
             verify_scratch_indices=_MetadataTensor((requests,), torch.int32),
         ),
         aux_hidden_states=_MetadataTensor((rows, width), torch.bfloat16),
@@ -156,10 +156,7 @@ def test_verify_metadata_separates_token_rows_from_request_rows(q):
         (
             replace(
                 view,
-                kda=KdaStepView(
-                    state_indices=view.kda.state_indices,
-                    track_decode_state=Mock(),
-                ),
+                kda=KdaStepView(state_indices=view.kda.state_indices),
             ),
             "scratch indices is not a tensor",
         ),
@@ -186,11 +183,11 @@ def test_verify_binding_borrows_and_seals_both_intermediate_pools():
     hybrid = HybridPoolView(
         mla=MlaPoolView(
             reserved_capacity=128,
-            serving_capacity=lambda: 128,
+            serving_capacity=128,
             post_capture_active=False,
             page_size=64,
-            logical_dtype=torch.float8_e4m3fn,
-            storage_dtype=torch.uint8,
+            logical_dtype_code=DTYPE_CODE[torch.float8_e4m3fn],
+            storage_dtype_code=DTYPE_CODE[torch.uint8],
             layer_mapping={0: 0},
             caches={0: torch.zeros(1)},
         ),
@@ -387,14 +384,18 @@ def test_decode_tracks_state_but_verify_only_writes_checkpoints(q):
         ),
         kda=KdaStepView(
             state_indices=torch.tensor([3, 0], dtype=torch.int32),
-            track_decode_state=track,
             verify_scratch_indices=torch.tensor([0, 7], dtype=torch.int32)
             if q > 1
             else None,
         ),
         aux_hidden_states=torch.full((rows, len(taps) * 7168), -1.0) if q > 1 else None,
     )
-    with patch("sgl_nvidia_mega.kimi_k3.executor._validate_step_inputs"):
+    with (
+        patch("sgl_nvidia_mega.kimi_k3.executor._validate_step_inputs"),
+        patch.object(
+            KdaStepView, "track_decode_state", lambda self, layer_id: track(layer_id)
+        ),
+    ):
         output = KimiK3MegakernelExecutor(resources).run(
             torch.zeros(rows, dtype=torch.int64), torch.zeros(rows, 7168), view
         )

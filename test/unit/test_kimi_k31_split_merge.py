@@ -292,7 +292,7 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             "get_parallel": lambda: types.SimpleNamespace(tp_rank=0),
             "get_exec": lambda: graphs,
             "get_spec": lambda: self.spec,
-            "apply_dflash_verify_logits_adjustments": lambda **kw: log("adjust"),
+            "adjust_verify_logits": lambda *a, **kw: log("adjust"),
             "_prepare_dflash_draft_block_unchecked": lambda **kw: log("prepare_block"),
             "ForwardBatch": lambda **kw: log("forward_batch") or kw,
             "DFlashVerifyInput": lambda **kw: verify_input,
@@ -339,8 +339,9 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             top_ks=torch.tensor([20]),
             penalizer_orchestrator=None,
             has_custom_logit_processor=False,
-            grammar_mask=None,
+            step_penalties=None,
             logit_bias=None,
+            watermark=None,
             sampling_mask_batch_indices=None,
         )
         info.update(sampling)
@@ -432,7 +433,10 @@ class K31DFlashRuntimeRound(unittest.TestCase):
         sampling = {
             "top_p": dict(need_top_p_sampling=True),
             "top_k": dict(need_top_k_sampling=True),
+            "penalties": dict(step_penalties=object()),
             "logit bias": dict(logit_bias=torch.zeros(1)),
+            "custom logit processor": dict(has_custom_logit_processor=True),
+            "watermark": dict(watermark=object()),
             "sampling mask": dict(sampling_mask_batch_indices=[0]),
         }
         for name, fields in [*cases.items(), *sampling.items()]:

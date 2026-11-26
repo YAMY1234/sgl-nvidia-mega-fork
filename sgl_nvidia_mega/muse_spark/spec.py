@@ -50,7 +50,7 @@ SGLANG_READS = {
 
 
 # the SGLang megakernel contract this spec is written against
-API_VERSION = 2
+API_VERSION = 3
 
 EAGER_TEST_SWITCHES = ("SGLANG_NVIDIA_MEGAKERNEL_PARITY",)
 

@@ -14,6 +14,7 @@ SGLANG_READS = {
     "kernels/ops/speculative/eagle.py": ("fill_bonus_tokens_func",),
     "srt/speculative/eagle_worker_common.py": ("eagle_sample", "run_eagle_verify"),
     "srt/speculative/eagle_worker_v2.py": ("run_eagle_verify",),
+    "srt/sampling/sampling_batch_info.py": ("step_penalties", "logit_bias"),
 }
 
 SEED = 20261116
@@ -88,10 +89,7 @@ class VerifyTail:
             reasons.append("grammar")
         if getattr(batch, "return_logprob", False):
             reasons.append("logprob")
-        if (
-            si.acc_additive_penalties is not None
-            or si.acc_scaling_penalties is not None
-        ):
+        if si.step_penalties is not None:
             reasons.append("penalty")
         if si.logit_bias is not None:
             reasons.append("logit_bias")

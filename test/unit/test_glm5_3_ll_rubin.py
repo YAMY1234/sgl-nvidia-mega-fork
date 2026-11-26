@@ -229,7 +229,7 @@ def test_the_tp4_draft_admits_sm107(monkeypatch):
         speculative_eagle_topk=1, speculative_use_rejection_sampling=False
     )
     rt.get_parallel = lambda: SimpleNamespace(
-        tp_size=4, pp_size=1, enable_dp_attention=False, enable_dp_lm_head=False
+        tp_size=4, pp_size=1, attn_dp_enabled=False, enable_dp_lm_head=False
     )
     monkeypatch.setitem(sys.modules, "sglang.srt.runtime_context", rt)
     from sglang.srt.environ import envs

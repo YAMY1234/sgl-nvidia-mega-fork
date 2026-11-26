@@ -17,8 +17,6 @@ SGLANG_READS = {
         "tp_size",
         "attn_dp_size",
         "ep_size",
-        "dp_size",
-        "enable_dp_attention",
     ),
 }
 
@@ -199,12 +197,7 @@ def from_parallel(parallel) -> Topology:
 
 
 def from_config(cfg) -> Topology:
-    # Startup guards may run before legacy --dp-size/--enable-dp-attention is
-    # normalized to attn_dp_size; the published ParallelContext is already resolved.
-    attention_dp = cfg.attn_dp_size or 1
-    if cfg.enable_dp_attention:
-        attention_dp = max(attention_dp, cfg.dp_size or 1)
-    return Topology(cfg.tp_size, attention_dp, cfg.ep_size or 1)
+    return Topology(cfg.tp_size, cfg.attn_dp_size or 1, cfg.ep_size or 1)
 
 
 def select(requested: frozenset, topology: Topology) -> frozenset:

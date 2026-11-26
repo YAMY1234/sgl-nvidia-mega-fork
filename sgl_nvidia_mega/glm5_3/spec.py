@@ -141,7 +141,7 @@ SGLANG_READS = {
 
 ARCHITECTURE = "GlmMoeDsaForCausalLM"
 # the SGLang megakernel contract this spec is written against
-API_VERSION = 2
+API_VERSION = 3
 
 # The co-resident cooperative grid the served kernels need at one CTA per SM: the
 # 9-16-row MoE fold hop (sm103/hop/moe_fold.py, MoeFoldArBsum) launches rows x CLUSTER

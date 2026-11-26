@@ -118,7 +118,7 @@ from . import bed
 SGLANG_READS = {
     "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
     "srt/arg_groups/resolution_hooks.py": ("register_resolution_hook",),
-    "srt/utils/common.py": ("is_float4_e2m1fn_x2",),
+    "srt/utils/device.py": ("is_float4_e2m1fn_x2",),
     "srt/mem_cache/swa_memory_pool.py": ("SWAKVPool",),
 }
 
@@ -479,7 +479,7 @@ def _install_resolution() -> bool:
 
 
 def _is_nvfp4(dtype_str, dtype) -> bool:
-    from sglang.srt.utils.common import is_float4_e2m1fn_x2
+    from sglang.srt.utils.device import is_float4_e2m1fn_x2
 
     return dtype_str == "nvfp4" and is_float4_e2m1fn_x2(dtype)
 

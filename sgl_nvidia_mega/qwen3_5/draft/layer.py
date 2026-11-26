@@ -78,7 +78,7 @@ SGLANG_READS = {
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/models/qwen3_5_mtp.py:Qwen3_5ForCausalLMMTP.forward": "6d038e59d55980a6",
+    "srt/models/qwen3_5_mtp.py:Qwen3_5ForCausalLMMTP.forward": "95a8ba199326ac1f",
     "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer.forward": "6473f673a1a0796b",
 }
 
@@ -88,7 +88,8 @@ def fc_input(parts, token_ids, hidden):
     rows ``hidden`` [rows, hidden] they follow."""
     lm = parts.lm
     _note_fc_cat()
-    return lm.fc(
+    # fc is a ReplicatedLinear: it returns (output, output bias)
+    out, _ = lm.fc(
         norms_into_cat(
             parts.embed(token_ids),
             hidden,
@@ -96,6 +97,7 @@ def fc_input(parts, token_ids, hidden):
             lm.pre_fc_norm_hidden,
         )
     )
+    return out
 
 
 def norms_into_cat(embeds, hidden, norm_embeds, norm_hidden):

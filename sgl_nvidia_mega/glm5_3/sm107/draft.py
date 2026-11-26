@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import dataclasses
+import functools
+
 import torch
 
 from . import target as launch
 
 SGLANG_READS = {
+    "srt/layers/logits_processor.py": ("LogitsProcessorOutput",),
     "srt/distributed/parallel_state.py": ("get_tp_group",),
     "srt/distributed/communication_op.py": ("tensor_model_parallel_all_gather",),
     "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
@@ -498,10 +502,33 @@ class DraftRunner:
         return self.dt64
 
 
+@functools.lru_cache(maxsize=None)
+def _logits_output_fields():
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+    return {f.name: f for f in dataclasses.fields(LogitsProcessorOutput)}
+
+
 class _FakeLogits:
+    """SGLang's LogitsProcessorOutput as the fused draft hands it to the stock draft-extend
+    tail: the logits and hidden states given here, every other field of the installed
+    SGLang's dataclass at its default, since its EAGLE worker may read any of them."""
+
     def __init__(self, next_token_logits, hidden_states):
         self.next_token_logits = next_token_logits
         self.hidden_states = hidden_states
+
+    def __getattr__(self, name):
+        # Only reached for names not set here: the field's default, cached on first read.
+        f, missing = _logits_output_fields().get(name), dataclasses.MISSING
+        if f is None or (f.default is missing and f.default_factory is missing):
+            raise AttributeError(f"{type(self).__name__} has no {name!r}")
+        if f.default_factory is not missing:
+            value = f.default_factory()
+            setattr(self, name, value)
+            return value
+        setattr(type(self), name, f.default)
+        return f.default
 
 
 class _LeanFB:

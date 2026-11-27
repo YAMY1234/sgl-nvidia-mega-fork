@@ -857,6 +857,13 @@ def resolve_sparse_mla_profile(
     tile = profile.tile_size_q or {"swap": 16, "keep": 64, "2cta": 128}[profile.family]
     work = rows * ceil(heads / tile)
     splits = profile.split_kv
+    # Experiment knob (lever C): force the KV split count, e.g. MEGA_D576_SPLIT=3.
+    _forced = int(__import__("os").environ.get("MEGA_D576_SPLIT", "0"))
+    if _forced > 0:
+        splits = _forced
+        if _forced > 1:
+            # 1CTA persistent queues do not enumerate KV splits.
+            profile = replace(profile, scheduler="nonpersistent")
     if splits == 0:
         # Fill a resident wave using instruction-aligned KV partitions.
         # More splits shorten each CTA's work but increase partial-O/LSE merge

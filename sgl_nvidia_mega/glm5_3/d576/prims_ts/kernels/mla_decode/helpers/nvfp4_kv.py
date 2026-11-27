@@ -334,6 +334,8 @@ def convert_nvfp4x8(word: Int32, scale: Int32):
 # built once per CTA with the f16x2 sequence above gives the same bytes with
 # integer PRMT/LOP3 instead of 12 F2FP/HMUL2 instructions per eight values.
 NVFP4_LUT_BYTES = 256 * 8
+# Experiment knob, read at kernel build time: MEGA_D576_NOCONVERT=1 skips conversion.
+_NOCONVERT = __import__("os").environ.get("MEGA_D576_NOCONVERT") == "1"
 
 
 def use_nvfp4_lut() -> bool:
@@ -862,7 +864,13 @@ def store_nvfp4_record(
         for pair in cutlass.range_constexpr(2):
             row = first_row + Int32(chunk * 16 + pair * 8)
             scale = (scales[chunk] >> Int32(pair * 8)) & Int32(255)
-            if cutlass.const_expr(lut is not None):
+            if cutlass.const_expr(_NOCONVERT):
+                # Timing-only upper bound (wrong numerics): store raw words unconverted.
+                a = packed[chunk * 4 + pair * 2]
+                b = a
+                c = packed[chunk * 4 + pair * 2 + 1]
+                d = c
+            elif cutlass.const_expr(lut is not None):
                 t0, t1 = load_nvfp4_lut(lut, scale)
                 a, b = convert_nvfp4x8_lut(packed[chunk * 4 + pair * 2], t0, t1)
                 c, d = convert_nvfp4x8_lut(packed[chunk * 4 + pair * 2 + 1], t0, t1)

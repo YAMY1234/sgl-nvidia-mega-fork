@@ -2177,6 +2177,11 @@ def configure_sparse_mla(
         and cfg.use_persistent_scheduler
         else 1
     )
+    # Experiment knob (build time): a third retained converted tile instead of the
+    # second raw slot, so converting tile t+3 waits on PV(t) rather than PV(t+1).
+    kv3 = retained_nvfp4_kv and __import__("os").environ.get("MEGA_D576_KV3") == "1"
+    if kv3:
+        raw_record_ring = 1
     if retained_nvfp4_kv:
         page_stages = 4 if raw_record_ring == 2 else 2
     if single and reuse and kv_stages >= 6 and not cfg.is_fp8_qkv():
@@ -2275,7 +2280,7 @@ def configure_sparse_mla(
             whole_kv_tile=True,
             raw_record_ring=raw_record_ring,
         )
-        kv_stages = 2
+        kv_stages = 3 if kv3 else 2
     return dataclass_replace(
         cfg,
         **roles,

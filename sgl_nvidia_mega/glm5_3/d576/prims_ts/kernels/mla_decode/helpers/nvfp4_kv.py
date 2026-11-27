@@ -328,6 +328,60 @@ def convert_nvfp4x8(word: Int32, scale: Int32):
     return values[0], values[1]
 
 
+
+# SM107 exact lookup-table converter. RN_e4m3(e2m1 * scale) depends only on the
+# 3-bit magnitude and the scale byte, so a 2 KiB SMEM table T[scale][mag]
+# built once per CTA with the f16x2 sequence above gives the same bytes with
+# integer PRMT/LOP3 instead of 12 F2FP/HMUL2 instructions per eight values.
+NVFP4_LUT_BYTES = 256 * 8
+
+
+def use_nvfp4_lut() -> bool:
+    """Whether NVFP4 KV conversion uses the SMEM table (SM107 only)."""
+    return use_sm107_nvfp4_converter()
+
+
+@cute.jit
+def fill_nvfp4_lut(lut, tid, nthreads: cutlass.Constexpr[int]):
+    """Write T[s] = the eight E4M3 bytes of magnitudes 0..7 times scale byte s."""
+    for s in cutlass.range(tid, 256, nthreads):
+        lo, hi = convert_nvfp4x8(Int32(0x76543210), prepare_nvfp4_scale(s))
+        store_shared_u32x2(lut, s * Int32(8), lo, hi)
+
+
+@cute.jit
+def load_nvfp4_lut(lut, scale):
+    """Return T[scale] as two words (magnitudes 0..3, 4..7)."""
+    t = cutlass.Pointer(lut + scale * Int32(8), dtype=Int32).load(count=2, alignment=8)
+    return t[0], t[1]
+
+
+@cute.jit
+def convert_nvfp4x8_lut(word: Int32, t0: Int32, t1: Int32):
+    """Table form of ``convert_nvfp4x8``: eight E2M1 nibbles to eight E4M3 bytes.
+
+    PRMT picks T[mag] per nibble from (t0, t1), selected by the sign-masked
+    nibbles. Odd values sit in high nibbles, so their sign is already bit 7
+    of their byte; even values' signs reach bit 7 in ``word << 4``. One PRMT
+    per output word puts those sign bits in value order, and LOP3 ORs them in.
+    """
+    return cute.arch.inline_ptx(
+        "{ .reg .b32 k, m, mh, wl, a, c, s0, s1;\n"
+        "  mov.b32 k, 0x80808080;\n"
+        "  and.b32 m, {$r0}, 0x77777777;\n"
+        "  shr.u32 mh, m, 16;\n"
+        "  prmt.b32 a, {$r1}, {$r2}, m;\n"
+        "  prmt.b32 c, {$r1}, {$r2}, mh;\n"
+        "  shl.b32 wl, {$r0}, 4;\n"
+        "  prmt.b32 s0, wl, {$r0}, 0x5140;\n"
+        "  prmt.b32 s1, wl, {$r0}, 0x7362;\n"
+        "  lop3.b32 {$w0}, a, s0, k, 0xF8;\n"
+        "  lop3.b32 {$w1}, c, s1, k, 0xF8;\n"
+        "}",
+        write_only_types=[Int32, Int32],
+        read_only_args=[word, t0, t1],
+    )
+
 # ===========================================================================
 # TMA descriptors, gathering and staging
 # ===========================================================================
@@ -790,6 +844,7 @@ def store_nvfp4_record(
     *,
     stage_bytes: cutlass.Constexpr[int],
     rope_dim: cutlass.Constexpr[int],
+    lut=None,
 ):
     """Convert a register snapshot and write conflict-free panels."""
     lane = thread_idx & Int32(31)
@@ -806,9 +861,15 @@ def store_nvfp4_record(
     for chunk in cutlass.range_constexpr(8):
         for pair in cutlass.range_constexpr(2):
             row = first_row + Int32(chunk * 16 + pair * 8)
-            sf = prepare_nvfp4_scale((scales[chunk] >> Int32(pair * 8)) & Int32(255))
-            a, b = convert_nvfp4x8(packed[chunk * 4 + pair * 2], sf)
-            c, d = convert_nvfp4x8(packed[chunk * 4 + pair * 2 + 1], sf)
+            scale = (scales[chunk] >> Int32(pair * 8)) & Int32(255)
+            if cutlass.const_expr(lut is not None):
+                t0, t1 = load_nvfp4_lut(lut, scale)
+                a, b = convert_nvfp4x8_lut(packed[chunk * 4 + pair * 2], t0, t1)
+                c, d = convert_nvfp4x8_lut(packed[chunk * 4 + pair * 2 + 1], t0, t1)
+            else:
+                sf = prepare_nvfp4_scale(scale)
+                a, b = convert_nvfp4x8(packed[chunk * 4 + pair * 2], sf)
+                c, d = convert_nvfp4x8(packed[chunk * 4 + pair * 2 + 1], sf)
             store_shared_u32x4(
                 dst + panel * Int32(stage_bytes),
                 swizzle_byte_offset(row * Int32(128) + local_column, 128),
@@ -847,6 +908,7 @@ def convert_nvfp4_record(
     rope_dim: cutlass.Constexpr[int],
     raw=None,
     raw_empty=None,
+    lut=None,
 ):
     """Snapshot two16-value rows per lane, then write conflict-free panels."""
     if cutlass.const_expr(raw is None):
@@ -868,6 +930,7 @@ def convert_nvfp4_record(
         rope,
         stage_bytes=stage_bytes,
         rope_dim=rope_dim,
+        lut=lut,
     )
 
 

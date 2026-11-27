@@ -48,6 +48,9 @@ from ...helpers.nvfp4_kv import (
     snapshot_nvfp4_record,
     release_raw_record,
     store_nvfp4_record,
+    NVFP4_LUT_BYTES,
+    fill_nvfp4_lut,
+    use_nvfp4_lut,
 )
 from ...helpers.gather import (
     gather4,
@@ -1259,6 +1262,8 @@ class SmemKvResource(MlaResource):
     q_ref: object = None
 
     _nv_raw_alloc: object = None
+    _nv_lut_alloc: object = None
+    _nv_lut: object = None
     _nv_raw: object = None
     _nv_scratch_alloc: object = None
     _nv_barrier_alloc: object = None
@@ -1315,6 +1320,14 @@ class SmemKvResource(MlaResource):
                         alignment=1024,
                     )
                 allocations.append(self._nv_raw_alloc)
+            if use_nvfp4_lut():
+                if self._nv_lut_alloc is None:
+                    self._nv_lut_alloc = SmemAllocation(
+                        name=f"{self.name}_nv_lut",
+                        size_bytes=NVFP4_LUT_BYTES,
+                        alignment=16,
+                    )
+                allocations.append(self._nv_lut_alloc)
         return allocations
 
     @cute.jit
@@ -1352,6 +1365,10 @@ class SmemKvResource(MlaResource):
             self._nv_barriers = smem_array(
                 context, self._nv_barrier_alloc, Int64, self.cfg.load_num_warps
             )
+            if cutlass.const_expr(use_nvfp4_lut()):
+                self._nv_lut = smem_array(
+                    context, self._nv_lut_alloc, cutlass.Uint8, NVFP4_LUT_BYTES
+                )
         if self._smem_kv is not None:
             # FP8 descriptors use dtype-specific major-K strides rather than
             # the BF16 128B-row swizzle group.
@@ -1411,6 +1428,17 @@ class SmemKvResource(MlaResource):
                 prims.mbarrier_init(self._nv_barriers.data_ptr(warp), count)
             cute.arch.mbarrier_init_fence()
             cute.arch.sync_warp()
+            if cutlass.const_expr(use_nvfp4_lut()):
+                # Every load warp converts, so all of them build and then see T.
+                fill_nvfp4_lut(
+                    self._nv_lut.data_ptr(),
+                    cute.arch.thread_idx()[0] - Int32(self.cfg.load_warp_idx * 32),
+                    32 * self.cfg.load_num_warps,
+                )
+                if cutlass.const_expr(not self.cfg.async_nvfp4_kv_gather):
+                    prims.barrier_cta_sync(
+                        barrier_id=12, thread_count=32 * self.cfg.load_num_warps
+                    )
             if cutlass.const_expr(self.cfg.async_nvfp4_kv_gather):
                 # Raw barriers are shared by the gather and transform warps.
                 # IDs 14/15 belong to TMEM; 13 is reserved for this load group.
@@ -1419,6 +1447,10 @@ class SmemKvResource(MlaResource):
                     thread_count=32
                     * (self.cfg.load_num_warps + self.cfg.page_offsets_num_warps),
                 )
+
+    def _nv_lut_ptr(self):
+        """SMEM conversion table pointer, or None off SM107."""
+        return self._nv_lut.data_ptr() if use_nvfp4_lut() else None
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
@@ -1596,6 +1628,7 @@ class SmemKvResource(MlaResource):
                         self._nv_rope,
                         stage_bytes=cfg.kv_smem_tile_bytes,
                         rope_dim=cfg.rope_dim,
+                        lut=self._nv_lut_ptr(),
                     )
                 else:
                     # The metadata warp issues gathers independently, so
@@ -1627,6 +1660,7 @@ class SmemKvResource(MlaResource):
                             rope_dim=cfg.rope_dim,
                             raw=raw_ptr,
                             raw_empty=raw_empty,
+                            lut=self._nv_lut_ptr(),
                         )
                     else:
                         convert_nvfp4_record(
@@ -1634,6 +1668,7 @@ class SmemKvResource(MlaResource):
                             cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
                             stage_bytes=cfg.kv_smem_tile_bytes,
                             rope_dim=cfg.rope_dim,
+                            lut=self._nv_lut_ptr(),
                         )
             return
         if cutlass.const_expr(cfg.sparse_reuse_kv and not is_v):

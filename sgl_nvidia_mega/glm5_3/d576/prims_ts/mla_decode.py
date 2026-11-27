@@ -2574,17 +2574,17 @@ def _resolve_sparse_mla_plan(
     affect geometry or workspace sizing.
     """
     import cutlass
-    from fi076_prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
+    from .kernels.mla_decode.throughput_latency_1cta.config import (
         MlaProfile,
         compute_workspace_size,
     )
-    from fi076_prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
+    from .kernels.mla_decode.throughput_latency_1cta.kernel import (
         ThroughputLatencyMlaDecodeTs,
     )
-    from fi076_prims_ts.kernels.mla_decode.throughput_2cta.config import (
+    from .kernels.mla_decode.throughput_2cta.config import (
         compute_workspace_size as workspace_2cta,
     )
-    from fi076_prims_ts.kernels.mla_decode.throughput_2cta.kernel import (
+    from .kernels.mla_decode.throughput_2cta.kernel import (
         MlaDecodeTs,
     )
 

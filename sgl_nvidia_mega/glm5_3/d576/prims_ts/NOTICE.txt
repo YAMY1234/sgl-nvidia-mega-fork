@@ -1,0 +1,5 @@
+fi076_prims_ts = flashinfer/attention/prims_ts from the public flashinfer-python 0.7.6 wheel (sha256 0938421247...,
+https://pypi.org/project/flashinfer-python/0.7.6/, Apache-2.0), relocated as a top-level package so only PrimTS comes from 0.7.6 while
+the rest of FlashInfer stays the image's 0.7.3. Only change: relative imports that climbed above prims_ts were rewritten to absolute
+`flashinfer.` imports (they resolve to 0.7.3, which provides them; require_cute_dsl_arch is missing in 0.7.3 but only used lazily by the
+non-MLA decode/context paths). Absolute self-imports (`flashinfer.attention.prims_ts...`, 4 in mla_decode.py) were rewritten to `fi076_prims_ts...`; without that they loaded the image's 0.7.3 classes (v5 run 1: AttributeError fixed_seqlen). Measurement/A-B use only; adoption = a real FlashInfer 0.7.6 bump.

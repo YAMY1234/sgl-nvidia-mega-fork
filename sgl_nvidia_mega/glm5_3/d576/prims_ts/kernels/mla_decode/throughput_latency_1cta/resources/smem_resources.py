@@ -48,6 +48,8 @@ from ...helpers.nvfp4_kv import (
     snapshot_nvfp4_record,
     release_raw_record,
     store_nvfp4_record,
+    convert_nvfp4_snapshot,
+    EARLY_CONVERT,
     NVFP4_LUT_BYTES,
     fill_nvfp4_lut,
     use_nvfp4_lut,
@@ -1271,6 +1273,7 @@ class SmemKvResource(MlaResource):
     _nv_barriers: object = None
     # Register snapshot of one raw NVFP4 record tile (early_raw_snapshot).
     _nv_packed: object = None
+    _nv_conv: object = None
     _nv_scales: object = None
     _nv_rope: object = None
 
@@ -1411,6 +1414,8 @@ class SmemKvResource(MlaResource):
             self._nv_packed = cutlass.Array(Int32, 32, space=cutlass.AddressSpace.rmem)
             self._nv_scales = cutlass.Array(Int32, 8, space=cutlass.AddressSpace.rmem)
             self._nv_rope = cutlass.Array(Int32, 8, space=cutlass.AddressSpace.rmem)
+            if cutlass.const_expr(EARLY_CONVERT):
+                self._nv_conv = cutlass.Array(Int32, 64, space=cutlass.AddressSpace.rmem)
         if cutlass.const_expr(self.cfg.has_nvfp4_kv):
             warp = cute.arch.thread_idx()[0] // 32 - self.cfg.load_warp_idx
             if prims.elect_sync():
@@ -1562,6 +1567,10 @@ class SmemKvResource(MlaResource):
             rope_dim=cfg.rope_dim,
         )
         release_raw_record(raw_empty)
+        if cutlass.const_expr(EARLY_CONVERT):
+            convert_nvfp4_snapshot(
+                self._nv_packed, self._nv_scales, self._nv_conv, lut=self._nv_lut_ptr()
+            )
 
     @cute.jit
     def load_nvfp4_stage_payload(
@@ -1629,6 +1638,7 @@ class SmemKvResource(MlaResource):
                         stage_bytes=cfg.kv_smem_tile_bytes,
                         rope_dim=cfg.rope_dim,
                         lut=self._nv_lut_ptr(),
+                        converted=self._nv_conv if EARLY_CONVERT else None,
                     )
                 else:
                     # The metadata warp issues gathers independently, so

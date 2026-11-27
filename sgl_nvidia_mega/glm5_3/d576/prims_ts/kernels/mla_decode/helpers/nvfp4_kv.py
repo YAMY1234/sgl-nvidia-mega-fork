@@ -336,6 +336,8 @@ def convert_nvfp4x8(word: Int32, scale: Int32):
 NVFP4_LUT_BYTES = 256 * 8
 # Experiment knob, read at kernel build time: MEGA_D576_NOCONVERT=1 skips conversion.
 _NOCONVERT = __import__("os").environ.get("MEGA_D576_NOCONVERT") == "1"
+# MEGA_D576_EARLYCONV=1: convert right after the early raw snapshot, before the KV acquire.
+EARLY_CONVERT = __import__("os").environ.get("MEGA_D576_EARLYCONV") == "1"
 
 
 def use_nvfp4_lut() -> bool:
@@ -837,6 +839,31 @@ def release_raw_record(raw_empty):
 
 
 @cute.jit
+def convert_nvfp4_snapshot(packed, scales, converted, lut=None):
+    """Convert a register snapshot to E4M3 words in ``converted`` (64 words),
+    in ``store_nvfp4_record``'s order, so conversion can run before the KV
+    stage is acquired."""
+    for chunk in cutlass.range_constexpr(8):
+        for pair in cutlass.range_constexpr(2):
+            scale = (scales[chunk] >> Int32(pair * 8)) & Int32(255)
+            w0 = packed[chunk * 4 + pair * 2]
+            w1 = packed[chunk * 4 + pair * 2 + 1]
+            if cutlass.const_expr(lut is not None):
+                t0, t1 = load_nvfp4_lut(lut, scale)
+                a, b = convert_nvfp4x8_lut(w0, t0, t1)
+                c, d = convert_nvfp4x8_lut(w1, t0, t1)
+            else:
+                sf = prepare_nvfp4_scale(scale)
+                a, b = convert_nvfp4x8(w0, sf)
+                c, d = convert_nvfp4x8(w1, sf)
+            base = (chunk * 2 + pair) * 4
+            converted[base] = a
+            converted[base + 1] = b
+            converted[base + 2] = c
+            converted[base + 3] = d
+
+
+@cute.jit
 def store_nvfp4_record(
     dst,
     thread_idx,
@@ -847,8 +874,12 @@ def store_nvfp4_record(
     stage_bytes: cutlass.Constexpr[int],
     rope_dim: cutlass.Constexpr[int],
     lut=None,
+    converted=None,
 ):
-    """Convert a register snapshot and write conflict-free panels."""
+    """Convert a register snapshot and write conflict-free panels.
+
+    With ``converted`` (from ``convert_nvfp4_snapshot``) the E4M3 words are
+    already in registers and only the stores remain."""
     lane = thread_idx & Int32(31)
     first_row = thread_idx >> Int32(5)
     # Same RoPE lane/row assignment as snapshot_nvfp4_record.
@@ -864,7 +895,13 @@ def store_nvfp4_record(
         for pair in cutlass.range_constexpr(2):
             row = first_row + Int32(chunk * 16 + pair * 8)
             scale = (scales[chunk] >> Int32(pair * 8)) & Int32(255)
-            if cutlass.const_expr(_NOCONVERT):
+            if cutlass.const_expr(converted is not None):
+                base = (chunk * 2 + pair) * 4
+                a = converted[base]
+                b = converted[base + 1]
+                c = converted[base + 2]
+                d = converted[base + 3]
+            elif cutlass.const_expr(_NOCONVERT):
                 # Timing-only upper bound (wrong numerics): store raw words unconverted.
                 a = packed[chunk * 4 + pair * 2]
                 b = a

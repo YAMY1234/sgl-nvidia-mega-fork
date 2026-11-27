@@ -2174,7 +2174,12 @@ def configure_sparse_mla(
         if retained_nvfp4_kv
         and cfg.raw_record_ring_fits()
         and cfg.kv_cache_format != "fp8"
-        and cfg.use_persistent_scheduler
+        and (
+            cfg.use_persistent_scheduler
+            # Knob: also give split (nonpersistent) launches the two-slot ring, so the
+            # early register snapshot (and MEGA_D576_EARLYCONV) applies at N8-12 too.
+            or __import__("os").environ.get("MEGA_D576_RING2") == "1"
+        )
         else 1
     )
     # Experiment knob (build time): a third retained converted tile instead of the

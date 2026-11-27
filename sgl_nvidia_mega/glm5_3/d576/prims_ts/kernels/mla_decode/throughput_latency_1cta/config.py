@@ -2176,9 +2176,9 @@ def configure_sparse_mla(
         and cfg.kv_cache_format != "fp8"
         and (
             cfg.use_persistent_scheduler
-            # Knob: also give split (nonpersistent) launches the two-slot ring, so the
-            # early register snapshot (and MEGA_D576_EARLYCONV) applies at N8-12 too.
-            or __import__("os").environ.get("MEGA_D576_RING2") == "1"
+            # Split (nonpersistent) launches get the two-slot ring too, so the early
+            # register snapshot and early conversion apply at N8-12 (MEGA_D576_RING2=0 disables).
+            or __import__("os").environ.get("MEGA_D576_RING2", "1") == "1"
         )
         else 1
     )

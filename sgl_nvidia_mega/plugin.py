@@ -60,6 +60,11 @@ SGLANG_READS = {
 
 def register() -> None:
     """SGLang's plugin loader calls this in every process, before any model is built."""
+    # GLM-5.2 D576 PrimTS override: opt-in (SGL_MEGA_D576_PRIMTS=1), independent of the
+    # megakernel flag.
+    from sgl_nvidia_mega.glm5_3.d576 import plugin_hook as d576_hook
+
+    d576_hook.register()
     try:
         import sglang.kernels.plugin_kernels.nvidia.spec as megakernels
     except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389

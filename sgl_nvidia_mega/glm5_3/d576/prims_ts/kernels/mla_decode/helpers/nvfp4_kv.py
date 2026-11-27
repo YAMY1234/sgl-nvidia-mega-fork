@@ -336,8 +336,8 @@ def convert_nvfp4x8(word: Int32, scale: Int32):
 NVFP4_LUT_BYTES = 256 * 8
 # Experiment knob, read at kernel build time: MEGA_D576_NOCONVERT=1 skips conversion.
 _NOCONVERT = __import__("os").environ.get("MEGA_D576_NOCONVERT") == "1"
-# MEGA_D576_EARLYCONV=1: convert right after the early raw snapshot, before the KV acquire.
-EARLY_CONVERT = __import__("os").environ.get("MEGA_D576_EARLYCONV") == "1"
+# Convert right after the early raw snapshot, before the KV acquire (MEGA_D576_EARLYCONV=0 disables).
+EARLY_CONVERT = __import__("os").environ.get("MEGA_D576_EARLYCONV", "1") == "1"
 
 
 def use_nvfp4_lut() -> bool:

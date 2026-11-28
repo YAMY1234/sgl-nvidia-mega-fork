@@ -25,6 +25,7 @@ the stock code. The draft is composed and its kernels are built when the target 
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -112,6 +113,9 @@ SGLANG_READS = {
         "do_tensor_parallel_all_gather_dp_attn",
         "use_attn_tp_group",
         "vocab_size",
+        "should_apply_lm_head_quant_method",
+        "use_fp32_lm_head",
+        "rl_on_policy_target",
     ),
     "srt/environ.py": ("envs", "SGLANG_ENABLE_EMBED_REPLICATION"),
     "srt/runtime_context.py": ("get_parallel", "get_spec"),
@@ -138,6 +142,10 @@ EH_NORM_OPTIONS = dict(
 )
 # the draft's step modes (SGLang's Step.mode of the draft graphs)
 DECODE, EXTEND = "decode", "draft_extend"
+# the draft LM head's MXFP8 stream (off unless set to "mxfp8"), and the row bounds of its built variants
+# (one row per request in draft decode and in the row-selected draft extend)
+DRAFT_LM_HEAD_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_LM_HEAD"
+LM_HEAD_MAX_ROWS = (2, 4, 8)
 
 
 def draft_rows(tokens: int, widths) -> Tuple[int, ...]:
@@ -254,6 +262,11 @@ class ComposedDraft(DraftFront):
         self._key: Optional[Tuple[str, int]] = (
             None  # the (mode, rows) of the forward being captured
         )
+        # the draft LM head's MXFP8 copy (DRAFT_LM_HEAD_ENV), or None: ll.gemm / SGLang's head
+        self.lm_head_q = None
+        self._lm_head_w: Optional[torch.Tensor] = None
+        self._lm_head_why = "off"
+        self._lm_head_mxfp8_logged: set[int] = set()
 
     # ------------------------------------------------------------------ build
 
@@ -306,11 +319,20 @@ class ComposedDraft(DraftFront):
             )
 
     def _arm_lm_head(self, lm_head) -> None:
-        """The draft graphs' LM head rows (one per request: draft decode, and the draft extend's select_index rows)
-        on ll.gemm's lm_head role (unit ``ll.gemm.lm_head``), built outside capture; the logits processor
-        (``make_draft_logits_processor``) runs it there."""
+        """The draft graphs' LM head rows (one per request: draft decode, and the draft extend's select_index rows):
+        when ``DRAFT_LM_HEAD_ENV=mxfp8`` is set, build an MXFP8 copy of this rank's BF16 shard and precompile its
+        stream kernels for 1-8 rows; always also build ``ll.gemm``'s lm_head role as fallback (rows > 8, eager,
+        or when MXFP8 is off/declined)."""
         from sgl_nvidia_mega.glm5_3 import ll
 
+        mode = os.environ.get(DRAFT_LM_HEAD_ENV, "").strip().lower()
+        if mode not in ("", "0", "off", "bf16"):
+            if mode != "mxfp8":
+                raise ValueError(
+                    f"NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: {DRAFT_LM_HEAD_ENV}={mode!r} "
+                    "(expected mxfp8 or unset)"
+                )
+            self._quantize_lm_head(getattr(lm_head, "weight", None))
         if self.profile is None:
             return
         tokens = self.profile.tokens_per_request
@@ -318,6 +340,95 @@ class ComposedDraft(DraftFront):
         ll.build_linear(
             "lm_head", lm_head, rows, sm=self.profile.sm, sms=self.profile.sms
         )
+
+    def _quantize_lm_head(self, w: Optional[torch.Tensor]) -> None:
+        """Quantize ``w`` (this rank's BF16 LM head shard) to the MXFP8 copy and build its
+        stream kernels outside capture; every rank serves it or none does."""
+        from sgl_nvidia_mega.glm5_3.sm103.draft import lm_head_mxfp8 as lh
+
+        q, why = None, ""
+        if w is None:
+            why = "the draft's lm_head has no weight"
+        elif torch.cuda.is_current_stream_capturing():
+            why = "the head was shared under CUDA-graph capture"
+        else:
+            why = lh.unsupported_reason(w, LM_HEAD_MAX_ROWS[-1])
+        if not why:
+            q = lh.quantize(w.detach())
+            why = lh.scale_reason(q)
+        if not why:
+            n, k = q.shape
+            probe = torch.zeros(1, k, dtype=torch.bfloat16, device=w.device)
+            for max_rows in LM_HEAD_MAX_ROWS:
+                lh.precompile(n, k, w.device, max_rows=max_rows)
+                lh.matmul(probe, q, max_rows=max_rows)  # module load outside capture
+            torch.cuda.synchronize(w.device)
+        whys = runtime.tp_gather([why] if why else [])
+        if any(whys):
+            self.lm_head_q, self._lm_head_w = None, None
+            self._lm_head_why = "MXFP8 declined: " + runtime.per_rank(whys)
+            if self.rank == 0:
+                logger.warning(
+                    "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: LM head stays stock: %s",
+                    self._lm_head_why,
+                )
+            return
+        # the BF16 tensor the copy was made from: served only while the head is it
+        self.lm_head_q, self._lm_head_w = q, w
+        self._lm_head_why = ""
+        self.derived.add("draft.lm_head_mxfp8.codes", q.codes)
+        self.derived.add("draft.lm_head_mxfp8.scales", q.scales)
+        if self.rank == 0:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: LM head on an MXFP8 copy "
+                "of the shard %s (rows 1-%d, copy %.1f MiB)",
+                tuple(q.shape),
+                LM_HEAD_MAX_ROWS[-1],
+                (q.codes.numel() + q.scales.numel()) / 2**20,
+            )
+
+    def lm_head_logits(
+        self,
+        processor,
+        x: torch.Tensor,
+        lm_head,
+        embedding_bias=None,
+    ) -> Optional[torch.Tensor]:
+        """This rank's draft logits shard [rows, N] from the MXFP8 copy, or None (fall back
+        to ``ll.gemm`` / SGLang's head): only inside a captured draft step, at 1-8 BF16 rows,
+        without bias, LoRA, head quantization, FP32 logits, or RL on-policy target."""
+        q = self.lm_head_q
+        if q is None or not self.engaged() or embedding_bias is not None:
+            return None
+        from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+        from sgl_nvidia_mega.glm5_3.sm103.draft import lm_head_mxfp8 as lh
+
+        w, src = getattr(lm_head, "weight", None), self._lm_head_w
+        if (
+            w is None
+            or src is None
+            or w.data_ptr() != src.data_ptr()
+            or tuple(w.shape) != q.shape
+            or (hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"))
+            or should_apply_lm_head_quant_method(
+                lm_head, getattr(lm_head, "quant_method", None)
+            )
+            or getattr(processor, "use_fp32_lm_head", False)
+            or getattr(processor, "rl_on_policy_target", None) is not None
+        ):
+            return None
+        rows = x.shape[0]
+        max_rows = next((m for m in LM_HEAD_MAX_ROWS if rows <= m), None)
+        if max_rows is None or lh.x_reason(x, q.shape[1], max_rows):
+            return None
+        if self.rank == 0 and rows not in self._lm_head_mxfp8_logged:
+            self._lm_head_mxfp8_logged.add(rows)
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: captured MXFP8 LM head at %d rows (max_rows=%d)",
+                rows,
+                max_rows,
+            )
+        return lh.matmul(x, q, max_rows=max_rows)
 
     def _units(self, mode: str, rows: int) -> str:
         owners = self.build.compositions[(mode, rows)].owners
@@ -575,18 +686,33 @@ class ComposedDraft(DraftFront):
 
 
 def make_draft_logits_processor(config, fused_draft: ComposedDraft):
-    """SGLang's logits processor with the LM head on ``ll.gemm``'s lm_head role at the rows ``ComposedDraft.arm``
-    built (TGV), else SGLang's processor as is. The draft top-1 is SGLang's."""
+    """SGLang's logits processor with the draft LM head on the MXFP8 stream when
+    ``DRAFT_LM_HEAD_ENV=mxfp8`` is armed (inside captured draft steps at 1-8 rows),
+    else ``ll.gemm``'s lm_head role at the rows ``ComposedDraft.arm`` built, else
+    SGLang's processor as is. The draft top-1 is SGLang's."""
     from sglang.srt.layers.logits_processor import LogitsProcessor
 
     from sgl_nvidia_mega.glm5_3 import ll
 
     gemm = ll.module("gemm")
-    if gemm is None:
-        return LogitsProcessor(config)
+    bases = (
+        (gemm.LmHeadMixin, LogitsProcessor)
+        if gemm is not None
+        else (LogitsProcessor,)
+    )
 
-    class GlmDraftLogitsProcessor(gemm.LmHeadMixin, LogitsProcessor):
-        pass
+    class GlmDraftLogitsProcessor(*bases):
+        def _compute_lm_head(
+            self, hidden_states, lm_head, embedding_bias=None, **kwargs
+        ):
+            logits = fused_draft.lm_head_logits(
+                self, hidden_states, lm_head, embedding_bias
+            )
+            if logits is not None:
+                return logits
+            return super()._compute_lm_head(
+                hidden_states, lm_head, embedding_bias, **kwargs
+            )
 
     return GlmDraftLogitsProcessor(config)
 

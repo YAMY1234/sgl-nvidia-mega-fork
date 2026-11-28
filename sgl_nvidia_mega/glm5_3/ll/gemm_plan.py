@@ -24,6 +24,7 @@ measured: ``ll.device``); anywhere else every role keeps SGLang's GEMM.
 
 from __future__ import annotations
 
+import os
 from typing import Dict, Optional, Tuple
 
 import msgspec
@@ -139,17 +140,19 @@ PLAN: Tuple[Entry, ...] = (
     Entry("q_b", (2048, 2048), (_tgv(17, 96),), preferred=False),
 )
 
-# Rubin (VR200, SM107, 212 SMs): GB300's plan, derived, not measured, without the
-# router's split-K ranges. The kernels are the same (TGV: SGLang's CuTe DSL kernel, which
-# has a 10.7 path; split-K: the vendored copy where FlashInfer's explicit tactics do not
-# serve SM107, ll.gemm), and every split-K tactic still fits one wave of 212 SMs with 16
-# GPCs assumed (at most 96 CTAs against 164). The router keeps SGLang's gate on Rubin: its
-# split-K logits passed the router-vs-cuBLAS bound there but missed the separate FP64
-# comparison (error to FP64 at most 1.5x cuBLAS's plus 1e-6) at 18 and 20 rows, where
-# Rubin's cuBLAS is closer to FP64 than GB300's. The ranges start at 17 rows; one or two
-# requests at 3-6 tokens never reach them. The crossovers against SGLang's GEMM are
-# GB300 measurements.
-RUBIN_PLAN: Tuple[Entry, ...] = tuple(e for e in PLAN if e.role != "router")
+# Rubin (VR200, SM107, 212 SMs): GB300's plan with T73 C1b Rubin measurements applied:
+# - lm_head (38720, 6144): TGV wins +3.18 us at M=1 on Rubin, but loses -0.94 to -1.69 us
+#   at M=2..16 (and ties at M=18..24) vs cuBLAS -> serve TGV at M=1 only on Rubin.
+# - router (256, 6144): split-K omitted by default (passed router-vs-cuBLAS 5e-6 on Rubin,
+#   missed synthetic 1.5x cuBLAS-to-FP64 ratio at M=18,20; all tactics fit one wave of 212
+#   SMs with 16 GPCs). Opt-in via SGLANG_NVIDIA_MEGAKERNEL_GLM_RUBIN_ROUTER_SPLITK=1 for
+#   cap>=3 (M>=17) Rubin A/B.
+RUBIN_ROUTER_SPLITK_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_RUBIN_ROUTER_SPLITK"
+RUBIN_PLAN: Tuple[Entry, ...] = tuple(
+    Entry("lm_head", (38720, 6144), (_tgv(1, 1),)) if e.role == "lm_head" else e
+    for e in PLAN
+    if e.role != "router"
+)
 
 # (compute capability, SMs) -> the plan for that GPU
 PLANS: Dict[Tuple[Tuple[int, int], int], Tuple[Entry, ...]] = {
@@ -173,7 +176,16 @@ TOLERANCES: Dict[str, float] = {
 
 def device_plan(sm, sms: int) -> Optional[Tuple[Entry, ...]]:
     """The plan for the GPU of compute capability ``sm`` with ``sms`` SMs, or None."""
-    return PLANS.get((tuple(int(v) for v in sm), int(sms)))
+    entries = PLANS.get((tuple(int(v) for v in sm), int(sms)))
+    if (
+        entries is RUBIN_PLAN
+        and os.environ.get(RUBIN_ROUTER_SPLITK_ENV, "").strip().lower()
+        in ("1", "true", "on", "yes")
+    ):
+        router_entry = entry("router", (256, 6144), PLAN)
+        if router_entry is not None:
+            return (router_entry, *entries)
+    return entries
 
 
 def device_gpcs(sm) -> int:

@@ -2718,12 +2718,16 @@ def _resolve_sparse_mla_plan(
         and not max_extra_topk
         and not use_attention_sinks
         and output_quant is None
+        and max_rows <= 4096
     )
     if stream_k:
         # One static persistent wave; the per-row persistent schedule's tiles.
         profile = replace(
             profile, split_kv=1, scheduler="static", whole_kv_tile=False
         )
+    if __import__("os").environ.get("MEGA_D576_SKDBG") == "static":
+        profile = replace(profile, scheduler="static")
+        stream_k = False
     family, tile = profile.family, profile.tile_size_q
     splits, head_dim_ctas = profile.split_kv, profile.head_dim_ctas
     dtype_name = "bf16" if q_dtype == torch.bfloat16 else "e4m3"
@@ -2832,12 +2836,13 @@ def _resolve_sparse_mla_plan(
 
 
 def _stream_k_workspace_bytes(sm_count: int, max_rows: int) -> int:
-    """One FP32 O + LSE partial slot per CTA, then one counter per row x warp."""
-    return _stream_k_counter_offset(sm_count) + max_rows * 4 * 4
+    """One BF16 O + FP32 LSE partial slot per CTA, then one counter per row x warp."""
+    # Counters (up to 4096 rows x 4 warps), then a 16-slot debug timeline per CTA.
+    return _stream_k_counter_offset(sm_count) + 65536 + sm_count * 128
 
 
 def _stream_k_counter_offset(sm_count: int) -> int:
-    return sm_count * (64 * 512 * 4 + 2 * 64 * 4)
+    return sm_count * (64 * 512 * 2 + 2 * 64 * 4)
 
 
 _D576_HEAD_DIM = 576

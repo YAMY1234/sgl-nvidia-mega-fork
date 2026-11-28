@@ -33,6 +33,8 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ...helpers.math import final_lse
+
+_SKDBG = __import__("os").environ.get("MEGA_D576_SKDBG", "")
 from ...helpers.constants import (
     SMEM_WORD_BYTE_SHIFT,
     SMEM_WORD_BYTES,
@@ -161,6 +163,8 @@ class TmemCorrResource(MlaResource):
     _tail_sink: object = None
     # Stream-K partial/merge workspace (int8 view), set by the kernel.
     sk_workspace: object = None
+    # Stream-K merge output staging: 32 heads x 128B per correction warp.
+    _sk_stage_alloc: object = None
 
     def _prefetches_tail_sink(self):
         # Keep-AB fused epilogues read one sink per row-owning lane: one per
@@ -292,6 +296,14 @@ class TmemCorrResource(MlaResource):
                         )
                     allocs.append(self._quant_scratch_alloc)
                 return allocs
+            if self.cfg.stream_k:
+                if self._sk_stage_alloc is None:
+                    self._sk_stage_alloc = SmemAllocation(
+                        name=f"{self.name}_skStage",
+                        size_bytes=self.cfg.correction_num_warps * 32 * 128,
+                        alignment=128,
+                    )
+                return [self._ws_scale_alloc, self._sk_stage_alloc]
             return [self._ws_scale_alloc]
 
         if self._coalesced_keeps_output():
@@ -3433,6 +3445,17 @@ class TmemCorrResource(MlaResource):
         )
 
     @cute.jit
+    def _sk_trace(self, base, off_cnt, cta, warp_idx, lane_idx, event: int):
+        # MEGA_D576_SKDBG=trace: globaltimer per (CTA, event) from warp 0 lane 0.
+        if cutlass.const_expr(_SKDBG == "trace"):
+            if warp_idx == Int32(0) and lane_idx == Int32(0):
+                cutlass.inttoptr(
+                    base + Int64(off_cnt + 65536) + Int64(cta * Int32(16) + Int32(event)) * Int64(8),
+                    mem_space=1,
+                    dtype=Int64,
+                ).store(Int64(cute.arch.globaltimer()))
+
+    @cute.jit
     def _sk_lse(self, final_max, reduced_sum):
         """Base-2 LSE of this tile's partial (-inf when no key survived)."""
         lse_sum = reduced_sum[0]
@@ -3447,41 +3470,137 @@ class TmemCorrResource(MlaResource):
         return lse_val
 
     @cute.jit
-    def _sk_merge_rows(
+    def _sk_block_col(self, blk, half):
+        """First column of 32-column merge block ``blk`` of this warp's half."""
+        return (
+            (blk // Int32(4)) * Int32(2 * self.cfg.head_dim_per_stage_v)
+            + half * Int32(128)
+            + (blk % Int32(4)) * Int32(32)
+        )
+
+    @cute.jit
+    def _sk_prefetch_block(
+        self, peer_bases, blk, half, lane_idx, parity_off, num_peers: cutlass.Constexpr[int]
+    ):
+        """L1-prefetch one merge block (16 lines per peer) for this warp."""
+        if lane_idx < Int32(16):
+            col8 = self._sk_block_col(blk, half) // Int32(8) + lane_idx // Int32(4)
+            for j in cutlass.range_constexpr(num_peers):
+                address = (
+                    peer_bases[j]
+                    + Int64((col8 * Int32(64) + parity_off) * Int32(16))
+                    + Int64((lane_idx % Int32(4)) * Int32(128))
+                )
+                cute.arch.inline_ptx(
+                    "prefetch.global.L1 [{$r0}];", read_only_args=[address]
+                )
+
+    @cute.jit
+    def _sk_merge_blocks(
         self,
         stage_info,
-        o_tmem_cols,
-        own_scale,
-        own_weight,
-        peer_weights,
-        peer_rows,
-        inv,
-        out_row_addr,
+        base,
+        first,
         half,
+        head,
+        warp_idx,
+        lane_idx,
+        tmem_o0,
+        tmem_stage_step,
+        own_factor,
+        peer_w,
+        inv,
+        row,
+        cta_idx_q,
+        head_base_idx,
+        *,
         num_peers: cutlass.Constexpr[int],
     ):
-        """Merge this lane's head row: own TMEM O plus ``num_peers`` FP32 partials."""
+        """Merge this warp's 32 heads x 256 columns in four 64-column blocks.
+
+        Each 32-column sub-block L1-prefetches the next one of every peer, then
+        loads its peer words. Merged BF16 rows go through a swizzled SMEM slice
+        so each global store writes whole 128B lines (lane-per-head stores
+        touched 32 lines per instruction).
+        """
         cfg = self.cfg
-        chunk = 16
-        for v_stage_idx in cutlass.range_constexpr(0, cfg.v_head_dim_stages, 2):
-            for chunk_idx in cutlass.range_constexpr(0, 128, chunk):
-                col = Int32(v_stage_idx * cfg.head_dim_per_stage_v + chunk_idx) + half * Int32(128)
-                peers = []
+        heads = 64
+        dim = 512
+        chunk = 32
+        parity_off = (head // Int32(32)) * Int32(32)
+        peer_bases = [
+            base + Int64((first + Int32(j + 1)) * Int32(dim * heads)) * Int64(2)
+            for j in range(num_peers)
+        ]
+        stage = smem_array(
+            stage_info.context,
+            self._sk_stage_alloc,
+            Int32,
+            cfg.correction_num_warps * 32 * 32,
+        )
+        warp_stage = stage.data_ptr().toint(Int32) + warp_idx * Int32(32 * 128)
+        out_base = self.o_tensor.iterator.raw_ptr().toint(Int64)
+
+        # Output row address of each 16B store slot (head 4k + lane / 8), hoisted.
+        out_addrs = []
+        out_ok = []
+        for k in cutlass.range_constexpr(8):
+            h_local = Int32(4 * k) + lane_idx // Int32(8)
+            global_head_idx = head_base_idx + parity_off + h_local
+            storage_flat_query_row, _, _, _, valid_output_row = flat_query_row_state(
+                global_head_idx,
+                cta_idx_q,
+                cfg.tile_size_q,
+                cfg.logical_num_heads_q,
+                cfg.logical_seq_len_q,
+                cu_seqlens_q=self.cu_seqlens_q,
+                batch_idx=row,
+            )
+            out_row = public_query_flat_row(
+                cfg, storage_flat_query_row, row, self.cu_seqlens_q
+            )
+            out_addrs.append(
+                out_base
+                + (
+                    Int64(out_row) * Int64(cfg.head_dim_v)
+                    + Int64((lane_idx % Int32(8)) * Int32(8))
+                )
+                * Int64(cfg.o_dtype_bytes)
+            )
+            out_ok.append(
+                (global_head_idx < Int32(cfg.num_heads_q)) & valid_output_row
+            )
+        own_scale = own_factor * inv
+        peer_scale = [peer_w[j] * inv for j in range(num_peers)]
+        self._sk_prefetch_block(peer_bases, Int32(0), half, lane_idx, parity_off, num_peers)
+        for it in cutlass.range(4, unroll=1):
+            for sub in cutlass.range_constexpr(2):
+                blk = it * Int32(2) + Int32(sub)
+                if blk + Int32(1) < Int32(8):
+                    self._sk_prefetch_block(
+                        peer_bases, blk + Int32(1), half, lane_idx, parity_off, num_peers
+                    )
+                col = self._sk_block_col(blk, half)
+                vecs = []
                 for j in cutlass.range_constexpr(num_peers):
-                    vals = []
-                    for q in cutlass.range_constexpr(chunk // 4):
-                        vals.append(
+                    for q in cutlass.range_constexpr(chunk // 8):
+                        vecs.append(
                             cutlass.inttoptr(
-                                peer_rows[j] + Int64(col + Int32(4 * q)) * Int64(4),
+                                peer_bases[j]
+                                + Int64(head) * Int64(16)
+                                + Int64((col // Int32(8) + Int32(q)) * Int32(heads))
+                                * Int64(16),
                                 mem_space=1,
-                                dtype=Float32,
+                                dtype=Int32,
                             ).load(count=4, alignment=16)
                         )
-                    peers.append(vals)
                 own = prims.tcgen05_ld(
                     prims.Tcgen05LdStShape.SHAPE_32X32B,
                     prims.make_tmem_ptr(
-                        o_tmem_cols[v_stage_idx // 2] + Int32(chunk_idx), Float32
+                        tmem_o0
+                        + (blk // Int32(4)) * tmem_stage_step
+                        + (blk % Int32(4)) * Int32(chunk),
+                        Float32,
                     ),
                     num=chunk,
                 )
@@ -3489,23 +3608,50 @@ class TmemCorrResource(MlaResource):
                 cute.arch.fence_view_async_tmem_load()
                 acc = cutlass.Array(Float32, chunk, space=cutlass.AddressSpace.rmem)
                 for e in cutlass.range_constexpr(chunk):
-                    acc[e] = own[e] * (own_scale * own_weight)
+                    acc[e] = own[e] * own_scale
                 for j in cutlass.range_constexpr(num_peers):
-                    for q in cutlass.range_constexpr(chunk // 4):
+                    for q in cutlass.range_constexpr(chunk // 8):
                         for e in cutlass.range_constexpr(4):
-                            acc[4 * q + e] = acc[4 * q + e] + peer_weights[j] * Float32(
-                                peers[j][q][e]
+                            word = Int32(vecs[j * (chunk // 8) + q][e])
+                            lo = cprims.mov_b32(word << Int32(16), target_type=Float32)
+                            hi = cprims.mov_b32(word & Int32(-65536), target_type=Float32)
+                            acc[8 * q + 2 * e] = acc[8 * q + 2 * e] + peer_scale[j] * lo
+                            acc[8 * q + 2 * e + 1] = (
+                                acc[8 * q + 2 * e + 1] + peer_scale[j] * hi
                             )
-                packed = cutlass.Array(Int32, chunk // 2, space=cutlass.AddressSpace.rmem)
-                for p in cutlass.range_constexpr(chunk // 2):
-                    packed[p] = pack_float2_to_bf16(acc[2 * p] * inv, acc[2 * p + 1] * inv)
-                for q in cutlass.range_constexpr(chunk // 8):
+                packed = cutlass.Array(Int32, 16, space=cutlass.AddressSpace.rmem)
+                for p in cutlass.range_constexpr(16):
+                    packed[p] = pack_float2_to_bf16(acc[2 * p], acc[2 * p + 1])
+                # Row ``lane`` of the warp slice; 16B chunk c sits at c ^ (lane & 7).
+                for q in cutlass.range_constexpr(4):
+                    c = Int32(sub * 4 + q)
                     cutlass.inttoptr(
-                        out_row_addr
-                        + Int64(col + Int32(8 * q)) * Int64(cfg.o_dtype_bytes),
-                        mem_space=1,
+                        warp_stage
+                        + lane_idx * Int32(128)
+                        + ((c ^ (lane_idx & Int32(7))) << Int32(4)),
+                        mem_space=3,
                         dtype=Int32,
                     ).store(packed.load(4 * q, 4), alignment=16)
+            cute.arch.sync_warp()
+            col64 = self._sk_block_col(it * Int32(2), half)
+            for k in cutlass.range_constexpr(8):
+                h_local = Int32(4 * k) + lane_idx // Int32(8)
+                c = lane_idx % Int32(8)
+                words = cutlass.inttoptr(
+                    warp_stage
+                    + h_local * Int32(128)
+                    + ((c ^ (h_local & Int32(7))) << Int32(4)),
+                    mem_space=3,
+                    dtype=Int32,
+                ).load(count=4, alignment=16)
+                if out_ok[k]:
+                    cutlass.inttoptr(
+                        out_addrs[k] + Int64(col64) * Int64(cfg.o_dtype_bytes),
+                        mem_space=1,
+                        dtype=Int32,
+                    ).store(words, alignment=16)
+            # The next block overwrites this warp's slice.
+            cute.arch.sync_warp()
 
     @cute.jit
     def _sk_store_partial_and_merge(
@@ -3521,15 +3667,16 @@ class TmemCorrResource(MlaResource):
 
         The first CTA of a row computes the row's leading tiles as its last
         work, so it is the natural last finisher. Every other CTA of the row
-        (for which the row is its first row) stores FP32 O normalized by its
-        own sum plus a base-2 LSE into its own slot, then increments a
-        per-(row, correction warp) counter with GPU-scope release. The first
-        CTA's warp waits (acquire) for nseg - 1 arrivals, merges its TMEM O
-        with the peers' partials using the split reducer's LSE combine,
-        stores BF16 O and the final LSE, and resets the counter for the next
-        launch. Waits only point at higher CTAs, and one wave is resident.
-        Each warp owns 32 heads x 256 columns (WS Layout E), so warps never
-        wait for each other.
+        (the row is its first row) stores BF16 O normalized by its own sum and
+        a base-2 LSE into its slot, then increments a per-(row, correction
+        warp) counter with GPU-scope release. The first CTA's warp waits
+        (acquire) for nseg - 1 arrivals, merges its TMEM O with the peers'
+        partials using the split reducer's LSE combine, stores BF16 O and the
+        final LSE, and resets the counter for the next launch. Waits only point
+        at higher CTAs of one resident wave. Each warp owns 32 heads x 256
+        columns (WS Layout E), so warps never wait for each other. Partials are
+        column-major over heads, so a warp's 32 lanes touch one 128B line.
+        Loops stay rolled: unrolled epilogues ran cold out of the I-cache.
         """
         cfg = self.cfg
         if cutlass.const_expr(
@@ -3538,7 +3685,7 @@ class TmemCorrResource(MlaResource):
             raise ValueError("stream-K merge supports the WS Layout-E M64 D512 tile")
         heads = 64
         dim = 512
-        off_lse = cfg.stream_k_max_ctas * heads * dim * 4
+        off_lse = cfg.stream_k_max_ctas * heads * dim * 2
         off_cnt = off_lse + cfg.stream_k_max_ctas * 2 * heads * 4
         warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
@@ -3557,20 +3704,26 @@ class TmemCorrResource(MlaResource):
         head = (warp_idx % Int32(2)) * Int32(32) + lane_idx
         lse_val = self._sk_lse(final_max, reduced_sum)
         store_scale = final_scale0[0]
-        o_tmem_cols = [
+        # WS O: stages 0 and 2 hold this warp's two 128-column blocks.
+        tmem_o0 = (
             tmem_row_base
             + self._o_base_col()
-            + o_stage_tmem_col_offset(cfg, tail_o_stage_idx_0, v_stage_idx)
-            for v_stage_idx in range(0, cfg.v_head_dim_stages, 2)
-        ]
+            + o_stage_tmem_col_offset(cfg, tail_o_stage_idx_0, 0)
+        )
+        tmem_stage_step = o_stage_tmem_col_offset(
+            cfg, tail_o_stage_idx_0, 2
+        ) - o_stage_tmem_col_offset(cfg, tail_o_stage_idx_0, 0)
         counter = cutlass.inttoptr(
             base + Int64(off_cnt) + Int64((row * Int32(4) + warp_idx) * Int32(4)),
             mem_space=1,
             dtype=Int32,
         )
+        chunk = 32
 
         if cta != first:
-            # Publisher: FP32 partial row + LSE into slot ``cta``, then release.
+            # Publisher: BF16 partial (the split reducer's precision) + LSE into
+            # slot ``cta``, then release. FP32 partials doubled the tail traffic.
+            self._sk_trace(base, off_cnt, cta, warp_idx, lane_idx, 0)
             cutlass.inttoptr(
                 base
                 + Int64(off_lse)
@@ -3578,34 +3731,51 @@ class TmemCorrResource(MlaResource):
                 mem_space=1,
                 dtype=Float32,
             ).store(lse_val)
-            o_row_addr = base + Int64((cta * Int32(heads) + head) * Int32(dim)) * Int64(4)
-            for v_stage_idx in cutlass.range_constexpr(0, cfg.v_head_dim_stages, 2):
-                col0 = Int32(v_stage_idx * cfg.head_dim_per_stage_v) + half * Int32(128)
-                for chunk_idx in cutlass.range_constexpr(0, 128, 32):
-                    o_loaded = prims.tcgen05_ld(
-                        prims.Tcgen05LdStShape.SHAPE_32X32B,
-                        prims.make_tmem_ptr(
-                            o_tmem_cols[v_stage_idx // 2] + Int32(chunk_idx), Float32
-                        ),
-                        num=32,
-                    )
-                    prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-                    cute.arch.fence_view_async_tmem_load()
-                    for sub in cutlass.range_constexpr(0, 32, 4):
-                        vals = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
-                        for k in cutlass.range_constexpr(4):
-                            vals[k] = o_loaded[sub + k] * store_scale
-                        cutlass.inttoptr(
-                            o_row_addr + Int64(col0 + Int32(chunk_idx + sub)) * Int64(4),
-                            mem_space=1,
-                            dtype=Float32,
-                        ).store(vals.load(0, 4), alignment=16)
+            # Layout [slot][col / 8][head][8 x BF16]: a warp's 16B words are contiguous.
+            slot_base = base + Int64(cta * Int32(dim * heads)) * Int64(2) + Int64(
+                head
+            ) * Int64(16)
+            pub_chunk = 64
+            for blk in cutlass.range(4, unroll=1):
+                stage_blk = blk // Int32(2)
+                col = (
+                    stage_blk * Int32(2 * cfg.head_dim_per_stage_v)
+                    + half * Int32(128)
+                    + (blk % Int32(2)) * Int32(pub_chunk)
+                )
+                o_loaded = prims.tcgen05_ld(
+                    prims.Tcgen05LdStShape.SHAPE_32X32B,
+                    prims.make_tmem_ptr(
+                        tmem_o0
+                        + stage_blk * tmem_stage_step
+                        + (blk % Int32(2)) * Int32(pub_chunk),
+                        Float32,
+                    ),
+                    num=pub_chunk,
+                )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                cute.arch.fence_view_async_tmem_load()
+                for q in cutlass.range_constexpr(pub_chunk // 8):
+                    words = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+                    for e in cutlass.range_constexpr(4):
+                        words[e] = pack_float2_to_bf16(
+                            o_loaded[8 * q + 2 * e] * store_scale,
+                            o_loaded[8 * q + 2 * e + 1] * store_scale,
+                        )
+                    cutlass.inttoptr(
+                        slot_base
+                        + Int64((col // Int32(8) + Int32(q)) * Int32(heads)) * Int64(16),
+                        mem_space=1,
+                        dtype=Int32,
+                    ).store(words.load(0, 4), alignment=16)
             cute.arch.sync_warp()
             if lane_idx == Int32(0):
                 cute.arch.fence_acq_rel_gpu()
                 cute.arch.atomic_add(counter, Int32(1), sem="release", scope="gpu")
+            self._sk_trace(base, off_cnt, cta, warp_idx, lane_idx, 1)
         else:
             # Merger: wait for the nseg - 1 publishers of this warp's slice.
+            self._sk_trace(base, off_cnt, cta, warp_idx, lane_idx, 2)
             if lane_idx == Int32(0):
                 arrived = cute.arch.load(counter, Int32, sem="acquire", scope="gpu")
                 while arrived < nseg - Int32(1):
@@ -3615,46 +3785,59 @@ class TmemCorrResource(MlaResource):
                 counter.store(Int32(0))
             cute.arch.sync_warp()
             cute.arch.fence_acq_rel_gpu()
-            # Peers are CTAs first + 1 .. first + nseg - 1 (at most three).
+            self._sk_trace(base, off_cnt, cta, warp_idx, lane_idx, 3)
+            # Peers are CTAs first + 1 .. first + nseg - 1 (at most three: the grid
+            # keeps every CTA share >= (tiles - 1) / 3).
             peer_lse = cutlass.Array(Float32, 3, space=cutlass.AddressSpace.rmem)
             m = lse_val
+            if cutlass.const_expr(_SKDBG == "trace"):
+                c0 = cute.arch.clock64()
+                probe = cutlass.inttoptr(
+                    base
+                    + Int64(off_lse)
+                    + Int64((((first + Int32(1)) * Int32(2) + half) * Int32(heads) + head) * Int32(4)),
+                    mem_space=1,
+                    dtype=Float32,
+                ).load()
+                if probe == Float32(12345.0):
+                    c0 = c0 + Int64(1)
+                c1 = cute.arch.clock64()
+                if warp_idx == Int32(0) and lane_idx == Int32(0):
+                    cutlass.inttoptr(
+                        base + Int64(off_cnt + 65536) + Int64(cta * Int32(16) + Int32(8)) * Int64(8),
+                        mem_space=1,
+                        dtype=Int64,
+                    ).store(Int64(c1 - c0) + Int64(probe != Float32(12345.0)) * Int64(0))
             for j in cutlass.range_constexpr(3):
                 peer_lse[j] = Float32(-Float32.inf)
                 if Int32(j + 1) < nseg:
-                    peer_lse[j] = cute.arch.load(
-                        cutlass.inttoptr(
-                            base
-                            + Int64(off_lse)
-                            + Int64(
-                                (((first + Int32(j + 1)) * Int32(2) + half) * Int32(heads) + head)
-                                * Int32(4)
-                            ),
-                            mem_space=1,
-                            dtype=Float32,
+                    peer_lse[j] = cutlass.inttoptr(
+                        base
+                        + Int64(off_lse)
+                        + Int64(
+                            (
+                                ((first + Int32(j + 1)) * Int32(2) + half) * Int32(heads)
+                                + head
+                            )
+                            * Int32(4)
                         ),
-                        Float32,
-                        cop="cg",
-                    )
+                        mem_space=1,
+                        dtype=Float32,
+                    ).load()
                 m = cute.math.max(m, peer_lse[j])
             own_weight = Float32(0)
             if lse_val != Float32(-Float32.inf):
                 own_weight = cute.math.exp2(lse_val - m, fastmath=True)
             wsum = own_weight
-            peer_weights = cutlass.Array(Float32, 3, space=cutlass.AddressSpace.rmem)
+            peer_w = cutlass.Array(Float32, 3, space=cutlass.AddressSpace.rmem)
             for j in cutlass.range_constexpr(3):
-                peer_weights[j] = Float32(0)
+                peer_w[j] = Float32(0)
                 if peer_lse[j] != Float32(-Float32.inf):
-                    peer_weights[j] = cute.math.exp2(peer_lse[j] - m, fastmath=True)
-                wsum = wsum + peer_weights[j]
+                    peer_w[j] = cute.math.exp2(peer_lse[j] - m, fastmath=True)
+                wsum = wsum + peer_w[j]
             inv = Float32(0)
             if wsum > Float32(0):
                 inv = Float32(1.0) / wsum
-            peer_rows = [
-                base
-                + Int64(((first + Int32(j + 1)) * Int32(heads) + head) * Int32(dim))
-                * Int64(4)
-                for j in range(3)
-            ]
             global_head_idx = head_base_idx + head
             storage_flat_query_row, _, _, _, valid_output_row = flat_query_row_state(
                 global_head_idx,
@@ -3671,24 +3854,24 @@ class TmemCorrResource(MlaResource):
             out_row_addr = self.o_tensor.iterator.raw_ptr().toint(Int64) + Int64(
                 out_row
             ) * Int64(cfg.head_dim_v * cfg.o_dtype_bytes)
-            # Specialize on the peer count so each body's loads issue together.
+            valid = (global_head_idx < Int32(cfg.num_heads_q)) & valid_output_row
+            own_factor = store_scale * own_weight
+            self._sk_trace(base, off_cnt, cta, warp_idx, lane_idx, 5)
+            peer_w0, peer_w1, peer_w2 = peer_w[0], peer_w[1], peer_w[2]
+            args = (
+                stage_info, base, first, half, head, warp_idx, lane_idx, tmem_o0,
+                tmem_stage_step, own_factor, (peer_w0, peer_w1, peer_w2), inv, row,
+                cta_idx_q, head_base_idx,
+            )
+            # Specialize on the peer count so every issued load is useful.
             if nseg == Int32(2):
-                self._sk_merge_rows(
-                    stage_info, o_tmem_cols, store_scale, own_weight, peer_weights,
-                    peer_rows, inv, out_row_addr, half, 1,
-                )
+                self._sk_merge_blocks(*args, num_peers=1)
             elif nseg == Int32(3):
-                self._sk_merge_rows(
-                    stage_info, o_tmem_cols, store_scale, own_weight, peer_weights,
-                    peer_rows, inv, out_row_addr, half, 2,
-                )
+                self._sk_merge_blocks(*args, num_peers=2)
             else:
-                self._sk_merge_rows(
-                    stage_info, o_tmem_cols, store_scale, own_weight, peer_weights,
-                    peer_rows, inv, out_row_addr, half, 3,
-                )
+                self._sk_merge_blocks(*args, num_peers=3)
             if cutlass.const_expr(self.lse_tensor is not None):
-                if half == Int32(0):
+                if half == Int32(0) and valid:
                     merged = Float32(-Float32.inf)
                     if wsum > Float32(0):
                         merged = m + cute.math.log2(wsum, fastmath=True)
@@ -3697,6 +3880,7 @@ class TmemCorrResource(MlaResource):
                     (self.lse_tensor.iterator.raw_ptr() + out_row).store(
                         final_lse(merged, cfg.lse_base_on_e)
                     )
+            self._sk_trace(base, off_cnt, cta, warp_idx, lane_idx, 4)
 
     @cute.jit
     def _normalize_and_store_tail_o(
@@ -3743,7 +3927,21 @@ class TmemCorrResource(MlaResource):
                     inst1_sum_arr=inst1_sum_arr,
                 )
             )
-            if cutlass.const_expr(cfg.stream_k):
+            if cutlass.const_expr(cfg.stream_k and _SKDBG == "nomerge"):
+                if Int32(task_cache[_TASK_CACHE_SK_NSEG]) == Int32(1):
+                    self._store_final_tail(
+                        stage_info,
+                        task_cache,
+                        final_max,
+                        reduced_sum,
+                        final_scale0,
+                        final_scale1,
+                        tail_o_stage_idx_0,
+                        tail_o_stage_idx_1,
+                        head_dim_offset,
+                        quant_staged,
+                    )
+            elif cutlass.const_expr(cfg.stream_k):
                 if Int32(task_cache[_TASK_CACHE_SK_NSEG]) > Int32(1):
                     self._sk_store_partial_and_merge(
                         stage_info,

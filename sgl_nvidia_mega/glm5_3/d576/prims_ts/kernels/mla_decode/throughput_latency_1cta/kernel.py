@@ -102,6 +102,8 @@ from ..helpers.nvfp4_kv import (
     Nvfp4KVConfig,
     make_nvfp4_kv_maps,
 )
+_SKDBG = __import__("os").environ.get("MEGA_D576_SKDBG", "")
+
 from ..helpers.constants import LOG2_E, TMEM_LIFECYCLE_BARRIER_ID, TMEM_READY_BARRIER_ID
 from ..helpers.math import canonicalize_softmax_rescale_threshold_log2
 from ..helpers.mask import MaskType, normalize_mask_type
@@ -120,6 +122,22 @@ from ..parallel_reduction_topology import (
     make_balanced_parallel_reduction_topology,
     validate_parallel_reduction_workspace,
 )
+
+
+@cute.jit
+def _sk_trace_cta(cfg, sk_workspace, event: int):
+    """MEGA_D576_SKDBG=trace: one globaltimer stamp per CTA from thread 0."""
+    if cutlass.const_expr(_SKDBG == "trace" and cfg.stream_k):
+        if cute.arch.thread_idx()[0] == Int32(0):
+            off = cfg.stream_k_max_ctas * (64 * 512 * 2 + 2 * 64 * 4) + 65536
+            cutlass.inttoptr(
+                Int64(sk_workspace.iterator.toint())
+                + Int64(off)
+                + Int64(Int32(cute.arch.block_idx()[2]) * Int32(16) + Int32(event))
+                * Int64(8),
+                mem_space=1,
+                dtype=Int64,
+            ).store(Int64(cute.arch.globaltimer()))
 
 
 @cute.jit
@@ -1811,6 +1829,9 @@ def _make_single_kv_pipe_task_graph(
         SmemAllocation("ll_mla_q64_tmem_ptr_i32", dtype=Int32, alignment=4)
     )
     smem_allocator.compute_layout()
+    if _SKDBG == "trace":
+        print("SKDBG smem total", smem_allocator.total, "capacity", target_smem_capacity_bytes(), flush=True)
+        smem_allocator.print_usage_report()
 
     tmem_allocator = TmemAllocator()
     tmem_allocator.add_resource(tmem_s)
@@ -2927,6 +2948,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             ):
                 prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
+        _sk_trace_cta(cfg, sk_workspace, 6)
         if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Tensor)):
             scale_softmax_log2 = softmax_scale_operand[0] * LOG2_E
         else:
@@ -3208,6 +3230,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 thread_count=cfg.threads_per_cta,
             )
         task_manager.run()
+        _sk_trace_cta(cfg, sk_workspace, 7)
         if cutlass.const_expr(has_runtime_activity_guard):
             if not run_task_graph and query_tile_is_active:
                 if cutlass.const_expr(cfg.use_cluster_reduction == 1):

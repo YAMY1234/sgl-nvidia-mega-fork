@@ -64,6 +64,9 @@ def _runtime_split_windows(capacity: int) -> tuple[tuple[int, int], ...]:
 # per thread, but caps a slice at four D-per-CTA rows so the four warps can
 # still compute one row's shared LSE state each.
 PARALLEL_GMEM_REDUCTION_THREADS = 128
+# MEGA_D576_RED_BAR0=1: the reducer CTA (all 128 threads) syncs on barrier 0. Named barrier N
+# reserves N + 1 of the SM's 16 hardware barriers per CTA; barrier 4 capped residency at 3 CTAs/SM.
+_RED_BAR0 = __import__("os").environ.get("MEGA_D576_RED_BAR0", "0") == "1"
 # Register budget for prefetching each thread's split partials (BF16 elements).
 _MAX_PREFETCH_PARTIAL_ELEMENTS = 32
 PARALLEL_GMEM_REDUCTION_ELEMENTS_PER_THREAD = 8
@@ -430,7 +433,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                         ] = stats_weight
 
     prims.barrier_cta_sync(
-        barrier_id=SPLIT_REDUCTION_SCALE_BARRIER_ID,
+        barrier_id=0 if _RED_BAR0 else SPLIT_REDUCTION_SCALE_BARRIER_ID,
         thread_count=reducer_threads,
     )
 
@@ -751,7 +754,7 @@ def _run_parallel_gmem_reduction_shared_stats(
                 )
 
     prims.barrier_cta_sync(
-        barrier_id=SPLIT_REDUCTION_SCALE_BARRIER_ID,
+        barrier_id=0 if _RED_BAR0 else SPLIT_REDUCTION_SCALE_BARRIER_ID,
         thread_count=reducer_threads,
     )
 

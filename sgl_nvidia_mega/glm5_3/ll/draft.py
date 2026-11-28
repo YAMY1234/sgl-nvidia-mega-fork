@@ -130,14 +130,17 @@ class RowParallelEhFamily:
             self.model.model.eh_proj.weight, tp.rank_in_group, tp.world_size
         )
         self.derived.add("draft.eh_proj_row_parallel", self.rp.weight)
-        ll.build_linear(
-            "eh_proj",
-            self.rp,
-            widths,
-            sm=self.profile.sm,
-            sms=self.profile.sms,
-        )
-        self.rp._use_ll = True
+        from sgl_nvidia_mega.glm5_3.ll import gemm_plan
+
+        if gemm_plan.env_on(gemm_plan.RUBIN_QUICKWINS_ENV):
+            ll.build_linear(
+                "eh_proj",
+                self.rp,
+                widths,
+                sm=self.profile.sm,
+                sms=self.profile.sms,
+            )
+            self.rp._use_ll = True
         hop = target_hop_family(self.model)
         why = "the target's LL hops are not served" if hop is None else None
         if hop is not None:

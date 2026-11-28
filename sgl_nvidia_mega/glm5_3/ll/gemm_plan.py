@@ -147,12 +147,20 @@ PLAN: Tuple[Entry, ...] = (
 #   missed synthetic 1.5x cuBLAS-to-FP64 ratio at M=18,20; all tactics fit one wave of 212
 #   SMs with 16 GPCs). Opt-in via SGLANG_NVIDIA_MEGAKERNEL_GLM_RUBIN_ROUTER_SPLITK=1 for
 #   cap>=3 (M>=17) Rubin A/B.
+# The lm_head change and the draft eh_proj on ll.gemm (ll/draft.py) are opt-in together via
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_RUBIN_QUICKWINS=1; unset keeps the previous Rubin plan.
 RUBIN_ROUTER_SPLITK_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_RUBIN_ROUTER_SPLITK"
-RUBIN_PLAN: Tuple[Entry, ...] = tuple(
+RUBIN_QUICKWINS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_RUBIN_QUICKWINS"
+RUBIN_PLAN: Tuple[Entry, ...] = tuple(e for e in PLAN if e.role != "router")
+RUBIN_QUICKWINS_PLAN: Tuple[Entry, ...] = tuple(
     Entry("lm_head", (38720, 6144), (_tgv(1, 1),)) if e.role == "lm_head" else e
-    for e in PLAN
-    if e.role != "router"
+    for e in RUBIN_PLAN
 )
+
+
+def env_on(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "on", "yes")
+
 
 # (compute capability, SMs) -> the plan for that GPU
 PLANS: Dict[Tuple[Tuple[int, int], int], Tuple[Entry, ...]] = {
@@ -177,11 +185,11 @@ TOLERANCES: Dict[str, float] = {
 def device_plan(sm, sms: int) -> Optional[Tuple[Entry, ...]]:
     """The plan for the GPU of compute capability ``sm`` with ``sms`` SMs, or None."""
     entries = PLANS.get((tuple(int(v) for v in sm), int(sms)))
-    if (
-        entries is RUBIN_PLAN
-        and os.environ.get(RUBIN_ROUTER_SPLITK_ENV, "").strip().lower()
-        in ("1", "true", "on", "yes")
-    ):
+    if entries is not RUBIN_PLAN:
+        return entries
+    if env_on(RUBIN_QUICKWINS_ENV):
+        entries = RUBIN_QUICKWINS_PLAN
+    if env_on(RUBIN_ROUTER_SPLITK_ENV):
         router_entry = entry("router", (256, 6144), PLAN)
         if router_entry is not None:
             return (router_entry, *entries)

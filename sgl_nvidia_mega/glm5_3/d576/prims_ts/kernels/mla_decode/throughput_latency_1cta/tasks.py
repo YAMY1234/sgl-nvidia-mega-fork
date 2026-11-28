@@ -652,7 +652,7 @@ def create_keeps_mma_ab_correction_task(
                 inst_idx=0,
                 is_tail=True,
             )
-            if cfg.ws_tail_staged_stripes:
+            if cfg.ws_tail_staged_stripes or cfg.stream_k:
                 # Read O, release it to the next tile's PV, then finish the tail.
                 tmem_corr.correct_tail_and_stage(
                     old_max_arr=old_max_arr,

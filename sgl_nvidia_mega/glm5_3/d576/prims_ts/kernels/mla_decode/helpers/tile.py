@@ -640,3 +640,18 @@ def sk_trace(cfg, sk_workspace, event: int):
             mem_space=1,
             dtype=cutlass.Int64,
         ).store(cutlass.Int64(cute.arch.globaltimer()))
+
+
+@cute.jit
+def sk_trace_value(cfg, sk_workspace, event: int, value):
+    """Store an Int64 debug value in slot ``event`` when MEGA_D576_SKTRACE=1."""
+    if cutlass.const_expr(SK_TRACE and cfg.stream_k):
+        _, _, off_cnt = stream_k_workspace_layout(cfg.stream_k_max_ctas)
+        cutlass.inttoptr(
+            cutlass.Int64(sk_workspace.iterator.toint())
+            + cutlass.Int64(off_cnt + SK_TRACE_ROWS * 4)
+            + cutlass.Int64(Int32(cute.arch.block_idx()[2]) * Int32(16) + Int32(event))
+            * cutlass.Int64(8),
+            mem_space=1,
+            dtype=cutlass.Int64,
+        ).store(cutlass.Int64(value))

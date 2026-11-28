@@ -94,6 +94,7 @@ from .parallel_reduction import (
     parallel_gmem_reduction_threads,
     run_parallel_gmem_reduction_kernel,
     run_stream_k_gmem_reduction_kernel,
+    SK_RED_SLICES_PER_CTA,
     supports_parallel_gmem_reduction,
 )
 from .reduction import gmem_reduction_launch_shape, run_gmem_reduction_kernel
@@ -2831,7 +2832,13 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 o, lse, sk_o, sk_lse, cache_seqs, cu_seqlens_q, sk_ctas,
                 max_q_len=max_q_len,
             ).launch(
-                grid=(cfg.num_heads_q * cfg.head_dim_v // sk_elements, 1, batch_size),
+                grid=(
+                    cfg.num_heads_q
+                    * cfg.head_dim_v
+                    // (sk_elements * SK_RED_SLICES_PER_CTA),
+                    1,
+                    batch_size,
+                ),
                 block=[parallel_gmem_reduction_threads(sk_elements), 1, 1],
                 stream=stream,
                 min_blocks_per_mp=1,

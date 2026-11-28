@@ -42,6 +42,10 @@ GMEM_REDUCTION_WARP_LANES = 32
 # Stream-K reducer: segment partials loaded before the statistics round trip
 # (MEGA_D576_SK_PREFETCH, 0 disables); segments past it load after the stats.
 _SK_PREFETCH = int(__import__("os").environ.get("MEGA_D576_SK_PREFETCH", "4"))
+# Stream-K reducer output slices per CTA (MEGA_D576_SK_RED_SLICES): fewer CTAs.
+SK_RED_SLICES_PER_CTA = int(__import__("os").environ.get("MEGA_D576_SK_RED_SLICES", "2"))
+# MEGA_D576_RED_BAR0=1: the split-KV G1 reducer also syncs on barrier 0.
+_RED_BAR0 = __import__("os").environ.get("MEGA_D576_RED_BAR0", "0") == "1"
 GMEM_REDUCTION_WARPS_PER_CTA = 4
 # A runtime split count runs in the smallest fully unrolled window that holds
 # it; only the slots above the previous window are predicated. One compiled
@@ -256,6 +260,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     requested_splits=None,
     request_is_active=True,
     stream_k=None,
+    slice_override=None,
 ):
     """Reduce G1 partials with the compact row-shared schedule.
 
@@ -272,6 +277,8 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
         split_limit = stream_k[1]
 
     slice_idx, block_idx_y, batch_idx = cute.arch.block_idx()
+    if cutlass.const_expr(slice_override is not None):
+        slice_idx = slice_override
     thread_idx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane_idx = thread_idx % Int32(GMEM_REDUCTION_WARP_LANES)
@@ -509,8 +516,12 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                             + weight_split_idx
                         ] = stats_weight
 
+    # Stream-K CTAs sync on barrier 0: a named barrier id N reserves N + 1 of
+    # the SM's 16 barriers per CTA, which capped residency at 3 CTAs per SM.
     prims.barrier_cta_sync(
-        barrier_id=SPLIT_REDUCTION_SCALE_BARRIER_ID,
+        barrier_id=0
+        if stream_k is not None or _RED_BAR0
+        else SPLIT_REDUCTION_SCALE_BARRIER_ID,
         thread_count=reducer_threads,
     )
 
@@ -1237,15 +1248,18 @@ def run_stream_k_gmem_reduction_kernel(
         cfg, cache_seqs, Int32(cute.size(cache_seqs.shape)), row, stream_k_ctas
     )
     # Inactive (single-segment) rows skip every load and store.
-    _run_parallel_gmem_reduction_g1_shared_stats(
-        output,
-        lse,
-        acc_output,
-        acc_lse,
-        cache_seqs,
-        cu_seqlens_q,
-        cfg,
-        elements_per_slice,
-        request_is_active=nseg > Int32(1),
-        stream_k=(first, nseg, Int32(cfg.stream_k_max_ctas)),
-    )
+    slices = cute.arch.grid_dim()[0]
+    for rep_i in cutlass.range_constexpr(SK_RED_SLICES_PER_CTA):
+        _run_parallel_gmem_reduction_g1_shared_stats(
+            output,
+            lse,
+            acc_output,
+            acc_lse,
+            cache_seqs,
+            cu_seqlens_q,
+            cfg,
+            elements_per_slice,
+            request_is_active=nseg > Int32(1),
+            stream_k=(first, nseg, Int32(cfg.stream_k_max_ctas)),
+            slice_override=cute.arch.block_idx()[0] + Int32(rep_i) * slices,
+        )

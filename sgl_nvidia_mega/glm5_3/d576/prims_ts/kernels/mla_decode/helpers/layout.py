@@ -49,6 +49,10 @@ _TASK_CACHE_WARP_IDX = 2
 _TASK_CACHE_LANE_IDX = 3
 _TASK_CACHE_SEQ_LEN_KV = 4
 _TASK_CACHE_LOCAL_KV_TILES = 5
+# Stream-K only: first planned KV tile of this CTA's row segment, and the
+# number of CTAs that share the row (1: the segment is the whole row).
+_TASK_CACHE_SK_BEGIN = 6
+_TASK_CACHE_SK_NSEG = 7
 
 
 def num_softmax_scale_groups(cfg: MlaConfig) -> int:

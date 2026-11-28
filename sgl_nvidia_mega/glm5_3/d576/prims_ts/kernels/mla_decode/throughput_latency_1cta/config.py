@@ -239,6 +239,12 @@ class MlaConfig(Nvfp4KVConfig):
     # whole grid; an early release only moves their launch and prologue onto
     # SMs this grid leaves idle, which crowds them once the grid is large.
     pdl_entry_trigger_max_ctas: int = 0
+    # Stream-K (MEGA_D576_STREAMK): one wave of at most stream_k_max_ctas CTAs
+    # splits rows x stream_k_tiles_per_row planned KV tiles evenly; split rows
+    # merge their partials in the last finishing CTA (see TmemCorrResource).
+    stream_k: bool = False
+    stream_k_tiles_per_row: int = 0
+    stream_k_max_ctas: int = 0
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
     # Planned KV tiles per instruction group (1 Keeps, 2 Swaps); zero selects

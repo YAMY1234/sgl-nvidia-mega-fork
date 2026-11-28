@@ -77,6 +77,9 @@ _MLA_LATENT_DIM = 512
 _MLA_ROPE_DIM = 64
 _PDL = __import__("os").environ.get("MEGA_D576_PDL", "0") == "1"
 _PDL_TRIGGER = int(__import__("os").environ.get("MEGA_D576_PDL_TRIGGER", "0"))
+# MEGA_D576_STREAMK=1: D576 H64 1CTA plans run one stream-K wave (see
+# MlaConfig.stream_k) instead of the per-row persistent or split+reducer grid.
+_STREAMK = __import__("os").environ.get("MEGA_D576_STREAMK", "0") == "1"
 _MLA_QUERY_DIM = _MLA_LATENT_DIM + _MLA_ROPE_DIM
 _SUPPORTED_INPUT_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 _SUPPORTED_OUTPUT_DTYPES = (torch.bfloat16,)
@@ -2705,6 +2708,22 @@ def _resolve_sparse_mla_plan(
         # deferral; zero restores exact maxima for every schedule.
         profile = replace(profile, defer_max_update=False)
         kernel_threshold = softmax_rescale_threshold_log2
+    stream_k = (
+        _STREAMK
+        and profile.family == "keep"
+        and qk_rope_head_dim == 64
+        and q_dtype == torch.float8_e4m3fn
+        and num_qo_heads == 64
+        and max_q_len == 1
+        and not max_extra_topk
+        and not use_attention_sinks
+        and output_quant is None
+    )
+    if stream_k:
+        # One static persistent wave; the per-row persistent schedule's tiles.
+        profile = replace(
+            profile, split_kv=1, scheduler="static", whole_kv_tile=False
+        )
     family, tile = profile.family, profile.tile_size_q
     splits, head_dim_ctas = profile.split_kv, profile.head_dim_ctas
     dtype_name = "bf16" if q_dtype == torch.bfloat16 else "e4m3"
@@ -2779,11 +2798,17 @@ def _resolve_sparse_mla_plan(
             kv_cache_format=kv_cache_format,
             extra_kv_cache_format=extra_kv_cache_format,
         )
+        if stream_k:
+            kernel.stream_k = True
+            kernel.stream_k_tiles_per_row = capacity // 128
+            kernel.stream_k_max_ctas = sm_count
         core_bytes = compute_workspace_size(
             cfg=kernel._make_config(),
             partial_o_dtype=cutlass.BFloat16,
             lse_dtype=cutlass.Float32,
         )
+        if stream_k:
+            core_bytes = max(core_bytes, _stream_k_workspace_bytes(sm_count, max_rows))
     spec = _make_mla_decode_compile_spec(
         _MLADecodeLaunchSpec(kernel, (), core_bytes, splits),
         device_index=device.index,
@@ -2804,6 +2829,15 @@ def _resolve_sparse_mla_plan(
     ):
         sections[name], byte_end = _append_workspace_section(byte_end, shape, dtype)
     return device, profile, spec, sections, byte_end, capacity, output_quant
+
+
+def _stream_k_workspace_bytes(sm_count: int, max_rows: int) -> int:
+    """One FP32 O + LSE partial slot per CTA, then one counter per row x warp."""
+    return _stream_k_counter_offset(sm_count) + max_rows * 4 * 4
+
+
+def _stream_k_counter_offset(sm_count: int) -> int:
+    return sm_count * (64 * 512 * 4 + 2 * 64 * 4)
 
 
 _D576_HEAD_DIM = 576
@@ -3187,6 +3221,11 @@ class BatchSparseMLADecodePagedTSWrapper:
             name: _workspace_section_view(workspace, section)
             for name, section in sections.items()
         }
+        if family != "2cta" and spec.kernel.stream_k:
+            # Merge counters start at zero; each merge resets its own.
+            buffers["core"][
+                _stream_k_counter_offset(spec.kernel.stream_k_max_ctas) :
+            ].zero_()
         # Finalize the joint distribution in the main kernel or its existing
         # split-KV reducer. No per-source outputs or finishing launch are needed.
         if not reload_d576:

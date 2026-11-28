@@ -44,6 +44,7 @@ from ...helpers.constants import (
 
 from ...helpers.layout import (
     _TASK_CACHE_LANE_IDX,
+    _TASK_CACHE_SK_NSEG,
     _TASK_CACHE_TMEM_BASE_OFFSET,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
     _TASK_CACHE_WARP_IDX,
@@ -95,6 +96,7 @@ from ...helpers.tile import (
     head_idx_for_stage,
     global_kv_tile_idx,
     runtime_seq_len_kv_from_task_cache,
+    stream_k_row_owner,
 )
 
 from .common import (
@@ -157,6 +159,8 @@ class TmemCorrResource(MlaResource):
     # TMA descriptor of the public output, used by the WS TMA output stores.
     tma_o_desc: object = None
     _tail_sink: object = None
+    # Stream-K partial/merge workspace (int8 view), set by the kernel.
+    sk_workspace: object = None
 
     def _prefetches_tail_sink(self):
         # Keep-AB fused epilogues read one sink per row-owning lane: one per
@@ -3352,6 +3356,349 @@ class TmemCorrResource(MlaResource):
             )
 
     @cute.jit
+    def _store_final_tail(
+        self,
+        stage_info: StageInfo,
+        task_cache,
+        final_max,
+        reduced_sum,
+        final_scale0,
+        final_scale1,
+        tail_o_stage_idx_0,
+        tail_o_stage_idx_1,
+        head_dim_offset,
+        quant_staged,
+    ):
+        """Store the final O/LSE of a tile (or its split-KV partial)."""
+        cfg = self.cfg
+        tmem_row_base = task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+        self._store_lse_to_gmem(stage_info, task_cache, final_max, reduced_sum)
+
+        for v_stage_idx in cutlass.range_constexpr(cfg.v_head_dim_stages):
+            base_addr0 = (
+                tmem_row_base
+                + self._o_base_col()
+                + o_stage_tmem_col_offset(cfg, tail_o_stage_idx_0, v_stage_idx)
+            )
+            base_addr1 = (
+                tmem_row_base
+                + self._o_base_col()
+                + o_stage_tmem_col_offset(cfg, tail_o_stage_idx_1, v_stage_idx)
+            )
+            if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
+                self._store_keeps_tail_o_stage(
+                    stage_info,
+                    task_cache,
+                    base_addr0=base_addr0,
+                    final_scale0=final_scale0,
+                    v_stage_idx=v_stage_idx,
+                    head_dim_offset=head_dim_offset,
+                    quant_staged=quant_staged,
+                )
+            elif cutlass.const_expr(
+                self.output_quant is not None and cfg.fuse_sparse_epilogue
+            ):
+                self._store_swap_quantized_stage(
+                    stage_info,
+                    task_cache,
+                    base_addr0,
+                    base_addr1,
+                    final_scale0,
+                    final_scale1,
+                    v_stage_idx,
+                    head_dim_offset,
+                )
+            else:
+                self._stage_swaps_tail_o_to_smem(
+                    task_cache,
+                    base_addr0=base_addr0,
+                    base_addr1=base_addr1,
+                    final_scale0=final_scale0,
+                    final_scale1=final_scale1,
+                )
+                cute.arch.fence_view_async_shared()
+                prims.barrier_cta_sync(
+                    barrier_id=self.store_barrier_id,
+                    thread_count=WARPGROUP_THREADS,
+                )
+                self._store_o_slice_to_gmem(
+                    stage_info, task_cache, v_stage_idx, head_dim_offset
+                )
+                prims.barrier_cta_sync(
+                    barrier_id=self.store_barrier_id,
+                    thread_count=WARPGROUP_THREADS,
+                )
+        self._reduce_cluster_partials_and_store(
+            stage_info, task_cache, head_dim_offset
+        )
+
+    @cute.jit
+    def _sk_lse(self, final_max, reduced_sum):
+        """Base-2 LSE of this tile's partial (-inf when no key survived)."""
+        lse_sum = reduced_sum[0]
+        if cutlass.const_expr(self.cfg.is_fp8_qkv()):
+            lse_sum = lse_sum * fp8_p_scale_rcp(self.cfg)
+        lse_val = (
+            cute.math.log2(lse_sum, fastmath=True)
+            + self.scale_softmax_log2 * final_max[0]
+        )
+        if final_max[0] == neg_max_f32():
+            lse_val = Float32(-Float32.inf)
+        return lse_val
+
+    @cute.jit
+    def _sk_merge_rows(
+        self,
+        stage_info,
+        o_tmem_cols,
+        own_scale,
+        own_weight,
+        peer_weights,
+        peer_rows,
+        inv,
+        out_row_addr,
+        half,
+        num_peers: cutlass.Constexpr[int],
+    ):
+        """Merge this lane's head row: own TMEM O plus ``num_peers`` FP32 partials."""
+        cfg = self.cfg
+        chunk = 16
+        for v_stage_idx in cutlass.range_constexpr(0, cfg.v_head_dim_stages, 2):
+            for chunk_idx in cutlass.range_constexpr(0, 128, chunk):
+                col = Int32(v_stage_idx * cfg.head_dim_per_stage_v + chunk_idx) + half * Int32(128)
+                peers = []
+                for j in cutlass.range_constexpr(num_peers):
+                    vals = []
+                    for q in cutlass.range_constexpr(chunk // 4):
+                        vals.append(
+                            cutlass.inttoptr(
+                                peer_rows[j] + Int64(col + Int32(4 * q)) * Int64(4),
+                                mem_space=1,
+                                dtype=Float32,
+                            ).load(count=4, alignment=16)
+                        )
+                    peers.append(vals)
+                own = prims.tcgen05_ld(
+                    prims.Tcgen05LdStShape.SHAPE_32X32B,
+                    prims.make_tmem_ptr(
+                        o_tmem_cols[v_stage_idx // 2] + Int32(chunk_idx), Float32
+                    ),
+                    num=chunk,
+                )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                cute.arch.fence_view_async_tmem_load()
+                acc = cutlass.Array(Float32, chunk, space=cutlass.AddressSpace.rmem)
+                for e in cutlass.range_constexpr(chunk):
+                    acc[e] = own[e] * (own_scale * own_weight)
+                for j in cutlass.range_constexpr(num_peers):
+                    for q in cutlass.range_constexpr(chunk // 4):
+                        for e in cutlass.range_constexpr(4):
+                            acc[4 * q + e] = acc[4 * q + e] + peer_weights[j] * Float32(
+                                peers[j][q][e]
+                            )
+                packed = cutlass.Array(Int32, chunk // 2, space=cutlass.AddressSpace.rmem)
+                for p in cutlass.range_constexpr(chunk // 2):
+                    packed[p] = pack_float2_to_bf16(acc[2 * p] * inv, acc[2 * p + 1] * inv)
+                for q in cutlass.range_constexpr(chunk // 8):
+                    cutlass.inttoptr(
+                        out_row_addr
+                        + Int64(col + Int32(8 * q)) * Int64(cfg.o_dtype_bytes),
+                        mem_space=1,
+                        dtype=Int32,
+                    ).store(packed.load(4 * q, 4), alignment=16)
+
+    @cute.jit
+    def _sk_store_partial_and_merge(
+        self,
+        stage_info: StageInfo,
+        task_cache,
+        final_max,
+        reduced_sum,
+        final_scale0,
+        tail_o_stage_idx_0,
+    ):
+        """Stream-K split row: peers publish partials, the row's first CTA merges.
+
+        The first CTA of a row computes the row's leading tiles as its last
+        work, so it is the natural last finisher. Every other CTA of the row
+        (for which the row is its first row) stores FP32 O normalized by its
+        own sum plus a base-2 LSE into its own slot, then increments a
+        per-(row, correction warp) counter with GPU-scope release. The first
+        CTA's warp waits (acquire) for nseg - 1 arrivals, merges its TMEM O
+        with the peers' partials using the split reducer's LSE combine,
+        stores BF16 O and the final LSE, and resets the counter for the next
+        launch. Waits only point at higher CTAs, and one wave is resident.
+        Each warp owns 32 heads x 256 columns (WS Layout E), so warps never
+        wait for each other.
+        """
+        cfg = self.cfg
+        if cutlass.const_expr(
+            not cfg.ws_native_e or cfg.tile_size_q != 64 or cfg.head_dim_v != 512
+        ):
+            raise ValueError("stream-K merge supports the WS Layout-E M64 D512 tile")
+        heads = 64
+        dim = 512
+        off_lse = cfg.stream_k_max_ctas * heads * dim * 4
+        off_cnt = off_lse + cfg.stream_k_max_ctas * 2 * heads * 4
+        warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
+        lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+        tmem_row_base = task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+        base = Int64(self.sk_workspace.iterator.toint())
+        row = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
+        cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
+        head_base_idx = head_idx_for_stage(self.head_idx, cfg, stage_info)
+        num_rows = Int32(cute.size(self.cache_seqs.shape))
+        cta = Int32(cute.arch.block_idx()[2])
+        nseg = Int32(task_cache[_TASK_CACHE_SK_NSEG])
+        first = stream_k_row_owner(
+            cfg, num_rows, row * Int32(cfg.stream_k_tiles_per_row)
+        )
+        half = warp_idx // Int32(2)
+        head = (warp_idx % Int32(2)) * Int32(32) + lane_idx
+        lse_val = self._sk_lse(final_max, reduced_sum)
+        store_scale = final_scale0[0]
+        o_tmem_cols = [
+            tmem_row_base
+            + self._o_base_col()
+            + o_stage_tmem_col_offset(cfg, tail_o_stage_idx_0, v_stage_idx)
+            for v_stage_idx in range(0, cfg.v_head_dim_stages, 2)
+        ]
+        counter = cutlass.inttoptr(
+            base + Int64(off_cnt) + Int64((row * Int32(4) + warp_idx) * Int32(4)),
+            mem_space=1,
+            dtype=Int32,
+        )
+
+        if cta != first:
+            # Publisher: FP32 partial row + LSE into slot ``cta``, then release.
+            cutlass.inttoptr(
+                base
+                + Int64(off_lse)
+                + Int64(((cta * Int32(2) + half) * Int32(heads) + head) * Int32(4)),
+                mem_space=1,
+                dtype=Float32,
+            ).store(lse_val)
+            o_row_addr = base + Int64((cta * Int32(heads) + head) * Int32(dim)) * Int64(4)
+            for v_stage_idx in cutlass.range_constexpr(0, cfg.v_head_dim_stages, 2):
+                col0 = Int32(v_stage_idx * cfg.head_dim_per_stage_v) + half * Int32(128)
+                for chunk_idx in cutlass.range_constexpr(0, 128, 32):
+                    o_loaded = prims.tcgen05_ld(
+                        prims.Tcgen05LdStShape.SHAPE_32X32B,
+                        prims.make_tmem_ptr(
+                            o_tmem_cols[v_stage_idx // 2] + Int32(chunk_idx), Float32
+                        ),
+                        num=32,
+                    )
+                    prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                    cute.arch.fence_view_async_tmem_load()
+                    for sub in cutlass.range_constexpr(0, 32, 4):
+                        vals = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
+                        for k in cutlass.range_constexpr(4):
+                            vals[k] = o_loaded[sub + k] * store_scale
+                        cutlass.inttoptr(
+                            o_row_addr + Int64(col0 + Int32(chunk_idx + sub)) * Int64(4),
+                            mem_space=1,
+                            dtype=Float32,
+                        ).store(vals.load(0, 4), alignment=16)
+            cute.arch.sync_warp()
+            if lane_idx == Int32(0):
+                cute.arch.fence_acq_rel_gpu()
+                cute.arch.atomic_add(counter, Int32(1), sem="release", scope="gpu")
+        else:
+            # Merger: wait for the nseg - 1 publishers of this warp's slice.
+            if lane_idx == Int32(0):
+                arrived = cute.arch.load(counter, Int32, sem="acquire", scope="gpu")
+                while arrived < nseg - Int32(1):
+                    arrived = cute.arch.load(
+                        counter, Int32, sem="acquire", scope="gpu"
+                    )
+                counter.store(Int32(0))
+            cute.arch.sync_warp()
+            cute.arch.fence_acq_rel_gpu()
+            # Peers are CTAs first + 1 .. first + nseg - 1 (at most three).
+            peer_lse = cutlass.Array(Float32, 3, space=cutlass.AddressSpace.rmem)
+            m = lse_val
+            for j in cutlass.range_constexpr(3):
+                peer_lse[j] = Float32(-Float32.inf)
+                if Int32(j + 1) < nseg:
+                    peer_lse[j] = cute.arch.load(
+                        cutlass.inttoptr(
+                            base
+                            + Int64(off_lse)
+                            + Int64(
+                                (((first + Int32(j + 1)) * Int32(2) + half) * Int32(heads) + head)
+                                * Int32(4)
+                            ),
+                            mem_space=1,
+                            dtype=Float32,
+                        ),
+                        Float32,
+                        cop="cg",
+                    )
+                m = cute.math.max(m, peer_lse[j])
+            own_weight = Float32(0)
+            if lse_val != Float32(-Float32.inf):
+                own_weight = cute.math.exp2(lse_val - m, fastmath=True)
+            wsum = own_weight
+            peer_weights = cutlass.Array(Float32, 3, space=cutlass.AddressSpace.rmem)
+            for j in cutlass.range_constexpr(3):
+                peer_weights[j] = Float32(0)
+                if peer_lse[j] != Float32(-Float32.inf):
+                    peer_weights[j] = cute.math.exp2(peer_lse[j] - m, fastmath=True)
+                wsum = wsum + peer_weights[j]
+            inv = Float32(0)
+            if wsum > Float32(0):
+                inv = Float32(1.0) / wsum
+            peer_rows = [
+                base
+                + Int64(((first + Int32(j + 1)) * Int32(heads) + head) * Int32(dim))
+                * Int64(4)
+                for j in range(3)
+            ]
+            global_head_idx = head_base_idx + head
+            storage_flat_query_row, _, _, _, valid_output_row = flat_query_row_state(
+                global_head_idx,
+                cta_idx_q,
+                cfg.tile_size_q,
+                cfg.logical_num_heads_q,
+                cfg.logical_seq_len_q,
+                cu_seqlens_q=self.cu_seqlens_q,
+                batch_idx=row,
+            )
+            out_row = public_query_flat_row(
+                cfg, storage_flat_query_row, row, self.cu_seqlens_q
+            )
+            out_row_addr = self.o_tensor.iterator.raw_ptr().toint(Int64) + Int64(
+                out_row
+            ) * Int64(cfg.head_dim_v * cfg.o_dtype_bytes)
+            # Specialize on the peer count so each body's loads issue together.
+            if nseg == Int32(2):
+                self._sk_merge_rows(
+                    stage_info, o_tmem_cols, store_scale, own_weight, peer_weights,
+                    peer_rows, inv, out_row_addr, half, 1,
+                )
+            elif nseg == Int32(3):
+                self._sk_merge_rows(
+                    stage_info, o_tmem_cols, store_scale, own_weight, peer_weights,
+                    peer_rows, inv, out_row_addr, half, 2,
+                )
+            else:
+                self._sk_merge_rows(
+                    stage_info, o_tmem_cols, store_scale, own_weight, peer_weights,
+                    peer_rows, inv, out_row_addr, half, 3,
+                )
+            if cutlass.const_expr(self.lse_tensor is not None):
+                if half == Int32(0):
+                    merged = Float32(-Float32.inf)
+                    if wsum > Float32(0):
+                        merged = m + cute.math.log2(wsum, fastmath=True)
+                        if cutlass.const_expr(cfg.fuse_sparse_epilogue):
+                            merged = merged * Float32(LN_2)
+                    (self.lse_tensor.iterator.raw_ptr() + out_row).store(
+                        final_lse(merged, cfg.lse_base_on_e)
+                    )
+
+    @cute.jit
     def _normalize_and_store_tail_o(
         self,
         stage_info: StageInfo,
@@ -3396,62 +3743,39 @@ class TmemCorrResource(MlaResource):
                     inst1_sum_arr=inst1_sum_arr,
                 )
             )
-            self._store_lse_to_gmem(stage_info, task_cache, final_max, reduced_sum)
-
-            for v_stage_idx in cutlass.range_constexpr(cfg.v_head_dim_stages):
-                base_addr0 = (
-                    tmem_row_base
-                    + self._o_base_col()
-                    + o_stage_tmem_col_offset(cfg, tail_o_stage_idx_0, v_stage_idx)
-                )
-                base_addr1 = (
-                    tmem_row_base
-                    + self._o_base_col()
-                    + o_stage_tmem_col_offset(cfg, tail_o_stage_idx_1, v_stage_idx)
-                )
-                if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
-                    self._store_keeps_tail_o_stage(
+            if cutlass.const_expr(cfg.stream_k):
+                if Int32(task_cache[_TASK_CACHE_SK_NSEG]) > Int32(1):
+                    self._sk_store_partial_and_merge(
                         stage_info,
                         task_cache,
-                        base_addr0=base_addr0,
-                        final_scale0=final_scale0,
-                        v_stage_idx=v_stage_idx,
-                        head_dim_offset=head_dim_offset,
-                        quant_staged=quant_staged,
-                    )
-                elif cutlass.const_expr(
-                    self.output_quant is not None and cfg.fuse_sparse_epilogue
-                ):
-                    self._store_swap_quantized_stage(
-                        stage_info,
-                        task_cache,
-                        base_addr0,
-                        base_addr1,
+                        final_max,
+                        reduced_sum,
                         final_scale0,
-                        final_scale1,
-                        v_stage_idx,
-                        head_dim_offset,
+                        tail_o_stage_idx_0,
                     )
                 else:
-                    self._stage_swaps_tail_o_to_smem(
+                    self._store_final_tail(
+                        stage_info,
                         task_cache,
-                        base_addr0=base_addr0,
-                        base_addr1=base_addr1,
-                        final_scale0=final_scale0,
-                        final_scale1=final_scale1,
+                        final_max,
+                        reduced_sum,
+                        final_scale0,
+                        final_scale1,
+                        tail_o_stage_idx_0,
+                        tail_o_stage_idx_1,
+                        head_dim_offset,
+                        quant_staged,
                     )
-                    cute.arch.fence_view_async_shared()
-                    prims.barrier_cta_sync(
-                        barrier_id=self.store_barrier_id,
-                        thread_count=WARPGROUP_THREADS,
-                    )
-                    self._store_o_slice_to_gmem(
-                        stage_info, task_cache, v_stage_idx, head_dim_offset
-                    )
-                    prims.barrier_cta_sync(
-                        barrier_id=self.store_barrier_id,
-                        thread_count=WARPGROUP_THREADS,
-                    )
-            self._reduce_cluster_partials_and_store(
-                stage_info, task_cache, head_dim_offset
-            )
+            else:
+                self._store_final_tail(
+                    stage_info,
+                    task_cache,
+                    final_max,
+                    reduced_sum,
+                    final_scale0,
+                    final_scale1,
+                    tail_o_stage_idx_0,
+                    tail_o_stage_idx_1,
+                    head_dim_offset,
+                    quant_staged,
+                )

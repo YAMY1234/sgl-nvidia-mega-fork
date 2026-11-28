@@ -51,6 +51,7 @@ from ..helpers.tile import (
     runtime_base_seq_len_kv,
     runtime_local_kv_tiles,
     runtime_seq_len_kv_from_task_cache,
+    stream_k_row_segment,
 )
 
 
@@ -72,6 +73,8 @@ class MlaDecodeTask(Task):
         self._lane_idx = Int32(0)
         self._seq_len_kv = Int32(0)
         self._local_kv_tiles = Int32(1)
+        self._sk_begin = Int32(0)
+        self._sk_nseg = Int32(0)
         self._runtime_body_active = None
 
     @cute.jit
@@ -137,8 +140,8 @@ class MlaDecodeTask(Task):
             self._lane_idx,
             self._seq_len_kv,
             self._local_kv_tiles,
-            Int32(0),
-            Int32(0),
+            self._sk_begin if self.cfg is not None and self.cfg.stream_k else Int32(0),
+            self._sk_nseg if self.cfg is not None and self.cfg.stream_k else Int32(0),
         )
 
     def get_domain(self, tile_coord):
@@ -202,9 +205,21 @@ class MlaDecodeTask(Task):
         )
         if self.cfg.fixed_sparse_kv_tiles > 0:
             return Int32(self.domain_bias)
-        total_kv_tiles = runtime_local_kv_tiles(
-            self.cfg, seq_len_kv, requested_splits=self.runtime_split_kv
-        )
+        if self.cfg.stream_k:
+            # This CTA's segment of the row: its tiles, first tile, sharers.
+            begin, end, nseg = stream_k_row_segment(
+                self.cfg,
+                self.seqlens_kv,
+                cute.size(self.seqlens_kv.shape),
+                batch_idx,
+            )
+            self._sk_begin = begin
+            self._sk_nseg = nseg
+            total_kv_tiles = cute.math.max(end - begin, Int32(1))
+        else:
+            total_kv_tiles = runtime_local_kv_tiles(
+                self.cfg, seq_len_kv, requested_splits=self.runtime_split_kv
+            )
         self._local_kv_tiles = total_kv_tiles
         remaining_kv_tiles = cute.math.max(
             total_kv_tiles - Int32(self.cfg.num_insts_kv), Int32(0)

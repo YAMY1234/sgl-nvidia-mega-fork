@@ -112,6 +112,8 @@ from ..helpers.tile import (
     runtime_split_pruning_is_profitable,
     runtime_split_tile_is_active,
     runtime_work_tile_is_active,
+    stream_k_cta_units,
+    stream_k_row_segment,
 )
 from ..parallel_reduction_topology import (
     choose_q64_parallel_reducer_cluster_size,
@@ -317,6 +319,44 @@ class ThroughputLatencyMlaStaticWorkQueue(WorkQueue):
         return self._work_tile_from_linear(next_linear_idx)
 
 
+class ThroughputLatencyMlaStreamKWorkQueue(ThroughputLatencyMlaStaticWorkQueue):
+    """Stream-K queue: each CTA walks the rows of its contiguous tile share.
+
+    Work tiles keep the persistent (0, 0, row) shape; the KV segment of the
+    row comes from the CTA's share (stream_k_row_segment in get_domain).
+    """
+
+    @cute.jit
+    def skip_work_tile_if(self, work_tile: WorkTileInfo):
+        """Skip a row whose share in this CTA lies past its valid tiles."""
+        _, _, row = work_tile.tile_idx
+        begin, end, _ = stream_k_row_segment(
+            self.cfg, self.cache_seqs, self.batch_size, Int32(row)
+        )
+        return begin >= end
+
+    @cute.jit
+    def _make_initial_work_tile(self) -> WorkTileInfo:
+        lo, hi = stream_k_cta_units(self.cfg, self.batch_size)
+        return WorkTileInfo(
+            (Int32(0), Int32(0), lo // Int32(self.cfg.stream_k_tiles_per_row)),
+            lo < hi,
+        )
+
+    @cute.jit
+    def _get_and_advance_work_tile_impl(
+        self,
+        stage_info,
+    ) -> WorkTileInfo:
+        _, _, row = stage_info.work_tile.tile_idx
+        next_row = Int32(row) + Int32(1)
+        _, hi = stream_k_cta_units(self.cfg, self.batch_size)
+        return WorkTileInfo(
+            (Int32(0), Int32(0), next_row),
+            next_row * Int32(self.cfg.stream_k_tiles_per_row) < hi,
+        )
+
+
 @dataclass(kw_only=True)
 class ThroughputLatencyMlaClcWorkQueue(WorkQueue):
     """CLC work queue shim for throughput-latency 1CTA captured schedules."""
@@ -406,7 +446,12 @@ def _make_static_work_queue(
     name: str,
 ):
     """Create the static persistent work queue shared by both 1CTA variants."""
-    return ThroughputLatencyMlaStaticWorkQueue(
+    queue_class = (
+        ThroughputLatencyMlaStreamKWorkQueue
+        if cfg.stream_k
+        else ThroughputLatencyMlaStaticWorkQueue
+    )
+    return queue_class(
         tile_scheduler_config=TileSchedulerConfig.create_static_persistent_tile_scheduler_params(
             tile_scheduler_params=tile_sched_params,
         ),
@@ -1897,6 +1942,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.coalesce_keeps_output = False
         self.use_pdl = False
         self.pdl_entry_trigger_max_ctas = 0
+        self.stream_k = False
+        self.stream_k_tiles_per_row = 0
+        self.stream_k_max_ctas = 0
 
         cfg = self._make_config()
         # Parallel standalone reduction requires a fixed split profile and a
@@ -2099,6 +2147,13 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 cfg,
                 use_pdl=True,
                 pdl_entry_trigger_max_ctas=self.pdl_entry_trigger_max_ctas,
+            )
+        if self.stream_k:
+            cfg = dataclass_replace(
+                cfg,
+                stream_k=True,
+                stream_k_tiles_per_row=self.stream_k_tiles_per_row,
+                stream_k_max_ctas=self.stream_k_max_ctas,
             )
         if self.split_kv_capacity is not None and cfg.use_multi_ctas_kv == 1:
             cfg = dataclass_replace(cfg, num_ctas_per_seq_kv=self.split_kv_capacity)
@@ -2635,6 +2690,22 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 tile_sched_params,
                 self.max_active_clusters,
             )
+            if cutlass.const_expr(cfg.stream_k):
+                # One wave; each CTA takes a contiguous share of the tiles.
+                # Each CTA takes at least ceil((tiles - 1) / 3) tiles, so a row
+                # spans at most four CTAs (the merge handles three peers).
+                sk_units = batch_size * Int32(cfg.stream_k_tiles_per_row)
+                grid = (
+                    1,
+                    1,
+                    cute.math.max(
+                        cute.math.min(
+                            Int32(cfg.stream_k_max_ctas),
+                            sk_units // Int32((cfg.stream_k_tiles_per_row + 1) // 3),
+                        ),
+                        Int32(1),
+                    ),
+                )
         else:
             launch_splits = Int32(cfg.num_ctas_per_seq_kv)
             if cutlass.const_expr(self.runtime_split_kv and use_gmem_reduction):
@@ -2701,6 +2772,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             kv_producer_args=kv_producer_args,
             tma_desc_o=tma_desc_o,
             cp_rank=cp_rank,
+            sk_workspace=workspace if cutlass.const_expr(cfg.stream_k) else None,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -2836,6 +2908,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         kv_producer_args=None,
         tma_desc_o: cutlass.GridConstant[cuda.TensorMap] = None,
         cp_rank: Int32 = 0,
+        sk_workspace: cute.Tensor = None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self.runtime_config(max_q_len)
@@ -3072,6 +3145,10 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             kv_producer=self.kv_producer,
             kv_producer_args=kv_producer_args,
         )
+        if cutlass.const_expr(cfg.stream_k):
+            if cutlass.const_expr(sk_workspace is None or not cfg.single_kv_pipe):
+                raise ValueError("stream-K needs the single-pipe graph and workspace")
+            cluster_corr_resource.sk_workspace = sk_workspace
         if cutlass.const_expr(has_runtime_activity_guard):
             # Initialize resource containers outside runtime control flow; only
             # task bodies skip inactive Q tiles and pruned KV splits.

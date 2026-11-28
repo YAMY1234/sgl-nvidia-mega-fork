@@ -21,7 +21,11 @@ from cutlass import Int32
 from cutlass.experimental.task_scheduling.resources import StageInfo
 
 from .context_parallel import local_kv_length
-from .layout import _TASK_CACHE_SEQ_LEN_KV, _TASK_CACHE_LOCAL_KV_TILES
+from .layout import (
+    _TASK_CACHE_SEQ_LEN_KV,
+    _TASK_CACHE_LOCAL_KV_TILES,
+    _TASK_CACHE_SK_BEGIN,
+)
 from .mask import MaskType, mask_visible_k_length
 from .query import (
     flat_query_row_state,
@@ -475,6 +479,10 @@ def global_kv_tile_idx(
     task_cache=None,
 ):
     """Map a local KV tile id to the global KV tile id for split-KV mode."""
+    if cutlass.const_expr(cfg.stream_k):
+        if cutlass.const_expr(task_cache is None):
+            raise ValueError("stream-K tile mapping needs the task cache")
+        return local_tile_idx + Int32(task_cache[_TASK_CACHE_SK_BEGIN])
     if cutlass.const_expr(cfg.use_multi_ctas_kv != 1):
         return local_tile_idx
     if cutlass.const_expr(requested_splits is not None and task_cache is not None):
@@ -559,3 +567,45 @@ def staged_kv_head_dim_call_idx(
     """Return the head-dim stage index within a K or V staged load group."""
     del cfg, stage_info, inst_id, is_v, section
     return stage_idx
+
+
+@cute.jit
+def stream_k_cta_units(cfg: MlaConfig, num_rows):
+    """Return this CTA's contiguous [lo, hi) share of rows x planned tiles."""
+    total = Int32(num_rows) * Int32(cfg.stream_k_tiles_per_row)
+    cta = Int32(cute.arch.block_idx()[2])
+    ctas = Int32(cute.arch.grid_dim()[2])
+    return (cta * total) // ctas, ((cta + Int32(1)) * total) // ctas
+
+
+@cute.jit
+def stream_k_row_segment(cfg: MlaConfig, cache_seqs, num_rows, row):
+    """Return (begin, end, nseg) of this CTA's segment of ``row`` in row tiles.
+
+    Rows are assigned by planned tiles (stream_k_tiles_per_row each) and the
+    segment is clipped to the row's valid tiles; begin >= end means empty.
+    nseg counts the CTAs whose clipped segment of the row is nonempty.
+    """
+    tiles = Int32(cfg.stream_k_tiles_per_row)
+    total = Int32(num_rows) * tiles
+    ctas = Int32(cute.arch.grid_dim()[2])
+    lo, hi = stream_k_cta_units(cfg, num_rows)
+    valid = (Int32(cache_seqs[row]) + Int32(cfg.tile_size_kv - 1)) // Int32(
+        cfg.tile_size_kv
+    )
+    valid = cute.math.max(cute.math.min(valid, tiles), Int32(1))
+    start = Int32(row) * tiles
+    begin = cute.math.max(lo, start) - start
+    end = cute.math.min(hi, start + valid) - start
+    # Owner of unit u: the largest CTA c with c * total // ctas <= u.
+    first = ((start + Int32(1)) * ctas + total - Int32(1)) // total - Int32(1)
+    last = ((start + valid) * ctas + total - Int32(1)) // total - Int32(1)
+    return begin, end, last - first + Int32(1)
+
+
+@cute.jit
+def stream_k_row_owner(cfg: MlaConfig, num_rows, unit):
+    """Return the CTA that owns global planned-tile ``unit``."""
+    total = Int32(num_rows) * Int32(cfg.stream_k_tiles_per_row)
+    ctas = Int32(cute.arch.grid_dim()[2])
+    return ((Int32(unit) + Int32(1)) * ctas + total - Int32(1)) // total - Int32(1)

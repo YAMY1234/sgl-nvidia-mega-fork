@@ -146,7 +146,7 @@ class TmemOResource(MlaResource):
     @cute.jit
     def _tail_has_prior_o(self, stage_info: StageInfo):
         """Return whether tail PV should accumulate into existing O state."""
-        if cutlass.const_expr(self.runtime_split_kv is not None):
+        if cutlass.const_expr(self.runtime_split_kv is not None or self.cfg.stream_k):
             return Int32(
                 decode_gen_task_cache(stage_info)[_TASK_CACHE_LOCAL_KV_TILES]
             ) > Int32(self.cfg.num_insts_kv)

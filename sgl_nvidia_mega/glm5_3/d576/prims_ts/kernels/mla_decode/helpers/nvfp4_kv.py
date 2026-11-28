@@ -848,7 +848,10 @@ def convert_nvfp4_snapshot(packed, scales, converted, lut=None):
             scale = (scales[chunk] >> Int32(pair * 8)) & Int32(255)
             w0 = packed[chunk * 4 + pair * 2]
             w1 = packed[chunk * 4 + pair * 2 + 1]
-            if cutlass.const_expr(lut is not None):
+            if cutlass.const_expr(_NOCONVERT):
+                # Timing-only upper bound (wrong numerics): keep the raw words.
+                a, b, c, d = w0, w0, w1, w1
+            elif cutlass.const_expr(lut is not None):
                 t0, t1 = load_nvfp4_lut(lut, scale)
                 a, b = convert_nvfp4x8_lut(w0, t0, t1)
                 c, d = convert_nvfp4x8_lut(w1, t0, t1)

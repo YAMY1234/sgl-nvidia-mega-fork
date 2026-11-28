@@ -75,6 +75,8 @@ from .kernels.mla_decode.sparse_policy import (
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 2"
 _MLA_LATENT_DIM = 512
 _MLA_ROPE_DIM = 64
+_PDL = __import__("os").environ.get("MEGA_D576_PDL", "0") == "1"
+_PDL_TRIGGER = int(__import__("os").environ.get("MEGA_D576_PDL_TRIGGER", "0"))
 _MLA_QUERY_DIM = _MLA_LATENT_DIM + _MLA_ROPE_DIM
 _SUPPORTED_INPUT_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 _SUPPORTED_OUTPUT_DTYPES = (torch.bfloat16,)
@@ -3196,6 +3198,11 @@ class BatchSparseMLADecodePagedTSWrapper:
                 kernel.fuse_sparse_reduction = splits > 1
             else:
                 kernel.finalize_output = True
+                # MEGA_D576_PDL=1: PDL launch for the 1-CTA kernel (split grids already use it);
+                # MEGA_D576_PDL_TRIGGER=N releases dependents at entry for grids of <= N CTAs.
+                if _PDL:
+                    kernel.use_pdl = True
+                    kernel.pdl_entry_trigger_max_ctas = _PDL_TRIGGER
             kernel.direct_sparse = True
             kernel.direct_sparse_capacities = (max_topk, max_extra_topk)
             spec = replace(

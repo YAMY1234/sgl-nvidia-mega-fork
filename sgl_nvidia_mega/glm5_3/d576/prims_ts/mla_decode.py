@@ -79,6 +79,7 @@ _PDL = __import__("os").environ.get("MEGA_D576_PDL", "0") == "1"
 _PDL_TRIGGER = int(__import__("os").environ.get("MEGA_D576_PDL_TRIGGER", "0"))
 _PDL_LATEWAIT = __import__("os").environ.get("MEGA_D576_PDL_LATEWAIT", "0") == "1"
 _IDXPREFETCH = __import__("os").environ.get("MEGA_D576_IDXPREFETCH", "0") == "1"
+_PDL_LOGGED = False
 _MLA_QUERY_DIM = _MLA_LATENT_DIM + _MLA_ROPE_DIM
 _SUPPORTED_INPUT_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 _SUPPORTED_OUTPUT_DTYPES = (torch.bfloat16,)
@@ -3213,6 +3214,14 @@ class BatchSparseMLADecodePagedTSWrapper:
                 if _PDL:
                     kernel.use_pdl = True
                     kernel.pdl_entry_trigger_max_ctas = _PDL_TRIGGER
+                    global _PDL_LOGGED
+                    if not _PDL_LOGGED:
+                        _PDL_LOGGED = True
+                        __import__("logging").getLogger(__name__).info(
+                            "MEGA_D576_PDL engaged trigger=%d latewait=%d",
+                            _PDL_TRIGGER,
+                            int(_PDL_LATEWAIT),
+                        )
                 # MEGA_D576_PDL_LATEWAIT=1: wait after the parameter-only setup;
                 # MEGA_D576_IDXPREFETCH=1: first-tile indices load beside lengths.
                 kernel.pdl_late_wait = _PDL_LATEWAIT

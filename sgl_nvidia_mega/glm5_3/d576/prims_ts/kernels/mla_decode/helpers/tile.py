@@ -609,3 +609,21 @@ def stream_k_row_owner(cfg: MlaConfig, num_rows, unit):
     total = Int32(num_rows) * Int32(cfg.stream_k_tiles_per_row)
     ctas = Int32(cute.arch.grid_dim()[2])
     return ((Int32(unit) + Int32(1)) * ctas + total - Int32(1)) // total - Int32(1)
+
+
+@cute.jit
+def stream_k_row_span(cfg: MlaConfig, cache_seqs, num_rows, row, ctas):
+    """Return (first CTA, nseg) of ``row`` for a stream-K grid of ``ctas`` CTAs.
+
+    Same clipping as stream_k_row_segment; used outside the stream-K grid.
+    """
+    tiles = Int32(cfg.stream_k_tiles_per_row)
+    total = Int32(num_rows) * tiles
+    valid = (Int32(cache_seqs[row]) + Int32(cfg.tile_size_kv - 1)) // Int32(
+        cfg.tile_size_kv
+    )
+    valid = cute.math.max(cute.math.min(valid, tiles), Int32(1))
+    start = Int32(row) * tiles
+    first = ((start + Int32(1)) * ctas + total - Int32(1)) // total - Int32(1)
+    last = ((start + valid) * ctas + total - Int32(1)) // total - Int32(1)
+    return first, last - first + Int32(1)

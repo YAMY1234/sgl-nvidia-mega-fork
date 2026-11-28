@@ -35,6 +35,8 @@ from cutlass.experimental.task_scheduling.resources import (
 from ...helpers.math import final_lse
 
 _SKDBG = __import__("os").environ.get("MEGA_D576_SKDBG", "")
+# MEGA_D576_SK_PUB=direct: STREAMK=2 partial rows stored lane-per-head (no smem stage).
+_SK_PUB = __import__("os").environ.get("MEGA_D576_SK_PUB", "stage")
 from ...helpers.constants import (
     SMEM_WORD_BYTE_SHIFT,
     SMEM_WORD_BYTES,
@@ -296,7 +298,7 @@ class TmemCorrResource(MlaResource):
                         )
                     allocs.append(self._quant_scratch_alloc)
                 return allocs
-            if self.cfg.stream_k:
+            if self.cfg.stream_k and (not self.cfg.stream_k_reduce or _SK_PUB == "stage"):
                 if self._sk_stage_alloc is None:
                     self._sk_stage_alloc = SmemAllocation(
                         name=f"{self.name}_skStage",
@@ -3654,6 +3656,145 @@ class TmemCorrResource(MlaResource):
             cute.arch.sync_warp()
 
     @cute.jit
+    def _sk_store_partial_slot(
+        self,
+        stage_info: StageInfo,
+        task_cache,
+        final_max,
+        reduced_sum,
+        final_scale0,
+        tail_o_stage_idx_0,
+    ):
+        """Stream-K + reducer: store this segment's BF16 O (own-sum normalized)
+        and base-2 LSE into the reducer's partial slot.
+
+        Slot of (row, segment j) with first CTA f: f for j == 0, else
+        stream_k_max_ctas + f + j. A CTA starts at most one split row (j == 0)
+        and continues at most one (j > 0), so slots never collide. Slot layout
+        [slot][head][512] BF16; LSE [slot][head] FP32 after the 2 x max_ctas
+        O slots.
+        """
+        cfg = self.cfg
+        if cutlass.const_expr(
+            not cfg.ws_native_e or cfg.tile_size_q != 64 or cfg.head_dim_v != 512
+        ):
+            raise ValueError("stream-K partials support the WS Layout-E M64 D512 tile")
+        heads = 64
+        dim = 512
+        off_lse = 2 * cfg.stream_k_max_ctas * heads * dim * 2
+        warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
+        lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+        tmem_row_base = task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+        base = Int64(self.sk_workspace.iterator.toint())
+        row = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
+        num_rows = Int32(cute.size(self.cache_seqs.shape))
+        cta = Int32(cute.arch.block_idx()[2])
+        first = stream_k_row_owner(
+            cfg, num_rows, row * Int32(cfg.stream_k_tiles_per_row)
+        )
+        slot = cta
+        if cta != first:
+            slot = cta + Int32(cfg.stream_k_max_ctas)
+        half = warp_idx // Int32(2)
+        head = (warp_idx % Int32(2)) * Int32(32) + lane_idx
+        lse_val = self._sk_lse(final_max, reduced_sum)
+        store_scale = final_scale0[0]
+        # An all-hole segment stores an explicit neutral partial (O = 0).
+        o_live = lse_val != Float32(-Float32.inf)
+        tmem_o0 = (
+            tmem_row_base
+            + self._o_base_col()
+            + o_stage_tmem_col_offset(cfg, tail_o_stage_idx_0, 0)
+        )
+        tmem_stage_step = o_stage_tmem_col_offset(
+            cfg, tail_o_stage_idx_0, 2
+        ) - o_stage_tmem_col_offset(cfg, tail_o_stage_idx_0, 0)
+        if half == Int32(0):
+            cutlass.inttoptr(
+                base + Int64(off_lse) + Int64(slot * Int32(heads) + head) * Int64(4),
+                mem_space=1,
+                dtype=Float32,
+            ).store(lse_val)
+        row_base = base + Int64(slot * Int32(heads) + head) * Int64(dim * 2)
+        pub_chunk = 64
+        if cutlass.const_expr(_SK_PUB == "stage"):
+            stage = smem_array(
+                stage_info.context,
+                self._sk_stage_alloc,
+                Int32,
+                cfg.correction_num_warps * 32 * 32,
+            )
+            warp_stage = stage.data_ptr().toint(Int32) + warp_idx * Int32(32 * 128)
+            # Store slot of head 4k + lane / 8 (16B chunk lane % 8), hoisted.
+            head_base = base + Int64(
+                slot * Int32(heads) + (warp_idx % Int32(2)) * Int32(32)
+            ) * Int64(dim * 2)
+        for blk in cutlass.range(4, unroll=1):
+            stage_blk = blk // Int32(2)
+            col = (
+                stage_blk * Int32(2 * cfg.head_dim_per_stage_v)
+                + half * Int32(128)
+                + (blk % Int32(2)) * Int32(pub_chunk)
+            )
+            o_loaded = prims.tcgen05_ld(
+                prims.Tcgen05LdStShape.SHAPE_32X32B,
+                prims.make_tmem_ptr(
+                    tmem_o0
+                    + stage_blk * tmem_stage_step
+                    + (blk % Int32(2)) * Int32(pub_chunk),
+                    Float32,
+                ),
+                num=pub_chunk,
+            )
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+            cute.arch.fence_view_async_tmem_load()
+            for q in cutlass.range_constexpr(pub_chunk // 8):
+                words = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+                for e in cutlass.range_constexpr(4):
+                    words[e] = pack_float2_to_bf16(
+                        o_loaded[8 * q + 2 * e] * store_scale,
+                        o_loaded[8 * q + 2 * e + 1] * store_scale,
+                    )
+                    if not o_live:
+                        words[e] = Int32(0)
+                if cutlass.const_expr(_SK_PUB == "stage"):
+                    # Row ``lane`` of the warp slice; 16B chunk q sits at q ^ (lane & 7).
+                    cutlass.inttoptr(
+                        warp_stage
+                        + lane_idx * Int32(128)
+                        + ((Int32(q) ^ (lane_idx & Int32(7))) << Int32(4)),
+                        mem_space=3,
+                        dtype=Int32,
+                    ).store(words.load(0, 4), alignment=16)
+                else:
+                    cutlass.inttoptr(
+                        row_base + Int64(col + Int32(8 * q)) * Int64(2),
+                        mem_space=1,
+                        dtype=Int32,
+                    ).store(words.load(0, 4), alignment=16)
+            if cutlass.const_expr(_SK_PUB == "stage"):
+                # Eight lanes write one head's 128B line: four whole lines per store.
+                cute.arch.sync_warp()
+                for k in cutlass.range_constexpr(8):
+                    h_local = Int32(4 * k) + lane_idx // Int32(8)
+                    c = lane_idx % Int32(8)
+                    staged = cutlass.inttoptr(
+                        warp_stage
+                        + h_local * Int32(128)
+                        + ((c ^ (h_local & Int32(7))) << Int32(4)),
+                        mem_space=3,
+                        dtype=Int32,
+                    ).load(count=4, alignment=16)
+                    cutlass.inttoptr(
+                        head_base
+                        + Int64(h_local) * Int64(dim * 2)
+                        + Int64(col + c * Int32(8)) * Int64(2),
+                        mem_space=1,
+                        dtype=Int32,
+                    ).store(staged, alignment=16)
+                cute.arch.sync_warp()
+
+    @cute.jit
     def _sk_store_partial_and_merge(
         self,
         stage_info: StageInfo,
@@ -3929,6 +4070,30 @@ class TmemCorrResource(MlaResource):
             )
             if cutlass.const_expr(cfg.stream_k and _SKDBG == "nomerge"):
                 if Int32(task_cache[_TASK_CACHE_SK_NSEG]) == Int32(1):
+                    self._store_final_tail(
+                        stage_info,
+                        task_cache,
+                        final_max,
+                        reduced_sum,
+                        final_scale0,
+                        final_scale1,
+                        tail_o_stage_idx_0,
+                        tail_o_stage_idx_1,
+                        head_dim_offset,
+                        quant_staged,
+                    )
+            elif cutlass.const_expr(cfg.stream_k and cfg.stream_k_reduce):
+                if Int32(task_cache[_TASK_CACHE_SK_NSEG]) > Int32(1):
+                    if cutlass.const_expr(_SKDBG != "nopub"):
+                        self._sk_store_partial_slot(
+                            stage_info,
+                            task_cache,
+                            final_max,
+                            reduced_sum,
+                            final_scale0,
+                            tail_o_stage_idx_0,
+                        )
+                else:
                     self._store_final_tail(
                         stage_info,
                         task_cache,

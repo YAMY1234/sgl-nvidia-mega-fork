@@ -245,6 +245,11 @@ class MlaConfig(Nvfp4KVConfig):
     stream_k: bool = False
     stream_k_tiles_per_row: int = 0
     stream_k_max_ctas: int = 0
+    # MEGA_D576_STREAMK=2: every segment of a split row publishes a partial and
+    # a PDL-launched gmem reducer combines them (no in-kernel merge). The grid
+    # gives each CTA at least stream_k_min_tiles planned tiles.
+    stream_k_reduce: bool = False
+    stream_k_min_tiles: int = 1
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
     # Planned KV tiles per instruction group (1 Keeps, 2 Swaps); zero selects

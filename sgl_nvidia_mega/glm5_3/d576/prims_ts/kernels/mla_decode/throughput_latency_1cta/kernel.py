@@ -93,6 +93,7 @@ from .parallel_reduction import (
     parallel_gmem_reduction_launch_shape,
     parallel_gmem_reduction_threads,
     run_parallel_gmem_reduction_kernel,
+    run_stream_k_gmem_reduction_kernel,
     supports_parallel_gmem_reduction,
 )
 from .reduction import gmem_reduction_launch_shape, run_gmem_reduction_kernel
@@ -1966,6 +1967,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.stream_k = False
         self.stream_k_tiles_per_row = 0
         self.stream_k_max_ctas = 0
+        self.stream_k_reduce = False
+        self.stream_k_min_tiles = 1
 
         cfg = self._make_config()
         # Parallel standalone reduction requires a fixed split profile and a
@@ -2175,6 +2178,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 stream_k=True,
                 stream_k_tiles_per_row=self.stream_k_tiles_per_row,
                 stream_k_max_ctas=self.stream_k_max_ctas,
+                stream_k_reduce=self.stream_k_reduce,
+                stream_k_min_tiles=self.stream_k_min_tiles,
             )
         if self.split_kv_capacity is not None and cfg.use_multi_ctas_kv == 1:
             cfg = dataclass_replace(cfg, num_ctas_per_seq_kv=self.split_kv_capacity)
@@ -2716,17 +2721,18 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 # Each CTA takes at least ceil((tiles - 1) / 3) tiles, so a row
                 # spans at most four CTAs (the merge handles three peers).
                 sk_units = batch_size * Int32(cfg.stream_k_tiles_per_row)
-                grid = (
-                    1,
-                    1,
-                    cute.math.max(
-                        cute.math.min(
-                            Int32(cfg.stream_k_max_ctas),
-                            sk_units // Int32((cfg.stream_k_tiles_per_row + 1) // 3),
-                        ),
-                        Int32(1),
+                sk_min_share = (cfg.stream_k_tiles_per_row + 1) // 3
+                if cutlass.const_expr(cfg.stream_k_reduce):
+                    # The reducer takes any segment count: no peer limit.
+                    sk_min_share = cfg.stream_k_min_tiles
+                sk_ctas = cute.math.max(
+                    cute.math.min(
+                        Int32(cfg.stream_k_max_ctas),
+                        sk_units // Int32(sk_min_share),
                     ),
+                    Int32(1),
                 )
+                grid = (1, 1, sk_ctas)
         else:
             launch_splits = Int32(cfg.num_ctas_per_seq_kv)
             if cutlass.const_expr(self.runtime_split_kv and use_gmem_reduction):
@@ -2802,6 +2808,35 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             min_blocks_per_mp=1,
             use_pdl=acc_o is not None or cfg.use_pdl,
         )
+        if cutlass.const_expr(
+            cfg.stream_k
+            and cfg.stream_k_reduce
+            and _SKDBG not in ("nored", "nopub")
+        ):
+            sk_heads, sk_dim = 64, 512
+            sk_slots = 2 * cfg.stream_k_max_ctas
+            sk_o = cute.make_tensor(
+                cute.recast_ptr(workspace.iterator, dtype=cutlass.BFloat16),
+                cute.make_layout(sk_slots * sk_heads * sk_dim),
+            )
+            sk_lse = cute.make_tensor(
+                cute.recast_ptr(
+                    workspace.iterator + Int64(sk_slots * sk_heads * sk_dim * 2),
+                    dtype=Float32,
+                ),
+                cute.make_layout(sk_slots * sk_heads),
+            )
+            sk_elements = PARALLEL_GMEM_REDUCTION_ELEMENTS_PER_SLICE
+            self.stream_k_reduction_kernel(
+                o, lse, sk_o, sk_lse, cache_seqs, cu_seqlens_q, sk_ctas,
+                max_q_len=max_q_len,
+            ).launch(
+                grid=(cfg.num_heads_q * cfg.head_dim_v // sk_elements, 1, batch_size),
+                block=[parallel_gmem_reduction_threads(sk_elements), 1, 1],
+                stream=stream,
+                min_blocks_per_mp=1,
+                use_pdl=True,
+            )
         if cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(
                 self.use_parallel_reduction or cfg.fuse_sparse_reduction
@@ -3309,6 +3344,36 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             num_reduction_ctas,
             requested_splits=requested_splits,
             cp_rank=cp_rank,
+        )
+
+    @cute.kernel
+    def stream_k_reduction_kernel(
+        self,
+        output: cute.Tensor,
+        lse: cute.Tensor,
+        sk_o: cute.Tensor,
+        sk_lse: cute.Tensor,
+        cache_seqs: cute.Tensor,
+        cu_seqlens_q: cute.Tensor,
+        sk_ctas: Int32,
+        max_q_len: cutlass.Int32 = 0,
+    ):
+        """Combine the stream-K segment partials of split rows."""
+
+        cfg = dataclass_replace(
+            self.runtime_config(max_q_len),
+            num_ctas_per_seq_kv=self.stream_k_tiles_per_row,
+        )
+        run_stream_k_gmem_reduction_kernel(
+            output,
+            lse,
+            sk_o,
+            sk_lse,
+            cache_seqs,
+            cu_seqlens_q,
+            cfg,
+            sk_ctas,
+            PARALLEL_GMEM_REDUCTION_ELEMENTS_PER_SLICE,
         )
 
     @cute.kernel

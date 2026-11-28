@@ -33,12 +33,15 @@ from ..helpers.ops import (
     warp_reduce_sum_f32,
 )
 from ..helpers.query import flat_query_row_state, public_query_flat_row
-from ..helpers.tile import runtime_request_publishes
+from ..helpers.tile import runtime_request_publishes, stream_k_row_span
 from ..parallel_reduction_topology import ParallelReductionTopology
 from .config import MlaConfig
 
 
 GMEM_REDUCTION_WARP_LANES = 32
+# Stream-K reducer: segment partials loaded before the statistics round trip
+# (MEGA_D576_SK_PREFETCH, 0 disables); segments past it load after the stats.
+_SK_PREFETCH = int(__import__("os").environ.get("MEGA_D576_SK_PREFETCH", "4"))
 GMEM_REDUCTION_WARPS_PER_CTA = 4
 # A runtime split count runs in the smallest fully unrolled window that holds
 # it; only the slots above the previous window are predicated. One compiled
@@ -95,6 +98,29 @@ def _split_o_row_base_offset(
             + Int64(head_idx)
         )
         * Int64(cfg.num_ctas_per_seq_kv)
+    ) * Int64(cfg.head_dim_v) + Int64(dim_idx)
+
+
+@cute.jit
+def _stream_k_slot(stream_k, split_idx: Int32) -> Int32:
+    """Slot of segment ``split_idx`` of a row whose first CTA is stream_k[0]."""
+
+    first, _, max_ctas = stream_k
+    slot = first + split_idx
+    if split_idx > Int32(0):
+        slot = slot + max_ctas
+    return slot
+
+
+@cute.jit
+def _split_o_offset(cfg: MlaConfig, stream_k, split_idx, head_idx, dim_idx) -> Int64:
+    """Offset of one split partial from the row base (stream-K: from the base)."""
+
+    if cutlass.const_expr(stream_k is None):
+        return Int64(split_idx) * Int64(cfg.head_dim_v)
+    return (
+        Int64(_stream_k_slot(stream_k, split_idx)) * Int64(cfg.num_heads_q)
+        + Int64(head_idx)
     ) * Int64(cfg.head_dim_v) + Int64(dim_idx)
 
 
@@ -229,14 +255,21 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     output_quant_args=None,
     requested_splits=None,
     request_is_active=True,
+    stream_k=None,
 ):
-    """Reduce G1 partials with the compact row-shared schedule."""
+    """Reduce G1 partials with the compact row-shared schedule.
+
+    ``stream_k`` = (first CTA, nseg, max CTAs) reads stream-K segment slots
+    (see _stream_k_slot) instead of the fixed [row][head][split] layout.
+    """
 
     split_limit = (
         Int32(cfg.num_ctas_per_seq_kv)
         if requested_splits is None
         else runtime_split_count(requested_splits)
     )
+    if cutlass.const_expr(stream_k is not None):
+        split_limit = stream_k[1]
 
     slice_idx, block_idx_y, batch_idx = cute.arch.block_idx()
     thread_idx, _, _ = cute.arch.thread_idx()
@@ -292,6 +325,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     # a fixed split count knows every slot at compile time.
     prefetch_partials = cutlass.const_expr(
         requested_splits is None
+        and stream_k is None
         and cfg.num_ctas_per_seq_kv * output_elements_per_thread
         <= _MAX_PREFETCH_PARTIAL_ELEMENTS
     )
@@ -321,6 +355,33 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                         elem_i
                     ]
 
+    sk_prefetch = 0
+    if cutlass.const_expr(stream_k is not None and output_elements_per_thread == 8):
+        sk_prefetch = min(_SK_PREFETCH, cfg.num_ctas_per_seq_kv)
+    if cutlass.const_expr(sk_prefetch > 0):
+        # Slots past nseg clamp to the last live segment; they are never used.
+        sk_last = split_limit - Int32(1)
+        sk_prefetched = cutlass.Array(
+            acc_output.element_type,
+            sk_prefetch * output_elements_per_thread,
+            space=cutlass.AddressSpace.rmem,
+        )
+        for split_i in cutlass.range_constexpr(sk_prefetch):
+            load_idx = cute.math.min(Int32(split_i), sk_last)
+            sk_ptr = acc_output.iterator.raw_ptr() + (
+                _split_o_offset(cfg, stream_k, load_idx, head_idx, dim_idx)
+                if valid_output
+                else Int64(0)
+            )
+            values = sk_ptr.load(
+                count=output_elements_per_thread,
+                alignment=output_elements_per_thread * cfg.partial_o_dtype_bytes,
+            )
+            for elem_i in cutlass.range_constexpr(output_elements_per_thread):
+                sk_prefetched[split_i * output_elements_per_thread + elem_i] = values[
+                    elem_i
+                ]
+
     smem_scale = cutlass.Array(
         Float32,
         rows_per_slice * cfg.num_ctas_per_seq_kv,
@@ -349,7 +410,8 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
         if cutlass.const_expr(not finalize_attention):
             valid_stats = valid_stats & request_is_active
         if valid_stats:
-            row_lse = acc_lse[stats_head_idx, None, q_idx, batch_idx]
+            if cutlass.const_expr(stream_k is None):
+                row_lse = acc_lse[stats_head_idx, None, q_idx, batch_idx]
             lse_per_lane = ceil_div(
                 cfg.num_ctas_per_seq_kv,
                 GMEM_REDUCTION_WARP_LANES,
@@ -368,11 +430,21 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                     stats_split_idx = lane_idx + Int32(
                         lane_slot_i * GMEM_REDUCTION_WARP_LANES
                     )
-                    lane_lse[lane_slot_i] = (
-                        Float32(row_lse[stats_split_idx])
-                        if stats_split_idx < split_limit
-                        else Float32(-Float32.inf)
-                    )
+                    lane_lse[lane_slot_i] = Float32(-Float32.inf)
+                    if stats_split_idx < split_limit:
+                        if cutlass.const_expr(stream_k is None):
+                            lane_lse[lane_slot_i] = Float32(row_lse[stats_split_idx])
+                        else:
+                            lane_lse[lane_slot_i] = Float32(
+                                (
+                                    acc_lse.iterator.raw_ptr()
+                                    + Int64(
+                                        _stream_k_slot(stream_k, stats_split_idx)
+                                        * Int32(cfg.num_heads_q)
+                                        + stats_head_idx
+                                    )
+                                ).load()
+                            )
                     lse_max = fmax_f32(lse_max, lane_lse[lane_slot_i])
 
             lse_max = warp_reduce_max_f32(lse_max)
@@ -405,7 +477,15 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                     batch_idx,
                     cu_seqlens_q,
                 )
-                if cutlass.const_expr(lse is not None):
+                if cutlass.const_expr(lse is not None and stream_k is not None):
+                    # Match the main kernel's final LSE convention.
+                    out_lse = global_lse
+                    if cutlass.const_expr(cfg.fuse_sparse_epilogue):
+                        out_lse = out_lse * Float32(0.6931471805599453)
+                    (lse.iterator.raw_ptr() + stats_output_query_row).store(
+                        final_lse(out_lse, cfg.lse_base_on_e)
+                    )
+                elif cutlass.const_expr(lse is not None):
                     (lse.iterator.raw_ptr() + stats_output_query_row).store(
                         final_lse(global_lse, cfg.lse_base_on_e or finalize_attention)
                     )
@@ -466,23 +546,75 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                                 (scale, scale),
                                 (output_acc[elem_i], output_acc[elem_i + 1]),
                             )
+        elif cutlass.const_expr(sk_prefetch > 0):
+            for split_i in cutlass.range_constexpr(sk_prefetch):
+                scale = Float32(0)
+                if Int32(split_i) < split_limit:
+                    scale = Float32(
+                        smem_scale[
+                            row_in_slice * Int32(cfg.num_ctas_per_seq_kv)
+                            + Int32(split_i)
+                        ]
+                    )
+                # Select live segments; an empty segment never multiplies in.
+                if scale > Float32(0):
+                    base = split_i * output_elements_per_thread
+                    for elem_i in cutlass.range_constexpr(
+                        0, output_elements_per_thread, 2
+                    ):
+                        output_acc[elem_i], output_acc[elem_i + 1] = ffma2(
+                            (
+                                Float32(sk_prefetched[base + elem_i]),
+                                Float32(sk_prefetched[base + elem_i + 1]),
+                            ),
+                            (scale, scale),
+                            (output_acc[elem_i], output_acc[elem_i + 1]),
+                        )
+            if cutlass.const_expr(sk_prefetch < cfg.num_ctas_per_seq_kv):
+                for split_idx in cutlass.range(Int32(sk_prefetch), split_limit, 1):
+                    scale = Float32(
+                        smem_scale[
+                            row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + split_idx
+                        ]
+                    )
+                    if scale > Float32(0):
+                        partial_o = (
+                            acc_output.iterator.raw_ptr()
+                            + _split_o_offset(
+                                cfg, stream_k, split_idx, head_idx, dim_idx
+                            )
+                        ).load(
+                            count=output_elements_per_thread,
+                            alignment=output_elements_per_thread
+                            * cfg.partial_o_dtype_bytes,
+                        ).to(Float32)
+                        for elem_i in cutlass.range_constexpr(
+                            0, output_elements_per_thread, 2
+                        ):
+                            output_acc[elem_i], output_acc[elem_i + 1] = ffma2(
+                                (partial_o[elem_i], partial_o[elem_i + 1]),
+                                (scale, scale),
+                                (output_acc[elem_i], output_acc[elem_i + 1]),
+                            )
         else:
             # Scratch strides remain static for the prepared capacity. Form the
             # 64-bit row base once to avoid repeated address linearization.
             # Runtime counts up to the largest window stay on an unrolled path;
             # only counts above it use the runtime chunk loop. Padding slots are
             # never read: predicated slots clamp to the last live split.
-            acc_row_ptr = acc_output.iterator.raw_ptr() + _split_o_row_base_offset(
-                cfg,
-                batch_idx,
-                q_idx,
-                head_idx,
-                dim_idx,
-            )
+            acc_row_ptr = acc_output.iterator.raw_ptr()
+            if cutlass.const_expr(stream_k is None):
+                acc_row_ptr = acc_row_ptr + _split_o_row_base_offset(
+                    cfg,
+                    batch_idx,
+                    q_idx,
+                    head_idx,
+                    dim_idx,
+                )
             # Pair FP32 channels while preserving each channel's split order.
             # Static splits unroll their exact count. A runtime count selects the
             # smallest window above it; slots at or below window_floor are live.
-            if cutlass.const_expr(requested_splits is None):
+            if cutlass.const_expr(requested_splits is None and stream_k is None):
                 windows = ((cfg.num_ctas_per_seq_kv - 1, cfg.num_ctas_per_seq_kv),)
             else:
                 windows = _runtime_split_windows(cfg.num_ctas_per_seq_kv)
@@ -509,10 +641,13 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                         )
                         if cutlass.const_expr(split_i > window_floor):
                             scale = scale if split_idx < split_limit else Float32(0)
-                        # Sparse inactive splits may leave their O partial untouched.
-                        if not finalize_attention or scale > Float32(0):
-                            split_ptr = acc_row_ptr + Int64(load_idx) * Int64(
-                                cfg.head_dim_v
+                        # Sparse inactive splits may leave their O partial untouched;
+                        # stream-K selects live segments instead of multiplying by 0.
+                        if (
+                            not finalize_attention and stream_k is None
+                        ) or scale > Float32(0):
+                            split_ptr = acc_row_ptr + _split_o_offset(
+                                cfg, stream_k, load_idx, head_idx, dim_idx
                             )
                             if cutlass.const_expr(output_elements_per_thread == 1):
                                 output_acc[0] += Float32(split_ptr.load()) * scale
@@ -550,8 +685,8 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                             )
                             scale = scale if split_idx < split_limit else Float32(0)
                             if not finalize_attention or scale > Float32(0):
-                                split_ptr = acc_row_ptr + Int64(load_idx) * Int64(
-                                    cfg.head_dim_v
+                                split_ptr = acc_row_ptr + _split_o_offset(
+                                    cfg, stream_k, load_idx, head_idx, dim_idx
                                 )
                                 if cutlass.const_expr(output_elements_per_thread == 1):
                                     output_acc[0] += Float32(split_ptr.load()) * scale
@@ -1073,4 +1208,44 @@ def run_parallel_gmem_reduction_kernel(
         elements_per_slice,
         requested_splits=requested_splits,
         request_is_active=request_is_active,
+    )
+
+
+@cute.jit
+def run_stream_k_gmem_reduction_kernel(
+    output,
+    lse,
+    acc_output,
+    acc_lse,
+    cache_seqs,
+    cu_seqlens_q,
+    cfg,
+    stream_k_ctas,
+    elements_per_slice: cutlass.Constexpr[int],
+):
+    """Combine stream-K segment partials of split rows (nseg > 1).
+
+    Rows held by one CTA were finished by the main kernel; their reducer
+    CTAs exit after the PDL wait. ``cfg.num_ctas_per_seq_kv`` must bound
+    nseg (the planned tiles per row).
+    """
+
+    prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+    prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+    row = cute.arch.block_idx()[2]
+    first, nseg = stream_k_row_span(
+        cfg, cache_seqs, Int32(cute.size(cache_seqs.shape)), row, stream_k_ctas
+    )
+    # Inactive (single-segment) rows skip every load and store.
+    _run_parallel_gmem_reduction_g1_shared_stats(
+        output,
+        lse,
+        acc_output,
+        acc_lse,
+        cache_seqs,
+        cu_seqlens_q,
+        cfg,
+        elements_per_slice,
+        request_is_active=nseg > Int32(1),
+        stream_k=(first, nseg, Int32(cfg.stream_k_max_ctas)),
     )

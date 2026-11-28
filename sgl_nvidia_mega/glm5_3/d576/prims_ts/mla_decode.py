@@ -80,6 +80,9 @@ _PDL_TRIGGER = int(__import__("os").environ.get("MEGA_D576_PDL_TRIGGER", "0"))
 _PDL_LATEWAIT = __import__("os").environ.get("MEGA_D576_PDL_LATEWAIT", "0") == "1"
 _IDXPREFETCH = __import__("os").environ.get("MEGA_D576_IDXPREFETCH", "0") == "1"
 _PDL_LOGGED = False
+_OSTORE = __import__("os").environ.get("MEGA_D576_OSTORE", "")
+if _OSTORE not in ("", "0", "smem", "tma"):
+    raise ValueError(f"MEGA_D576_OSTORE must be smem or tma, got {_OSTORE!r}")
 _MLA_QUERY_DIM = _MLA_LATENT_DIM + _MLA_ROPE_DIM
 _SUPPORTED_INPUT_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 _SUPPORTED_OUTPUT_DTYPES = (torch.bfloat16,)
@@ -3226,6 +3229,8 @@ class BatchSparseMLADecodePagedTSWrapper:
                 # MEGA_D576_IDXPREFETCH=1: first-tile indices load beside lengths.
                 kernel.pdl_late_wait = _PDL_LATEWAIT
                 kernel.sparse_index_prefetch = _IDXPREFETCH
+                # MEGA_D576_OSTORE=smem|tma: final BF16 O staged through SMEM.
+                kernel.ws_output_store = "" if _OSTORE == "0" else _OSTORE
             kernel.direct_sparse = True
             kernel.direct_sparse_capacities = (max_topk, max_extra_topk)
             spec = replace(

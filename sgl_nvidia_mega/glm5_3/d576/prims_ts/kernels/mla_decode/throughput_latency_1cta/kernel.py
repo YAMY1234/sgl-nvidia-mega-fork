@@ -2029,6 +2029,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.pdl_entry_trigger_max_ctas = 0
         self.pdl_late_wait = False
         self.sparse_index_prefetch = False
+        self.ws_output_store = ""
 
         cfg = self._make_config()
         # Parallel standalone reduction requires a fixed split profile and a
@@ -2236,6 +2237,15 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             cfg = dataclass_replace(cfg, pdl_late_wait=True)
         if self.sparse_index_prefetch:
             cfg = dataclass_replace(cfg, sparse_index_prefetch=True)
+        if self.ws_output_store and cfg.ws_pv and cfg.ws_native_e:
+            # MEGA_D576_OSTORE: the WS Layout-E final-O store through SMEM in
+            # 64-column chunks (smem: coalesced STG.128; tma: SW128 TMA boxes).
+            # The FP8 WS profile already uses these paths; Layout E is shared.
+            cfg = dataclass_replace(
+                cfg,
+                ws_coalesce_cols=64,
+                ws_tma_output=self.ws_output_store == "tma",
+            )
         if self.split_kv_capacity is not None and cfg.use_multi_ctas_kv == 1:
             cfg = dataclass_replace(cfg, num_ctas_per_seq_kv=self.split_kv_capacity)
         if not self.fixed_seqlen:

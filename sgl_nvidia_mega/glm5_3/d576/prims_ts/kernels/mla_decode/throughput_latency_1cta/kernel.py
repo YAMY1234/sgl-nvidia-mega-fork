@@ -1927,6 +1927,8 @@ def _make_single_kv_pipe_task_graph(
     )
     return task_manager, corr
 
+_OSTORE_LOGGED = False
+
 
 class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
     """Throughput-latency 1CTA MLA over dense pages or prepared sparse rows."""
@@ -2246,6 +2248,12 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 ws_coalesce_cols=64,
                 ws_tma_output=self.ws_output_store == "tma",
             )
+            global _OSTORE_LOGGED
+            if not _OSTORE_LOGGED:
+                _OSTORE_LOGGED = True
+                __import__("logging").getLogger(__name__).info(
+                    "MEGA_D576_OSTORE engaged mode=%s", self.ws_output_store
+                )
         if self.split_kv_capacity is not None and cfg.use_multi_ctas_kv == 1:
             cfg = dataclass_replace(cfg, num_ctas_per_seq_kv=self.split_kv_capacity)
         if not self.fixed_seqlen:

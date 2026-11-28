@@ -245,6 +245,11 @@ class MlaConfig(Nvfp4KVConfig):
     stream_k: bool = False
     stream_k_tiles_per_row: int = 0
     stream_k_max_ctas: int = 0
+    # Fewest planned tiles per CTA: caps the wave at rows x tiles / this.
+    stream_k_min_tiles: int = 1
+    # Relaxed polls (~64 ns apart) the row's first CTA waits for its peers
+    # before falling back to publishing (MEGA_D576_SK_SPIN).
+    stream_k_spin_polls: int = 32
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
     # Planned KV tiles per instruction group (1 Keeps, 2 Swaps); zero selects

@@ -609,3 +609,34 @@ def stream_k_row_owner(cfg: MlaConfig, num_rows, unit):
     total = Int32(num_rows) * Int32(cfg.stream_k_tiles_per_row)
     ctas = Int32(cute.arch.grid_dim()[2])
     return ((Int32(unit) + Int32(1)) * ctas + total - Int32(1)) // total - Int32(1)
+
+
+def stream_k_workspace_layout(max_ctas: int):
+    """Byte offsets of the stream-K workspace: two BF16 partial slots per CTA,
+    each [correction warp 4][col / 8 32][head 32][8 x BF16] (one contiguous
+    16 KB slice per warp), then their FP32 LSEs [slot][warp][32], then one
+    INT32 counter per row."""
+    slot_bytes = 64 * 512 * 2
+    off_lse = 2 * max_ctas * slot_bytes
+    off_cnt = off_lse + 2 * max_ctas * 4 * 32 * 4
+    return slot_bytes, off_lse, off_cnt
+
+
+# MEGA_D576_SKTRACE=1 (debug): per-CTA globaltimer stamps after the counters.
+SK_TRACE = __import__("os").environ.get("MEGA_D576_SKTRACE", "0") == "1"
+SK_TRACE_ROWS = 4096
+
+
+@cute.jit
+def sk_trace(cfg, sk_workspace, event: int):
+    """Stamp event ``event`` (0..15) of this CTA when MEGA_D576_SKTRACE=1."""
+    if cutlass.const_expr(SK_TRACE and cfg.stream_k):
+        _, _, off_cnt = stream_k_workspace_layout(cfg.stream_k_max_ctas)
+        cutlass.inttoptr(
+            cutlass.Int64(sk_workspace.iterator.toint())
+            + cutlass.Int64(off_cnt + SK_TRACE_ROWS * 4)
+            + cutlass.Int64(Int32(cute.arch.block_idx()[2]) * Int32(16) + Int32(event))
+            * cutlass.Int64(8),
+            mem_space=1,
+            dtype=cutlass.Int64,
+        ).store(cutlass.Int64(cute.arch.globaltimer()))

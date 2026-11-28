@@ -80,6 +80,8 @@ _PDL_TRIGGER = int(__import__("os").environ.get("MEGA_D576_PDL_TRIGGER", "0"))
 # MEGA_D576_STREAMK=1: D576 H64 1CTA plans run one stream-K wave (see
 # MlaConfig.stream_k) instead of the per-row persistent or split+reducer grid.
 _STREAMK = __import__("os").environ.get("MEGA_D576_STREAMK", "0") == "1"
+# MEGA_D576_SK_MIN_TILES=k: at most rows x tiles / k CTAs (fewer, longer shares).
+_STREAMK_MIN_TILES = int(__import__("os").environ.get("MEGA_D576_SK_MIN_TILES", "1"))
 _MLA_QUERY_DIM = _MLA_LATENT_DIM + _MLA_ROPE_DIM
 _SUPPORTED_INPUT_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 _SUPPORTED_OUTPUT_DTYPES = (torch.bfloat16,)
@@ -2711,6 +2713,9 @@ def _resolve_sparse_mla_plan(
     stream_k = (
         _STREAMK
         and profile.family == "keep"
+        # Only the persistent per-row regime (rows >= SMs / 2); split plans
+        # below it already fill the wave.
+        and profile.scheduler != "nonpersistent"
         and qk_rope_head_dim == 64
         and q_dtype == torch.float8_e4m3fn
         and num_qo_heads == 64
@@ -2718,16 +2723,12 @@ def _resolve_sparse_mla_plan(
         and not max_extra_topk
         and not use_attention_sinks
         and output_quant is None
-        and max_rows <= 4096
+        # The FP8-primary tail scale lookup has no stream-K tile offset.
+        and kv_cache_format != "fp8"
     )
     if stream_k:
-        # One static persistent wave; the per-row persistent schedule's tiles.
-        profile = replace(
-            profile, split_kv=1, scheduler="static", whole_kv_tile=False
-        )
-    if __import__("os").environ.get("MEGA_D576_SKDBG") == "static":
+        # One static persistent wave over the per-row schedule's tiles.
         profile = replace(profile, scheduler="static")
-        stream_k = False
     family, tile = profile.family, profile.tile_size_q
     splits, head_dim_ctas = profile.split_kv, profile.head_dim_ctas
     dtype_name = "bf16" if q_dtype == torch.bfloat16 else "e4m3"
@@ -2806,6 +2807,7 @@ def _resolve_sparse_mla_plan(
             kernel.stream_k = True
             kernel.stream_k_tiles_per_row = capacity // 128
             kernel.stream_k_max_ctas = sm_count
+            kernel.stream_k_min_tiles = _STREAMK_MIN_TILES
         core_bytes = compute_workspace_size(
             cfg=kernel._make_config(),
             partial_o_dtype=cutlass.BFloat16,
@@ -2836,13 +2838,19 @@ def _resolve_sparse_mla_plan(
 
 
 def _stream_k_workspace_bytes(sm_count: int, max_rows: int) -> int:
-    """One BF16 O + FP32 LSE partial slot per CTA, then one counter per row x warp."""
-    # Counters (up to 4096 rows x 4 warps), then a 16-slot debug timeline per CTA.
-    return _stream_k_counter_offset(sm_count) + 65536 + sm_count * 128
+    """Stream-K partial slots and LSEs, then one merge counter per row."""
+    from .kernels.mla_decode.helpers.tile import stream_k_workspace_layout
+
+    from .kernels.mla_decode.helpers.tile import SK_TRACE_ROWS
+
+    # Counters, then a 16-slot debug timeline per CTA (MEGA_D576_SKTRACE).
+    return stream_k_workspace_layout(sm_count)[2] + max(max_rows, SK_TRACE_ROWS) * 4 + sm_count * 128
 
 
 def _stream_k_counter_offset(sm_count: int) -> int:
-    return sm_count * (64 * 512 * 2 + 2 * 64 * 4)
+    from .kernels.mla_decode.helpers.tile import stream_k_workspace_layout
+
+    return stream_k_workspace_layout(sm_count)[2]
 
 
 _D576_HEAD_DIM = 576
@@ -3227,10 +3235,10 @@ class BatchSparseMLADecodePagedTSWrapper:
             for name, section in sections.items()
         }
         if family != "2cta" and spec.kernel.stream_k:
-            # Merge counters start at zero; each merge resets its own.
-            buffers["core"][
-                _stream_k_counter_offset(spec.kernel.stream_k_max_ctas) :
-            ].zero_()
+            # Stream-K partials and merge counters live in a wrapper-owned
+            # buffer: the counters must start at zero and are never shared with
+            # another plan's scratch. Each completed row resets its counter.
+            buffers["core"] = torch.zeros_like(buffers["core"])
         # Finalize the joint distribution in the main kernel or its existing
         # split-KV reducer. No per-source outputs or finishing launch are needed.
         if not reload_d576:

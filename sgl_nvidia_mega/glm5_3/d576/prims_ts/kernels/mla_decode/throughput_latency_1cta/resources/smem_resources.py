@@ -684,6 +684,8 @@ class SmemPageOffsetsResource(MlaResource):
     _smem_page_offsets: object = None
     nv_target: cutlass.Constexpr = None
     request_lengths: object = None
+    # MEGA_D576_IDXPREFETCH: rmem [row, tile_start, i0..i3] filled at kernel entry.
+    idx_prefetch: object = None
     cached_page_ids: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
@@ -862,14 +864,39 @@ class SmemPageOffsetsResource(MlaResource):
                 # gather, avoiding another global index read in KV loaders.
                 # Full tiles can use unmasked reads; live-length tails and
                 # holes preserve the source tag on synthesized invalid rows.
-                if tile_start + pages_per_tile <= routes.origin + routes.length:
-                    quad = routes.load_full_quad(tile_start + position)
-                    for j in cutlass.range_constexpr(4):
-                        raw[j] = quad[j]
+                if cutlass.const_expr(self.idx_prefetch is None):
+                    if tile_start + pages_per_tile <= routes.origin + routes.length:
+                        quad = routes.load_full_quad(tile_start + position)
+                        for j in cutlass.range_constexpr(4):
+                            raw[j] = quad[j]
+                    else:
+                        quad = routes.load_quad(tile_start + position)
+                        for j in cutlass.range_constexpr(4):
+                            raw[j] = quad[j]
                 else:
-                    quad = routes.load_quad(tile_start + position)
-                    for j in cutlass.range_constexpr(4):
-                        raw[j] = quad[j]
+                    # The entry prefetch read this lane's quad of a primary row
+                    # at a guessed tile; on a match apply load_quad's masks
+                    # (live length, -1 holes, source tag) to it instead.
+                    pf = self.idx_prefetch
+                    if (
+                        (Int32(pf[0]) == batch_idx)
+                        & (Int32(pf[1]) == tile_start)
+                        & (routes.origin == Int32(0))
+                    ):
+                        for j in cutlass.range_constexpr(4):
+                            index = Int32(pf[2 + j])
+                            valid = tile_start + position + Int32(j) < routes.length
+                            if cutlass.const_expr(not routes.valid_prefix):
+                                valid = valid & (index >= Int32(0))
+                            raw[j] = (index if valid else Int32(0x7FFFFFFF)) | routes.tag
+                    elif tile_start + pages_per_tile <= routes.origin + routes.length:
+                        quad = routes.load_full_quad(tile_start + position)
+                        for j in cutlass.range_constexpr(4):
+                            raw[j] = quad[j]
+                    else:
+                        quad = routes.load_quad(tile_start + position)
+                        for j in cutlass.range_constexpr(4):
+                            raw[j] = quad[j]
                 self._smem_page_offsets.data_ptr(smem_offset).store(
                     raw.load(0, 4), alignment=16
                 )

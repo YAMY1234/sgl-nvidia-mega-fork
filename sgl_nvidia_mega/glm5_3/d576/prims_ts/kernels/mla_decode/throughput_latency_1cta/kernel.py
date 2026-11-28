@@ -105,7 +105,10 @@ from ..helpers.nvfp4_kv import (
 from ..helpers.constants import LOG2_E, TMEM_LIFECYCLE_BARRIER_ID, TMEM_READY_BARRIER_ID
 from ..helpers.math import canonicalize_softmax_rescale_threshold_log2
 from ..helpers.mask import MaskType, normalize_mask_type
+from ..helpers.context_parallel import local_kv_length
+from ..helpers.sparse_indices import _sparse_execution_length
 from ..helpers.tile import (
+    global_kv_tile_idx,
     runtime_request_publishes,
     runtime_split_count,
     runtime_query_tile_is_active,
@@ -467,6 +470,133 @@ def _make_clc_work_queue_and_throttle(
             name=throttle_name,
         ),
     )
+
+
+def _entry_read_options(
+    cfg, kv_producer, acc_o, softmax_scale, output_scale, sparse_inputs
+):
+    """Return (late PDL wait, first-tile index prefetch) for this trace (plain Python).
+
+    Only the sparse-direct path without a custom KV producer and with host
+    scalar scales defers its input reads; anything else keeps the entry wait.
+    """
+    direct = cfg.sparse_direct and kv_producer is None
+    late = (
+        cfg.pdl_late_wait
+        and (cfg.use_pdl or acc_o is not None)
+        and direct
+        and not isinstance(softmax_scale, cute.Tensor)
+        and not isinstance(output_scale, cute.Tensor)
+        and not isinstance(sparse_inputs[5], cute.Tensor)
+    )
+    return late, cfg.sparse_index_prefetch and direct
+
+
+@cute.jit
+def _prefetch_first_sparse_index_quad(
+    cfg: MlaConfig,
+    out,
+    primary_indices,
+    extra_indices,
+    batch_idx,
+    cta_idx_kv,
+    *,
+    persistent: cutlass.Constexpr[bool],
+    requested_splits=None,
+    cp_rank: Int32 = 0,
+):
+    """MEGA_D576_IDXPREFETCH: issue this page-offset lane's first-tile index quad now.
+
+    Rows hold capacity slots, so the quad loads unmasked from the primary row,
+    in parallel with the length load. The tile is guessed from capacity-long
+    rows; out = [row, tile_start, i0..i3] (row -1 when not loaded), which the
+    loader masks, or ignores when the real row/tile/source differ.
+    """
+    out[0] = Int32(-1)
+    out[1] = Int32(-1)
+    for j in cutlass.range_constexpr(4):
+        out[2 + j] = Int32(0)
+    row = Int32(0)
+    if cutlass.const_expr(persistent):
+        # A persistent CTA's first work tile is its own block coordinate.
+        row = Int32(cute.arch.block_idx()[2]) // Int32(cfg.num_ctas_for_all_heads)
+    else:
+        row = Int32(batch_idx)
+    tile_start = Int32(0)
+    if cutlass.const_expr(cfg.use_multi_ctas_kv == 1 and not persistent):
+        full_length = _sparse_execution_length(
+            Int32(primary_indices.shape[-1]),
+            Int32(extra_indices.shape[-1])
+            if cfg.sparse_direct_capacities[1] > 0
+            else Int32(0),
+        )
+        tile_start = global_kv_tile_idx(
+            cfg,
+            Int32(0),
+            local_kv_length(cfg, full_length, cp_rank),
+            cta_idx_kv,
+            requested_splits=requested_splits,
+        ) * Int32(cfg.pages_per_kv_tile)
+    tidx = cute.arch.thread_idx()[0]
+    lane_idx = tidx % Int32(32)
+    issuer = tidx // Int32(32) - Int32(cfg.page_offsets_warp_idx)
+    position = lane_idx * Int32(4)
+    if cutlass.const_expr(cfg.async_nvfp4_kv_gather):
+        position = issuer * Int32(64) + (lane_idx % Int32(16)) * Int32(4)
+    if (
+        issuer >= Int32(0)
+        and issuer < Int32(cfg.page_offsets_num_warps)
+        and position < Int32(cfg.pages_per_kv_tile)
+        and (not cfg.async_nvfp4_kv_gather or lane_idx < Int32(16))
+        and tile_start + position + Int32(4) <= Int32(primary_indices.shape[-1])
+    ):
+        indices = primary_indices[Int64(row), None]
+        values = cutlass.Pointer(
+            indices.iterator + tile_start + position, dtype=Int32
+        ).load(count=4, alignment=4)
+        out[0] = row
+        out[1] = tile_start
+        for j in cutlass.range_constexpr(4):
+            out[2 + j] = Int32(values[j])
+
+
+@cute.jit
+def _runtime_task_graph_activity(
+    cfg: MlaConfig,
+    cache_seqs,
+    cu_seqlens_q,
+    batch_idx,
+    cta_idx_q,
+    cta_idx_kv,
+    *,
+    split_pruning: cutlass.Constexpr[bool],
+    requested_splits=None,
+    cp_rank: Int32 = 0,
+):
+    """The kernel's runtime activity guard, evaluated after a late PDL wait."""
+    query_tile_is_active = cutlass.Boolean(True)
+    split_tile_is_active = cutlass.Boolean(True)
+    if cutlass.const_expr(cu_seqlens_q is not None):
+        query_tile_is_active = cute.arch.make_warp_uniform(
+            runtime_query_tile_is_active(cfg, cu_seqlens_q, batch_idx, cta_idx_q)
+        )
+    if cutlass.const_expr(split_pruning):
+        split_tile_is_active = cute.arch.make_warp_uniform(
+            runtime_split_tile_is_active(
+                cfg,
+                cache_seqs,
+                cu_seqlens_q,
+                batch_idx,
+                cta_idx_q,
+                cta_idx_kv,
+                requested_splits=requested_splits,
+                cp_rank=cp_rank,
+            )
+        )
+    query_tile_is_active = query_tile_is_active & (
+        runtime_request_publishes(cfg, cache_seqs, batch_idx, cp_rank=cp_rank)
+    )
+    return query_tile_is_active, query_tile_is_active and split_tile_is_active
 
 
 def build_throughput_latency_mla_task_manager(
@@ -1897,6 +2027,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.coalesce_keeps_output = False
         self.use_pdl = False
         self.pdl_entry_trigger_max_ctas = 0
+        self.pdl_late_wait = False
+        self.sparse_index_prefetch = False
 
         cfg = self._make_config()
         # Parallel standalone reduction requires a fixed split profile and a
@@ -2100,6 +2232,10 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 use_pdl=True,
                 pdl_entry_trigger_max_ctas=self.pdl_entry_trigger_max_ctas,
             )
+        if self.pdl_late_wait:
+            cfg = dataclass_replace(cfg, pdl_late_wait=True)
+        if self.sparse_index_prefetch:
+            cfg = dataclass_replace(cfg, sparse_index_prefetch=True)
         if self.split_kv_capacity is not None and cfg.use_multi_ctas_kv == 1:
             cfg = dataclass_replace(cfg, num_ctas_per_seq_kv=self.split_kv_capacity)
         if not self.fixed_seqlen:
@@ -2839,7 +2975,15 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self.runtime_config(max_q_len)
-        if cutlass.const_expr(cfg.use_pdl or acc_o is not None):
+        late_wait, index_prefetch = _entry_read_options(
+            cfg,
+            self.kv_producer,
+            acc_o,
+            softmax_scale_operand,
+            output_scale,
+            sparse_inputs,
+        )
+        if cutlass.const_expr((cfg.use_pdl or acc_o is not None) and not late_wait):
             # A PDL launch can start before the preceding grid completes, so
             # every input read below (metadata, Q, KV, sinks) waits for it.
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
@@ -2889,6 +3033,11 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                         capacity + ((cutlass.Int32(ci.shape[-1]) + 127) // 128) * 128
                     )
                 capacity = cute.math.max(cutlass.Int32(256), capacity)
+                if cutlass.const_expr(late_wait):
+                    # Binding a row loads its lengths here, before the late
+                    # wait. Leave the views unbound (the persistent form):
+                    # every length read then happens at its use, after it.
+                    request = None
                 page_offsets, cache_seqs = bind_sparse_kv_indices(
                     si,
                     ci,
@@ -2952,7 +3101,24 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             and runtime_split_pruning_is_profitable(cfg.num_ctas_per_seq_kv)
         )
         has_runtime_activity_guard = tile_sched_params is None
-        if cutlass.const_expr(has_runtime_activity_guard):
+        index_prefetch_quad = None
+        if cutlass.const_expr(index_prefetch):
+            index_prefetch_quad = cutlass.Array(
+                Int32, 6, space=cutlass.AddressSpace.rmem
+            )
+            if cutlass.const_expr(not late_wait):
+                _prefetch_first_sparse_index_quad(
+                    cfg,
+                    index_prefetch_quad,
+                    sparse_inputs[0],
+                    sparse_inputs[1],
+                    batch_idx,
+                    cta_idx_kv,
+                    persistent=not has_runtime_activity_guard,
+                    requested_splits=requested_splits,
+                    cp_rank=cp_rank,
+                )
+        if cutlass.const_expr(has_runtime_activity_guard and not late_wait):
             # Decode launch coordinates against the configured maximum grid,
             # then independently drop compact-Q padding and profitable split
             # suffixes. S2/S3 retain configured split work: too few mainloop
@@ -3072,12 +3238,16 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             kv_producer=self.kv_producer,
             kv_producer_args=kv_producer_args,
         )
-        if cutlass.const_expr(has_runtime_activity_guard):
+        if cutlass.const_expr(has_runtime_activity_guard and not late_wait):
             # Initialize resource containers outside runtime control flow; only
             # task bodies skip inactive Q tiles and pruned KV splits.
             for task in task_manager.tasks:
                 assert isinstance(task, MlaDecodeTask)
                 task._runtime_body_active = run_task_graph
+        if cutlass.const_expr(index_prefetch):
+            for resource in task_manager.resources:
+                if isinstance(resource, SmemPageOffsetsResource):
+                    resource.idx_prefetch = index_prefetch_quad
         task_manager.setup_resources_and_tasks()
         smem_allocator = task_manager.smem_allocator
         assert smem_allocator is not None
@@ -3130,6 +3300,40 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 barrier_id=TMEM_LIFECYCLE_BARRIER_ID,
                 thread_count=cfg.threads_per_cta,
             )
+        if cutlass.const_expr(late_wait):
+            # Everything above reads only kernel parameters, grid-constant
+            # tensormaps, SMEM and TMEM (plus a non-binding L2 prefetch of the
+            # sinks). Every thread of every warp role waits here, at top level
+            # and outside any warp-gated region, before its first global read
+            # or write: the activity guard below and the whole task graph.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+            if cutlass.const_expr(index_prefetch):
+                _prefetch_first_sparse_index_quad(
+                    cfg,
+                    index_prefetch_quad,
+                    sparse_inputs[0],
+                    sparse_inputs[1],
+                    batch_idx,
+                    cta_idx_kv,
+                    persistent=not has_runtime_activity_guard,
+                    requested_splits=requested_splits,
+                    cp_rank=cp_rank,
+                )
+            if cutlass.const_expr(has_runtime_activity_guard):
+                query_tile_is_active, run_task_graph = _runtime_task_graph_activity(
+                    cfg,
+                    cache_seqs,
+                    cu_seqlens_q,
+                    batch_idx,
+                    cta_idx_q,
+                    cta_idx_kv,
+                    split_pruning=enable_runtime_split_pruning,
+                    requested_splits=requested_splits,
+                    cp_rank=cp_rank,
+                )
+                for task in task_manager.tasks:
+                    assert isinstance(task, MlaDecodeTask)
+                    task._runtime_body_active = run_task_graph
         task_manager.run()
         if cutlass.const_expr(has_runtime_activity_guard):
             if not run_task_graph and query_tile_is_active:

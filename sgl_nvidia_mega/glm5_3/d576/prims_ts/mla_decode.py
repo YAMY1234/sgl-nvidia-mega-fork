@@ -77,6 +77,8 @@ _MLA_LATENT_DIM = 512
 _MLA_ROPE_DIM = 64
 _PDL = __import__("os").environ.get("MEGA_D576_PDL", "0") == "1"
 _PDL_TRIGGER = int(__import__("os").environ.get("MEGA_D576_PDL_TRIGGER", "0"))
+_PDL_LATEWAIT = __import__("os").environ.get("MEGA_D576_PDL_LATEWAIT", "0") == "1"
+_IDXPREFETCH = __import__("os").environ.get("MEGA_D576_IDXPREFETCH", "0") == "1"
 _MLA_QUERY_DIM = _MLA_LATENT_DIM + _MLA_ROPE_DIM
 _SUPPORTED_INPUT_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 _SUPPORTED_OUTPUT_DTYPES = (torch.bfloat16,)
@@ -3131,6 +3133,14 @@ class BatchSparseMLADecodePagedTSWrapper:
         ``448 * 2**-T`` instead of 448, with the precision cost described
         there.
         """
+        if kv_cache_format == "nvfp4.fp8rope" and max_topk < 512:
+            # Capacity <= 256 selects a different, much slower profile branch
+            # (L128: 14.5 vs 9.6 us); plan the full row capacity.
+            raise ValueError(
+                "nvfp4.fp8rope requires max_topk >= 512: smaller capacities "
+                "select a much slower kernel profile; plan the full top-k "
+                f"capacity (e.g. 2048), got {max_topk}"
+            )
         (device, profile, spec, sections, byte_end, _, output_quant) = (
             _resolve_sparse_mla_plan(
                 device,
@@ -3203,6 +3213,10 @@ class BatchSparseMLADecodePagedTSWrapper:
                 if _PDL:
                     kernel.use_pdl = True
                     kernel.pdl_entry_trigger_max_ctas = _PDL_TRIGGER
+                # MEGA_D576_PDL_LATEWAIT=1: wait after the parameter-only setup;
+                # MEGA_D576_IDXPREFETCH=1: first-tile indices load beside lengths.
+                kernel.pdl_late_wait = _PDL_LATEWAIT
+                kernel.sparse_index_prefetch = _IDXPREFETCH
             kernel.direct_sparse = True
             kernel.direct_sparse_capacities = (max_topk, max_extra_topk)
             spec = replace(

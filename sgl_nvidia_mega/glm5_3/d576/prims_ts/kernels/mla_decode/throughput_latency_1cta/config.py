@@ -239,6 +239,12 @@ class MlaConfig(Nvfp4KVConfig):
     # whole grid; an early release only moves their launch and prologue onto
     # SMs this grid leaves idle, which crowds them once the grid is large.
     pdl_entry_trigger_max_ctas: int = 0
+    # Move the PDL wait from kernel entry to just before the task graph, after
+    # setup that reads only parameters (MEGA_D576_PDL_LATEWAIT).
+    pdl_late_wait: bool = False
+    # Load the first KV tile's sparse indices at entry beside the row lengths,
+    # assuming capacity-long rows; the loader masks them (MEGA_D576_IDXPREFETCH).
+    sparse_index_prefetch: bool = False
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
     # Planned KV tiles per instruction group (1 Keeps, 2 Swaps); zero selects
